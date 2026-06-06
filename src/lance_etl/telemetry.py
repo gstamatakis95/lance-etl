@@ -5,14 +5,14 @@ events into Datadog. Telemetry clients are created per process via :meth:`Teleme
 :class:`TelemetryConfig` is the only object pickled into executor closures.
 
 Lance emits structured trace events (file audits, dataset events, object-store throttling, index I/O, and execution
-stats) through a non-blocking callback that :func:`attach_lance_event_bridge` registers; the bridge turns those events
+stats) through a non-blocking callback that :func:`attach_lance_event_bridge` registers. The bridge turns those events
 into Datadog counters, gauges, and distributions and forwards them as logs. The bridge attaches automatically the first
 time :meth:`Telemetry.create` runs in a process, so driver and executors both report Lance internals. The performance
 tuning that the Lance guide describes (compute and I/O thread pools, the scan read-ahead buffer, log and trace levels)
 is applied through :class:`LanceRuntimeConfig` and :func:`apply_lance_runtime`.
 
 Assumes a Datadog Agent reachable from every node for DogStatsD on the configured host and port. The ddtrace, datadog,
-and lance imports use version and availability fallbacks; adjust the import block if installed versions differ.
+and lance imports use version and availability fallbacks. Adjust the import block if installed versions differ.
 """
 
 from __future__ import annotations
@@ -72,7 +72,7 @@ class TelemetryConfig:
         metric_prefix: Namespace prepended to every metric name.
         constant_tags: Tags attached to every metric, each formatted as a DogStatsD ``"key:value"`` string (e.g.
             ``["team:data", "region:us-east-1"]``). Passing plain keys without values is accepted by the DogStatsD
-            protocol but loses the value dimension; always include the colon and value.
+            protocol but loses the value dimension. Always include the colon and value.
     """
 
     service: str = "lance-pipeline"
@@ -93,12 +93,12 @@ class LanceRuntimeConfig:
     current process for the driver, and returns the variables it set so the caller can mirror them onto executors.
 
     Attributes:
-        cpu_threads: Value for ``LANCE_CPU_THREADS``; set this below the executor core count when several tasks share an
-            executor to avoid compute oversubscription.
-        io_threads: Value for ``LANCE_IO_THREADS``; cloud stores often need 128 or 256 to saturate bandwidth.
-        io_buffer_size_bytes: Value for ``LANCE_DEFAULT_IO_BUFFER_SIZE``; raise it alongside the I/O thread count.
+        cpu_threads: Value for ``LANCE_CPU_THREADS``. Set this below the executor core count when several tasks share
+            an executor to avoid compute oversubscription.
+        io_threads: Value for ``LANCE_IO_THREADS``. Cloud stores often need 128 or 256 to saturate bandwidth.
+        io_buffer_size_bytes: Value for ``LANCE_DEFAULT_IO_BUFFER_SIZE``. Raise it alongside the I/O thread count.
         lance_log: Value for ``LANCE_LOG`` controlling log filtering by level and target.
-        lance_tracing: Value for ``LANCE_TRACING`` controlling the trace level the event bridge observes; the key events
+        lance_tracing: Value for ``LANCE_TRACING`` controlling the trace level the event bridge observes. The key events
             are emitted at ``info``.
     """
 
@@ -409,7 +409,7 @@ class Telemetry:
     def error(self, message: str, tags: list[str] | None = None) -> None:
         """Log the current exception and increment an error counter.
 
-        Call this from an ``except`` block; the active exception and traceback are logged before the caller re-raises to
+        Call this from an ``except`` block. The active exception and traceback are logged before the caller re-raises to
         fail fast.
 
         Args:

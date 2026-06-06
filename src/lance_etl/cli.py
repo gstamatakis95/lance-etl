@@ -18,8 +18,9 @@ from datetime import UTC, datetime, timedelta
 from pyspark.sql import SparkSession
 
 from lance_etl.arrow_types import resolve_type_map
+from lance_etl.cloud_storage import discover_datasets
 from lance_etl.compaction import CompactionConfig, LanceCompactor
-from lance_etl.etl import ETLConfig, IcebergToLanceETL
+from lance_etl.etl import DEFAULT_PARTITION_COLS, ETLConfig, IcebergToLanceETL, PartitionDerivation
 from lance_etl.indexing import IndexJobConfig, LanceIndexer
 from lance_etl.telemetry import (
     LanceRuntimeConfig,
@@ -70,6 +71,55 @@ def parse_key_values(pairs: Sequence[str] | None) -> dict[str, str]:
     return result
 
 
+def parse_partition_cols(value: str | None) -> list[str] | None:
+    """Parse the comma-separated ``--partition-by`` column list.
+
+    Args:
+        value: The raw flag value, or None when the flag is absent.
+
+    Returns:
+        The column names in dataset-path order, or None when the flag is absent so the configuration default applies.
+
+    Raises:
+        ValueError: If the flag is present but lists no columns.
+    """
+    if value is None:
+        return None
+    columns: list[str] = [part.strip() for part in value.split(",") if part.strip()]
+    if not columns:
+        raise ValueError(f"--partition-by must list at least one column, got {value!r}")
+    return columns
+
+
+def parse_partition_derivations(specs: Sequence[str] | None) -> list[PartitionDerivation]:
+    """Parse repeated ``--partition-derive NAME=SOURCE:FORMAT`` arguments.
+
+    ``FORMAT`` is a Python strftime pattern (supported directives ``%Y %y %m %d %H %M %S %j %%``) translated to
+    Spark's ``date_format`` pattern, for example ``event_date=processing_timestamp:%Y-%m-%d``.
+
+    Args:
+        specs: The raw ``NAME=SOURCE:FORMAT`` strings, or None.
+
+    Returns:
+        One :class:`PartitionDerivation` per argument.
+
+    Raises:
+        ValueError: If an argument is not in ``NAME=SOURCE:FORMAT`` form or any part is empty.
+    """
+    result: list[PartitionDerivation] = []
+    for spec in specs or []:
+        if "=" not in spec:
+            raise ValueError(f"expected NAME=SOURCE:FORMAT, got {spec!r}")
+        name, rest = spec.split("=", 1)
+        if ":" not in rest:
+            raise ValueError(f"expected NAME=SOURCE:FORMAT, got {spec!r}")
+        source_col, strftime_format = rest.split(":", 1)
+        if not name or not source_col or not strftime_format:
+            raise ValueError(f"expected NAME=SOURCE:FORMAT with non-empty parts, got {spec!r}")
+        result.append(PartitionDerivation(name=name, source_col=source_col, strftime_format=strftime_format))
+    return result
+
+
 def build_telemetry_config(args: argparse.Namespace) -> TelemetryConfig:
     """Build a telemetry configuration from common arguments.
 
@@ -110,7 +160,11 @@ def build_lance_runtime_config(args: argparse.Namespace) -> LanceRuntimeConfig:
 
 
 def load_dataset_uris(args: argparse.Namespace) -> list[str]:
-    """Collect dataset URIs from arguments and an optional file.
+    """Collect dataset URIs from arguments, an optional file, and base-URI discovery.
+
+    When ``--base-uri`` is supplied, every ``*.lance`` dataset under it is discovered recursively at any depth, so
+    deeper partition hierarchies produced by custom ``--partition-by`` layouts are picked up alongside the historical
+    three-level layout.
 
     Args:
         args: Parsed command-line arguments.
@@ -119,12 +173,14 @@ def load_dataset_uris(args: argparse.Namespace) -> list[str]:
         The list of dataset URIs.
 
     Raises:
-        ValueError: If no dataset URIs are provided.
+        ValueError: If no dataset URIs are provided or discovered.
     """
     uris: list[str] = list(args.dataset_uri or [])
     if args.datasets_file:
         with open(args.datasets_file, encoding="utf-8") as handle:
             uris.extend(line.strip() for line in handle if line.strip())
+    if args.base_uri:
+        uris.extend(discover_datasets(args.base_uri, parse_key_values(args.storage_option) or None))
     if not uris:
         raise ValueError("no dataset URIs provided")
     return uris
@@ -141,9 +197,8 @@ def run_etl(args: argparse.Namespace, spark: SparkSession) -> None:
         base_uri=args.base_uri,
         telemetry=build_telemetry_config(args),
         key_col=args.key_col,
-        org_col=args.org_col,
-        tenant_col=args.tenant_col,
-        namespace_col=args.namespace_col,
+        partition_cols=parse_partition_cols(args.partition_by) or list(DEFAULT_PARTITION_COLS),
+        partition_derivations=parse_partition_derivations(args.partition_derive),
         vectors_col=args.vectors_col,
         metadata_col=args.metadata_col,
         ts_col=args.ts_col,
@@ -253,19 +308,19 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
         "--lance-cpu-threads",
         type=int,
         default=None,
-        help="LANCE_CPU_THREADS; set below executor cores when tasks share an executor",
+        help="LANCE_CPU_THREADS — set below executor cores when tasks share an executor",
     )
     parser.add_argument(
         "--lance-io-threads",
         type=int,
         default=None,
-        help="LANCE_IO_THREADS; cloud stores often need 128 or 256",
+        help="LANCE_IO_THREADS — cloud stores often need 128 or 256",
     )
     parser.add_argument(
         "--lance-io-buffer-size",
         type=int,
         default=None,
-        help="LANCE_DEFAULT_IO_BUFFER_SIZE in bytes; raise with the I/O thread count",
+        help="LANCE_DEFAULT_IO_BUFFER_SIZE in bytes — raise alongside the I/O thread count",
     )
     parser.add_argument("--lance-log", default=None, help="LANCE_LOG filter, for example info")
     parser.add_argument("--lance-tracing", default=None, help="LANCE_TRACING level the event bridge observes")
@@ -279,6 +334,14 @@ def add_dataset_arguments(parser: argparse.ArgumentParser) -> None:
     """
     parser.add_argument("--dataset-uri", action="append", help="Dataset URI, repeatable")
     parser.add_argument("--datasets-file", help="File with one dataset URI per line")
+    parser.add_argument(
+        "--base-uri",
+        default=None,
+        help=(
+            "Discover datasets recursively under this URI: every *.lance path at any depth is included, so custom "
+            "--partition-by hierarchies are picked up alongside the default three-level layout."
+        ),
+    )
 
 
 def add_two_tier_arguments(parser: argparse.ArgumentParser, include_vector_floor: bool = False) -> None:
@@ -316,7 +379,7 @@ def add_two_tier_arguments(parser: argparse.ArgumentParser, include_vector_floor
             type=int,
             default=50_000,
             help=(
-                "Datasets with fewer than this many rows skip IVF_RQ vector indexing; Lance flat KNN is adequate "
+                "Datasets with fewer than this many rows skip IVF_RQ vector indexing. Lance flat KNN is adequate "
                 "at this scale and training an IVF with too few rows degrades quality. Default 50000."
             ),
         )
@@ -340,9 +403,25 @@ def build_parser() -> argparse.ArgumentParser:
     etl.add_argument("--end", required=True, help="ISO 8601 or epoch milliseconds")
     etl.add_argument("--base-uri", required=True)
     etl.add_argument("--key-col", default="vector_id")
-    etl.add_argument("--org-col", default="org_id")
-    etl.add_argument("--tenant-col", default="tenant_id")
-    etl.add_argument("--namespace-col", default="namespace")
+    etl.add_argument(
+        "--partition-by",
+        default=None,
+        help=(
+            "Comma-separated columns routing each row to its dataset. The path is base_uri/<val1>/.../<valN>.lance "
+            "in this order. Every column must exist in the source table or be produced by --partition-derive. "
+            "Default: org_id,tenant_id,namespace. A key whose partition value changes between runs leaves a stale "
+            "copy in the previously-routed dataset. Readers deduplicate."
+        ),
+    )
+    etl.add_argument(
+        "--partition-derive",
+        action="append",
+        help=(
+            "Derived partition column as NAME=SOURCE:FORMAT, repeatable. FORMAT is a Python strftime pattern "
+            "(supported directives: %%Y %%y %%m %%d %%H %%M %%S %%j %%%%) translated to Spark's date_format and "
+            "applied to SOURCE before routing, e.g. event_date=processing_timestamp:%%Y-%%m-%%d."
+        ),
+    )
     etl.add_argument("--vectors-col", default="vectors")
     etl.add_argument("--metadata-col", default="metadata")
     etl.add_argument("--ts-col", default="timestamp")
@@ -453,7 +532,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Parse arguments, build a Spark session, and dispatch the subcommand.
 
     Args:
-        argv: Optional argument vector; defaults to ``sys.argv``.
+        argv: Optional argument vector. Defaults to ``sys.argv``.
 
     Returns:
         A process exit code.

@@ -2,9 +2,10 @@
 
 The pipeline can run against AWS S3, Google Cloud Storage, or Azure Blob Storage. pylance reaches the datasets through
 its own Rust object-store layer, driven by each job's ``storage_options``, so it is already portable. This module exists
-for the one place that needs a filesystem of its own: the IVF_RQ artifact sidecar in the indexing job, which reads and
-writes plain files next to a dataset (the trained centroids, the RaBitQ model, and a manifest). That work runs only on
-the driver.
+for the places that need a filesystem of their own: the IVF_RQ artifact sidecar in the indexing job, which reads and
+writes plain files next to a dataset (the trained centroids, the RaBitQ model, and a manifest), and
+:func:`discover_datasets`, which recursively enumerates ``*.lance`` datasets at any depth under a base URI for the
+compact and index subcommands. That work runs only on the driver.
 
 :func:`resolve_filesystem` builds the right ``pyarrow.fs`` filesystem for any of the three providers from the same
 ``storage_options`` mapping pylance uses. When no explicit credentials are supplied it delegates to
@@ -19,10 +20,10 @@ Provider caveats:
   ``access_token`` raises ``ValueError`` (``pyarrow/_gcsfs.pyx:108-111``). If you authenticate with a service-account
   file use ``GOOGLE_APPLICATION_CREDENTIALS`` and omit both keys so Application Default Credentials picks it up.
 - Azure: ``AzureFileSystem`` requires ``account_name`` as a positional argument (``pyarrow/_azurefs.pyx:110``).
-  Supplying no ``account_name`` raises ``TypeError``; this module rejects that combination early with a clear error.
+  Supplying no ``account_name`` raises ``TypeError``. This module rejects that combination early with a clear error.
   With a managed identity supply ``account_name`` and omit the key.
 
-The ``pyarrow.fs`` constructor keyword names for GCS and Azure have shifted across pyarrow versions; verify them against
+The ``pyarrow.fs`` constructor keyword names for GCS and Azure have shifted across pyarrow versions. Verify them against
 the installed pyarrow if explicit credentials are passed for those providers.
 """
 
@@ -140,7 +141,7 @@ def validate_gcs_kwargs(kwargs: dict[str, Any]) -> None:
 
     ``GcsFileSystem`` requires ``access_token`` and ``credential_token_expiration`` to be supplied together
     (``pyarrow/_gcsfs.pyx:108-111``). Passing only the token raises inside the Cython constructor with a confusing
-    message; this helper surfaces the problem early with an actionable one.
+    message. This helper surfaces the problem early with an actionable one.
 
     Args:
         kwargs: The mapped GCS constructor keywords to validate.
@@ -210,10 +211,42 @@ def resolve_filesystem(uri: str, storage_options: dict[str, Any] | None) -> tupl
     return pa_fs.AzureFileSystem(**kwargs), path
 
 
+def discover_datasets(base_uri: str, storage_options: dict[str, Any] | None = None) -> list[str]:
+    """Recursively discover Lance datasets at any depth under a base URI.
+
+    Walks the base location with one recursive listing on the resolved filesystem (local or any supported object
+    store) and returns every distinct path whose component name ends in ``.lance``, however deep it sits. This keeps
+    discovery depth-agnostic: the historical ``{org}/{tenant}/{namespace}.lance`` layout and deeper custom partition
+    hierarchies such as ``{org}/{tenant}/{namespace}/{event_date}.lance`` are both picked up. Entries inside a dataset
+    are collapsed to the dataset path, and sidecar directories such as ``{dataset}.lance.artifacts`` do not match
+    because their final component does not end in ``.lance``.
+
+    Args:
+        base_uri: Root location under which datasets live, in any supported URI scheme or a local path.
+        storage_options: The same options passed to pylance, or ``None``.
+
+    Returns:
+        The discovered dataset URIs, rooted at ``base_uri`` and sorted.
+    """
+    filesystem, base_path = resolve_filesystem(base_uri, storage_options)
+    base: str = base_path.rstrip("/")
+    selector: pa_fs.FileSelector = pa_fs.FileSelector(base, recursive=True, allow_not_found=True)
+    datasets: set[str] = set()
+    for info in filesystem.get_file_info(selector):
+        relative: str = info.path[len(base) :].lstrip("/")
+        components: list[str] = relative.split("/")
+        for depth, component in enumerate(components):
+            if component.endswith(".lance"):
+                datasets.add("/".join(components[: depth + 1]))
+                break
+    root: str = base_uri.rstrip("/")
+    return sorted(f"{root}/{path}" for path in datasets)
+
+
 def write_object(filesystem: Any, path: str, data: bytes) -> None:
     """Write bytes to a path on a resolved filesystem.
 
-    The parent directory is created first because local filesystems require it; on object stores ``create_dir`` is a
+    The parent directory is created first because local filesystems require it. On object stores ``create_dir`` is a
     harmless no-op since directories are implicit there.
 
     Args:

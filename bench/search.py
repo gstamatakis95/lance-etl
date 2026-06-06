@@ -362,6 +362,16 @@ def run_search(config: BenchConfig) -> dict[str, Any]:
         queries = queries[: config.max_queries]
 
     first_queries: dict[str, Any] = measure_first_queries(stub, pb2, config, queries)
+    max_nprobes: int = max(config.nprobes)
+    warmup_count: int = config.warmup_queries
+    if warmup_count > 0:
+        logger.info("warmup: %d queries at nprobes=%d (results discarded)", warmup_count, max_nprobes)
+        for org in config.org_ids():
+            for query in queries[:warmup_count]:
+                request = pb2.VectorSearchRequest(
+                    org_id=org, query=vector_query(pb2, query, config.search_k, max_nprobes, None)
+                )
+                timed_call(stub.VectorSearch, request)
     sweep: list[dict[str, Any]] = []
     for nprobes in config.nprobes:
         for refine_factor in config.refine_factors:

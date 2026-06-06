@@ -12,9 +12,9 @@ rewrite tasks fan out across executors as JSON, and the driver commits the colle
 Python ``Compaction.commit`` binding hard-codes default compaction options, so ``defer_index_remap`` cannot take effect
 on this tier: every index covering a rewritten fragment is remapped inline during the commit. The rewrite tasks
 themselves capture the row addresses deferral needs, so this is a gap in the Python binding, not a format limitation.
-Budget driver commit time accordingly for heavily indexed head datasets; the rewrite I/O itself still runs on executors.
+Budget driver commit time accordingly for heavily indexed head datasets. The rewrite I/O itself still runs on executors.
 ``max_source_fragments`` is applied at plan time and caps how many fragments one run consumes, enabling incremental
-compaction of head datasets. Multiple tier-B datasets run concurrently from a driver thread pool; each worker thread
+compaction of head datasets. Multiple tier-B datasets run concurrently from a driver thread pool. Each worker thread
 pins its Spark jobs to the FAIR scheduler pool named by ``scheduler_pool``, so set ``spark.scheduler.mode=FAIR`` (and
 optionally an allocation file defining the pool) on the session.
 
@@ -62,11 +62,11 @@ class CompactionConfig:
         max_bytes_per_file: Maximum bytes per compacted file.
         materialize_deletions: Whether to physically remove deleted rows.
         materialize_deletions_threshold: Deletion fraction above which a fragment is rewritten to drop deleted rows.
-        defer_index_remap: Defer index remap instead of rewriting indices inline; honored only on the small-dataset
+        defer_index_remap: Defer index remap instead of rewriting indices inline. Honored only on the small-dataset
             tier, where ``Compaction.execute`` parses all options. The large-dataset tier ignores it because the Python
             ``Compaction.commit`` binding commits with default options and always remaps indices inline.
         max_source_fragments: Cap on source fragments consumed per run, oldest first, for incremental compaction of
-            large datasets; ``None`` means no limit. ``0`` is rejected: it is not a disable sentinel and would be
+            large datasets. ``None`` means no limit. ``0`` is rejected: it is not a disable sentinel and would be
             refused by Lance's option parser.
         num_threads: Worker threads inside a single rewrite task.
         batch_size: Rows per batch when rewriting.
@@ -114,7 +114,7 @@ class CompactionConfig:
             Options accepted by ``Compaction.execute``, omitting unset values.
 
         Raises:
-            ValueError: If ``max_source_fragments`` is ``0``; use ``None`` for unlimited.
+            ValueError: If ``max_source_fragments`` is ``0``. Use ``None`` for unlimited.
         """
         if self.max_source_fragments == 0:
             raise ValueError("max_source_fragments=0 is not supported; use None to disable the limit")
@@ -297,7 +297,7 @@ class LanceCompactor:
     def compact_one(self, spark: SparkSession, uri: str, telemetry: Telemetry) -> dict[str, Any]:
         """Plan, execute across executors, and commit one large dataset's compaction.
 
-        The driver only plans and commits; rewrite I/O runs on executors. Index remap happens inline during the driver
+        The driver only plans and commits. Rewrite I/O runs on executors. Index remap happens inline during the driver
         commit (the binding ignores ``defer_index_remap`` here, a binding gap rather than a format limitation), so
         commit duration grows with the number and size of indices covering rewritten fragments. With
         ``max_source_fragments`` set, each run consumes a bounded slice of the oldest fragments for incremental
@@ -371,7 +371,7 @@ class LanceCompactor:
         """Compact large datasets concurrently from a driver thread pool.
 
         Each worker thread runs one dataset's plan/execute/commit cycle and pins its Spark jobs to the FAIR scheduler
-        pool, so several large datasets share the cluster instead of queueing FIFO. All datasets are attempted; the
+        pool, so several large datasets share the cluster instead of queueing FIFO. All datasets are attempted. The
         first failure is re-raised after the pool drains.
 
         Args:

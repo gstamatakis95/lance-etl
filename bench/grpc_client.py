@@ -21,7 +21,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import grpc
 import numpy as np
+from grpc_tools import protoc
 
 from bench.config import PROTO_PATH
 
@@ -39,8 +41,6 @@ def generate_stubs(gen_dir: Path) -> Path:
         RuntimeError: If protoc fails.
         FileNotFoundError: If the repository proto file is missing.
     """
-    from grpc_tools import protoc
-
     if not PROTO_PATH.exists():
         raise FileNotFoundError(f"search proto not found at {PROTO_PATH}")
     gen_dir.mkdir(parents=True, exist_ok=True)
@@ -93,8 +93,6 @@ def open_stub(endpoint: str, pb2_grpc: ModuleType, lance_root: str, timeout_seco
     Raises:
         RuntimeError: If the server is unreachable, with instructions to start it.
     """
-    import grpc
-
     channel = grpc.insecure_channel(endpoint)
     try:
         grpc.channel_ready_future(channel).result(timeout=timeout_seconds)

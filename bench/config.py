@@ -11,6 +11,7 @@ import argparse
 from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 PACKAGE_DIR: Path = Path(__file__).resolve().parent
 REPO_ROOT: Path = PACKAGE_DIR.parent
@@ -74,6 +75,7 @@ class BenchConfig:
 
     Attributes:
         command: The subcommand being executed.
+        dataset: Name of the registered dataset adapter driving the run; defaults to the canonical SIFT1M corpus.
         workspace: Directory holding downloaded data, prepared artifacts, the Iceberg warehouse, and Lance datasets.
         results_root: Directory under which per-run result directories are created.
         run_id: Identifier of the current run; one run directory aggregates every phase's artifacts.
@@ -111,9 +113,11 @@ class BenchConfig:
         prewarm: Call the prewarm hook before timing first queries.
         sha256: Optional pinned checksum for the downloaded sift archive.
         force: Rebuild prepared artifacts even when a manifest already exists.
+        warmup_queries: Queries issued at the maximum nprobes before the timed sweep; set to 0 to skip warmup.
     """
 
     command: str
+    dataset: str = "sift1m"
     workspace: Path = DEFAULT_WORKSPACE
     results_root: Path = DEFAULT_RESULTS_ROOT
     run_id: str = field(default_factory=default_run_id)
@@ -150,6 +154,7 @@ class BenchConfig:
     prewarm: bool = False
     sha256: str | None = None
     force: bool = False
+    warmup_queries: int = 100
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> BenchConfig:
@@ -161,15 +166,15 @@ class BenchConfig:
         Returns:
             The populated configuration.
         """
-        values: dict[str, object] = {}
+        values: dict[str, Any] = {}
         for item in fields(cls):
             if hasattr(args, item.name):
-                value: object = getattr(args, item.name)
+                value: Any = getattr(args, item.name)
                 if value is not None or item.name in ("ivf_partitions", "compact_target_rows", "max_queries", "sha256"):
                     values[item.name] = value
         values["workspace"] = Path(args.workspace).resolve()
         values["results_root"] = Path(args.results_root).resolve()
-        return cls(**values)  # type: ignore[arg-type]
+        return cls(**values)
 
     def table(self) -> str:
         """Return the fully qualified Iceberg table name.
@@ -178,14 +183,6 @@ class BenchConfig:
             The ``catalog.db.table`` identifier.
         """
         return f"{self.catalog}.db.{self.table_name}"
-
-    def sift_dir(self) -> Path:
-        """Return the directory holding the extracted SIFT1M files.
-
-        Returns:
-            The ``sift`` directory under the workspace.
-        """
-        return self.workspace / "sift"
 
     def warehouse_dir(self) -> Path:
         """Return the local Iceberg warehouse directory.
@@ -206,10 +203,16 @@ class BenchConfig:
     def prepared_key(self) -> str:
         """Return the cache key identifying one prepared corpus shape.
 
+        The default ``sift1m`` dataset keeps its historical un-prefixed key; other datasets are prefixed with their
+        adapter name so prepared artifacts never collide across datasets.
+
         Returns:
-            A key derived from the fields that change the corpus or ground truth.
+            A key derived from the dataset and the fields that change the corpus or ground truth.
         """
-        return f"n{self.limit}-t{self.tenants}-s{self.seed}-c{self.num_clusters}"
+        shape: str = f"n{self.limit}-t{self.tenants}-s{self.seed}-c{self.num_clusters}"
+        if self.dataset == "sift1m":
+            return shape
+        return f"{self.dataset}-{shape}"
 
     def prepared_dir(self) -> Path:
         """Return the directory of prepared artifacts for the current shape.
@@ -251,6 +254,7 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
     Args:
         parser: The subcommand parser to extend.
     """
+    parser.add_argument("--dataset", default="sift1m", help="Registered dataset adapter name; default sift1m")
     parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
     parser.add_argument("--results-root", type=Path, default=DEFAULT_RESULTS_ROOT)
     parser.add_argument("--run-id", dest="run_id", default=None)
@@ -289,6 +293,7 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--prewarm", action="store_true")
     parser.add_argument("--sha256", default=None, help="Pinned sha256 of sift.tar.gz")
     parser.add_argument("--force", action="store_true", help="Rebuild prepared artifacts")
+    parser.add_argument("--warmup-queries", type=int, default=100, help="Warmup queries before timed sweep; 0 skips")
 
 
 def build_parser() -> argparse.ArgumentParser:

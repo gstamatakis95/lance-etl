@@ -1,9 +1,9 @@
 """Command-line dispatch for the SIFT1M benchmark phases.
 
-Each subcommand maps to one phase module; ``all`` chains the full pipeline. Phase modules are imported lazily so the
-lightweight subcommands (and the test suite) do not pay for Spark, gRPC, or matplotlib imports. The search phase in the
-``all`` chain is skipped with a recorded reason when the gRPC server is unreachable so the rest of the report still
-materializes; the standalone ``search`` subcommand fails loudly instead.
+Each subcommand maps to one phase module; ``all`` chains the full pipeline. Phase modules are resolved through
+``importlib`` at dispatch time so the lightweight subcommands (and the test suite) do not pay for Spark or matplotlib
+imports. The search phase in the ``all`` chain is skipped with a recorded reason when the gRPC server is unreachable so
+the rest of the report still materializes; the standalone ``search`` subcommand fails loudly instead.
 """
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ import json
 import logging
 import os
 from typing import Any
+
+import grpc
 
 from bench.config import BenchConfig, build_parser
 from bench.results import save_phase
@@ -56,8 +58,6 @@ def server_reachable(config: BenchConfig) -> bool:
     Returns:
         ``True`` when a channel becomes ready within a short budget.
     """
-    import grpc
-
     channel = grpc.insecure_channel(config.endpoint)
     try:
         grpc.channel_ready_future(channel).result(timeout=3.0)
@@ -107,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
         A process exit code.
     """
     os.environ.setdefault("DD_TRACE_ENABLED", "false")
+    os.environ.setdefault("MPLBACKEND", "Agg")
     args: argparse.Namespace = build_parser().parse_args(argv)
     logging.basicConfig(
         level=logging.getLevelName(args.log_level.upper()), format="%(asctime)s %(levelname)s %(message)s"

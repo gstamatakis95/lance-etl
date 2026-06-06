@@ -10,7 +10,7 @@ Routing is dynamic: ``ETLConfig.partition_cols`` lists the columns whose values 
 ``base_uri/<val1>/<val2>/.../<valN>.lance`` in order, and the collapse window, the routing repartition, and the
 per-partition Arrow ``group_by`` all derive from that one list. Partition columns may also be derived from source
 columns with ``ETLConfig.partition_derivations`` (for example an ``event_date`` day partition derived from a
-``processing_timestamp`` column); derivations are materialized before the collapse and repartition so derived columns
+``processing_timestamp`` column). Derivations are materialized before the collapse and repartition so derived columns
 are usable in ``partition_cols``.
 
 Duplicate semantics across partitions are deliberately ALLOW: ``merge_insert`` stays keyed on ``key_col`` per dataset,
@@ -23,7 +23,7 @@ instead of duplicating, so no separate bulk path is needed.
 
 An optional timestamp window filter (``window_start`` / ``window_end`` / ``window_column`` on :class:`ETLConfig`) can
 narrow the rows that reach the collapse and merge steps to those whose ``window_column`` value falls within
-``[window_start, window_end)``.  Both bounds are ISO-8601 strings; absent means the bound is open (full-table).  The
+``[window_start, window_end)``.  Both bounds are ISO-8601 strings. An absent bound means the bound is open (full-table). The
 filter is applied as a Spark ``DataFrame.filter`` call immediately after the Iceberg read so Spark can push it down into
 the Iceberg scan for partition pruning.
 
@@ -31,7 +31,7 @@ Cross-contamination is prevented structurally: the dataset URI is a validated pu
 rows are shuffled by routing key, so a row can only reach its own dataset. Lance has no map type and structs are not
 used downstream, so ``vectors`` and ``metadata`` are flattened with ``map_keys``/``map_values`` into ``{col}_keys`` and
 ``{col}_values`` parallel list columns associated by index. ``conflict_retries`` makes concurrent runs on the same
-dataset safe; any other failure propagates so the job fails fast.
+dataset safe. Any other failure propagates so the job fails fast.
 
 Requires pylance and the Datadog Agent on the executors.
 """
@@ -74,9 +74,9 @@ STRFTIME_TO_SPARK: dict[str, str] = {
 def strftime_to_spark_format(strftime_format: str) -> str:
     """Translate a Python strftime pattern into a Spark ``date_format`` pattern.
 
-    Supported directives are ``%Y %y %m %d %H %M %S %j %%``; any other directive raises so a typo cannot silently
+    Supported directives are ``%Y %y %m %d %H %M %S %j %%``. Any other directive raises so a typo cannot silently
     produce wrong partition values. Literal letters are single-quoted because Spark treats bare letters as pattern
-    symbols; other literal characters pass through unchanged.
+    symbols. Other literal characters pass through unchanged.
 
     Args:
         strftime_format: The strftime pattern, for example ``%Y-%m-%d``.
@@ -121,7 +121,7 @@ class PartitionDerivation:
         name: Name of the derived column added to the DataFrame.
         source_col: Source timestamp column the derivation reads.
         strftime_format: Python strftime pattern (for example ``%Y-%m-%d``) translated to Spark's ``date_format``
-            pattern via :func:`strftime_to_spark_format`; only ``%Y %y %m %d %H %M %S %j %%`` are supported.
+            pattern via :func:`strftime_to_spark_format`. Only ``%Y %y %m %d %H %M %S %j %%`` are supported.
     """
 
     name: str
@@ -178,46 +178,39 @@ class ETLConfig:
         base_uri: Root location under which per-tenant datasets live.
         telemetry: Telemetry configuration.
         key_col: Unique vector id column and per-dataset merge key.
-        org_col: Legacy organisation routing column; feeds the default ``partition_cols``.
-        tenant_col: Legacy tenant routing column; feeds the default ``partition_cols``.
-        namespace_col: Legacy namespace routing column; feeds the default ``partition_cols``.
         partition_cols: Columns whose values route each row to its dataset and build the dataset path
-            ``base_uri/<val1>/<val2>/.../<valN>.lance`` in list order; each path component is validated against
+            ``base_uri/<val1>/<val2>/.../<valN>.lance`` in list order. Each path component is validated against
             ``path_component_pattern``. Every entry must exist in the source or be produced by
-            ``partition_derivations``. Defaults to ``["org_id", "tenant_id", "namespace"]`` (or the legacy
-            ``org_col`` / ``tenant_col`` / ``namespace_col`` overrides), which is byte-identical to the historical
-            fixed routing. Duplicate semantics across partitions are deliberately ALLOW: ``merge_insert`` stays
-            keyed on ``key_col`` per dataset, so a key whose partition value changes between runs leaves a stale
-            copy in the previously-routed dataset, and deletes only reach the currently-routed dataset; readers and
-            serving layers handle deduplication.
+            ``partition_derivations``. Defaults to ``["org_id", "tenant_id", "namespace"]``, which is byte-identical
+            to the historical fixed routing. Duplicate semantics across partitions are deliberately ALLOW:
+            ``merge_insert`` stays keyed on ``key_col`` per dataset, so a key whose partition value changes between
+            runs leaves a stale copy in the previously-routed dataset, and deletes only reach the currently-routed
+            dataset. Readers and serving layers handle deduplication.
         partition_derivations: Derived partition columns materialized with ``F.date_format`` before the collapse and
-            the routing repartition, so derived names are usable in ``partition_cols``; formats are Python strftime
+            the routing repartition, so derived names are usable in ``partition_cols``. Formats are Python strftime
             patterns translated via :func:`strftime_to_spark_format`.
         vectors_col: Map column of vectors flattened into parallel arrays.
         metadata_col: Map column of metadata flattened into parallel arrays.
         ts_col: Event timestamp column used for last-write-wins collapse.
         op_col: Operation column carrying insert, update, or delete.
-        delete_op_values: Operation values treated as deletes; others upsert.
+        delete_op_values: Operation values treated as deletes. Others upsert.
         column_types: Map of column name to target Arrow type, for types Spark cannot express such as float16.
         storage_options: Object-store options forwarded to pylance.
         num_partitions: Shuffle partitions for routing co-location.
         conflict_retries: Retry budget for concurrent merge commits.
-        retry_timeout: Total time budget for conflict retries; raised above the 30-second Lance default to give headroom
-            on hot multi-tenant datasets.
+        retry_timeout: Total time budget for conflict retries. Raised above the 30-second Lance default to give
+            headroom on hot multi-tenant datasets.
         guard_updates_by_ts: Enable the strict timestamp guard on updates.
         iceberg_read_options: Extra Iceberg reader options merged into the read.
         path_component_pattern: Allowed pattern for each routing component.
-        window_start: ISO-8601 lower bound (inclusive) for the source timestamp window filter; absent means open.
-        window_end: ISO-8601 upper bound (exclusive) for the source timestamp window filter; absent means open.
-        window_column: Column used for the timestamp window pushdown filter; defaults to ``updated_at``.
+        window_start: ISO-8601 lower bound (inclusive) for the source timestamp window filter. Absent means open.
+        window_end: ISO-8601 upper bound (exclusive) for the source timestamp window filter. Absent means open.
+        window_column: Column used for the timestamp window pushdown filter. Defaults to ``updated_at``.
     """
 
     base_uri: str
     telemetry: TelemetryConfig
     key_col: str = "vector_id"
-    org_col: str = "org_id"
-    tenant_col: str = "tenant_id"
-    namespace_col: str = "namespace"
     partition_cols: list[str] = field(default_factory=lambda: list(DEFAULT_PARTITION_COLS))
     partition_derivations: list[PartitionDerivation] = field(default_factory=list)
     vectors_col: str = "vectors"
@@ -238,36 +231,69 @@ class ETLConfig:
     window_column: str = "updated_at"
 
     def routing_cols(self) -> list[str]:
-        """Return the routing columns in path order.
+        """Return the routing columns in dataset-path order.
 
         Returns:
-            The organisation, tenant, and namespace column names.
+            The partition columns routing each row to its dataset, in path order.
         """
-        return [self.org_col, self.tenant_col, self.namespace_col]
+        return list(self.partition_cols)
 
 
-def dataset_uri(config: ETLConfig, org_id: str, tenant_id: str, namespace: str) -> str:
+def validate_partition_spec(partition_cols: list[str], derivations: list[PartitionDerivation]) -> None:
+    """Validate the partition routing specification at configuration-build time.
+
+    Checks everything that does not require the source schema: at least one partition column, no duplicate partition
+    columns, unique derivation names, and translatable derivation formats. Whether every partition column actually
+    exists in the source (or is produced by a derivation) is checked against the real DataFrame by
+    :meth:`IcebergToLanceETL.validate_schema` before any work runs.
+
+    Args:
+        partition_cols: The partition columns in dataset-path order.
+        derivations: The configured derived partition columns.
+
+    Raises:
+        ValueError: If the partition column list is empty or carries duplicates, a derivation name is duplicated, or a
+            derivation format uses an unsupported strftime directive.
+    """
+    if not partition_cols:
+        raise ValueError("partition_cols must list at least one column")
+    duplicate_cols: list[str] = sorted({column for column in partition_cols if partition_cols.count(column) > 1})
+    if duplicate_cols:
+        raise ValueError(f"partition_cols carries duplicate columns: {duplicate_cols}")
+    names: list[str] = [derivation.name for derivation in derivations]
+    duplicate_names: list[str] = sorted({name for name in names if names.count(name) > 1})
+    if duplicate_names:
+        raise ValueError(f"partition_derivations carries duplicate names: {duplicate_names}")
+    for derivation in derivations:
+        derivation.spark_format()
+
+
+def dataset_uri(config: ETLConfig, *components: str) -> str:
     """Build the validated dataset URI for one routing key.
+
+    The path is ``base_uri/<val1>/<val2>/.../<valN>.lance`` over ``config.routing_cols()`` in order, so the default
+    configuration yields the historical ``{base_uri}/{org_id}/{tenant_id}/{namespace}.lance`` layout byte-identically.
 
     Args:
         config: ETL configuration.
-        org_id: Organisation routing value.
-        tenant_id: Tenant routing value.
-        namespace: Namespace routing value.
+        *components: One routing value per configured partition column, in path order.
 
     Returns:
         The dataset URI confined to the routing-key prefix.
 
     Raises:
-        ValueError: If any routing component is null or fails validation, which prevents path traversal and routing
-            collisions.
+        ValueError: If the component count does not match the configured partition columns, or any component is null
+            or fails validation, which prevents path traversal and routing collisions.
     """
+    routing: list[str] = config.routing_cols()
+    if len(components) != len(routing):
+        raise ValueError(f"expected {len(routing)} routing components for {routing}, got {len(components)}")
     pattern: re.Pattern[str] = re.compile(config.path_component_pattern)
-    for component in (org_id, tenant_id, namespace):
-        if component is None or not pattern.match(component):
+    for component in components:
+        if not isinstance(component, str) or not pattern.match(component):
             raise ValueError(f"invalid routing component: {component!r}")
     base: str = config.base_uri.rstrip("/")
-    return f"{base}/{org_id}/{tenant_id}/{namespace}.lance"
+    return f"{base}/{'/'.join(components)}.lance"
 
 
 def cast_table(table: pa.Table, column_types: dict[str, pa.DataType]) -> pa.Table:
@@ -278,7 +304,7 @@ def cast_table(table: pa.Table, column_types: dict[str, pa.DataType]) -> pa.Tabl
         column_types: Map of column name to target Arrow type.
 
     Returns:
-        The table with the requested columns cast; others untouched.
+        The table with the requested columns cast. Others are untouched.
     """
     if not column_types:
         return table
@@ -328,7 +354,7 @@ def build_delete_predicate(key_col: str, keys: pa.Array) -> str:
     return f"{key_col} IN ({joined})"
 
 
-def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, str, str], group: pa.Table) -> tuple[int, int]:
+def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], group: pa.Table) -> tuple[int, int]:
     """Apply one dataset's terminal rows with merge upsert and physical delete.
 
     Bootstrap strategy: when the dataset does not exist yet, an empty table is written with ``lance.write_dataset(...,
@@ -337,18 +363,18 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, str, st
     in place instead of duplicating it.
 
     The merge ``execute()`` return dict provides authoritative row counts (``num_inserted_rows``, ``num_updated_rows``,
-    ``num_deleted_rows``); we report those rather than recomputing from the source table.
+    ``num_deleted_rows``). We report those rather than recomputing from the source table.
 
     Args:
         config: ETL configuration.
         telemetry: Telemetry facade for the current executor.
-        key: The ``(org_id, tenant_id, namespace)`` routing key.
+        key: The routing key, one value per configured partition column in path order.
         group: Rows for this routing key carrying the op column.
 
     Returns:
         The counts of upserted (inserted + updated) and deleted rows.
     """
-    uri: str = dataset_uri(config, key[0], key[1], key[2])
+    uri: str = dataset_uri(config, *key)
     is_delete: pa.Array = pc.is_in(group[config.op_col], value_set=pa.array(config.delete_op_values))
     payload_cols: list[str] = [c for c in group.column_names if c != config.op_col]
     upserts: pa.Table = cast_table(group.filter(pc.invert(is_delete)).select(payload_cols), config.column_types)
@@ -405,43 +431,79 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, str, st
     return upserted, deleted
 
 
-def build_stats_batch(rows: list[tuple[str, str, str, int, int]]) -> pa.RecordBatch:
+def snapshot_id_bounds(spark: SparkSession, table: str, start_ms: int, end_ms: int) -> tuple[int | None, int | None]:
+    """Resolve a wall-clock window to Iceberg snapshot-id bounds via the snapshots metadata table.
+
+    Queries ``{table}.snapshots`` and walks the snapshots in ``committed_at`` order. The start bound is the last
+    snapshot committed strictly before ``start_ms`` — the state the previous window already processed, used as the
+    exclusive ``start-snapshot-id`` of an incremental append scan. The end bound is the last snapshot committed at or
+    before ``end_ms`` — the inclusive ``end-snapshot-id``. Either bound is None when no snapshot satisfies it.
+
+    Args:
+        spark: Active Spark session.
+        table: Fully qualified Iceberg table name.
+        start_ms: Window start in epoch milliseconds.
+        end_ms: Window end in epoch milliseconds.
+
+    Returns:
+        ``(start_id, end_id)`` snapshot ids, each None when no snapshot satisfies the bound.
+    """
+    snapshots: DataFrame = spark.read.format("iceberg").load(f"{table}.snapshots")
+    committed: list[tuple[int, int]] = sorted(
+        (int(row["committed_at"].timestamp() * 1000), int(row["snapshot_id"]))
+        for row in snapshots.select("committed_at", "snapshot_id").collect()
+    )
+    start_id: int | None = None
+    end_id: int | None = None
+    for committed_ms, snapshot_id in committed:
+        if committed_ms < start_ms:
+            start_id = snapshot_id
+        if committed_ms <= end_ms:
+            end_id = snapshot_id
+    return start_id, end_id
+
+
+def build_stats_batch(rows: list[tuple[Any, ...]], schema: pa.Schema) -> pa.RecordBatch:
     """Build the per-partition stats record batch.
 
     Args:
-        rows: One ``(org, tenant, namespace, upserted, deleted)`` per dataset.
+        rows: One ``(*routing_values, upserted, deleted)`` per dataset, matching the schema's column order.
+        schema: The stats schema produced by :func:`stats_schema` for the configured routing columns.
 
     Returns:
-        A record batch conforming to ``STATS_SCHEMA``.
+        A record batch conforming to the given schema.
     """
-    return pa.RecordBatch.from_arrays(
-        [
-            pa.array([r[0] for r in rows], pa.string()),
-            pa.array([r[1] for r in rows], pa.string()),
-            pa.array([r[2] for r in rows], pa.string()),
-            pa.array([r[3] for r in rows], pa.int64()),
-            pa.array([r[4] for r in rows], pa.int64()),
-        ],
-        schema=STATS_SCHEMA,
-    )
+    arrays: list[pa.Array] = [pa.array([row[index] for row in rows], field.type) for index, field in enumerate(schema)]
+    return pa.RecordBatch.from_arrays(arrays, schema=schema)
 
 
 class IcebergToLanceETL:
     """Routes an Iceberg increment into per-tenant Lance datasets."""
 
     def __init__(self, config: ETLConfig) -> None:
-        """Initialize the ETL.
+        """Initialize the ETL, validating the partition specification early.
 
         Args:
             config: ETL configuration.
+
+        Raises:
+            ValueError: If the partition columns or derivations fail :func:`validate_partition_spec`.
         """
+        validate_partition_spec(config.routing_cols(), config.partition_derivations)
         self.config: ETLConfig = config
 
     def read_increment(self, spark: SparkSession, table: str, start_ms: int, end_ms: int) -> DataFrame:
-        """Read appended rows in a time range using Iceberg incremental options.
+        """Read the rows committed to an Iceberg table within a wall-clock window.
 
-        Uses ``start-timestamp`` and ``end-timestamp`` in epoch milliseconds. The exact option names depend on the
-        Iceberg version; override or extend via ``iceberg_read_options`` if the deployment differs.
+        Iceberg 1.10 rejects the ``start-timestamp`` / ``end-timestamp`` read options outside changelog scans
+        (``SparkScanBuilder``: "Cannot set start-timestamp or end-timestamp for incremental scans and batch scan.
+        They are only valid for changelog scans."), so the window is first resolved to snapshot ids through
+        :func:`snapshot_id_bounds` over the ``{table}.snapshots`` metadata table. When a snapshot exists strictly
+        before the window start, the read is an incremental append scan bounded by ``start-snapshot-id`` (exclusive)
+        and ``end-snapshot-id`` (inclusive). When the table has no snapshot before the window start (first run), the
+        read falls back to a full batch scan pinned to the window's last snapshot via ``snapshot-id``. When the
+        window resolves to no snapshots at all, an empty DataFrame with the current table schema is returned.
+        ``iceberg_read_options`` are merged into every non-empty read.
 
         Args:
             spark: Active Spark session.
@@ -452,9 +514,14 @@ class IcebergToLanceETL:
         Returns:
             The incremental rows as a DataFrame.
         """
-        reader = (
-            spark.read.format("iceberg").option("start-timestamp", str(start_ms)).option("end-timestamp", str(end_ms))
-        )
+        start_id, end_id = snapshot_id_bounds(spark, table, start_ms, end_ms)
+        if end_id is None or start_id == end_id:
+            return spark.read.format("iceberg").load(table).limit(0)
+        reader = spark.read.format("iceberg")
+        if start_id is None:
+            reader = reader.option("snapshot-id", str(end_id))
+        else:
+            reader = reader.option("start-snapshot-id", str(start_id)).option("end-snapshot-id", str(end_id))
         for option_key, option_value in self.config.iceberg_read_options.items():
             reader = reader.option(option_key, option_value)
         return reader.load(table)
@@ -463,7 +530,7 @@ class IcebergToLanceETL:
         """Apply the optional timestamp window pushdown filter.
 
         Filters ``source`` to rows where ``config.window_column`` falls within ``[window_start, window_end)``.  Both
-        bounds are ISO-8601 strings and are optional; an absent bound leaves that side of the interval open.  The filter
+        bounds are ISO-8601 strings and are optional. An absent bound leaves that side of the interval open.  The filter
         is applied as a ``DataFrame.filter`` SQL-string predicate before any shuffle so Spark can push it down into the
         Iceberg scan for partition pruning.  When neither bound is set the DataFrame is returned unchanged
         (full-table behaviour).
@@ -487,6 +554,9 @@ class IcebergToLanceETL:
     def validate_schema(self, source: DataFrame) -> None:
         """Validate that the source carries every required column.
 
+        Every partition column must exist in the source or be produced by a configured derivation, and every
+        derivation's source column must exist in the source.
+
         Args:
             source: The incremental source DataFrame.
 
@@ -494,17 +564,42 @@ class IcebergToLanceETL:
             ValueError: If a required column is missing.
         """
         config: ETLConfig = self.config
+        derived: set[str] = {derivation.name for derivation in config.partition_derivations}
         required: list[str] = [
             config.key_col,
             config.ts_col,
             config.op_col,
             config.vectors_col,
             config.metadata_col,
-            *config.routing_cols(),
+            *(derivation.source_col for derivation in config.partition_derivations),
+            *(column for column in config.routing_cols() if column not in derived),
         ]
         missing: list[str] = [c for c in required if c not in source.columns]
         if missing:
-            raise ValueError(f"source is missing required columns: {missing}")
+            raise ValueError(
+                f"source is missing required columns: {missing} "
+                "(every partition column must exist in the source or be produced by partition_derivations)"
+            )
+
+    def derive_partition_columns(self, source: DataFrame) -> DataFrame:
+        """Materialize the configured derived partition columns.
+
+        Each derivation is applied as ``F.date_format`` over its source column before the collapse and the routing
+        repartition, so derived names are usable in ``partition_cols`` and land in the written datasets as regular
+        payload columns.
+
+        Args:
+            source: The incremental source DataFrame.
+
+        Returns:
+            The DataFrame with one extra string column per derivation, or the original when none are configured.
+        """
+        result: DataFrame = source
+        for derivation in self.config.partition_derivations:
+            result = result.withColumn(
+                derivation.name, F.date_format(F.col(derivation.source_col), derivation.spark_format())
+            )
+        return result
 
     def flatten_maps(self, source: DataFrame) -> DataFrame:
         """Flatten the vector and metadata maps into struct-free parallel arrays.
@@ -564,9 +659,12 @@ class IcebergToLanceETL:
         driver_telemetry: Telemetry = Telemetry.create(config.telemetry)
         with driver_telemetry.span("lance.etl.run") as run_span:
             self.validate_schema(source)
-            collapsed: DataFrame = self.collapse(self.flatten_maps(source))
-            routed: DataFrame = collapsed.repartition(config.num_partitions, *[F.col(c) for c in config.routing_cols()])
+            prepared: DataFrame = self.derive_partition_columns(source)
+            collapsed: DataFrame = self.collapse(self.flatten_maps(prepared))
+            routing: list[str] = config.routing_cols()
+            routed: DataFrame = collapsed.repartition(config.num_partitions, *[F.col(c) for c in routing])
             etl_config: ETLConfig = config
+            partition_stats_schema: pa.Schema = stats_schema(routing)
 
             def merge_partition(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
                 """Merge one Spark partition's datasets on an executor.
@@ -582,21 +680,21 @@ class IcebergToLanceETL:
                     return
                 telemetry: Telemetry = Telemetry.create(etl_config.telemetry)
                 table: pa.Table = pa.Table.from_batches(collected)
-                results: list[tuple[str, str, str, int, int]] = []
+                results: list[tuple[Any, ...]] = []
                 with telemetry.span("lance.etl.partition"):
                     try:
                         for key, group in group_by_routing(table, etl_config.routing_cols()):
                             upserted, deleted = apply_merge(etl_config, telemetry, key, group)
-                            results.append((key[0], key[1], key[2], upserted, deleted))
+                            results.append((*key, upserted, deleted))
                     except Exception:
                         telemetry.error("etl partition failed")
                         raise
                 if results:
-                    yield build_stats_batch(results)
+                    yield build_stats_batch(results, partition_stats_schema)
 
             try:
                 with driver_telemetry.timed("run.execute_ms"):
-                    stats: DataFrame = routed.mapInArrow(merge_partition, schema=STATS_SCHEMA)
+                    stats: DataFrame = routed.mapInArrow(merge_partition, schema=stats_spark_ddl(routing))
                     totals = stats.agg(
                         F.count(F.lit(1)).alias("datasets"),
                         F.coalesce(F.sum("upserted"), F.lit(0)).alias("upserted"),

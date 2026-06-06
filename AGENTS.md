@@ -66,15 +66,23 @@ annotations` is required in every module.
 
 ### 4. ruff is the formatter and linter; line length is 120
 
-Before committing any Python change:
+ALWAYS run both commands after any Python change (a PostToolUse hook in `.claude/settings.json`
+also runs them automatically after every file edit):
 
 ```bash
-uvx ruff format src/ tests/ airflow/
-uvx ruff check src/ tests/ airflow/
+uvx ruff format src/ tests/ airflow/ bench/
+uvx ruff check src/ tests/ airflow/ bench/
 ```
 
-The enabled rule sets are `E, W, F, I, B, UP, SIM, ARG` (see `pyproject.toml`). Both commands
-must exit 0. Do not suppress warnings without a written justification in the PR description.
+The enabled rule sets are `E, W, F, I, B, UP, SIM, ARG, PLC0415` (see `pyproject.toml`). Both
+commands must exit 0. Do not suppress warnings without a written justification in the PR
+description.
+
+### 4b. All imports at the top of the file, always
+
+No imports inside functions, methods, or conditional branches — enforced by `E402` and `PLC0415`.
+Lazy imports for optional dependencies are not an accepted exception; put the dependency in the
+appropriate dependency group instead.
 
 ### 5. Spark: heavy work in executors only
 

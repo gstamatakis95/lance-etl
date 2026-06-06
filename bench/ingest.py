@@ -1,13 +1,16 @@
 """Run the real Iceberg-to-Lance ETL over the benchmark source table.
 
-Drives ``lance_etl.cli.main`` with a constructed argv for full fidelity: the same code path production uses, including
-the Iceberg incremental read, the ``--window-start`` / ``--window-end`` timestamp pushdown flags, the routing shuffle,
-and the executor-side ``merge_insert``. With ``--batches B`` the synthetic day is split into B consecutive windows and
-the ETL runs once per window, producing B merge commits (and therefore multiple fragments) per dataset for the
-compaction phase to consume.
+Drives the production :meth:`lance_etl.etl.IcebergToLanceETL.run` end to end, source read included: the same
+configuration the ``lance-etl etl`` CLI would build (routing columns, last-write-wins collapse on ``updated_at``, the
+fixed-size-list vector cast, the routing shuffle, and the executor-side ``merge_insert``) plus the production
+``apply_window_filter`` pushdown. ``read_increment`` resolves the snapshot window through the ``{table}.snapshots``
+metadata table; the benchmark passes a snapshot window of ``[0, now]`` that brackets the table's entire history, so no
+snapshot precedes the window start and the read takes the production first-run fallback — a full batch scan pinned to
+the window's last snapshot via the ``snapshot-id`` option. The source table is written once by prepare, so the
+``updated_at`` window filter is the per-batch slicer.
 
-The Spark session is created here with the Iceberg catalog configuration before each CLI invocation; the CLI's
-``getOrCreate`` then reuses it and stops it when the window finishes.
+With ``--batches B`` the synthetic day is split into B consecutive windows and the ETL runs once per window, producing
+B merge commits (and therefore multiple fragments) per dataset for the compaction phase to consume.
 """
 
 from __future__ import annotations
@@ -21,9 +24,13 @@ from typing import Any
 import lance
 
 from bench.config import BenchConfig
+from bench.datasets import adapter_for
+from bench.indexes import bench_telemetry_config
 from bench.prepare import BASE_DAY, MINUTES_PER_DAY
 from bench.results import save_phase
 from bench.spark_session import build_spark
+from lance_etl.arrow_types import resolve_type_map
+from lance_etl.etl import ETLConfig, IcebergToLanceETL
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -46,68 +53,56 @@ def batch_windows(batches: int) -> list[tuple[str, str]]:
     return windows
 
 
-def snapshot_bounds_ms(config: BenchConfig) -> tuple[int, int]:
-    """Read the Iceberg table's snapshot commit-time bounds for the incremental read.
+def etl_config(config: BenchConfig, dimension: int, window: tuple[str, str]) -> ETLConfig:
+    """Build the production ETL configuration for one batch window.
+
+    Mirrors exactly what ``lance-etl etl`` builds from the benchmark argv: every field not listed keeps the CLI
+    default, which equals the ``ETLConfig`` default.
 
     Args:
         config: Benchmark configuration.
-
-    Returns:
-        ``(start_ms, end_ms)`` bracketing every snapshot of the table.
-    """
-    spark = build_spark(config, "bench-ingest-bounds")
-    row = spark.sql(
-        f"SELECT unix_millis(MIN(committed_at)) AS start_ms, unix_millis(MAX(committed_at)) AS end_ms "
-        f"FROM {config.table()}.snapshots"
-    ).collect()[0]
-    return int(row["start_ms"]) - 60_000, int(row["end_ms"]) + 60_000
-
-
-def etl_argv(config: BenchConfig, start_ms: int, end_ms: int, window: tuple[str, str]) -> list[str]:
-    """Build the ``lance-etl etl`` argument vector for one batch window.
-
-    Args:
-        config: Benchmark configuration.
-        start_ms: Iceberg incremental-read start in epoch milliseconds.
-        end_ms: Iceberg incremental-read end in epoch milliseconds.
+        dimension: The dataset's vector dimension, driving the fixed-size-list cast.
         window: The ``updated_at`` window literals for the pushdown filter.
 
     Returns:
-        The argv handed to ``lance_etl.cli.main``.
+        The ETL configuration for the window.
     """
-    from bench.config import SIFT_DIM
+    return ETLConfig(
+        base_uri=str(config.lance_root()),
+        telemetry=bench_telemetry_config(),
+        ts_col="updated_at",
+        column_types=resolve_type_map({"vector": f"fixed_size_list<float32,{dimension}>"}),
+        num_partitions=config.etl_partitions,
+        window_start=window[0],
+        window_end=window[1],
+        window_column="updated_at",
+    )
 
-    return [
-        "--app-name",
-        "bench-etl",
-        "etl",
-        "--table",
-        config.table(),
-        "--start",
-        str(start_ms),
-        "--end",
-        str(end_ms),
-        "--base-uri",
-        str(config.lance_root()),
-        "--ts-col",
-        "updated_at",
-        "--column-type",
-        f"vector=fixed_size_list<float32,{SIFT_DIM}>",
-        "--num-partitions",
-        str(config.etl_partitions),
-        "--retry-timeout",
-        "120",
-        "--window-column",
-        "updated_at",
-        "--window-start",
-        window[0],
-        "--window-end",
-        window[1],
-        "--dd-service",
-        "lance-bench",
-        "--dd-env",
-        "bench",
-    ]
+
+def run_etl_window(config: BenchConfig, dimension: int, index: int, window: tuple[str, str]) -> float:
+    """Run the production ETL for one batch window and return its wall time.
+
+    Calls the production :meth:`lance_etl.etl.IcebergToLanceETL.run` with a snapshot window of ``[0, now]``: the
+    source table is written once by prepare, so every batch reads the same pinned snapshot through the
+    ``read_increment`` first-run fallback and the ``updated_at`` window filter slices out this batch's rows.
+
+    Args:
+        config: Benchmark configuration.
+        dimension: The dataset's vector dimension.
+        index: Zero-based window index, used for the Spark application name.
+        window: The ``updated_at`` window literals.
+
+    Returns:
+        The wall time of the window's ETL run in seconds.
+    """
+    spark = build_spark(config, f"bench-ingest-{index}")
+    started: float = time.perf_counter()
+    try:
+        etl: IcebergToLanceETL = IcebergToLanceETL(etl_config(config, dimension, window))
+        etl.run(spark, config.table(), 0, int(time.time() * 1000))
+    finally:
+        spark.stop()
+    return time.perf_counter() - started
 
 
 def dataset_row_counts(config: BenchConfig) -> dict[str, int]:
@@ -130,29 +125,18 @@ def run_ingest(config: BenchConfig) -> dict[str, Any]:
 
     Returns:
         The phase result document.
-
-    Raises:
-        RuntimeError: If any ETL invocation exits non-zero.
     """
-    from lance_etl.cli import main as lance_etl_main
-
     lance_root = config.lance_root()
     if lance_root.exists():
         shutil.rmtree(lance_root)
 
-    start_ms, end_ms = snapshot_bounds_ms(config)
+    dimension: int = adapter_for(config).dimension
     windows: list[tuple[str, str]] = batch_windows(config.batches)
     batch_results: list[dict[str, Any]] = []
     total_seconds: float = 0.0
     for index, window in enumerate(windows):
-        build_spark(config, f"bench-ingest-{index}")
-        argv: list[str] = etl_argv(config, start_ms, end_ms, window)
         logger.info("etl batch %d/%d window [%s, %s)", index + 1, len(windows), window[0], window[1])
-        started: float = time.perf_counter()
-        exit_code: int = lance_etl_main(argv)
-        elapsed: float = time.perf_counter() - started
-        if exit_code != 0:
-            raise RuntimeError(f"lance-etl etl exited {exit_code} for window {window}")
+        elapsed: float = run_etl_window(config, dimension, index, window)
         total_seconds += elapsed
         batch_results.append({"window_start": window[0], "window_end": window[1], "seconds": round(elapsed, 3)})
 

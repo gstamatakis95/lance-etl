@@ -8,12 +8,12 @@ place:
   every shard encodes with the same centroids and rotation. Segments are merged before commit.
 - :class:`BTreeIndexHandler` and :class:`BitmapIndexHandler` build scalar indices through the same segment API as the
   vector handler: per-shard ``create_index_uncommitted`` followed by a driver ``commit_existing_index_segments``. Bitmap
-  segments are merged into one segment first; btree segments are committed unmerged.
+  segments are merged into one segment first. Btree segments are committed unmerged.
 - :class:`FtsIndexHandler` builds a full-text (BM25) inverted index. Inverted indices use the distributed metadata-merge
   path: each shard builds its fragments under one shared index id, the driver merges the per-fragment metadata, and the
   index is published with a create-index commit.
 
-Vector and scalar handlers index only fragments not already covered by the existing segments; pass ``rebuild`` to
+Vector and scalar handlers index only fragments not already covered by the existing segments. Pass ``rebuild`` to
 reindex every fragment. Only the FTS handler rebuilds the whole index each run. Every commit retries conflicts with
 exponential backoff so it coexists with concurrent ingestion and compaction.
 
@@ -24,7 +24,7 @@ from the driver with a thread pool and Spark FAIR scheduler pools. IVF partition
 ``clamp(round(sqrt(rows)), 16, 4096)`` unless configured, degraded when the dataset cannot supply enough training rows,
 and the vector index is skipped entirely below a configurable row floor where flat KNN is sufficient.
 
-Requires pylance and the Datadog Agent on the executors; artifact IO uses pyarrow's filesystem layer.
+Requires pylance and the Datadog Agent on the executors. Artifact IO uses pyarrow's filesystem layer.
 """
 
 from __future__ import annotations
@@ -73,14 +73,14 @@ class IndexJobConfig:
         telemetry: Telemetry configuration.
         storage_options: Object-store options forwarded to pylance.
         vector_column: Vector column to index with IVF_RQ, if any.
-        num_partitions: IVF partitions; derived as ``clamp(round(sqrt(rows)), 16, 4096)`` when unset.
-        num_bits: RaBitQ bits per dimension; IVF_RQ uses 1.
-        vector_min_rows: Skip the vector index below this row count; flat KNN serves small datasets.
+        num_partitions: IVF partitions. Derived as ``clamp(round(sqrt(rows)), 16, 4096)`` when unset.
+        num_bits: RaBitQ bits per dimension. IVF_RQ uses 1.
+        vector_min_rows: Skip the vector index below this row count. Flat KNN serves small datasets.
         metric: Distance metric, such as ``L2``, ``cosine``, or ``dot``.
-        distance_type: IVF training distance; derived from ``metric`` if unset.
+        distance_type: IVF training distance. Derived from ``metric`` if unset.
         train_sample_rate: Rows sampled per partition when training the IVF.
         train_max_iters: Maximum k-means iterations when training the IVF.
-        vector_index_name: Vector index name; defaults to ``{vector_column}_idx``.
+        vector_index_name: Vector index name. Defaults to ``{vector_column}_idx``.
         scalar_columns: Columns to index with btree.
         bitmap_columns: Columns to index with bitmap.
         text_columns: Columns to index with a full-text inverted index.
@@ -231,7 +231,7 @@ def derive_num_partitions(rows: int, configured: int | None) -> int:
 def degrade_num_partitions(planned: int, rows: int, sample_rate: int) -> int:
     """Lower the partition count when training rows are insufficient.
 
-    ``train_ivf`` samples ``num_partitions * sample_rate`` rows; when the dataset cannot supply that many, the partition
+    ``train_ivf`` samples ``num_partitions * sample_rate`` rows. When the dataset cannot supply that many, the partition
     count is degraded to what the available rows can train.
 
     Args:
@@ -404,8 +404,8 @@ def lance_field_id(dataset: lance.LanceDataset, column: str) -> int:
     """Return the Lance field id for a top-level column.
 
     Uses the internal Lance schema rather than the Arrow positional index so the field id remains stable across schema
-    evolution. ``dataset._ds`` is the only way to access the Lance schema from Python; access is wrapped here to contain
-    the private-attribute usage.
+    evolution. ``dataset._ds`` is the only way to access the Lance schema from Python. Access is wrapped here to
+    contain the private-attribute usage.
 
     Args:
         dataset: The dataset to inspect.
@@ -708,8 +708,8 @@ class VectorIndexHandler(IndexHandler):
         """Check that reused artifacts match the requested configuration.
 
         The partition count is not compared: reused centroids define it, so the build adopts ``num_partitions`` from the
-        manifest instead. The manifest also carries the ``rabitq_model`` rotation string; its presence is checked by the
-        reuse branch in :meth:`prepare`, which retrains when a sidecar predates the model.
+        manifest instead. The manifest also carries the ``rabitq_model`` rotation string. Its presence is checked by
+        the reuse branch in :meth:`prepare`, which retrains when a sidecar predates the model.
 
         Args:
             manifest: The stored artifact manifest.
@@ -731,8 +731,8 @@ class VectorIndexHandler(IndexHandler):
     def prepare(self, dataset: lance.LanceDataset, uri: str, telemetry: Telemetry) -> object | None:
         """Load this dataset's IVF_RQ artifacts, or train and persist them.
 
-        Trains the IVF centroid model and mints one shared RaBitQ rotation via ``lance.lance.indices.build_rq_model``;
-        both are persisted to the sidecar manifest and broadcast. The SAME ``rabitq_model`` JSON string must reach every
+        Trains the IVF centroid model and mints one shared RaBitQ rotation via ``lance.lance.indices.build_rq_model``.
+        Both are persisted to the sidecar manifest and broadcast. The SAME ``rabitq_model`` JSON string must reach every
         executor because it pins the rotation, so per-fragment segments produce comparable binary codes and remain
         mergeable. If it were omitted, each ``create_index_uncommitted`` call would generate its own random rotation,
         which is only safe for a single non-merged segment. The partition count follows the size-aware policy and is
@@ -811,7 +811,7 @@ class VectorIndexHandler(IndexHandler):
             The uncommitted segment metadata.
 
         Raises:
-            ValueError: If ``artifacts`` is ``None``; vector segment builds require the artifact tuple produced by
+            ValueError: If ``artifacts`` is ``None``. Vector segment builds require the artifact tuple produced by
                 :meth:`prepare`.
         """
         if artifacts is None:
@@ -850,7 +850,7 @@ class BTreeIndexHandler(IndexHandler):
     def build_segment(self, dataset: lance.LanceDataset, fragment_ids: list[int], artifacts: object | None) -> Index:
         """Build one BTREE segment over a shard of fragments.
 
-        ``index_uuid`` must not be passed for BTREE segment builds; Lance mints segment ids itself.
+        ``index_uuid`` must not be passed for BTREE segment builds. Lance mints segment ids itself.
 
         Args:
             dataset: A dataset handle pinned to the build version.

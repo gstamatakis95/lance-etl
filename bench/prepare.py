@@ -5,17 +5,21 @@ columns (``org_id``, ``tenant_id``, ``namespace``), the merge key ``vector_id``,
 timestamp column ``updated_at`` (used as both the last-write-wins collapse column and the window-pushdown column), and
 the two required map columns ``vectors`` / ``metadata`` that the ETL flattens into parallel arrays. The actual
 embedding rides in a top-level ``vector array<float>`` column which the ingest phase casts to
-``fixed_size_list<float32, 128>`` through the ETL's ``--column-type`` flag, plus ``text`` (synthetic, cluster-seeded)
+``fixed_size_list<float32, dim>`` through the ETL's ``--column-type`` flag, plus ``text`` (synthetic, cluster-seeded)
 and ``category`` (low-cardinality, for the bitmap index) columns that flow through the ETL untouched.
 
-Row generation runs inside Spark executors via ``mapInArrow``: each task reads its own row slice straight from
-``sift_base.fvecs``, assigns clusters against the driver-trained centroids, and emits Arrow batches. ``updated_at``
+Row generation runs inside Spark executors via ``mapInArrow``: each task reads its own row slice straight through the
+dataset adapter, assigns clusters against the driver-trained centroids, and emits Arrow batches. ``updated_at``
 spreads rows deterministically over one synthetic day (minute ``index % 1440``) so the ingest phase can slice the day
 into ``--batches`` windows through the ETL's real ``--window-start`` / ``--window-end`` pushdown flags.
 
-Ground truth: the published ``sift_groundtruth.ivecs`` is used verbatim for the canonical full single-tenant run; any
-``--limit`` subset or multi-tenant split triggers an exact batched numpy brute-force recomputation per tenant so the
-benchmark stays self-consistent.
+Ground truth: the dataset's published ground truth is used verbatim for the canonical full single-tenant run when the
+adapter provides one; any ``--limit`` subset, multi-tenant split, or adapter without published truth triggers an exact
+batched numpy brute-force recomputation per tenant so the benchmark stays self-consistent.
+
+All corpus access goes through the :class:`bench.datasets.DatasetAdapter` resolved from ``--dataset``: the driver reads
+the queries, the k-means training sample, and the ground truth from the adapter, and each Spark executor task reads its
+own base-vector slice through the pickled adapter.
 """
 
 from __future__ import annotations
@@ -30,10 +34,11 @@ from typing import Any
 
 import numpy as np
 import pyarrow as pa
+from pyspark.sql import functions as F
 
-from bench.config import NAMESPACE, SIFT_BASE_COUNT, SIFT_GT_DEPTH, TENANT_ID, BenchConfig
-from bench.corpus import assign_clusters, build_vocabulary, row_text, train_centroids
-from bench.fvecs import read_fvecs, read_ivecs, read_vecs_rows
+from bench.config import NAMESPACE, TENANT_ID, BenchConfig
+from bench.corpus import assign_clusters, build_vocabulary, train_centroids
+from bench.datasets import DatasetAdapter, adapter_for
 from bench.groundtruth import brute_force_topk
 from bench.results import ensure_dir, read_json, save_phase, utc_now, write_json
 from bench.spark_session import build_spark
@@ -109,7 +114,8 @@ def single_entry_map(keys: list[str], items: pa.Array) -> pa.MapArray:
 def slice_record_batch(
     start: int,
     count: int,
-    base_path: str,
+    adapter: DatasetAdapter,
+    workspace: Path,
     centroids: np.ndarray,
     cluster_vocab: list[list[str]],
     common_vocab: list[str],
@@ -119,13 +125,14 @@ def slice_record_batch(
 ) -> pa.RecordBatch:
     """Build the Arrow batch for one contiguous slice of base vectors.
 
-    Runs inside a Spark executor task: reads its own slice from the fvecs file, assigns clusters, and generates the
-    deterministic per-row text and routing columns.
+    Runs inside a Spark executor task: reads its own slice through the pickled dataset adapter, assigns clusters, and
+    generates the deterministic per-row text and routing columns.
 
     Args:
         start: First global row index of the slice.
         count: Rows in the slice.
-        base_path: Path of ``sift_base.fvecs``, readable from the executor.
+        adapter: The dataset adapter, pickled into the task closure.
+        workspace: The benchmark workspace directory, readable from the executor.
         centroids: Broadcast-by-closure k-means centroids.
         cluster_vocab: Per-cluster vocabularies.
         common_vocab: Shared common-word pool.
@@ -136,13 +143,13 @@ def slice_record_batch(
     Returns:
         One record batch conforming to :func:`arrow_row_schema`.
     """
-    vectors: np.ndarray = read_vecs_rows(base_path, start, count, "<f4")
+    vectors: np.ndarray = adapter.base_vector_slice(workspace, start, count)
     clusters: np.ndarray = assign_clusters(vectors, centroids)
     norms: np.ndarray = np.linalg.norm(vectors, axis=1).astype(np.float32)
     indices: np.ndarray = np.arange(start, start + count, dtype=np.int64)
     org_ids: list[str] = [f"org{int(i) % tenants}" for i in indices]
     texts: list[str] = [
-        row_text(cluster_vocab, common_vocab, int(c), int(i), seed, cluster_terms=words_per_text)
+        adapter.text_for_row(cluster_vocab, common_vocab, int(c), int(i), seed, words_per_text)
         for c, i in zip(clusters, indices, strict=True)
     ]
     flat_offsets: pa.Array = pa.array(np.arange(count + 1, dtype=np.int32) * vectors.shape[1])
@@ -168,21 +175,22 @@ def slice_record_batch(
     )
 
 
-def write_iceberg_table(config: BenchConfig, centroids: np.ndarray, vocab: tuple[list[list[str]], list[str]]) -> float:
-    """Write the SIFT source rows into the local Iceberg table via Spark executors.
+def write_iceberg_table(
+    config: BenchConfig, adapter: DatasetAdapter, centroids: np.ndarray, vocab: tuple[list[list[str]], list[str]]
+) -> float:
+    """Write the corpus source rows into the local Iceberg table via Spark executors.
 
     Args:
         config: Benchmark configuration.
+        adapter: The dataset adapter providing executor-side base-vector slices.
         centroids: Trained cluster centroids.
         vocab: The cluster vocabularies and common pool.
 
     Returns:
         The wall time of the write in seconds.
     """
-    from pyspark.sql import functions as F
-
     spark = build_spark(config, "bench-prepare")
-    base_path: str = str(config.sift_dir() / "sift_base.fvecs")
+    workspace: Path = config.workspace
     cluster_vocab, common_vocab = vocab
     tenants: int = config.tenants
     seed: int = config.seed
@@ -208,7 +216,8 @@ def write_iceberg_table(config: BenchConfig, centroids: np.ndarray, vocab: tuple
                 yield slice_record_batch(
                     int(start),
                     int(count),
-                    base_path,
+                    adapter,
+                    workspace,
                     centroids,
                     cluster_vocab,
                     common_vocab,
@@ -228,43 +237,50 @@ def write_iceberg_table(config: BenchConfig, centroids: np.ndarray, vocab: tuple
     return elapsed
 
 
-def tenant_ground_truth(config: BenchConfig, queries: np.ndarray) -> dict[str, np.ndarray]:
+def tenant_ground_truth(
+    config: BenchConfig, adapter: DatasetAdapter, queries: np.ndarray
+) -> tuple[dict[str, np.ndarray], str]:
     """Compute or load the per-tenant ground truth as global vector ids.
+
+    The adapter's published ground truth is used verbatim for the canonical full single-tenant run; any subset,
+    multi-tenant split, or adapter without published truth triggers an exact brute-force recomputation per tenant.
 
     Args:
         config: Benchmark configuration.
+        adapter: The dataset adapter.
         queries: The full query matrix.
 
     Returns:
-        One ``(num_queries, depth)`` int64 array per org id.
+        One ``(num_queries, depth)`` int64 array per org id, and the manifest source label.
     """
-    gt_path: Path = config.sift_dir() / "sift_groundtruth.ivecs"
-    if config.limit == SIFT_BASE_COUNT and config.tenants == 1:
-        return {"org0": read_ivecs(gt_path)[:, :SIFT_GT_DEPTH].astype(np.int64)}
-    base: np.ndarray = read_fvecs(config.sift_dir() / "sift_base.fvecs", limit=config.limit)
+    if config.limit == adapter.base_count and config.tenants == 1:
+        published: np.ndarray | None = adapter.ground_truth(config.workspace)
+        if published is not None:
+            return {"org0": published}, adapter.ground_truth_source
+    base: np.ndarray = adapter.base_vectors(config.workspace, limit=config.limit)
     result: dict[str, np.ndarray] = {}
     for tenant in range(config.tenants):
         ids: np.ndarray = np.arange(tenant, config.limit, config.tenants, dtype=np.int64)
         logger.info("brute-force ground truth for org%d over %d vectors", tenant, len(ids))
-        result[f"org{tenant}"] = brute_force_topk(base[ids], ids, queries, SIFT_GT_DEPTH)
-    return result
+        result[f"org{tenant}"] = brute_force_topk(base[ids], ids, queries, adapter.gt_depth)
+    return result, "brute_force"
 
 
-def compute_cluster_artifact(config: BenchConfig, centroids: np.ndarray) -> np.ndarray:
+def compute_cluster_artifact(config: BenchConfig, adapter: DatasetAdapter, centroids: np.ndarray) -> np.ndarray:
     """Assign every base vector in scope to its cluster for FTS scoring.
 
     Args:
         config: Benchmark configuration.
+        adapter: The dataset adapter.
         centroids: Trained cluster centroids.
 
     Returns:
         An int32 array of cluster ids indexed by global vector id.
     """
-    base_path: Path = config.sift_dir() / "sift_base.fvecs"
     parts: list[np.ndarray] = []
     for start in range(0, config.limit, KMEANS_SAMPLE_ROWS):
         count: int = min(KMEANS_SAMPLE_ROWS, config.limit - start)
-        parts.append(assign_clusters(read_vecs_rows(base_path, start, count, "<f4"), centroids))
+        parts.append(assign_clusters(adapter.base_vector_slice(config.workspace, start, count), centroids))
     return np.concatenate(parts)
 
 
@@ -285,16 +301,17 @@ def run_prepare(config: BenchConfig) -> dict[str, Any]:
         manifest: dict[str, Any] = read_json(manifest_path)
         return save_phase(config, "prepare", {"skipped": True, "manifest": manifest})
 
-    queries: np.ndarray = read_fvecs(config.sift_dir() / "sift_query.fvecs")
-    sample: np.ndarray = read_fvecs(config.sift_dir() / "sift_base.fvecs", limit=min(config.limit, KMEANS_SAMPLE_ROWS))
+    adapter: DatasetAdapter = adapter_for(config)
+    queries: np.ndarray = adapter.query_vectors(config.workspace)
+    sample: np.ndarray = adapter.base_vectors(config.workspace, limit=min(config.limit, KMEANS_SAMPLE_ROWS))
     centroids: np.ndarray = train_centroids(sample, config.num_clusters, config.seed)
     vocab: tuple[list[list[str]], list[str]] = build_vocabulary(
         len(centroids), config.words_per_cluster, config.common_words, config.seed
     )
 
-    write_seconds: float = write_iceberg_table(config, centroids, vocab)
-    clusters: np.ndarray = compute_cluster_artifact(config, centroids)
-    ground_truth: dict[str, np.ndarray] = tenant_ground_truth(config, queries)
+    write_seconds: float = write_iceberg_table(config, adapter, centroids, vocab)
+    clusters: np.ndarray = compute_cluster_artifact(config, adapter, centroids)
+    ground_truth, ground_truth_source = tenant_ground_truth(config, adapter, queries)
 
     np.save(prepared / "queries.npy", queries)
     np.save(prepared / "centroids.npy", centroids)
@@ -309,7 +326,7 @@ def run_prepare(config: BenchConfig) -> dict[str, Any]:
         "num_clusters": len(centroids),
         "table": config.table(),
         "iceberg_write_seconds": round(write_seconds, 3),
-        "ground_truth_source": "ivecs" if (config.limit == SIFT_BASE_COUNT and config.tenants == 1) else "brute_force",
+        "ground_truth_source": ground_truth_source,
     }
     write_json(manifest_path, manifest)
     return save_phase(config, "prepare", {"skipped": False, "manifest": manifest})

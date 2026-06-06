@@ -2,7 +2,9 @@
 
 Reads every ``<phase>.json`` present in the run directory and writes ``summary.md`` (markdown tables), ``recall.csv``
 (the recall/latency sweep), ``results.csv`` (a long-format combination of every phase's headline metrics), and
-``pareto.png`` (recall@10 versus QPS per sweep point, one line per refine factor).
+``pareto.png`` (recall@10 versus QPS per sweep point, one line per refine factor). The benchmark CLI defaults
+``MPLBACKEND`` to ``Agg`` before this module loads; :func:`plot_pareto` additionally forces the Agg backend right
+before drawing so direct imports of this module never touch a GUI toolkit either.
 """
 
 from __future__ import annotations
@@ -10,6 +12,9 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 from typing import Any
+
+import matplotlib
+import matplotlib.pyplot as plt
 
 from bench.config import PHASE_NAMES, BenchConfig
 from bench.results import ensure_dir, load_phase, save_phase, utc_now
@@ -103,23 +108,20 @@ def write_results_csv(path: Path, phases: dict[str, dict[str, Any] | None]) -> i
     return len(rows)
 
 
-def plot_pareto(path: Path, sweep: list[dict[str, Any]]) -> bool:
+def plot_pareto(path: Path, sweep: list[dict[str, Any]], title: str) -> bool:
     """Plot recall@10 versus single-stream QPS, one line per refine factor.
 
     Args:
         path: Destination PNG.
         sweep: The sweep points from the search phase.
+        title: The plot title, carrying the dataset name.
 
     Returns:
         ``True`` when a plot was written.
     """
     if not sweep:
         return False
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
+    matplotlib.use("Agg", force=True)
     figure, axes = plt.subplots(figsize=(8, 6))
     refine_values: list[int | None] = sorted({point["refine_factor"] for point in sweep}, key=lambda v: (v is None, v))
     for refine in refine_values:
@@ -136,7 +138,7 @@ def plot_pareto(path: Path, sweep: list[dict[str, Any]]) -> bool:
             axes.annotate(f"np={point['nprobes']}", (point["qps_single_stream"], point["recall_at_10"]), fontsize=7)
     axes.set_xlabel("QPS (single stream)")
     axes.set_ylabel("recall@10")
-    axes.set_title("SIFT1M recall vs QPS (IVF_RQ sweep)")
+    axes.set_title(title)
     axes.grid(True, alpha=0.3)
     axes.legend()
     figure.tight_layout()
@@ -156,7 +158,7 @@ def summary_sections(config: BenchConfig, phases: dict[str, dict[str, Any] | Non
         The markdown section strings.
     """
     sections: list[str] = [
-        f"# SIFT1M benchmark run `{config.run_id}`",
+        f"# {config.dataset.upper()} benchmark run `{config.run_id}`",
         f"Generated {utc_now()} | limit={config.limit} tenants={config.tenants} seed={config.seed} "
         f"batches={config.batches}",
     ]
@@ -185,7 +187,7 @@ def summary_sections(config: BenchConfig, phases: dict[str, dict[str, Any] | Non
         sections.append(markdown_table(["dataset", "fragments before", "fragments after"], rows))
         sections.append(f"Total wall: {compact['total_seconds']}s")
     search: dict[str, Any] | None = phases.get("search")
-    if search:
+    if search and "sweep" in search:
         sections.append("## Recall / latency sweep")
         sections.append(
             markdown_table(
@@ -230,11 +232,12 @@ def run_report(config: BenchConfig) -> dict[str, Any]:
     written: list[str] = []
 
     search: dict[str, Any] | None = phases.get("search")
-    sweep: list[dict[str, Any]] = search["sweep"] if search else []
+    sweep: list[dict[str, Any]] = search.get("sweep", []) if search else []
     if sweep:
         write_sweep_csv(run_directory / "recall.csv", sweep)
         written.append("recall.csv")
-        if plot_pareto(run_directory / "pareto.png", sweep):
+        title: str = f"{config.dataset.upper()} recall vs QPS (IVF_RQ sweep)"
+        if plot_pareto(run_directory / "pareto.png", sweep, title):
             written.append("pareto.png")
     metric_rows: int = write_results_csv(run_directory / "results.csv", phases)
     written.append("results.csv")

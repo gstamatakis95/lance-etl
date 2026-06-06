@@ -12,6 +12,46 @@ service SearchService {
   rpc TextSearch(TextSearchRequest) returns (TextSearchResponse);
   // Runs a vector leg and a text leg, then fuses the ranked lists with the configured strategy.
   rpc HybridSearch(HybridSearchRequest) returns (HybridSearchResponse);
+  // Proactively pulls one org's metadata and index structures into the local caches.
+  rpc Prewarm(PrewarmRequest) returns (PrewarmResponse);
+}
+
+// Request for SearchService.Prewarm.
+message PrewarmRequest {
+  // Organization whose dataset is prewarmed.
+  string org_id = 1;
+  // Warm dataset metadata (manifest, transaction, index listing). Implied by warming any index.
+  bool metadata = 2;
+  // Warm all indexes of the dataset; ignored when index_names is non-empty.
+  bool all_indexes = 3;
+  // Warm only these named indexes.
+  repeated string index_names = 4;
+  // Also pull FTS position data for inverted indexes (needed for phrase queries).
+  bool fts_with_position = 5;
+}
+
+// Response for SearchService.Prewarm.
+message PrewarmResponse {
+  // True when dataset metadata was loaded into the cache.
+  bool metadata_warmed = 1;
+  // Per-index outcomes in completion order.
+  repeated PrewarmedIndex indexes = 2;
+  // Wall-clock milliseconds spent opening the dataset and loading metadata.
+  uint64 metadata_duration_ms = 3;
+  // Wall-clock milliseconds for the whole call.
+  uint64 total_duration_ms = 4;
+  // Approximate bytes resident in the shared index cache after the call.
+  uint64 index_cache_size_bytes = 5;
+}
+
+// Outcome of prewarming one index.
+message PrewarmedIndex {
+  // Index name as listed in the dataset manifest.
+  string name = 1;
+  // Milliseconds spent prewarming this index (all delta segments).
+  uint64 duration_ms = 2;
+  // Empty on success; a client-safe reason when this index was skipped or failed.
+  string error = 3;
 }
 
 // Distance metric for nearest-neighbor search.

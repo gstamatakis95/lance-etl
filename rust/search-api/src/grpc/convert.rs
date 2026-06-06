@@ -5,9 +5,38 @@ use serde_json::{Map, Value};
 
 use crate::domain::{
     CompareOp, DistanceKind, Filter, FilterMode, FusedHit, FusionSpec, Fuzziness, Hit, HybridQuery, Literal, MatchSpec,
-    PhraseSpec, SearchError, TextOperator, TextQuery, TextQueryNode, VectorQuery,
+    PhraseSpec, PrewarmReport, PrewarmSpec, SearchError, TextOperator, TextQuery, TextQueryNode, VectorQuery,
 };
 use crate::pb;
+
+/// Converts a proto prewarm request into the domain spec (org id travels separately).
+pub fn prewarm_spec_from_proto(request: &pb::PrewarmRequest) -> PrewarmSpec {
+    PrewarmSpec {
+        metadata: request.metadata,
+        all_indexes: request.all_indexes,
+        index_names: request.index_names.clone(),
+        fts_with_position: request.fts_with_position,
+    }
+}
+
+/// Converts a domain prewarm report into the proto response.
+pub fn prewarm_report_to_proto(report: PrewarmReport) -> pb::PrewarmResponse {
+    pb::PrewarmResponse {
+        metadata_warmed: report.metadata_warmed,
+        indexes: report
+            .indexes
+            .into_iter()
+            .map(|index| pb::PrewarmedIndex {
+                name: index.name,
+                duration_ms: index.duration.as_millis() as u64,
+                error: index.error.unwrap_or_default(),
+            })
+            .collect(),
+        metadata_duration_ms: report.metadata_duration.as_millis() as u64,
+        total_duration_ms: report.total_duration.as_millis() as u64,
+        index_cache_size_bytes: report.index_cache_size_bytes,
+    }
+}
 
 /// Converts an optional proto vector query into the domain query.
 pub fn vector_query_from_proto(query: Option<pb::VectorQuery>) -> Result<VectorQuery, SearchError> {

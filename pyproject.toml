@@ -29,7 +29,10 @@ line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "W", "F", "I", "B", "UP", "SIM", "ARG"]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "ARG", "PLC0415"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "integration: slow end-to-end tests that run Spark in local mode",
+]

@@ -11,6 +11,7 @@ still verifying that the correct Column expressions are produced for both bounds
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -21,7 +22,7 @@ from lance_etl.telemetry import TelemetryConfig
 
 
 @pytest.fixture
-def base_etl_config(tmp_path) -> ETLConfig:
+def base_etl_config(tmp_path: Path) -> ETLConfig:
     """Return a minimal ETLConfig rooted at a temporary directory.
 
     Args:

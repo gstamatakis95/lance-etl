@@ -1,0 +1,82 @@
+//! Prewarm-then-search IO assertions on a single provider: after Prewarm, vector, text, and
+//! hybrid searches trigger no further reads under `_indices/` or of versioned manifests, while
+//! `data/` reads stay nonzero — proving raw table data is served by the store, never the cache.
+
+mod common;
+
+use std::sync::Arc;
+
+use common::{CountingWrapper, ReadCounts, build_indexed_dataset, test_config};
+use search_api::domain::{FusionSpec, HybridQuery, PrewarmSpec, Prewarmer, SearchBackend, TextQuery, VectorQuery};
+use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
+use tempfile::TempDir;
+
+#[tokio::test]
+async fn searches_after_prewarm_do_no_index_or_manifest_io() {
+    let data_tmp = TempDir::new().unwrap();
+    let cache_tmp = TempDir::new().unwrap();
+    let uri = format!("file-object-store://{}/org1.lance", data_tmp.path().display());
+    build_indexed_dataset(&uri).await;
+    let config = test_config(data_tmp.path(), cache_tmp.path());
+
+    let counts = Arc::new(ReadCounts::default());
+    let provider = CachingDatasetProvider::with_inner_store_wrapper(
+        &config,
+        Some(Arc::new(CountingWrapper { counts: counts.clone() })),
+    );
+    let backend = LanceSearchBackend::new(provider);
+    let report = backend
+        .prewarm(
+            "org1",
+            PrewarmSpec {
+                metadata: true,
+                all_indexes: true,
+                index_names: vec![],
+                fts_with_position: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(report.metadata_warmed);
+    assert_eq!(report.indexes.len(), 2);
+    assert!(report.indexes.iter().all(|index| index.error.is_none()), "{report:?}");
+
+    let (indices_before, manifests_before, data_before) = counts.snapshot();
+
+    let vector = VectorQuery {
+        vector: vec![0.0, 1.0, 0.0, 0.0],
+        k: 2,
+        ..Default::default()
+    };
+    let hits = backend.vector_search("org1", vector.clone()).await.unwrap();
+    assert_eq!(hits.len(), 2);
+    let hits = backend.text_search("org1", TextQuery::simple("pear", 3)).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    let fused = backend
+        .hybrid_search(
+            "org1",
+            HybridQuery {
+                vector,
+                text: TextQuery::simple("pear", 0),
+                k: 2,
+                fusion: FusionSpec::default(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(fused.len(), 2);
+
+    let (indices_after, manifests_after, data_after) = counts.snapshot();
+    assert_eq!(
+        indices_after, indices_before,
+        "searches after prewarm must not read _indices/ from the store"
+    );
+    assert_eq!(
+        manifests_after, manifests_before,
+        "searches after prewarm must not re-read versioned manifests from the store"
+    );
+    assert!(
+        data_after > data_before,
+        "result materialization must read data/ from the store, proving raw data is never cached"
+    );
+}

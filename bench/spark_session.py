@@ -3,10 +3,16 @@
 The Iceberg Spark runtime is resolved at session start via ``spark.jars.packages``; the default coordinates target the
 newest Iceberg release with a Spark 4 runtime and can be overridden with ``--iceberg-package`` if the installed Spark
 minor version needs a different artifact. The session timezone is pinned to UTC so the ETL's ``TIMESTAMP`` window
-literals compare deterministically against the generated ``updated_at`` values.
+literals compare deterministically against the generated ``updated_at`` values. The worker Python is pinned to the
+driver's interpreter via ``PYSPARK_PYTHON`` (the only knob ``SparkContext`` consults when launched through the builder
+rather than spark-submit) so executor tasks resolve the same virtualenv (numpy, pylance) even when the harness runs
+without the venv activated on ``PATH``.
 """
 
 from __future__ import annotations
+
+import os
+import sys
 
 from pyspark.sql import SparkSession
 
@@ -24,6 +30,7 @@ def build_spark(config: BenchConfig, app_name: str) -> SparkSession:
     Returns:
         The active Spark session.
     """
+    os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
     warehouse: str = ensure_dir(config.warehouse_dir()).resolve().as_uri()
     builder = (
         SparkSession.builder.appName(app_name)

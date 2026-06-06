@@ -19,8 +19,8 @@ use search_api::pb::search_service_client::SearchServiceClient;
 use search_api::pb::search_service_server::SearchServiceServer;
 use search_api::pb::{
     BooleanQuery, CompareOp, Comparison, DistanceType, Filter, FtsQuery, Fusion, HybridSearchRequest, InList,
-    LiteralValue, MatchQuery, PhraseQuery, RrfFusion, TextQuery, TextSearchRequest, VectorQuery, VectorSearchRequest,
-    filter, fts_query, fusion, literal_value, text_query,
+    LiteralValue, MatchQuery, PhraseQuery, PrewarmRequest, RrfFusion, TextQuery, TextSearchRequest, VectorQuery,
+    VectorSearchRequest, filter, fts_query, fusion, literal_value, text_query,
 };
 use tempfile::TempDir;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -92,6 +92,14 @@ async fn serve(tmp: &TempDir) -> Channel {
         index_cache_bytes: 64 * 1024 * 1024,
         metadata_cache_bytes: 64 * 1024 * 1024,
         port: 0,
+        cache_dir: tmp.path().join("disk-cache"),
+        disk_index_cache_bytes: 64 * 1024 * 1024,
+        disk_store_cache_bytes: 64 * 1024 * 1024,
+        disk_cache_ttl_secs: 3600,
+        store_cache_max_range_bytes: 4 * 1024 * 1024,
+        disk_cache_sweep_secs: 300,
+        disk_cache_disabled: false,
+        prewarm_concurrency: 4,
     };
     let provider = CachingDatasetProvider::new(&config);
     let backend = Arc::new(LanceSearchBackend::new(provider));
@@ -432,6 +440,91 @@ async fn hybrid_fusion_config_is_applied() {
             fusion: Some(Fusion {
                 strategy: Some(fusion::Strategy::Rrf(RrfFusion { rrf_k: Some(-3.0) })),
             }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn prewarm_rpc_warms_metadata_and_indexes() {
+    let tmp = TempDir::new().unwrap();
+    let uri = format!("{}/org1.lance", tmp.path().display());
+    build_test_dataset(&uri).await;
+    let channel = serve(&tmp).await;
+    let mut client = SearchServiceClient::new(channel);
+
+    let response = client
+        .prewarm(PrewarmRequest {
+            org_id: "org1".into(),
+            metadata: true,
+            all_indexes: true,
+            index_names: vec![],
+            fts_with_position: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.metadata_warmed);
+    assert_eq!(response.indexes.len(), 1);
+    assert_eq!(response.indexes[0].name, "text_idx");
+    assert_eq!(response.indexes[0].error, "");
+
+    let response = client
+        .text_search(TextSearchRequest {
+            org_id: "org1".into(),
+            query: Some(simple_text_query("lemon", 3)),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.results.len(), 1);
+}
+
+#[tokio::test]
+async fn prewarm_rpc_reports_per_index_errors_and_org_status_codes() {
+    let tmp = TempDir::new().unwrap();
+    let uri = format!("{}/org1.lance", tmp.path().display());
+    build_test_dataset(&uri).await;
+    let channel = serve(&tmp).await;
+    let mut client = SearchServiceClient::new(channel);
+
+    let response = client
+        .prewarm(PrewarmRequest {
+            org_id: "org1".into(),
+            metadata: false,
+            all_indexes: false,
+            index_names: vec!["text_idx".into(), "no_such_index".into()],
+            fts_with_position: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.metadata_warmed);
+    assert_eq!(response.indexes.len(), 2);
+    let by_name = |name: &str| response.indexes.iter().find(|index| index.name == name).unwrap();
+    assert_eq!(by_name("text_idx").error, "");
+    assert!(!by_name("no_such_index").error.is_empty());
+
+    let status = client
+        .prewarm(PrewarmRequest {
+            org_id: "absent".into(),
+            metadata: true,
+            all_indexes: false,
+            index_names: vec![],
+            fts_with_position: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::NotFound);
+
+    let status = client
+        .prewarm(PrewarmRequest {
+            org_id: "../escape".into(),
+            metadata: true,
+            all_indexes: false,
+            index_names: vec![],
+            fts_with_position: false,
         })
         .await
         .unwrap_err();

@@ -53,6 +53,7 @@ class TestEverySubcommandParses:
         """Bare subcommands produce the documented defaults."""
         config: BenchConfig = config_for([command])
         assert config.command == command
+        assert config.dataset == "sift1m"
         assert config.limit == SIFT_BASE_COUNT
         assert config.tenants == 1
         assert config.seed == 42
@@ -171,6 +172,11 @@ class TestDerivedPaths:
         """The prepared cache key encodes limit, tenants, seed, and clusters."""
         config: BenchConfig = config_for(["prepare", "--limit", "100", "--tenants", "2", "--seed", "3"])
         assert config.prepared_key() == "n100-t2-s3-c64"
+
+    def test_prepared_key_prefixes_non_default_dataset(self) -> None:
+        """Non-default datasets get a name-prefixed prepared key; sift1m keeps its historical key."""
+        config: BenchConfig = config_for(["prepare", "--dataset", "gist1m", "--limit", "100"])
+        assert config.prepared_key() == "gist1m-n100-t1-s42-c64"
 
     def test_table_name(self) -> None:
         """The Iceberg table identifier is catalog.db.table."""

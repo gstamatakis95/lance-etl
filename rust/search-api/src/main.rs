@@ -12,14 +12,17 @@ use tonic::transport::Server;
 /// Backend type served by this binary: Lance over the caching base-URI-template provider.
 type Backend = LanceSearchBackend<CachingDatasetProvider>;
 
-/// Reads configuration from the environment, wires provider -> backend -> transport, and serves
-/// the gRPC API together with the standard gRPC health service.
+/// Reads configuration from the environment, wires provider -> backend -> transport, spawns the
+/// disk-cache janitor, and serves the gRPC API together with the standard gRPC health service.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let addr: SocketAddr = ([0, 0, 0, 0], config.port).into();
     let provider = CachingDatasetProvider::new(&config);
-    let backend = Arc::new(LanceSearchBackend::new(provider));
+    if let Some(janitor) = provider.janitor(&config) {
+        janitor.spawn(std::time::Duration::from_secs(config.disk_cache_sweep_secs));
+    }
+    let backend = Arc::new(LanceSearchBackend::new(provider).with_prewarm_concurrency(config.prewarm_concurrency));
     let service = SearchGrpc::new(backend);
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter

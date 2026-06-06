@@ -27,27 +27,49 @@ const SCORE_KEY: &str = "_score";
 
 /// Search backend executing queries with Lance scanners over datasets from a [`DatasetProvider`].
 pub struct LanceSearchBackend<P: DatasetProvider> {
-    provider: P,
+    pub(crate) provider: P,
+    pub(crate) prewarm_concurrency: usize,
+    pub(crate) metrics: std::sync::Arc<crate::telemetry::Metrics>,
 }
 
 impl<P: DatasetProvider> LanceSearchBackend<P> {
-    /// Creates a backend over the given dataset provider.
+    /// Creates a backend over the given dataset provider with the default prewarm concurrency
+    /// and telemetry disabled.
     pub fn new(provider: P) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            prewarm_concurrency: crate::config::DEFAULT_PREWARM_CONCURRENCY,
+            metrics: std::sync::Arc::new(crate::telemetry::Metrics::disabled()),
+        }
+    }
+
+    /// Sets how many indexes one Prewarm call loads concurrently.
+    pub fn with_prewarm_concurrency(mut self, prewarm_concurrency: usize) -> Self {
+        self.prewarm_concurrency = prewarm_concurrency.max(1);
+        self
+    }
+
+    /// Emits backend metrics (prewarm timings and outcomes) through the given facade.
+    pub fn with_metrics(mut self, metrics: std::sync::Arc<crate::telemetry::Metrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 }
 
 impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
+    #[tracing::instrument(name = "backend.vector_search", skip_all, fields(org_id = %org_id, search.k = query.k))]
     async fn vector_search(&self, org_id: &str, query: VectorQuery) -> Result<Vec<Hit>, SearchError> {
         let dataset = self.provider.dataset(org_id).await?;
         run_vector_query(&dataset, &query).await
     }
 
+    #[tracing::instrument(name = "backend.text_search", skip_all, fields(org_id = %org_id, search.k = query.k))]
     async fn text_search(&self, org_id: &str, query: TextQuery) -> Result<Vec<Hit>, SearchError> {
         let dataset = self.provider.dataset(org_id).await?;
         run_text_query(&dataset, &query).await
     }
 
+    #[tracing::instrument(name = "backend.hybrid_search", skip_all, fields(org_id = %org_id, search.k = query.k))]
     async fn hybrid_search(&self, org_id: &str, query: HybridQuery) -> Result<Vec<FusedHit>, SearchError> {
         if query.k == 0 {
             return Err(SearchError::invalid_argument("k must be a positive integer"));
@@ -65,8 +87,10 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
             run_vector_query(&dataset, &vector_query),
             run_text_query(&dataset, &text_query),
         );
+        let (vector_hits, text_hits) = (vector_hits?, text_hits?);
         let fusion = query.fusion.build();
-        Ok(fusion.fuse(vec![vector_hits?, text_hits?], query.k))
+        let fuse_span = tracing::info_span!("fusion.fuse", search.k = query.k);
+        Ok(fuse_span.in_scope(|| fusion.fuse(vec![vector_hits, text_hits], query.k)))
     }
 }
 
@@ -135,6 +159,7 @@ fn apply_common_options(
 }
 
 /// Runs one nearest-neighbor query against an open dataset.
+#[tracing::instrument(name = "lance.vector_query", skip_all, fields(search.k = query.k))]
 async fn run_vector_query(dataset: &Dataset, query: &VectorQuery) -> Result<Vec<Hit>, SearchError> {
     validate_k(query.k)?;
     if query.vector.is_empty() {
@@ -192,6 +217,7 @@ async fn run_vector_query(dataset: &Dataset, query: &VectorQuery) -> Result<Vec<
 }
 
 /// Runs one full-text query against an open dataset.
+#[tracing::instrument(name = "lance.text_query", skip_all, fields(search.k = query.k))]
 async fn run_text_query(dataset: &Dataset, query: &TextQuery) -> Result<Vec<Hit>, SearchError> {
     validate_k(query.k)?;
     let fetch = query.k + query.offset.unwrap_or(0);

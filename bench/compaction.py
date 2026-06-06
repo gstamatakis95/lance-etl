@@ -18,6 +18,7 @@ from bench.config import BenchConfig
 from bench.indexes import bench_telemetry_config
 from bench.results import save_phase
 from bench.spark_session import build_spark
+from lance_etl.compaction import CompactionConfig, LanceCompactor
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -43,8 +44,6 @@ def run_compact(config: BenchConfig) -> dict[str, Any]:
     Returns:
         The phase result document.
     """
-    from lance_etl.compaction import CompactionConfig, LanceCompactor
-
     uris: list[str] = config.dataset_uris()
     before: dict[str, int] = fragment_counts(uris)
     compaction_config = CompactionConfig(
