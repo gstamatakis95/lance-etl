@@ -45,9 +45,17 @@ class CloudProvider(StrEnum):
     LOCAL = "local"
 
 
-AWS_SCHEMES: tuple[str, ...] = ("s3", "s3a")
-GCS_SCHEMES: tuple[str, ...] = ("gs", "gcs")
-AZURE_SCHEMES: tuple[str, ...] = ("az", "azure", "abfs", "abfss", "adl")
+SCHEME_PROVIDERS: dict[str, CloudProvider] = {
+    "s3": CloudProvider.AWS,
+    "s3a": CloudProvider.AWS,
+    "gs": CloudProvider.GCS,
+    "gcs": CloudProvider.GCS,
+    "az": CloudProvider.AZURE,
+    "azure": CloudProvider.AZURE,
+    "abfs": CloudProvider.AZURE,
+    "abfss": CloudProvider.AZURE,
+    "adl": CloudProvider.AZURE,
+}
 
 S3_OPTION_KEYS: dict[str, str] = {
     "access_key_id": "access_key",
@@ -80,6 +88,11 @@ AZURE_OPTION_KEYS: dict[str, str] = {
     "azure_storage_sas_token": "sas_token",
     "azure_storage_sas_key": "sas_token",
 }
+PROVIDER_OPTION_KEYS: dict[CloudProvider, dict[str, str]] = {
+    CloudProvider.AWS: S3_OPTION_KEYS,
+    CloudProvider.GCS: GCS_OPTION_KEYS,
+    CloudProvider.AZURE: AZURE_OPTION_KEYS,
+}
 
 
 def provider_for_uri(uri: str) -> CloudProvider:
@@ -91,14 +104,7 @@ def provider_for_uri(uri: str) -> CloudProvider:
     Returns:
         The matching provider, or ``LOCAL`` for file and unknown schemes.
     """
-    scheme: str = urlparse(uri).scheme.lower()
-    if scheme in AWS_SCHEMES:
-        return CloudProvider.AWS
-    if scheme in GCS_SCHEMES:
-        return CloudProvider.GCS
-    if scheme in AZURE_SCHEMES:
-        return CloudProvider.AZURE
-    return CloudProvider.LOCAL
+    return SCHEME_PROVIDERS.get(urlparse(uri).scheme.lower(), CloudProvider.LOCAL)
 
 
 def object_path(uri: str) -> str:
@@ -177,32 +183,17 @@ def resolve_filesystem(uri: str, storage_options: dict[str, Any] | None) -> tupl
             ``storage_options`` contains no ``account_name``.
     """
     provider: CloudProvider = provider_for_uri(uri)
-
-    if provider is CloudProvider.LOCAL:
+    kwargs: dict[str, Any] = map_storage_options(storage_options, PROVIDER_OPTION_KEYS.get(provider, {}))
+    if provider is CloudProvider.LOCAL or not kwargs:
         filesystem, path = pa_fs.FileSystem.from_uri(uri)
         return filesystem, path
 
     path = object_path(uri)
-
     if provider is CloudProvider.AWS:
-        kwargs: dict[str, Any] = map_storage_options(storage_options, S3_OPTION_KEYS)
-        if not kwargs:
-            filesystem, resolved_path = pa_fs.FileSystem.from_uri(uri)
-            return filesystem, resolved_path
         return pa_fs.S3FileSystem(**kwargs), path
-
     if provider is CloudProvider.GCS:
-        kwargs = map_storage_options(storage_options, GCS_OPTION_KEYS)
-        if not kwargs:
-            filesystem, resolved_path = pa_fs.FileSystem.from_uri(uri)
-            return filesystem, resolved_path
         validate_gcs_kwargs(kwargs)
         return pa_fs.GcsFileSystem(**kwargs), path
-
-    kwargs = map_storage_options(storage_options, AZURE_OPTION_KEYS)
-    if not kwargs:
-        filesystem, resolved_path = pa_fs.FileSystem.from_uri(uri)
-        return filesystem, resolved_path
     if "account_name" not in kwargs:
         raise ValueError(
             "AzureFileSystem requires 'account_name'. "

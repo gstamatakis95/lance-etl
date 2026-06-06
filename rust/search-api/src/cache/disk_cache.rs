@@ -14,7 +14,7 @@ use lance_core::Result as LanceResult;
 use lance_core::cache::{CacheBackend, CacheCodec, CacheEntry, InternalCacheKey, MokaCacheBackend};
 use serde_json::Value;
 
-use crate::cache::layout::{SweepStats, atomic_write, dir_stats, hash_hex, sweep_tier, touch_file};
+use crate::cache::layout::{SweepStats, atomic_write, dir_stats, gauge_sub, hash_hex, sweep_tier, touch_file};
 use crate::telemetry::{CacheName, EvictionReason, Metrics, Tier};
 
 /// Sidecar file mapping full cache-key prefixes to their hashed directory names, enabling
@@ -118,12 +118,8 @@ impl DiskIndexCacheBackend {
     /// Deletes one disk entry after a read or decode failure, adjusting accounting.
     async fn drop_corrupt_entry(&self, path: &Path) {
         if let Ok(meta) = tokio::fs::metadata(path).await {
-            self.disk_bytes.fetch_sub(
-                meta.len().min(self.disk_bytes.load(Ordering::Relaxed)),
-                Ordering::Relaxed,
-            );
-            self.disk_entries
-                .fetch_sub(1.min(self.disk_entries.load(Ordering::Relaxed)), Ordering::Relaxed);
+            gauge_sub(&self.disk_bytes, meta.len());
+            gauge_sub(&self.disk_entries, 1);
         }
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -177,8 +173,7 @@ impl DiskIndexCacheBackend {
                 .unwrap_or(buf.len() as u64);
             match old_len {
                 Some(old) => {
-                    self.disk_bytes
-                        .fetch_sub(old.min(self.disk_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
+                    gauge_sub(&self.disk_bytes, old);
                     self.disk_bytes.fetch_add(new_on_disk, Ordering::Relaxed);
                 }
                 None => {
@@ -325,12 +320,8 @@ impl CacheBackend for DiskIndexCacheBackend {
             let dir = self.root.join(dir_name.as_str());
             let (bytes, entries) = dir_stats(&dir);
             let _ = tokio::fs::remove_dir_all(&dir).await;
-            self.disk_bytes
-                .fetch_sub(bytes.min(self.disk_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
-            self.disk_entries.fetch_sub(
-                entries.min(self.disk_entries.load(Ordering::Relaxed)),
-                Ordering::Relaxed,
-            );
+            gauge_sub(&self.disk_bytes, bytes);
+            gauge_sub(&self.disk_entries, entries);
         }
         if !matching.is_empty() {
             let snapshot = {

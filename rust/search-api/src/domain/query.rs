@@ -223,6 +223,16 @@ pub struct HybridQuery {
     pub fusion: FusionSpec,
 }
 
+/// The result of one vector search: ranked hits plus dataset provenance for recall capture.
+#[derive(Debug, Clone, Default)]
+pub struct VectorSearchOutcome {
+    /// Hits ordered nearest-first.
+    pub hits: Vec<Hit>,
+    /// The committed version of the Lance dataset that served the query. `None` for date-range
+    /// fan-out, where several per-day datasets (each with its own version) contribute.
+    pub dataset_version: Option<u64>,
+}
+
 /// One ranked hit from a single search leg.
 #[derive(Debug, Clone)]
 pub struct Hit {

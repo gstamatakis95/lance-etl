@@ -245,6 +245,7 @@ pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) 
         id_column: "vector_id".to_string(),
         statsd_addr: "127.0.0.1:8125".to_string(),
         telemetry_disabled: true,
+        recall_sample_rate: 0.0,
     }
 }
 

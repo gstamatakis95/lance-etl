@@ -49,8 +49,8 @@ async fn searches_after_prewarm_do_no_index_or_manifest_io() {
         k: 2,
         ..Default::default()
     };
-    let hits = backend.vector_search(&target, vector.clone()).await.unwrap();
-    assert_eq!(hits.len(), 2);
+    let outcome = backend.vector_search(&target, vector.clone()).await.unwrap();
+    assert_eq!(outcome.hits.len(), 2);
     let hits = backend
         .text_search(&target, TextQuery::simple("pear", 3))
         .await

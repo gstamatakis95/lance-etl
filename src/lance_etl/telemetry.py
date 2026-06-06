@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -31,11 +32,6 @@ try:
     from ddtrace.trace import tracer as dd_tracer
 except ImportError:
     from ddtrace import tracer as dd_tracer
-
-try:
-    from ddtrace.trace import Context as DDContext
-except ImportError:
-    from ddtrace.context import Context as DDContext
 
 try:
     from lance.tracing import capture_trace_events
@@ -57,6 +53,33 @@ EVENT_TAG_KEYS: tuple[str, ...] = ("type", "mode", "event", "operation")
 HIGH_VOLUME_EVENTS: tuple[str, ...] = ("execution", "io_events")
 
 lance_bridge_attached: bool = False
+
+COMMIT_CONFLICT_MARKERS: tuple[str, ...] = ("Commit conflict", "Retryable commit conflict")
+"""Display-string markers of retryable Lance commit conflicts.
+
+These match ``Error::CommitConflict`` and ``Error::RetryableCommitConflict``. ``Error::IncompatibleTransaction``
+(``"Incompatible transaction"``) and ``Error::TooMuchWriteContention`` (``"Too many concurrent writers"``) are
+deliberately excluded: hard conflicts must never be retried and contention exhaustion already spent Lance's own
+internal retry budget.
+"""
+
+
+def is_commit_conflict_error(exc: BaseException) -> bool:
+    """Report whether an exception marks a retryable Lance commit conflict.
+
+    Lance surfaces commit conflicts to Python as ``OSError`` or ``RuntimeError`` whose message carries one of
+    :data:`COMMIT_CONFLICT_MARKERS`.
+
+    Args:
+        exc: The exception to inspect.
+
+    Returns:
+        ``True`` when the exception is a retryable commit conflict.
+    """
+    if not isinstance(exc, (OSError, RuntimeError)):
+        return False
+    message: str = str(exc)
+    return any(marker in message for marker in COMMIT_CONFLICT_MARKERS)
 
 
 @dataclass
@@ -148,9 +171,10 @@ def commit_with_retries(
 ) -> Any:
     """Run a commit action, retrying optimistic-concurrency conflicts.
 
-    The action should re-read any dataset state it needs so each retry observes the latest committed version. Backoff
-    doubles per attempt up to a cap. Lance surfaces commit conflicts as ``OSError`` or ``RuntimeError`` with a message
-    containing ``"Commit conflict"`` or ``"Retryable commit conflict"``.
+    The action should re-read any dataset state it needs so each retry observes the latest committed version. Each
+    retry sleeps a uniformly random duration in ``[0, backoff_seconds * 2**attempt)`` (capped at 64 units), so
+    concurrent committers on one dataset randomize apart instead of colliding on every slot. Conflicts are detected
+    with :func:`is_commit_conflict_error`, which matches retryable markers only and lets hard conflicts propagate.
 
     Args:
         action: The commit to attempt, returning any result.
@@ -169,13 +193,12 @@ def commit_with_retries(
         try:
             return action()
         except (OSError, RuntimeError) as exc:
-            msg = str(exc)
-            if "Commit conflict" not in msg and "Retryable commit conflict" not in msg:
+            if not is_commit_conflict_error(exc):
                 raise
             last_exc = exc
             if on_conflict is not None:
                 on_conflict()
-            time.sleep(backoff_seconds * (2 ** min(attempt, 6)))
+            time.sleep(random.uniform(0.0, backoff_seconds * (2 ** min(attempt, 6))))
     assert last_exc is not None
     raise last_exc
 
@@ -398,15 +421,6 @@ class Telemetry:
         """
         self.statsd.distribution(name, value, tags=tags)
 
-    def event(self, name: str, tags: list[str] | None = None) -> None:
-        """Record a discrete domain event as a counter.
-
-        Args:
-            name: Event metric name relative to the configured prefix.
-            tags: Optional per-call tags.
-        """
-        self.statsd.increment(name, 1, tags=tags)
-
     def error(self, message: str, tags: list[str] | None = None) -> None:
         """Log the current exception and increment an error counter.
 
@@ -436,23 +450,3 @@ class Telemetry:
             yield
         finally:
             self.distribution(name, (time.perf_counter() - started) * 1000.0, tags=tags)
-
-    def current_context_ids(self) -> tuple[int, int] | None:
-        """Return the active trace and span ids for executor propagation.
-
-        Returns:
-            A ``(trace_id, span_id)`` tuple, or ``None`` when no span is active.
-        """
-        context = self.tracer.current_trace_context()
-        if context is None:
-            return None
-        return (context.trace_id, context.span_id)
-
-    def activate(self, trace_id: int, span_id: int) -> None:
-        """Activate a remote trace context so new spans link to the driver.
-
-        Args:
-            trace_id: Trace id captured on the driver.
-            span_id: Span id captured on the driver.
-        """
-        self.tracer.context_provider.activate(DDContext(trace_id=trace_id, span_id=span_id))

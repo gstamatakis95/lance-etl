@@ -1,0 +1,341 @@
+"""Tests for incremental index maintenance, delta bounding, retrain triggers, and stale-commit guards.
+
+Drives the executor-task layer directly on local-fs datasets, with no Spark involved, covering the small-tier
+maintain-instead-of-rebuild path, ``optimize_indices`` coverage extension, delta merging via ``index_stats``, the
+IVF ``rows_at_train`` growth retrain trigger, the FTS incremental-maintenance gate, and the guards that stop stale
+index work from being published after a concurrent compaction.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import lance
+import pyarrow as pa
+import pytest
+from conftest import make_vector_table, write_fragmented_dataset
+from lance.dataset import Index
+from lance.optimize import Compaction
+
+from lance_etl.compaction import CompactionConfig
+from lance_etl.indexing import (
+    BTreeIndexHandler,
+    FtsIndexHandler,
+    IndexJobConfig,
+    VectorIndexHandler,
+    commit_segments,
+    index_dataset_locally,
+    index_delta_count,
+    merge_index_deltas,
+    optimize_existing_index,
+    serialize_segment,
+    split_evenly,
+)
+from lance_etl.telemetry import Telemetry, TelemetryConfig
+
+ROWS: int = 2048
+DIM: int = 8
+ROWS_PER_FRAGMENT: int = 512
+
+
+@pytest.fixture
+def dataset_uri(tmp_path: Path) -> str:
+    """Write a four-fragment local dataset and return its URI.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+
+    Returns:
+        The dataset URI.
+    """
+    uri: str = str(tmp_path / "maintenance.lance")
+    write_fragmented_dataset(uri, make_vector_table(rows=ROWS, dim=DIM), max_rows_per_file=ROWS_PER_FRAGMENT)
+    return uri
+
+
+def maintenance_config(**overrides: object) -> IndexJobConfig:
+    """Build the indexing configuration used by the maintenance tests.
+
+    Args:
+        overrides: Field overrides applied on top of the test defaults.
+
+    Returns:
+        A configuration with a small explicit partition count and no row floor.
+    """
+    base: dict[str, object] = {
+        "telemetry": TelemetryConfig(),
+        "vector_column": "vector",
+        "num_partitions": 4,
+        "vector_min_rows": 1,
+        "scalar_columns": ["id"],
+        "bitmap_columns": ["category"],
+        "text_columns": ["text"],
+        "commit_retries": 5,
+        "commit_backoff_seconds": 0.0,
+    }
+    base.update(overrides)
+    return IndexJobConfig(**base)
+
+
+def fragment_ids_of(uri: str) -> list[int]:
+    """Return the fragment ids of a dataset.
+
+    Args:
+        uri: The dataset URI.
+
+    Returns:
+        The fragment ids in dataset order.
+    """
+    return [fragment.fragment_id for fragment in lance.dataset(uri).get_fragments()]
+
+
+def index_coverage(uri: str, index_name: str) -> set[int]:
+    """Return the union of fragment ids covered by an index's segments.
+
+    Args:
+        uri: The dataset URI.
+        index_name: The index to inspect.
+
+    Returns:
+        The covered fragment ids.
+    """
+    covered: set[int] = set()
+    for description in lance.dataset(uri).describe_indices():
+        if description.name == index_name:
+            for segment in description.segments:
+                covered.update(segment.fragment_ids)
+    return covered
+
+
+def append_fragment(uri: str, rows: int, start_id: int) -> None:
+    """Append one new fragment of rows to a dataset.
+
+    Args:
+        uri: The dataset URI.
+        rows: How many rows to append.
+        start_id: The first id value of the appended range.
+    """
+    table: pa.Table = make_vector_table(rows=rows, dim=DIM, seed=start_id)
+    reindexed: pa.Table = table.set_column(0, "id", pa.array(range(start_id, start_id + rows), pa.int64()))
+    lance.write_dataset(reindexed, uri, mode="append")
+
+
+def build_btree_segments(uri: str, config: IndexJobConfig, telemetry: Telemetry, shards: int) -> None:
+    """Build and commit BTREE segments over every fragment, mirroring the segment path.
+
+    Args:
+        uri: The dataset URI.
+        config: Indexing configuration.
+        telemetry: Telemetry facade.
+        shards: How many shards to split the fragments into.
+    """
+    handler: BTreeIndexHandler = BTreeIndexHandler(config, "id", "id_idx")
+    version: int = lance.dataset(uri).version
+    documents: list[str] = []
+    for group in split_evenly(fragment_ids_of(uri), shards):
+        segment: Index = handler.build_segment(lance.dataset(uri, version=version), group, None)
+        documents.append(serialize_segment(segment))
+    commit_segments(uri, documents, "id", "id_idx", False, config, telemetry)
+
+
+def test_index_dataset_locally_second_run_maintains(dataset_uri: str) -> None:
+    """A second small-tier run maintains existing indices instead of rebuilding."""
+    config: IndexJobConfig = maintenance_config()
+    first: dict[str, object] = index_dataset_locally(dataset_uri, config)
+    assert all("maintained" not in entry for entry in first["indexes"])
+    second: dict[str, object] = index_dataset_locally(dataset_uri, config)
+    by_index: dict[str, dict[str, object]] = {entry["index"]: entry for entry in second["indexes"]}
+    assert by_index["vector_idx"]["maintained"] is True
+    assert by_index["id_idx"]["maintained"] is True
+    assert by_index["category_bitmap_idx"]["maintained"] is True
+    assert by_index["text_fts_idx"]["maintained"] is True
+    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
+    assert dataset.to_table(nearest={"column": "vector", "q": [0.5] * DIM, "k": 3}).num_rows == 3
+    assert dataset.to_table(filter="id = 7").num_rows == 1
+
+
+def test_index_dataset_locally_rebuild_flag_forces_rebuild(dataset_uri: str) -> None:
+    """The rebuild flag keeps the create path even when indices exist."""
+    config: IndexJobConfig = maintenance_config()
+    index_dataset_locally(dataset_uri, config)
+    rebuilt: dict[str, object] = index_dataset_locally(dataset_uri, maintenance_config(rebuild=True))
+    assert all("maintained" not in entry for entry in rebuilt["indexes"])
+
+
+def test_optimize_existing_index_covers_new_fragments(dataset_uri: str, telemetry: Telemetry) -> None:
+    """Incremental maintenance extends coverage to fragments appended after the build."""
+    config: IndexJobConfig = maintenance_config()
+    build_btree_segments(dataset_uri, config, telemetry, shards=2)
+    append_fragment(dataset_uri, rows=ROWS_PER_FRAGMENT, start_id=ROWS)
+    assert index_coverage(dataset_uri, "id_idx") != set(fragment_ids_of(dataset_uri))
+    optimize_existing_index(dataset_uri, "id_idx", config, telemetry)
+    assert index_coverage(dataset_uri, "id_idx") == set(fragment_ids_of(dataset_uri))
+
+
+def test_merge_index_deltas_bounds_accumulation(dataset_uri: str, telemetry: Telemetry) -> None:
+    """Deltas above the cap are merged into one, and a merged index is left alone."""
+    config: IndexJobConfig = maintenance_config(max_index_deltas=1)
+    build_btree_segments(dataset_uri, config, telemetry, shards=2)
+    assert index_delta_count(lance.dataset(dataset_uri), "id_idx") == 2
+    assert merge_index_deltas(dataset_uri, "id_idx", config, telemetry) is True
+    assert index_delta_count(lance.dataset(dataset_uri), "id_idx") == 1
+    assert merge_index_deltas(dataset_uri, "id_idx", config, telemetry) is False
+    assert lance.dataset(dataset_uri).to_table(filter="id = 7").num_rows == 1
+
+
+def manifest_path_of(uri: str) -> Path:
+    """Return the local-fs path of the vector artifact manifest.
+
+    Args:
+        uri: The dataset URI.
+
+    Returns:
+        The manifest path.
+    """
+    return Path(f"{uri}.artifacts") / "vector" / "manifest.json"
+
+
+def test_prepare_records_rows_at_train(dataset_uri: str, telemetry: Telemetry) -> None:
+    """Training persists the row count the centroids were trained on."""
+    config: IndexJobConfig = maintenance_config()
+    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
+    manifest: dict[str, object] = json.loads(manifest_path_of(dataset_uri).read_text())
+    assert manifest["rows_at_train"] == ROWS
+
+
+def test_growth_trigger_retrains_and_targets_all_fragments(dataset_uri: str, telemetry: Telemetry) -> None:
+    """Rows growing past the factor force a retrain and a full-fragment rebuild."""
+    config: IndexJobConfig = maintenance_config()
+    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
+    artifacts: object | None = handler.prepare(dataset, dataset_uri, telemetry)
+    version: int = dataset.version
+    documents: list[str] = []
+    for group in split_evenly(fragment_ids_of(dataset_uri), 2):
+        segment: Index = handler.build_segment(lance.dataset(dataset_uri, version=version), group, artifacts)
+        documents.append(serialize_segment(segment))
+    commit_segments(dataset_uri, documents, "vector", "vector_idx", True, config, telemetry)
+
+    covered_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    assert covered_handler.target_fragments(lance.dataset(dataset_uri)) == []
+
+    manifest_file: Path = manifest_path_of(dataset_uri)
+    manifest: dict[str, object] = json.loads(manifest_file.read_text())
+    manifest["rows_at_train"] = ROWS // 8
+    manifest_file.write_text(json.dumps(manifest))
+
+    retrain_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    current: lance.LanceDataset = lance.dataset(dataset_uri)
+    assert retrain_handler.target_fragments(current) == fragment_ids_of(dataset_uri)
+    retrain_handler.prepare(current, dataset_uri, telemetry)
+    assert retrain_handler.reused_artifacts is False
+    refreshed: dict[str, object] = json.loads(manifest_file.read_text())
+    assert refreshed["rows_at_train"] == ROWS
+
+
+def test_manifest_without_rows_at_train_retrains_once(dataset_uri: str, telemetry: Telemetry) -> None:
+    """A manifest predating the retrain trigger retrains once to record the field."""
+    config: IndexJobConfig = maintenance_config()
+    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
+    manifest_file: Path = manifest_path_of(dataset_uri)
+    manifest: dict[str, object] = json.loads(manifest_file.read_text())
+    del manifest["rows_at_train"]
+    manifest_file.write_text(json.dumps(manifest))
+    second: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    second.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
+    assert second.reused_artifacts is False
+    assert json.loads(manifest_file.read_text())["rows_at_train"] == ROWS
+
+
+def test_within_growth_factor_reuses_artifacts(dataset_uri: str, telemetry: Telemetry) -> None:
+    """Artifacts keep being reused while rows stay within the growth factor."""
+    config: IndexJobConfig = maintenance_config()
+    VectorIndexHandler(config, "vector", "vector_idx").prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
+    second: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    second.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
+    assert second.reused_artifacts is True
+
+
+def test_fts_maintainable_gates(dataset_uri: str) -> None:
+    """The FTS incremental gate requires an existing index, no rebuild, and a small backlog."""
+    config: IndexJobConfig = maintenance_config()
+    handler: FtsIndexHandler = FtsIndexHandler(config, "text", "text_fts_idx")
+    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
+    assert handler.maintainable(dataset) is False
+
+    dataset.create_scalar_index("text", "INVERTED", name="text_fts_idx", **config.fts_params())
+    indexed: lance.LanceDataset = lance.dataset(dataset_uri)
+    assert handler.maintainable(indexed) is True
+
+    rebuild_handler: FtsIndexHandler = FtsIndexHandler(maintenance_config(rebuild=True), "text", "text_fts_idx")
+    assert rebuild_handler.maintainable(indexed) is False
+
+    append_fragment(dataset_uri, rows=ROWS_PER_FRAGMENT, start_id=ROWS)
+    backlog_handler: FtsIndexHandler = FtsIndexHandler(
+        maintenance_config(fts_max_unindexed_fragments=0), "text", "text_fts_idx"
+    )
+    assert backlog_handler.maintainable(lance.dataset(dataset_uri)) is False
+
+
+def compact_fragments(uri: str, max_source_fragments: int | None, target_rows_per_fragment: int = ROWS * 2) -> None:
+    """Compact a dataset in process, optionally bounding the consumed fragments.
+
+    Args:
+        uri: The dataset URI.
+        max_source_fragments: Cap on source fragments, or ``None`` for all. The cap admits whole rewrite tasks
+            oldest-first, so partial compaction needs a target small enough to split the plan into tasks within it.
+        target_rows_per_fragment: Desired rows per compacted fragment, controlling task sizes.
+    """
+    config: CompactionConfig = CompactionConfig(
+        telemetry=TelemetryConfig(),
+        target_rows_per_fragment=target_rows_per_fragment,
+        max_source_fragments=max_source_fragments,
+        num_threads=1,
+        run_cleanup=False,
+    )
+    Compaction.execute(lance.dataset(uri), config.execute_options())
+
+
+def test_commit_segments_skips_when_all_segments_stale(dataset_uri: str, telemetry: Telemetry) -> None:
+    """A compaction landing between build and commit drops every stale segment."""
+    config: IndexJobConfig = maintenance_config()
+    handler: BTreeIndexHandler = BTreeIndexHandler(config, "id", "id_idx")
+    version: int = lance.dataset(dataset_uri).version
+    documents: list[str] = []
+    for group in split_evenly(fragment_ids_of(dataset_uri), 2):
+        segment: Index = handler.build_segment(lance.dataset(dataset_uri, version=version), group, None)
+        documents.append(serialize_segment(segment))
+    compact_fragments(dataset_uri, max_source_fragments=None)
+    commit_segments(dataset_uri, documents, "id", "id_idx", False, config, telemetry)
+    names: list[str] = [description.name for description in lance.dataset(dataset_uri).describe_indices()]
+    assert "id_idx" not in names
+
+
+def test_commit_segments_keeps_fresh_segments(dataset_uri: str, telemetry: Telemetry) -> None:
+    """Only the segments whose fragments were rewritten are dropped from the commit."""
+    config: IndexJobConfig = maintenance_config()
+    handler: BTreeIndexHandler = BTreeIndexHandler(config, "id", "id_idx")
+    original_ids: list[int] = fragment_ids_of(dataset_uri)
+    version: int = lance.dataset(dataset_uri).version
+    documents: list[str] = []
+    for fragment_id in original_ids:
+        segment: Index = handler.build_segment(lance.dataset(dataset_uri, version=version), [fragment_id], None)
+        documents.append(serialize_segment(segment))
+    compact_fragments(dataset_uri, max_source_fragments=2, target_rows_per_fragment=ROWS_PER_FRAGMENT * 2)
+    surviving: set[int] = set(original_ids) & set(fragment_ids_of(dataset_uri))
+    assert 0 < len(surviving) < len(original_ids)
+    commit_segments(dataset_uri, documents, "id", "id_idx", False, config, telemetry)
+    assert index_coverage(dataset_uri, "id_idx") == surviving
+
+
+def test_fts_commit_index_raises_on_missing_fragments(dataset_uri: str, telemetry: Telemetry) -> None:
+    """The inverted-index publish refuses coverage of fragments that no longer exist."""
+    config: IndexJobConfig = maintenance_config()
+    handler: FtsIndexHandler = FtsIndexHandler(config, "text", "text_fts_idx")
+    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
+    stale_ids: list[int] = [*fragment_ids_of(dataset_uri), 9999]
+    with pytest.raises(ValueError, match="no longer exist"):
+        handler.commit_index(dataset_uri, dataset, "00000000-0000-0000-0000-000000000000", stale_ids, telemetry)

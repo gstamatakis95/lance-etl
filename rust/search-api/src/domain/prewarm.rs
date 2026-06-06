@@ -29,24 +29,19 @@ impl PrewarmSpec {
     /// the caller can report a per-index error). Otherwise `all_indexes` selects every available
     /// name. Otherwise nothing is warmed.
     pub fn resolve_targets(&self, available: &[String]) -> Vec<String> {
-        if !self.index_names.is_empty() {
-            let mut seen = std::collections::HashSet::new();
-            return self
-                .index_names
-                .iter()
-                .filter(|name| seen.insert(name.as_str()))
-                .cloned()
-                .collect();
-        }
-        if self.all_indexes {
-            let mut seen = std::collections::HashSet::new();
-            return available
-                .iter()
-                .filter(|name| seen.insert(name.as_str()))
-                .cloned()
-                .collect();
-        }
-        Vec::new()
+        let source: &[String] = if !self.index_names.is_empty() {
+            &self.index_names
+        } else if self.all_indexes {
+            available
+        } else {
+            return Vec::new();
+        };
+        let mut seen = std::collections::HashSet::new();
+        source
+            .iter()
+            .filter(|name| seen.insert(name.as_str()))
+            .cloned()
+            .collect()
     }
 }
 

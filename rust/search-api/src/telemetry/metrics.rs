@@ -167,9 +167,9 @@ impl FanoutLeg {
 
 /// Typed facade over the DogStatsD client so call sites cannot invent metric names or tags.
 ///
-/// Tag policy: only `rpc`, `status`, `cold`, `cache`, `tier`, `outcome`, `reason`, `kind`, and
-/// `leg` — `org_id` never appears on metrics (30k orgs would explode the timeseries count).
-/// Org-level visibility comes from traces and logs.
+/// Tag policy: only `rpc`, `status`, `cold`, `cache`, `tier`, `outcome`, `reason`, `kind`,
+/// `leg`, and `filtered` — `org_id` never appears on metrics (30k orgs would explode the
+/// timeseries count). Org-level visibility comes from traces and logs.
 pub struct Metrics {
     client: StatsdClient,
 }
@@ -358,6 +358,14 @@ impl Metrics {
             .send();
     }
 
+    /// One vector search captured for recall scoring, tagged by whether it carried a filter.
+    pub fn recall_sample(&self, filtered: bool) {
+        self.client
+            .count_with_tags("recall.samples", 1)
+            .with_tag("filtered", if filtered { "true" } else { "false" })
+            .send();
+    }
+
     /// Duration of reading the IVF centroids for one Clusters call.
     pub fn clusters_read(&self, duration: Duration) {
         self.client
@@ -503,6 +511,26 @@ mod tests {
         assert!(
             !lines.iter().any(|line| line.contains("reason:size")),
             "zero-count evictions must not be emitted: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn recall_sample_metric_renders_expected_tags() {
+        let (metrics, drain) = spy_metrics();
+        metrics.recall_sample(true);
+        metrics.recall_sample(false);
+        let lines = drain();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("search_api.recall.samples:1|c") && line.contains("filtered:true")),
+            "missing filtered sample count: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("search_api.recall.samples:1|c") && line.contains("filtered:false")),
+            "missing unfiltered sample count: {lines:?}"
         );
     }
 

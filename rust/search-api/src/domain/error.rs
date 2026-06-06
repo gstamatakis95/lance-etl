@@ -12,8 +12,6 @@ pub enum SearchError {
     InvalidArgument(String),
     /// The requested dataset (or an entity within it) does not exist.
     NotFound(String),
-    /// A dependency (object store, index) is temporarily unreachable.
-    Unavailable(String),
     /// Any other failure inside the engine.
     Internal(String),
 }
@@ -29,11 +27,6 @@ impl SearchError {
         Self::NotFound(message.into())
     }
 
-    /// Builds an `Unavailable` error.
-    pub fn unavailable(message: impl Into<String>) -> Self {
-        Self::Unavailable(message.into())
-    }
-
     /// Builds an `Internal` error.
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
@@ -42,10 +35,7 @@ impl SearchError {
     /// Returns the client-facing message.
     pub fn message(&self) -> &str {
         match self {
-            Self::InvalidArgument(message)
-            | Self::NotFound(message)
-            | Self::Unavailable(message)
-            | Self::Internal(message) => message,
+            Self::InvalidArgument(message) | Self::NotFound(message) | Self::Internal(message) => message,
         }
     }
 }
@@ -55,7 +45,6 @@ impl fmt::Display for SearchError {
         match self {
             Self::InvalidArgument(message) => write!(f, "invalid argument: {message}"),
             Self::NotFound(message) => write!(f, "not found: {message}"),
-            Self::Unavailable(message) => write!(f, "unavailable: {message}"),
             Self::Internal(message) => write!(f, "internal: {message}"),
         }
     }

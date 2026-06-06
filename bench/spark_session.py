@@ -1,4 +1,4 @@
-"""Spark session construction with a local Hadoop Iceberg catalog.
+"""Spark session construction with a local Hadoop Iceberg catalog, plus shared benchmark telemetry.
 
 The Iceberg Spark runtime is resolved at session start via ``spark.jars.packages``. The default coordinates target the
 newest Iceberg release with a Spark 4 runtime and can be overridden with ``--iceberg-package`` if the installed Spark
@@ -7,6 +7,9 @@ literals compare deterministically against the generated ``updated_at`` values. 
 driver's interpreter via ``PYSPARK_PYTHON`` (the only knob ``SparkContext`` consults when launched through the builder
 rather than spark-submit) so executor tasks resolve the same virtualenv (numpy, pylance) even when the harness runs
 without the venv activated on ``PATH``.
+
+:func:`bench_telemetry_config` lives here so every benchmark phase (ingest, index, compact) imports it from one
+place rather than reaching across into the index module.
 """
 
 from __future__ import annotations
@@ -18,6 +21,18 @@ from pyspark.sql import SparkSession
 
 from bench.config import BenchConfig
 from bench.results import ensure_dir
+from lance_etl.telemetry import TelemetryConfig
+
+
+def bench_telemetry_config() -> TelemetryConfig:
+    """Build the offline-safe telemetry configuration for benchmark jobs.
+
+    DogStatsD sends are fire-and-forget UDP so no agent is required in the benchmark environment.
+
+    Returns:
+        A ``TelemetryConfig`` tagged for the bench service and environment.
+    """
+    return TelemetryConfig(service="lance-bench", env="bench")
 
 
 def build_spark(config: BenchConfig, app_name: str) -> SparkSession:

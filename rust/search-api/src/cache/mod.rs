@@ -18,7 +18,3 @@ pub mod disk_cache;
 pub mod janitor;
 pub mod layout;
 pub mod store_cache;
-
-pub use disk_cache::DiskIndexCacheBackend;
-pub use janitor::CacheJanitor;
-pub use store_cache::MetadataByteCache;

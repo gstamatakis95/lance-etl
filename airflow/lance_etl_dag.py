@@ -3,10 +3,19 @@
 Pipeline stages (in order):
     1. ``etl``      — reads a bounded source window from the Iceberg source table and
                       upserts/deletes into per-tenant Lance datasets.
-    2. ``index``    — builds IVF_RQ vector and btree/bitmap/FTS scalar indices
-                      over the updated datasets.
-    3. ``compact``  — runs distributed compaction and version cleanup over the
-                      same datasets.
+    2. ``compact``  — runs distributed compaction and version cleanup over the
+                      updated datasets.
+    3. ``index``    — builds or incrementally maintains IVF_RQ vector and
+                      btree/bitmap/FTS scalar indices over the same datasets.
+
+Compaction runs before indexing on purpose. The compaction planner cannot bin fragments with different
+index-coverage sets together, and the distributed commit binding always remaps covering indices inline, so
+compacting the fresh still-uncovered merge_insert fragments first merges them into large fragments before any
+index covers them. Indexing then covers one large fragment per dataset and the inline remap cost for fresh data
+disappears. This order also serializes compaction and index commits per dataset within a run, which the large
+tier requires because its commit binding cannot defer index remap. ``max_active_runs=1`` extends that
+serialization across runs: overlapping runs would race same-name index maintenance commits (the loser's build is
+silently discarded) and let an index build overlap a compaction commit on the same dataset.
 
 Each stage maps to a ``SparkSubmitOperator`` that calls ``python -m lance_etl.cli <subcommand>`` with flags resolved
 from Airflow Variables and DAG-run params.
@@ -124,21 +133,22 @@ dag_params: dict[str, str | int] = {
 }
 
 
-def resolve_variable(key: str, param_key: str, params: dict) -> str:
+def resolve_variable(key: str, params: dict, param_key: str | None = None) -> str:
     """Return the Airflow Variable value if set, else fall back to the DAG-run param.
 
     The Variable is looked up under the name ``lance_etl_<key>``.  This lets operators override defaults without editing
-    the DAG file.
+    the DAG file.  When the Variable key and the params key are identical (the common case) the ``param_key`` argument
+    may be omitted.
 
     Args:
-        key: Short key used to build the Variable name.
-        param_key: Key in the ``params`` dict to use as the fallback.
+        key: Short key used to build the Variable name ``lance_etl_<key>``.
         params: DAG-run ``params`` dict (from the context or defaults).
+        param_key: Key in ``params`` to use as the fallback.  Defaults to ``key`` when not supplied.
 
     Returns:
         The resolved string value.
     """
-    return Variable.get(f"lance_etl_{key}", default_var=str(params[param_key]))
+    return Variable.get(f"lance_etl_{key}", default_var=str(params[param_key if param_key is not None else key]))
 
 
 def build_base_spark_conf(params: dict) -> dict[str, str]:
@@ -153,17 +163,12 @@ def build_base_spark_conf(params: dict) -> dict[str, str]:
     Returns:
         A flat ``{spark_key: value}`` dict suitable for ``SparkSubmitOperator.conf``.
     """
-    executor_instances = resolve_variable("executor_instances", "executor_instances", params)
-    executor_memory = resolve_variable("executor_memory", "executor_memory", params)
-    driver_memory = resolve_variable("driver_memory", "driver_memory", params)
-
     conf: dict[str, str] = {
-        "spark.executor.instances": str(executor_instances),
-        "spark.executor.memory": executor_memory,
-        "spark.driver.memory": driver_memory,
+        "spark.executor.instances": str(resolve_variable("executor_instances", params)),
+        "spark.executor.memory": resolve_variable("executor_memory", params),
+        "spark.driver.memory": resolve_variable("driver_memory", params),
     }
-
-    raw_overrides = resolve_variable("spark_conf_overrides", "spark_conf_overrides", params)
+    raw_overrides = resolve_variable("spark_conf_overrides", params)
     try:
         extra: dict[str, str] = json.loads(raw_overrides)
     except (json.JSONDecodeError, TypeError):
@@ -184,12 +189,12 @@ def build_dd_tag_flags(params: dict) -> list[str]:
     Returns:
         A list of alternating ``--dd-tag`` and ``key:value`` strings.
     """
-    raw = resolve_variable("dd_tags", "dd_tags", params).strip()
+    raw = resolve_variable("dd_tags", params).strip()
     if not raw:
         return []
     tokens: list[str] = []
-    for tag in raw.split(","):
-        tag = tag.strip()
+    for raw_tag in raw.split(","):
+        tag: str = raw_tag.strip()
         if tag:
             tokens += ["--dd-tag", tag]
     return tokens
@@ -216,29 +221,23 @@ def build_etl_application_args(params: dict) -> list[str]:
     Returns:
         Argument list starting with the ``etl`` subcommand token.
     """
-    iceberg_table = resolve_variable("iceberg_table", "iceberg_table", params)
-    lance_base_uri = resolve_variable("lance_base_uri", "lance_base_uri", params)
-    dd_service = resolve_variable("dd_service", "dd_service", params)
-    dd_env = resolve_variable("dd_env", "dd_env", params)
-    num_partitions = resolve_variable("num_partitions", "num_partitions", params)
-    window_column = Variable.get("lance_etl_window_column", default_var="updated_at")
-
+    window_column: str = Variable.get("lance_etl_window_column", default_var="updated_at")
     args = [
         "etl",
         "--table",
-        iceberg_table,
+        resolve_variable("iceberg_table", params),
         "--start",
         "{{ data_interval_start | string }}",
         "--end",
         "{{ data_interval_end | string }}",
         "--base-uri",
-        lance_base_uri,
+        resolve_variable("lance_base_uri", params),
         "--num-partitions",
-        str(num_partitions),
+        str(resolve_variable("num_partitions", params)),
         "--dd-service",
-        dd_service,
+        resolve_variable("dd_service", params),
         "--dd-env",
-        dd_env,
+        resolve_variable("dd_env", params),
         "--window-start",
         "{{ dag_run.conf.get('start', data_interval_start) | string }}",
         "--window-end",
@@ -251,67 +250,81 @@ def build_etl_application_args(params: dict) -> list[str]:
         args += ["--partition-by", partition_by]
     partition_derive: str = Variable.get("lance_etl_partition_derive", default_var="").strip()
     if partition_derive:
-        for spec in partition_derive.split(","):
-            spec = spec.strip()
+        for raw_spec in partition_derive.split(","):
+            spec: str = raw_spec.strip()
             if spec:
                 args += ["--partition-derive", spec]
     args += build_dd_tag_flags(params)
     return args
 
 
-def build_index_application_args(params: dict) -> list[str]:
-    """Build the CLI argument list for the ``index`` subcommand.
+def build_datasets_subcommand_args(subcommand: str, params: dict) -> list[str]:
+    """Build the CLI argument list for a datasets-file subcommand (``index`` or ``compact``).
+
+    Both subcommands share the same required flags: the datasets file, the Datadog service/env tags, and any
+    user-supplied tag pairs.  The only difference between them is the leading subcommand token.
 
     Args:
+        subcommand: The CLI subcommand token, either ``"index"`` or ``"compact"``.
         params: DAG-run ``params`` dict.
 
     Returns:
-        Argument list starting with the ``index`` subcommand token.
+        Argument list starting with ``subcommand``.
     """
-    datasets_file = resolve_variable("datasets_file", "datasets_file", params)
-    dd_service = resolve_variable("dd_service", "dd_service", params)
-    dd_env = resolve_variable("dd_env", "dd_env", params)
-
     args = [
-        "index",
+        subcommand,
         "--datasets-file",
-        datasets_file,
+        resolve_variable("datasets_file", params),
         "--dd-service",
-        dd_service,
+        resolve_variable("dd_service", params),
         "--dd-env",
-        dd_env,
+        resolve_variable("dd_env", params),
     ]
     args += build_dd_tag_flags(params)
     return args
 
 
-def build_compact_application_args(params: dict) -> list[str]:
-    """Build the CLI argument list for the ``compact`` subcommand.
+def make_lance_operator(
+    task_id: str,
+    conn_id: str,
+    application_args: list[str],
+    conf: dict[str, str],
+) -> SparkSubmitOperator:
+    """Construct a ``SparkSubmitOperator`` with the shared lance-etl defaults.
 
-    Compaction includes version cleanup (``run_cleanup`` is True by default in ``LanceCompactor``). No ``--no-cleanup``
-    flag is passed here.
+    All three pipeline tasks use the same ``LANCE_ETL_CLI`` application, the same ``PYTHONPATH`` environment variable,
+    and the same empty-string sentinels for optional Spark submit options.  This factory captures those constants in one
+    place.
 
     Args:
-        params: DAG-run ``params`` dict.
+        task_id: Airflow task identifier and the ``name`` suffix for the Spark application.
+        conn_id: Airflow Spark connection id.
+        application_args: CLI arguments forwarded after the application path.
+        conf: Spark configuration key/value pairs.
 
     Returns:
-        Argument list starting with the ``compact`` subcommand token.
+        The configured ``SparkSubmitOperator``.
     """
-    datasets_file = resolve_variable("datasets_file", "datasets_file", params)
-    dd_service = resolve_variable("dd_service", "dd_service", params)
-    dd_env = resolve_variable("dd_env", "dd_env", params)
-
-    args = [
-        "compact",
-        "--datasets-file",
-        datasets_file,
-        "--dd-service",
-        dd_service,
-        "--dd-env",
-        dd_env,
-    ]
-    args += build_dd_tag_flags(params)
-    return args
+    return SparkSubmitOperator(
+        task_id=task_id,
+        conn_id=conn_id,
+        application=LANCE_ETL_CLI,
+        application_args=application_args,
+        name=f"lance-etl-{task_id}",
+        conf=conf,
+        py_files="",
+        verbose=False,
+        do_xcom_push=False,
+        env_vars={"PYTHONPATH": "/opt/lance-etl/src"},
+        spark_binary="spark-submit",
+        driver_class_path="",
+        jars="",
+        packages="",
+        exclude_packages="",
+        keytab="",
+        principal="",
+        proxy_user="",
+    )
 
 
 default_args: dict = {
@@ -329,84 +342,24 @@ dag_schedule: str = Variable.get("lance_etl_schedule", default_var="@daily")
 
 with DAG(
     dag_id=DAG_ID,
-    description="Iceberg → Lance ETL: etl → index → compact (schedule driven by lance_etl_schedule Variable)",
+    description="Iceberg → Lance ETL: etl → compact → index (schedule driven by lance_etl_schedule Variable)",
     schedule=dag_schedule,
     start_date=datetime(2026, 6, 1, tzinfo=UTC),
     catchup=False,
-    max_active_runs=3,
+    max_active_runs=1,
     default_args=default_args,
     params=dag_params,
     tags=["lance", "etl", "vector-db"],
 ) as dag:
     spark_conn_id: str = Variable.get("lance_etl_spark_conn_id", default_var="spark_default")
+    spark_conf: dict[str, str] = build_base_spark_conf(dag_params)
 
-    etl_task = SparkSubmitOperator(
-        task_id="etl",
-        conn_id=spark_conn_id,
-        application=LANCE_ETL_CLI,
-        application_args=build_etl_application_args(dag_params),
-        name="lance-etl-etl",
-        conf=build_base_spark_conf(dag_params),
-        py_files="",
-        verbose=False,
-        do_xcom_push=False,
-        env_vars={
-            "PYTHONPATH": "/opt/lance-etl/src",
-        },
-        spark_binary="spark-submit",
-        driver_class_path="",
-        jars="",
-        packages="",
-        exclude_packages="",
-        keytab="",
-        principal="",
-        proxy_user="",
+    etl_task = make_lance_operator("etl", spark_conn_id, build_etl_application_args(dag_params), spark_conf)
+    compact_task = make_lance_operator(
+        "compact", spark_conn_id, build_datasets_subcommand_args("compact", dag_params), spark_conf
+    )
+    index_task = make_lance_operator(
+        "index", spark_conn_id, build_datasets_subcommand_args("index", dag_params), spark_conf
     )
 
-    index_task = SparkSubmitOperator(
-        task_id="index",
-        conn_id=spark_conn_id,
-        application=LANCE_ETL_CLI,
-        application_args=build_index_application_args(dag_params),
-        name="lance-etl-index",
-        conf=build_base_spark_conf(dag_params),
-        py_files="",
-        verbose=False,
-        do_xcom_push=False,
-        env_vars={
-            "PYTHONPATH": "/opt/lance-etl/src",
-        },
-        spark_binary="spark-submit",
-        driver_class_path="",
-        jars="",
-        packages="",
-        exclude_packages="",
-        keytab="",
-        principal="",
-        proxy_user="",
-    )
-
-    compact_task = SparkSubmitOperator(
-        task_id="compact",
-        conn_id=spark_conn_id,
-        application=LANCE_ETL_CLI,
-        application_args=build_compact_application_args(dag_params),
-        name="lance-etl-compact",
-        conf=build_base_spark_conf(dag_params),
-        py_files="",
-        verbose=False,
-        do_xcom_push=False,
-        env_vars={
-            "PYTHONPATH": "/opt/lance-etl/src",
-        },
-        spark_binary="spark-submit",
-        driver_class_path="",
-        jars="",
-        packages="",
-        exclude_packages="",
-        keytab="",
-        principal="",
-        proxy_user="",
-    )
-
-    etl_task >> index_task >> compact_task
+    etl_task >> compact_task >> index_task

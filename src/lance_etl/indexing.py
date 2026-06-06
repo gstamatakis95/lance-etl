@@ -9,20 +9,33 @@ place:
 - :class:`BTreeIndexHandler` and :class:`BitmapIndexHandler` build scalar indices through the same segment API as the
   vector handler: per-shard ``create_index_uncommitted`` followed by a driver ``commit_existing_index_segments``. Bitmap
   segments are merged into one segment first. Btree segments are committed unmerged.
-- :class:`FtsIndexHandler` builds a full-text (BM25) inverted index. Inverted indices use the distributed metadata-merge
-  path: each shard builds its fragments under one shared index id, the driver merges the per-fragment metadata, and the
-  index is published with a create-index commit.
+- :class:`FtsIndexHandler` maintains a full-text (BM25) inverted index. An existing index with a small unindexed
+  backlog is maintained incrementally with ``optimize_indices`` on one executor. The distributed metadata-merge rebuild
+  (each shard builds its fragments under one shared index id, the driver merges the per-fragment metadata, and the
+  index is published with a create-index commit) remains for first builds, large backlogs, and ``rebuild`` runs after
+  tokenizer-parameter changes.
 
 Vector and scalar handlers index only fragments not already covered by the existing segments. Pass ``rebuild`` to
-reindex every fragment. Only the FTS handler rebuilds the whole index each run. Every commit retries conflicts with
-exponential backoff so it coexists with concurrent ingestion and compaction.
+reindex every fragment. Every commit retries conflicts with randomized exponential backoff so it coexists with
+concurrent ingestion and compaction. Commits also guard against publishing stale work after a concurrent compaction:
+segment commits drop segments whose fragments were rewritten between build and commit (the next run re-covers them),
+and the inverted-index publish refuses to commit coverage of fragments that no longer exist.
+
+Incremental maintenance is bounded in two ways. Each incremental commit adds one index delta per run, so once an
+index accumulates more than ``max_index_deltas`` deltas they are merged into one with
+``optimize_indices(num_indices_to_merge=...)``, which also permanently retires any deferred frag-reuse remap debt.
+IVF centroids are retrained, through the full rebuild path, once the dataset grows past ``retrain_growth_factor``
+times the row count persisted as ``rows_at_train`` in the artifact sidecar, so reused centroids cannot go stale
+forever as an org grows.
 
 :class:`LanceIndexer.run` orchestrates many datasets in two tiers. Small datasets (fragment count below a configurable
-threshold) are batched into a single Spark job where each executor task indexes one whole dataset end-to-end with plain
-``create_index`` / ``create_scalar_index``. Large datasets keep the per-dataset segment fan-out, driven concurrently
-from the driver with a thread pool and Spark FAIR scheduler pools. IVF partition counts follow a size-aware policy:
-``clamp(round(sqrt(rows)), 16, 4096)`` unless configured, degraded when the dataset cannot supply enough training rows,
-and the vector index is skipped entirely below a configurable row floor where flat KNN is sufficient.
+threshold) are batched into a single Spark job where each executor task indexes one whole dataset end-to-end: existing
+indices are maintained incrementally with ``optimize_indices`` (a cheap no-op when nothing changed) and only missing
+indices, or every index on a ``rebuild`` run, are built with plain ``create_index`` / ``create_scalar_index``. Large
+datasets keep the per-dataset segment fan-out, driven concurrently from the driver with a thread pool and Spark FAIR
+scheduler pools. IVF partition counts follow a size-aware policy: ``clamp(round(sqrt(rows)), 16, 4096)`` unless
+configured, degraded when the dataset cannot supply enough training rows, and the vector index is skipped entirely
+below a configurable row floor where flat KNN is sufficient.
 
 Requires pylance and the Datadog Agent on the executors. Artifact IO uses pyarrow's filesystem layer.
 """
@@ -92,8 +105,16 @@ class IndexJobConfig:
         fts_remove_stop_words: Remove FTS stop words when set.
         fts_ascii_folding: Apply FTS ASCII folding when set.
         num_shards: Number of parallel builders per dataset.
-        rebuild: Reindex every fragment instead of only uncovered ones.
+        rebuild: Reindex every fragment instead of only uncovered ones. Also forces the small tier and the FTS handler
+            to rebuild instead of maintaining incrementally, which is the path for parameter changes.
         reuse_artifacts: Reuse the dataset's persisted IVF_RQ artifacts.
+        retrain_growth_factor: Retrain the IVF artifacts, through the full rebuild path, once the dataset's row count
+            exceeds this factor times the ``rows_at_train`` persisted in the artifact sidecar. Reused centroids
+            otherwise stay pinned forever while the org grows, degrading recall and partition balance.
+        max_index_deltas: Merge an index's accumulated deltas into one when ``index_stats`` reports more than this many
+            ``num_indices``. Each incremental run otherwise adds one delta that every query must consult.
+        fts_max_unindexed_fragments: Maintain an existing inverted index incrementally only while its unindexed backlog
+            is at or below this fragment count. Larger backlogs use the distributed metadata-merge rebuild.
         commit_retries: Retry budget for commit conflicts.
         commit_backoff_seconds: Base backoff between commit retries.
         small_dataset_fragment_threshold: Datasets with fewer fragments are indexed whole on one executor.
@@ -126,6 +147,9 @@ class IndexJobConfig:
     num_shards: int = 64
     rebuild: bool = False
     reuse_artifacts: bool = True
+    retrain_growth_factor: float = 4.0
+    max_index_deltas: int = 4
+    fts_max_unindexed_fragments: int = 32
     commit_retries: int = 20
     commit_backoff_seconds: float = 0.5
     small_dataset_fragment_threshold: int = 32
@@ -259,6 +283,22 @@ def artifact_directory(uri: str, column: str) -> str:
     return f"{uri.rstrip('/')}.artifacts/{column}"
 
 
+def sidecar_locations(uri: str, column: str, storage_options: dict[str, Any] | None) -> tuple[Any, str, str]:
+    """Resolve the artifact sidecar filesystem and its manifest and centroids paths.
+
+    Args:
+        uri: Dataset URI.
+        column: Vector column the artifacts belong to.
+        storage_options: Object-store options forwarded to pyarrow.
+
+    Returns:
+        A ``(filesystem, manifest_path, centroids_path)`` triple for the sidecar.
+    """
+    filesystem, base_path = resolve_filesystem(artifact_directory(uri, column), storage_options)
+    base: str = base_path.rstrip("/")
+    return filesystem, f"{base}/manifest.json", f"{base}/ivf_centroids.arrow"
+
+
 def centroids_to_ipc(centroids: pa.Array) -> bytes:
     """Serialize IVF centroids to an Arrow IPC stream.
 
@@ -356,6 +396,88 @@ def deserialize_segment(document: str) -> Index:
     )
 
 
+def optimize_existing_index(
+    uri: str,
+    index_name: str,
+    config: IndexJobConfig,
+    telemetry: Telemetry,
+    num_indices_to_merge: int | None = None,
+) -> None:
+    """Run incremental maintenance for one existing index, retrying conflicts.
+
+    Appends unindexed fragments to the existing index without retraining and no-ops cheaply when the index already
+    covers everything. Runs in the calling process, so call it from an executor task. Each retry re-opens the dataset
+    at the latest version, which makes the retry productive against concurrent ingestion and compaction.
+
+    Args:
+        uri: Dataset URI.
+        index_name: The existing index to maintain.
+        config: Indexing configuration.
+        telemetry: Telemetry facade for the current process.
+        num_indices_to_merge: When set, also merge the delta with this many existing indices.
+
+    Raises:
+        OSError | RuntimeError: If commits keep conflicting past the retry budget.
+    """
+    tags: list[str] = [f"index:{index_name}"]
+
+    def action() -> None:
+        """Optimize the index against the latest dataset version."""
+        dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+        kwargs: dict[str, Any] = {"index_names": [index_name]}
+        if num_indices_to_merge is not None:
+            kwargs["num_indices_to_merge"] = num_indices_to_merge
+        dataset.optimize.optimize_indices(**kwargs)
+        telemetry.incr("index.optimized", tags=tags)
+
+    commit_with_retries(
+        action,
+        config.commit_retries,
+        config.commit_backoff_seconds,
+        lambda: telemetry.incr("index.commit_conflict", tags=tags),
+    )
+
+
+def index_delta_count(dataset: lance.LanceDataset, index_name: str) -> int:
+    """Return how many deltas (per-name index metadata entries) an index has.
+
+    Args:
+        dataset: The dataset to inspect.
+        index_name: The index name.
+
+    Returns:
+        The ``num_indices`` value from the index statistics.
+    """
+    stats: dict[str, Any] = dataset.stats.index_stats(index_name)
+    return int(stats.get("num_indices") or 0)
+
+
+def merge_index_deltas(uri: str, index_name: str, config: IndexJobConfig, telemetry: Telemetry) -> bool:
+    """Merge an index's accumulated deltas into one when over the configured cap.
+
+    Incremental runs add one delta per run per index, and every query consults all of them. The merge rewrites the
+    deltas against current row addresses, which also permanently retires deferred frag-reuse remap debt. Runs in the
+    calling process, so call it from an executor task, and only for an index that exists.
+
+    Args:
+        uri: Dataset URI.
+        index_name: The existing index whose deltas to bound.
+        config: Indexing configuration.
+        telemetry: Telemetry facade for the current process.
+
+    Returns:
+        ``True`` if a merge ran, ``False`` when the delta count was within the cap.
+    """
+    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+    deltas: int = index_delta_count(dataset, index_name)
+    if deltas <= config.max_index_deltas:
+        return False
+    optimize_existing_index(uri, index_name, config, telemetry, num_indices_to_merge=deltas)
+    telemetry.incr("index.deltas_merged", tags=[f"index:{index_name}"])
+    logger.info("merged %d index deltas into one for %s on %s", deltas, index_name, uri)
+    return True
+
+
 def commit_segments(
     uri: str,
     segment_documents: list[str],
@@ -366,6 +488,12 @@ def commit_segments(
     telemetry: Telemetry,
 ) -> None:
     """Commit built segments, retrying conflicts to coexist with writers.
+
+    Each attempt validates the segments against the latest fragment set first. A concurrent compaction can rewrite
+    fragments between the segment build and this commit, and a blind retry at the new head version would then publish
+    segments pointing at fragments that no longer exist, silently corrupting search results. Stale segments are
+    dropped with a metric instead, leaving their fragments uncovered for the next incremental run to rebuild. When
+    every segment is stale the commit is skipped entirely.
 
     Args:
         uri: Dataset URI.
@@ -383,13 +511,27 @@ def commit_segments(
     tags: list[str] = [f"index:{index_name}"]
 
     def action() -> None:
-        """Merge if needed and commit the segments at the latest version."""
+        """Drop stale segments, merge if needed, and commit at the latest version."""
         dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-        if merge and len(segments) > 1:
-            merged = dataset.merge_existing_index_segments(segments)
+        live: set[int] = {fragment.fragment_id for fragment in dataset.get_fragments()}
+        fresh: list[Index] = [segment for segment in segments if set(segment.fragment_ids) <= live]
+        stale: int = len(segments) - len(fresh)
+        if stale:
+            telemetry.incr("index.stale_segments_dropped", value=stale, tags=tags)
+            logger.warning(
+                "dropping %d stale segments for %s on %s: their fragments were rewritten between build and commit",
+                stale,
+                index_name,
+                uri,
+            )
+        if not fresh:
+            logger.warning("every segment for %s on %s is stale; skipping commit, next run re-covers", index_name, uri)
+            return
+        if merge and len(fresh) > 1:
+            merged = dataset.merge_existing_index_segments(fresh)
             dataset.commit_existing_index_segments(index_name, column, [merged])
         else:
-            dataset.commit_existing_index_segments(index_name, column, segments)
+            dataset.commit_existing_index_segments(index_name, column, fresh)
         telemetry.incr("index.committed", tags=tags)
 
     commit_with_retries(
@@ -541,21 +683,83 @@ class IndexHandler:
         del dataset, uri, telemetry
         return None
 
+    def record_coverage(self, uri: str, dataset: lance.LanceDataset) -> None:
+        """Record this index's committed fragment coverage after a successful build.
+
+        Subclasses override this to persist coverage for staleness detection. The base implementation records
+        nothing, which is correct for scalar and inverted indexes whose inline compaction remap is sound.
+
+        Args:
+            uri: Dataset URI.
+            dataset: A dataset handle refreshed after the commit.
+        """
+        del uri, dataset
+
     def build_segment(self, dataset: lance.LanceDataset, fragment_ids: list[int], artifacts: object | None) -> Index:
-        """Build one uncommitted segment over a shard of fragments.
+        """Build one uncommitted scalar segment over a shard of fragments.
+
+        This base implementation covers the artifact-free scalar types (BTREE and BITMAP). ``index_uuid`` must not be
+        passed for these segment builds. Lance mints segment ids itself. ``replace=True`` bypasses the same-name
+        existence guard on the uncommitted path so incremental segments can extend an existing index. It removes
+        nothing, since delta removal happens only on the committed path. Handlers that need broadcast artifacts
+        override this method.
 
         Args:
             dataset: A dataset handle pinned to the build version.
             fragment_ids: The fragment ids for this shard.
-            artifacts: The broadcast artifact, or ``None``.
+            artifacts: The broadcast artifact, unused by scalar builds.
 
         Returns:
             The uncommitted segment metadata.
         """
-        raise NotImplementedError
+        del artifacts
+        return dataset.create_index_uncommitted(
+            column=self.column,
+            index_type=self.index_type(),
+            name=self.index_name,
+            replace=True,
+            fragment_ids=fragment_ids,
+        )
+
+    def merge_deltas(self, spark: SparkSession, uri: str, telemetry: Telemetry) -> bool:
+        """Merge this index's accumulated deltas on one executor when over the cap.
+
+        The driver only reads the index statistics. The merge itself, which can approach a rebuild for sort-merge
+        scalar types, runs in a single-task Spark job so heavy work stays off the driver.
+
+        Args:
+            spark: Active Spark session.
+            uri: Dataset URI.
+            telemetry: Driver telemetry facade.
+
+        Returns:
+            ``True`` if a merge ran.
+        """
+        config: IndexJobConfig = self.config
+        dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+        if self.index_name not in {description.name for description in dataset.describe_indices()}:
+            return False
+        if index_delta_count(dataset, self.index_name) <= config.max_index_deltas:
+            return False
+        index_name: str = self.index_name
+
+        def merge_one(target: str) -> bool:
+            """Merge the index deltas inside an executor task.
+
+            Args:
+                target: Dataset URI.
+
+            Returns:
+                ``True`` if a merge ran.
+            """
+            return merge_index_deltas(target, index_name, config, Telemetry.create(config.telemetry))
+
+        with telemetry.timed("index.delta_merge_ms", tags=[f"index:{index_name}"]):
+            merged: list[bool] = spark.sparkContext.parallelize([uri], 1).map(merge_one).collect()
+        return bool(merged and merged[0])
 
     def build(self, spark: SparkSession, uri: str, telemetry: Telemetry) -> dict[str, Any]:
-        """Build and commit this index across executors.
+        """Build and commit this index across executors, then bound its deltas.
 
         Args:
             spark: Active Spark session.
@@ -574,7 +778,13 @@ class IndexHandler:
         self.validate(dataset)
         targets: list[int] = self.target_fragments(dataset)
         if not targets:
-            return {"column": self.column, "index": self.index_name, "segments": 0, "fragments": 0}
+            return {
+                "column": self.column,
+                "index": self.index_name,
+                "segments": 0,
+                "fragments": 0,
+                "deltas_merged": self.merge_deltas(spark, uri, telemetry),
+            }
 
         artifacts: object | None = self.prepare(dataset, uri, telemetry)
         version: int = dataset.version
@@ -613,11 +823,13 @@ class IndexHandler:
             )
         with telemetry.timed("index.commit_ms", tags=[f"index:{self.index_name}"]):
             commit_segments(uri, segment_documents, self.column, self.index_name, self.merges(), config, telemetry)
+        self.record_coverage(uri, lance.dataset(uri, storage_options=config.storage_options))
         result: dict[str, Any] = {
             "column": self.column,
             "index": self.index_name,
             "segments": len(segment_documents),
             "fragments": len(targets),
+            "deltas_merged": self.merge_deltas(spark, uri, telemetry),
         }
         result.update(self.extra_stats())
         return result
@@ -704,6 +916,110 @@ class VectorIndexHandler(IndexHandler):
         if self.dimension(dataset) % 8 != 0:
             raise ValueError("IVF_RQ requires the vector dimension to be divisible by 8")
 
+    def load_manifest(self, uri: str) -> dict[str, Any] | None:
+        """Load the artifact sidecar manifest for this column, if present.
+
+        Args:
+            uri: Dataset URI.
+
+        Returns:
+            The parsed manifest, or ``None`` when no sidecar exists.
+        """
+        filesystem, manifest_path = sidecar_locations(uri, self.column, self.config.storage_options)[:2]
+        if not object_exists(filesystem, manifest_path):
+            return None
+        return json.loads(read_object(filesystem, manifest_path))
+
+    def growth_requires_retrain(self, manifest: dict[str, Any], rows: int) -> bool:
+        """Decide whether dataset growth since training forces a centroid retrain.
+
+        A manifest without ``rows_at_train`` predates the retrain trigger and retrains once to record it.
+
+        Args:
+            manifest: The stored artifact manifest.
+            rows: The dataset's current row count.
+
+        Returns:
+            ``True`` when the artifacts must be retrained instead of reused.
+        """
+        rows_at_train: Any = manifest.get("rows_at_train")
+        if rows_at_train is None:
+            return True
+        return rows > self.config.retrain_growth_factor * int(rows_at_train)
+
+    def remap_requires_rebuild(self, manifest: dict[str, Any], dataset: lance.LanceDataset) -> bool:
+        """Decide whether a compaction since the last build forces a full rebuild.
+
+        On the pinned lance build, compaction's inline eager remap silently corrupts IVF_RQ indexes (about half the
+        rows become unsearchable while the index still reports full coverage), and the deferred remap fails vector
+        queries loudly, so a remapped vector index can never be trusted. The manifest records the live fragment ids
+        covered when this handler last committed segments. Any of those fragments disappearing means a rewrite
+        consumed indexed fragments and the surviving index content went through the corrupting remap. A manifest
+        without the field predates this guard and reports no debt, since the field is recorded on every build pass.
+
+        Args:
+            manifest: The stored artifact manifest.
+            dataset: The dataset to inspect.
+
+        Returns:
+            ``True`` when fragments covered at the last build no longer exist.
+        """
+        covered: Any = manifest.get("covered_fragment_ids")
+        if covered is None:
+            return False
+        live: set[int] = {fragment.fragment_id for fragment in dataset.get_fragments()}
+        return not set(covered) <= live
+
+    def record_coverage(self, uri: str, dataset: lance.LanceDataset) -> None:
+        """Persist the live fragment ids this index covers after a successful commit.
+
+        Stored in the artifact sidecar manifest so the next maintenance pass can detect that a compaction rewrote
+        indexed fragments (see :meth:`remap_requires_rebuild`). Recorded only when a sidecar already exists, which is
+        always true after :meth:`prepare` ran for this build.
+
+        Args:
+            uri: Dataset URI.
+            dataset: A dataset handle refreshed after the commit.
+        """
+        manifest: dict[str, Any] | None = self.load_manifest(uri)
+        if manifest is None:
+            return
+        live: set[int] = {fragment.fragment_id for fragment in dataset.get_fragments()}
+        manifest["covered_fragment_ids"] = sorted(self.covered_fragments(dataset) & live)
+        filesystem, manifest_path = sidecar_locations(uri, self.column, self.config.storage_options)[:2]
+        write_object(filesystem, manifest_path, json.dumps(manifest).encode("utf-8"))
+
+    def target_fragments(self, dataset: lance.LanceDataset) -> list[int]:
+        """Return fragments to index, expanding to all of them on a retrain or after a corrupting remap.
+
+        Retrained centroids and rotation cannot merge with segments built from the old artifacts, so when the growth
+        trigger fires every fragment is rebuilt, exactly as on a ``rebuild`` run. The same full rebuild runs when
+        :meth:`remap_requires_rebuild` reports that a compaction rewrote covered fragments, because the inline remap
+        corrupts IVF_RQ content while leaving coverage statistics clean. Full incoming coverage replaces every prior
+        delta on commit, restoring recall from the intact row data.
+
+        Args:
+            dataset: The dataset to inspect.
+
+        Returns:
+            Every fragment when retraining, rebuilding, or repairing remap debt, otherwise only uncovered fragments.
+        """
+        config: IndexJobConfig = self.config
+        if config.reuse_artifacts and not config.rebuild:
+            manifest: dict[str, Any] | None = self.load_manifest(dataset.uri)
+            if manifest is not None and "rabitq_model" in manifest:
+                if self.growth_requires_retrain(manifest, dataset.count_rows()):
+                    return [fragment.fragment_id for fragment in dataset.get_fragments()]
+                if self.remap_requires_rebuild(manifest, dataset):
+                    logger.info(
+                        "rebuilding %s on %s: a compaction rewrote covered fragments and the inline remap "
+                        "cannot be trusted for IVF_RQ",
+                        self.index_name,
+                        dataset.uri,
+                    )
+                    return [fragment.fragment_id for fragment in dataset.get_fragments()]
+        return super().target_fragments(dataset)
+
     def validate_manifest(self, manifest: dict[str, Any], dimension: int) -> None:
         """Check that reused artifacts match the requested configuration.
 
@@ -738,6 +1054,11 @@ class VectorIndexHandler(IndexHandler):
         which is only safe for a single non-merged segment. The partition count follows the size-aware policy and is
         degraded when the dataset cannot supply ``num_partitions * sample_rate`` training rows.
 
+        Persisted artifacts are reused only while the dataset stays within ``retrain_growth_factor`` times the
+        ``rows_at_train`` recorded at training time. Past that, the centroids are retrained and every fragment is
+        rebuilt (see :meth:`target_fragments`), because stale centroids degrade recall and partition balance as an org
+        grows.
+
         Args:
             dataset: The dataset to train on if artifacts are absent.
             uri: Dataset URI used to locate the artifact sidecar.
@@ -749,13 +1070,23 @@ class VectorIndexHandler(IndexHandler):
         """
         config: IndexJobConfig = self.config
         dimension: int = self.dimension(dataset)
-        filesystem, base_path = resolve_filesystem(artifact_directory(uri, self.column), config.storage_options)
-        manifest_path: str = f"{base_path.rstrip('/')}/manifest.json"
-        centroids_path: str = f"{base_path.rstrip('/')}/ivf_centroids.arrow"
+        rows: int = dataset.count_rows()
+        filesystem, manifest_path, centroids_path = sidecar_locations(uri, self.column, config.storage_options)
 
         if config.reuse_artifacts and not config.rebuild and object_exists(filesystem, manifest_path):
             manifest: dict[str, Any] = json.loads(read_object(filesystem, manifest_path))
-            if "rabitq_model" in manifest:
+            if "rabitq_model" not in manifest:
+                logger.info("sidecar manifest for %s has no rabitq_model; retraining artifacts", uri)
+            elif self.growth_requires_retrain(manifest, rows):
+                telemetry.incr("artifacts.retrained_for_growth")
+                logger.info(
+                    "retraining IVF artifacts for %s: %d rows exceed %.1fx rows_at_train=%s",
+                    uri,
+                    rows,
+                    config.retrain_growth_factor,
+                    manifest.get("rows_at_train"),
+                )
+            else:
                 self.validate_manifest(manifest, dimension)
                 self.reused_artifacts = True
                 self.num_partitions_used = int(manifest["num_partitions"])
@@ -766,9 +1097,7 @@ class VectorIndexHandler(IndexHandler):
                     config.num_bits,
                     self.num_partitions_used,
                 )
-            logger.info("sidecar manifest for %s has no rabitq_model; retraining artifacts", uri)
 
-        rows: int = dataset.count_rows()
         planned: int = derive_num_partitions(rows, config.num_partitions)
         partitions: int = degrade_num_partitions(planned, rows, config.train_sample_rate)
         if partitions < planned:
@@ -790,6 +1119,7 @@ class VectorIndexHandler(IndexHandler):
             "num_bits": config.num_bits,
             "distance_type": config.resolved_distance_type(),
             "rabitq_model": rabitq_model,
+            "rows_at_train": rows,
             "created_at": datetime.now(UTC).isoformat(),
         }
         write_object(filesystem, centroids_path, centroids_bytes)
@@ -801,6 +1131,11 @@ class VectorIndexHandler(IndexHandler):
 
     def build_segment(self, dataset: lance.LanceDataset, fragment_ids: list[int], artifacts: object | None) -> Index:
         """Build one IVF_RQ segment over a shard of fragments.
+
+        ``replace=True`` is required for incremental coverage: the uncommitted build path applies the same-name
+        existence guard, and without it a segment build for an index that already exists raises. The flag only bypasses
+        that guard. Removal of prior deltas happens solely on the committed ``execute`` path, never here, so existing
+        coverage is preserved and :func:`commit_segments` publishes the new segments as a delta.
 
         Args:
             dataset: A dataset handle pinned to the build version.
@@ -823,6 +1158,7 @@ class VectorIndexHandler(IndexHandler):
             index_type="IVF_RQ",
             name=self.index_name,
             metric=self.config.metric,
+            replace=True,
             num_partitions=num_partitions,
             num_bits=num_bits,
             ivf_centroids=centroids,
@@ -836,7 +1172,7 @@ class BTreeIndexHandler(IndexHandler):
 
     Each shard calls ``create_index_uncommitted`` and the driver publishes the collected segments with
     ``commit_existing_index_segments``. BTREE segments do not support driver-side merging, so they are committed
-    unmerged. Incremental fragment coverage is inherited from :class:`IndexHandler`.
+    unmerged. The segment build and incremental fragment coverage are inherited from :class:`IndexHandler`.
     """
 
     def index_type(self) -> str:
@@ -847,34 +1183,13 @@ class BTreeIndexHandler(IndexHandler):
         """
         return "BTREE"
 
-    def build_segment(self, dataset: lance.LanceDataset, fragment_ids: list[int], artifacts: object | None) -> Index:
-        """Build one BTREE segment over a shard of fragments.
-
-        ``index_uuid`` must not be passed for BTREE segment builds. Lance mints segment ids itself.
-
-        Args:
-            dataset: A dataset handle pinned to the build version.
-            fragment_ids: The fragment ids for this shard.
-            artifacts: Unused. Btree builds need no broadcast artifact.
-
-        Returns:
-            The uncommitted segment metadata.
-        """
-        del artifacts
-        return dataset.create_index_uncommitted(
-            column=self.column,
-            index_type="BTREE",
-            name=self.index_name,
-            fragment_ids=fragment_ids,
-        )
-
 
 class BitmapIndexHandler(IndexHandler):
     """Builds a bitmap scalar index through the segment API.
 
     Each shard calls ``create_index_uncommitted`` and the driver merges the collected segments into one with
-    ``merge_existing_index_segments`` before publishing via ``commit_existing_index_segments``. Incremental fragment
-    coverage is inherited from :class:`IndexHandler`.
+    ``merge_existing_index_segments`` before publishing via ``commit_existing_index_segments``. The segment build and
+    incremental fragment coverage are inherited from :class:`IndexHandler`.
     """
 
     def index_type(self) -> str:
@@ -893,32 +1208,16 @@ class BitmapIndexHandler(IndexHandler):
         """
         return True
 
-    def build_segment(self, dataset: lance.LanceDataset, fragment_ids: list[int], artifacts: object | None) -> Index:
-        """Build one BITMAP segment over a shard of fragments.
-
-        Args:
-            dataset: A dataset handle pinned to the build version.
-            fragment_ids: The fragment ids for this shard.
-            artifacts: Unused. Bitmap builds need no broadcast artifact.
-
-        Returns:
-            The uncommitted segment metadata.
-        """
-        del artifacts
-        return dataset.create_index_uncommitted(
-            column=self.column,
-            index_type="BITMAP",
-            name=self.index_name,
-            fragment_ids=fragment_ids,
-        )
-
 
 class FtsIndexHandler(IndexHandler):
-    """Builds a full-text BM25 inverted index via the metadata-merge path.
+    """Maintains a full-text BM25 inverted index, rebuilding only when it must.
 
-    Inverted indices are not built through the segment API. Each shard builds its fragments under one shared index id,
-    the driver merges the per-fragment metadata, and the index is published with a create-index commit. The whole index
-    is rebuilt each run, so any existing index of the same name is dropped first.
+    An existing index whose unindexed backlog is within ``fts_max_unindexed_fragments`` is maintained incrementally on
+    one executor with ``optimize_indices``, which merges INVERTED deltas natively and falls back internally to an
+    old-plus-new rebuild only when the index's update criteria require it. The distributed metadata-merge rebuild
+    remains for first builds, large backlogs, and ``rebuild`` runs after tokenizer-parameter changes. Inverted indices
+    are not built through the segment API: each shard builds its fragments under one shared index id, the driver merges
+    the per-fragment metadata, and the index is published with a create-index commit.
     """
 
     def index_type(self) -> str:
@@ -928,6 +1227,61 @@ class FtsIndexHandler(IndexHandler):
             The string ``INVERTED``.
         """
         return "INVERTED"
+
+    def maintainable(self, dataset: lance.LanceDataset) -> bool:
+        """Decide whether the existing index can be maintained incrementally.
+
+        Args:
+            dataset: The dataset to inspect.
+
+        Returns:
+            ``True`` when the index exists, no rebuild was requested, and the unindexed backlog is within the
+            configured fragment threshold.
+        """
+        if self.config.rebuild or not self.covered_fragments(dataset):
+            return False
+        stats: dict[str, Any] = dataset.stats.index_stats(self.index_name)
+        return int(stats.get("num_unindexed_fragments") or 0) <= self.config.fts_max_unindexed_fragments
+
+    def maintain(self, spark: SparkSession, uri: str, telemetry: Telemetry) -> dict[str, Any]:
+        """Maintain the existing inverted index incrementally on one executor.
+
+        Runs ``optimize_indices`` for this index in a single-task Spark job, then bounds the delta count.
+
+        Args:
+            spark: Active Spark session.
+            uri: Dataset URI.
+            telemetry: Driver telemetry facade.
+
+        Returns:
+            A statistics dictionary for the index with ``maintained`` set.
+        """
+        config: IndexJobConfig = self.config
+        index_name: str = self.index_name
+
+        def maintain_one(target: str) -> bool:
+            """Optimize and delta-bound the index inside an executor task.
+
+            Args:
+                target: Dataset URI.
+
+            Returns:
+                ``True`` if a delta merge ran.
+            """
+            telemetry_local: Telemetry = Telemetry.create(config.telemetry)
+            optimize_existing_index(target, index_name, config, telemetry_local)
+            return merge_index_deltas(target, index_name, config, telemetry_local)
+
+        with telemetry.timed("index.build_ms", tags=[f"index:{index_name}"]):
+            merged: list[bool] = spark.sparkContext.parallelize([uri], 1).map(maintain_one).collect()
+        return {
+            "column": self.column,
+            "index": index_name,
+            "segments": 0,
+            "fragments": 0,
+            "maintained": True,
+            "deltas_merged": bool(merged and merged[0]),
+        }
 
     def commit_index(
         self,
@@ -939,6 +1293,11 @@ class FtsIndexHandler(IndexHandler):
     ) -> None:
         """Publish the merged inverted index, retrying conflicts.
 
+        Each attempt validates that every covered fragment still exists at the latest version. A concurrent compaction
+        can rewrite covered fragments between the executor build and this commit, and a blind retry at the new head
+        version would then publish an index whose row addresses point at compacted-away fragments. That state raises
+        instead, failing the dataset loudly so the next run rebuilds.
+
         Args:
             uri: Dataset URI.
             dataset: A dataset handle refreshed to the latest version after the executor build.
@@ -947,6 +1306,7 @@ class FtsIndexHandler(IndexHandler):
             telemetry: Driver telemetry facade.
 
         Raises:
+            ValueError: If covered fragments no longer exist because a compaction rewrote them.
             OSError | RuntimeError: If commits keep conflicting past the retry budget.
         """
         config: IndexJobConfig = self.config
@@ -959,6 +1319,13 @@ class FtsIndexHandler(IndexHandler):
         def action() -> None:
             """Publish the merged inverted index at the latest version."""
             current: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
+            live: set[int] = {fragment.fragment_id for fragment in current.get_fragments()}
+            missing: set[int] = fragments - live
+            if missing:
+                raise ValueError(
+                    f"inverted index {index_name} on {uri} covers fragments {sorted(missing)} that no longer exist; "
+                    "a compaction rewrote them between build and commit, so this build must be redone"
+                )
             index: Index = Index(
                 uuid=index_uuid,
                 name=index_name,
@@ -979,10 +1346,12 @@ class FtsIndexHandler(IndexHandler):
         )
 
     def build(self, spark: SparkSession, uri: str, telemetry: Telemetry) -> dict[str, Any]:
-        """Build and commit the inverted index across executors.
+        """Maintain the inverted index incrementally, or rebuild it across executors.
 
-        The dataset handle is refreshed after the executor build so the metadata merge and the publish commit both
-        operate against the latest committed version rather than the snapshot captured before the Spark job ran.
+        An existing index with a small unindexed backlog is maintained with ``optimize_indices`` on one executor.
+        Otherwise the full distributed rebuild runs: the dataset handle is refreshed after the executor build so the
+        metadata merge and the publish commit both operate against the latest committed version rather than the
+        snapshot captured before the Spark job ran.
 
         Args:
             spark: Active Spark session.
@@ -994,6 +1363,8 @@ class FtsIndexHandler(IndexHandler):
         """
         config: IndexJobConfig = self.config
         dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+        if self.maintainable(dataset):
+            return self.maintain(spark, uri, telemetry)
         if self.covered_fragments(dataset):
             dataset.drop_index(self.index_name)
             dataset = lance.dataset(uri, storage_options=config.storage_options)
@@ -1058,24 +1429,69 @@ class FtsIndexHandler(IndexHandler):
         }
 
 
-def index_dataset_locally(uri: str, config: IndexJobConfig) -> dict[str, Any]:
-    """Build every configured index for one small dataset on one executor.
+def maintain_index_locally(uri: str, index_name: str, config: IndexJobConfig, telemetry: Telemetry) -> bool:
+    """Maintain one existing index in process, then bound its delta count.
 
-    This is the small-dataset tier: no segment fan-out, just plain ``create_index`` / ``create_scalar_index`` calls
-    that build and commit each index end-to-end. Single-process ``create_index`` needs no shared RaBitQ model — a lone
-    non-merged segment may use its own random rotation. The vector index follows the same size-aware policy as the
-    distributed path and is skipped below the configured row floor.
+    Args:
+        uri: Dataset URI.
+        index_name: The existing index to maintain.
+        config: Indexing configuration.
+        telemetry: Telemetry facade for the current process.
+
+    Returns:
+        ``True`` if a delta merge ran after the maintenance pass.
+    """
+    optimize_existing_index(uri, index_name, config, telemetry)
+    return merge_index_deltas(uri, index_name, config, telemetry)
+
+
+def maintained_stats(column: str, index_name: str, fragments: int, deltas_merged: bool) -> dict[str, Any]:
+    """Build the statistics dictionary for an incrementally maintained index.
+
+    Args:
+        column: The indexed column.
+        index_name: The maintained index name.
+        fragments: The dataset's fragment count.
+        deltas_merged: Whether a delta merge ran after the maintenance pass.
+
+    Returns:
+        A statistics dictionary matching the large-tier shape with ``maintained`` set.
+    """
+    return {
+        "column": column,
+        "index": index_name,
+        "segments": 0,
+        "fragments": fragments,
+        "maintained": True,
+        "deltas_merged": deltas_merged,
+    }
+
+
+def index_dataset_locally(uri: str, config: IndexJobConfig) -> dict[str, Any]:
+    """Build or maintain every configured index for one small dataset on one executor.
+
+    This is the small-dataset tier: no segment fan-out. An index that already exists is maintained incrementally with
+    ``optimize_indices``, which appends only unindexed fragments and no-ops cheaply when the index is fully covered,
+    so sweeping the unchanged power-law tail costs near zero. Missing indices, or every index on a ``rebuild`` run
+    (the path for parameter changes), are built with plain ``create_index`` / ``create_scalar_index`` calls that build
+    and commit end-to-end. After each maintenance pass the index's deltas are merged once they exceed
+    ``max_index_deltas``. Single-process ``create_index`` needs no shared RaBitQ model — a lone non-merged segment may
+    use its own random rotation. The vector index follows the same size-aware policy as the distributed path and is
+    skipped below the configured row floor. Incremental vector maintenance assigns new rows to existing IVF partitions
+    without retraining, so a grown dataset retrains via the large tier's growth trigger once it crosses the fragment
+    threshold, or earlier via a ``rebuild`` run.
 
     Args:
         uri: Dataset URI.
         config: Indexing configuration.
 
     Returns:
-        A statistics dictionary matching the large-tier shape.
+        A statistics dictionary matching the large-tier shape. Maintained indices carry ``maintained: True``.
     """
     telemetry: Telemetry = Telemetry.create(config.telemetry)
     dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
     fragments: int = len(dataset.get_fragments())
+    existing: set[str] = {description.name for description in dataset.describe_indices()}
     indexes: list[dict[str, Any]] = []
     with telemetry.span("lance.indexing.local_dataset"):
         if config.vector_column is not None:
@@ -1093,6 +1509,10 @@ def index_dataset_locally(uri: str, config: IndexJobConfig) -> dict[str, Any]:
                         "skipped": reason,
                     }
                 )
+            elif index_name in existing and not config.rebuild:
+                with telemetry.timed("index.build_ms", tags=[f"index:{index_name}"]):
+                    merged: bool = maintain_index_locally(uri, index_name, config, telemetry)
+                indexes.append(maintained_stats(config.vector_column, index_name, fragments, merged))
             else:
                 planned: int = derive_num_partitions(rows, config.num_partitions)
                 partitions: int = degrade_num_partitions(planned, rows, config.train_sample_rate)
@@ -1122,10 +1542,15 @@ def index_dataset_locally(uri: str, config: IndexJobConfig) -> dict[str, Any]:
             *((column, "INVERTED", fts_index_name(column), config.fts_params()) for column in config.text_columns),
         ]
         for column, index_type, name, params in scalar_targets:
-            with telemetry.timed("index.build_ms", tags=[f"index:{name}"]):
-                dataset.create_scalar_index(column, index_type, name=name, replace=True, **params)
-            telemetry.incr("index.committed", tags=[f"index:{name}"])
-            indexes.append({"column": column, "index": name, "segments": 1, "fragments": fragments})
+            if name in existing and not config.rebuild:
+                with telemetry.timed("index.build_ms", tags=[f"index:{name}"]):
+                    merged = maintain_index_locally(uri, name, config, telemetry)
+                indexes.append(maintained_stats(column, name, fragments, merged))
+            else:
+                with telemetry.timed("index.build_ms", tags=[f"index:{name}"]):
+                    dataset.create_scalar_index(column, index_type, name=name, replace=True, **params)
+                telemetry.incr("index.committed", tags=[f"index:{name}"])
+                indexes.append({"column": column, "index": name, "segments": 1, "fragments": fragments})
     return {"uri": uri, "indexes": indexes, "tier": "small"}
 
 

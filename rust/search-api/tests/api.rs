@@ -24,7 +24,7 @@ use search_api::pb::{
     Fusion, HybridSearchRequest, InList, LiteralValue, MatchQuery, PhraseQuery, PrewarmRequest, RrfFusion, TextQuery,
     TextSearchRequest, VectorQuery, VectorSearchRequest, filter, fts_query, fusion, literal_value, text_query,
 };
-use search_api::telemetry::{self, Metrics};
+use search_api::telemetry::{self, Metrics, RecallCapture, RecallRecord};
 use tempfile::TempDir;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Code;
@@ -167,6 +167,11 @@ async fn serve(tmp: &TempDir) -> Channel {
 
 /// Like [`serve`] but emitting per-RPC metrics through the given facade.
 async fn serve_with_metrics(tmp: &TempDir, metrics: Arc<Metrics>) -> Channel {
+    serve_full(tmp, metrics, None).await
+}
+
+/// Like [`serve_with_metrics`] but optionally enabling sampled-query recall capture.
+async fn serve_full(tmp: &TempDir, metrics: Arc<Metrics>, recall: Option<RecallCapture>) -> Channel {
     drop(telemetry::init_tracing(true));
     let config = Config {
         base_uri: tmp.path().display().to_string(),
@@ -186,6 +191,7 @@ async fn serve_with_metrics(tmp: &TempDir, metrics: Arc<Metrics>) -> Channel {
         id_column: "vector_id".to_string(),
         statsd_addr: "127.0.0.1:8125".to_string(),
         telemetry_disabled: true,
+        recall_sample_rate: 0.0,
     };
     let provider = CachingDatasetProvider::with_telemetry(&config, metrics.clone());
     let backend = Arc::new(
@@ -194,7 +200,10 @@ async fn serve_with_metrics(tmp: &TempDir, metrics: Arc<Metrics>) -> Channel {
             .with_id_column(config.id_column.clone())
             .with_metrics(metrics.clone()),
     );
-    let service = SearchGrpc::with_metrics(backend, metrics);
+    let mut service = SearchGrpc::with_metrics(backend, metrics);
+    if let Some(recall) = recall {
+        service = service.with_recall(recall);
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
@@ -901,6 +910,130 @@ async fn missing_dataset_and_bad_target_return_proper_status_codes() {
         .unwrap_err();
     assert_eq!(status.code(), Code::InvalidArgument);
     assert!(status.message().contains("target"));
+}
+
+#[tokio::test]
+async fn recall_capture_samples_vector_searches_and_skips_text_hybrid_and_fanout() {
+    let tmp = TempDir::new().unwrap();
+    build_test_dataset(&org1_uri(&tmp)).await;
+    build_dated_datasets(tmp.path()).await;
+    let (receiver, sink) = cadence::SpyMetricSink::new();
+    let metrics = Arc::new(Metrics::from_sink(sink));
+    let captured: Arc<std::sync::Mutex<Vec<RecallRecord>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let records_sink = captured.clone();
+    let recall = RecallCapture::new(1.0, "vector_id", metrics.clone()).with_hook(Arc::new(move |record| {
+        records_sink.lock().unwrap().push(record.clone());
+    }));
+    let channel = serve_full(&tmp, metrics, Some(recall)).await;
+    let mut client = SearchServiceClient::new(channel);
+
+    let mut query = vector_query(vec![1.0, 0.0, 0.0, 0.0], 2);
+    query.filter = Some(compare_filter("id", CompareOp::Ge, 1));
+    let response = client
+        .vector_search(VectorSearchRequest {
+            target: target("org1"),
+            query: Some(query),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.results.len(), 2, "capture must not alter results");
+
+    {
+        let records = captured.lock().unwrap();
+        assert_eq!(records.len(), 1, "rate 1.0 must sample every eligible request");
+        let record = &records[0];
+        assert_eq!(record.org_id, "org1");
+        assert_eq!(record.tenant_id, "tenant1");
+        assert_eq!(record.namespace, "ns1");
+        assert_eq!(record.k, 2);
+        assert!(!record.sample_id.is_empty());
+        assert!(record.captured_at_unix_ms > 0);
+        assert!(
+            record.dataset_version.is_some(),
+            "the served dataset version must be captured"
+        );
+        assert_eq!(record.query_vector_json, "[1.0,0.0,0.0,0.0]");
+        assert_eq!(
+            record.filter_json.as_deref(),
+            Some(r#"{"compare":{"column":"id","op":"ge","value":{"int":1}}}"#)
+        );
+        let ids: Vec<serde_json::Value> = serde_json::from_str(&record.result_ids_json).unwrap();
+        assert_eq!(ids.len(), 2, "one id per served hit, in rank order");
+        assert_eq!(ids[0], serde_json::json!(1), "rank 1 must be the exact match");
+        let distances: Vec<f64> = serde_json::from_str(&record.result_distances_json).unwrap();
+        assert_eq!(distances.len(), 2);
+        assert!(distances[0] <= distances[1]);
+    }
+
+    client
+        .text_search(TextSearchRequest {
+            target: target("org1"),
+            query: Some(simple_text_query("lemon", 3)),
+        })
+        .await
+        .unwrap();
+    client
+        .hybrid_search(HybridSearchRequest {
+            target: target("org1"),
+            vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
+            text: Some(simple_text_query("pear", 0)),
+            k: 2,
+            fusion: None,
+        })
+        .await
+        .unwrap();
+    client
+        .vector_search(VectorSearchRequest {
+            target: dated_target("org1", "2026-06-01", "2026-06-03"),
+            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 3)),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        captured.lock().unwrap().len(),
+        1,
+        "text, hybrid, and date-range fan-out requests must never be sampled"
+    );
+
+    let response = client
+        .vector_search(VectorSearchRequest {
+            target: target("org1"),
+            query: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 1)),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.results.len(), 1);
+    {
+        let records = captured.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].filter_json, None, "unfiltered requests carry no filter");
+        let ids: Vec<serde_json::Value> = serde_json::from_str(&records[1].result_ids_json).unwrap();
+        assert_eq!(ids, vec![serde_json::json!(2)]);
+    }
+
+    let mut lines = Vec::new();
+    while let Ok(packet) = receiver.try_recv() {
+        lines.push(String::from_utf8(packet).unwrap());
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("search_api.recall.samples:1|c") && line.contains("filtered:true")),
+        "missing filtered recall sample count: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("search_api.recall.samples:1|c") && line.contains("filtered:false")),
+        "missing unfiltered recall sample count: {lines:?}"
+    );
+    assert_eq!(
+        lines.iter().filter(|line| line.contains("recall.samples")).count(),
+        2,
+        "exactly the two eligible requests must be counted: {lines:?}"
+    );
 }
 
 #[tokio::test]

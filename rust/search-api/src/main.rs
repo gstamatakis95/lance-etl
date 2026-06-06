@@ -7,7 +7,7 @@ use search_api::config::Config;
 use search_api::grpc::SearchGrpc;
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
 use search_api::pb::search_service_server::SearchServiceServer;
-use search_api::telemetry::{self, Metrics};
+use search_api::telemetry::{self, Metrics, RecallCapture};
 use tonic::transport::Server;
 use tonic_tracing_opentelemetry::middleware::filters::reject_healthcheck;
 use tonic_tracing_opentelemetry::middleware::server::OtelGrpcLayer;
@@ -43,7 +43,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_id_column(config.id_column.clone())
             .with_metrics(metrics.clone()),
     );
-    let service = SearchGrpc::with_metrics(backend, metrics);
+    let recall = RecallCapture::new(config.recall_sample_rate, config.id_column.clone(), metrics.clone());
+    let service = SearchGrpc::with_metrics(backend, metrics).with_recall(recall);
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
         .set_serving::<SearchServiceServer<SearchGrpc<Backend>>>()

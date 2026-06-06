@@ -70,6 +70,15 @@ pub async fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     tokio::fs::rename(&tmp, path).await
 }
 
+/// Decrements an atomic residency gauge without underflowing past zero.
+///
+/// The load-then-sub pair is not one transaction: under concurrent updates the gauge may drift
+/// low, which only makes the janitor briefly under-evict. The sweep reconciles any residual
+/// drift.
+pub fn gauge_sub(gauge: &AtomicU64, amount: u64) {
+    gauge.fetch_sub(amount.min(gauge.load(Ordering::Relaxed)), Ordering::Relaxed);
+}
+
 /// Best-effort mtime refresh so the sweep's LRU-by-mtime approximation tracks disk hits.
 pub fn touch_file(path: &Path) {
     let _ = std::fs::OpenOptions::new()

@@ -18,6 +18,12 @@ compaction of head datasets. Multiple tier-B datasets run concurrently from a dr
 pins its Spark jobs to the FAIR scheduler pool named by ``scheduler_pool``, so set ``spark.scheduler.mode=FAIR`` (and
 optionally an allocation file defining the pool) on the session.
 
+A tier-B commit conflict is never resolved by re-committing: ``commit_compaction`` pins its conflict scan to the plan
+version, so the same conflicting transaction is found on every attempt. The compactor instead treats a commit conflict
+as "rewrite results are stale" and loops back to plan plus re-execute, up to ``replan_budget`` cycles. A small
+``large_commit_retries`` budget remains around the commit itself purely for the raw manifest-write race. When every
+cycle conflicts, the dataset is skipped for this run with a hot-dataset metric and picked up by the next cycle.
+
 When ``defer_index_remap`` takes effect, the commit records a ``__lance_frag_reuse`` system index, visible in
 ``describe_indices()``, instead of rewriting the covering indices. No explicit follow-up step is required: the
 frag-reuse index is applied lazily at read time, with index fragment bitmaps and row ids remapped through it whenever an
@@ -45,9 +51,18 @@ import lance
 from lance.optimize import Compaction, CompactionMetrics, CompactionTask, RewriteResult
 from pyspark.sql import SparkSession
 
-from lance_etl.telemetry import Telemetry, TelemetryConfig, commit_with_retries
+from lance_etl.telemetry import Telemetry, TelemetryConfig, commit_with_retries, is_commit_conflict_error
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+COMPACTION_MODES: tuple[str, ...] = ("reencode", "try_binary_copy")
+"""Accepted compaction modes. ``force_binary_copy`` is rejected because it errors instead of falling back when a
+fragment is incompatible with binary copy, failing whole rewrite tasks on deletion-bearing fragments."""
+
+MIN_CLEANUP_HORIZON_SECONDS: int = 6 * 3600
+"""Floor for ``cleanup_older_than_seconds``. Version cleanup is not a transaction: an aggressive horizon can delete the
+transaction files an in-flight committer needs to rebase from its read version, breaking the longest-running tier-B
+plan-to-commit cycle on a head dataset. Several hours comfortably exceeds any single job."""
 
 
 @dataclass
@@ -72,7 +87,10 @@ class CompactionConfig:
             refused by Lance's option parser.
         num_threads: Worker threads inside a single rewrite task.
         batch_size: Rows per batch when rewriting.
-        compaction_mode: ``"reencode"``, ``"try_binary_copy"``, or ``"force_binary_copy"``.
+        compaction_mode: ``"reencode"`` or ``"try_binary_copy"``. Defaults to ``"try_binary_copy"``, which skips
+            decode and re-encode entirely when fragments are compatible and falls back to reencode per task otherwise.
+            Fragments with deletion files fall back automatically. ``"force_binary_copy"`` is rejected because it
+            errors instead of falling back.
         max_tasks: Maximum number of Spark tasks for one dataset's rewrites.
         large_dataset_fragment_threshold: Fragment count above which a dataset is compacted with the distributed plan
             instead of in one executor task.
@@ -80,10 +98,18 @@ class CompactionConfig:
         max_concurrent_large: Driver threads running large-dataset compactions concurrently.
         scheduler_pool: Spark FAIR scheduler pool for large-dataset jobs.
         run_cleanup: Whether to prune old versions after committing.
-        cleanup_older_than_seconds: Age threshold for version cleanup.
+        cleanup_older_than_seconds: Age threshold for version cleanup. ``None`` keeps the Lance default. Explicit
+            values below :data:`MIN_CLEANUP_HORIZON_SECONDS` are rejected because cleanup is not a transaction and can
+            delete the transaction files an in-flight committer needs to rebase.
         retain_versions: Number of recent versions to retain.
-        commit_retries: Retry budget for commit conflicts.
+        commit_retries: Retry budget for commit conflicts on the small tier, where the retry action re-plans and
+            re-executes the whole compaction so each attempt is productive.
         commit_backoff_seconds: Base backoff between commit retries.
+        large_commit_retries: Retry budget around the tier-B ``Compaction.commit`` call. Kept small because the commit
+            pins its conflict scan to the plan version, so a semantic conflict re-fails deterministically and only the
+            raw manifest-write race benefits from a retry.
+        replan_budget: Plan/execute/commit cycles attempted per tier-B dataset before the run skips it as hot and
+            defers it to the next cycle.
     """
 
     telemetry: TelemetryConfig
@@ -97,7 +123,7 @@ class CompactionConfig:
     max_source_fragments: int | None = None
     num_threads: int | None = None
     batch_size: int | None = None
-    compaction_mode: str | None = None
+    compaction_mode: str = "try_binary_copy"
     max_tasks: int = 256
     large_dataset_fragment_threshold: int = 128
     batch_partitions: int = 512
@@ -108,6 +134,8 @@ class CompactionConfig:
     retain_versions: int | None = None
     commit_retries: int = 20
     commit_backoff_seconds: float = 0.5
+    large_commit_retries: int = 2
+    replan_budget: int = 3
 
     def execute_options(self) -> dict[str, Any]:
         """Build the full options dict for single-process ``Compaction.execute``.
@@ -116,10 +144,13 @@ class CompactionConfig:
             Options accepted by ``Compaction.execute``, omitting unset values.
 
         Raises:
-            ValueError: If ``max_source_fragments`` is ``0``. Use ``None`` for unlimited.
+            ValueError: If ``max_source_fragments`` is ``0`` (use ``None`` for unlimited) or if ``compaction_mode`` is
+                not one of :data:`COMPACTION_MODES`.
         """
         if self.max_source_fragments == 0:
             raise ValueError("max_source_fragments=0 is not supported; use None to disable the limit")
+        if self.compaction_mode not in COMPACTION_MODES:
+            raise ValueError(f"compaction_mode must be one of {COMPACTION_MODES}, got {self.compaction_mode!r}")
         candidates: dict[str, Any] = {
             "target_rows_per_fragment": self.target_rows_per_fragment,
             "max_rows_per_group": self.max_rows_per_group,
@@ -176,6 +207,9 @@ def compaction_metrics_dict(metrics: CompactionMetrics) -> dict[str, int]:
 def cleanup_dataset(uri: str, config: CompactionConfig, telemetry: Telemetry) -> int:
     """Prune old versions of a dataset after compaction.
 
+    ``delete_unverified`` is never passed, so the 7-day unverified threshold keeps protecting executor-written rewrite
+    and index-segment files that are unreferenced until their driver commit.
+
     Args:
         uri: Dataset URI.
         config: Compaction configuration.
@@ -183,7 +217,19 @@ def cleanup_dataset(uri: str, config: CompactionConfig, telemetry: Telemetry) ->
 
     Returns:
         The number of bytes reclaimed.
+
+    Raises:
+        ValueError: If ``cleanup_older_than_seconds`` is set below :data:`MIN_CLEANUP_HORIZON_SECONDS`. The horizon
+            must exceed the longest-running concurrent job so its rebase can still read old transaction files.
     """
+    if (
+        config.cleanup_older_than_seconds is not None
+        and config.cleanup_older_than_seconds < MIN_CLEANUP_HORIZON_SECONDS
+    ):
+        raise ValueError(
+            f"cleanup_older_than_seconds={config.cleanup_older_than_seconds} is below the safe floor of "
+            f"{MIN_CLEANUP_HORIZON_SECONDS}; cleanup horizons must exceed the longest concurrent job"
+        )
     older_than: timedelta | None = (
         timedelta(seconds=config.cleanup_older_than_seconds) if config.cleanup_older_than_seconds is not None else None
     )
@@ -267,10 +313,13 @@ class LanceCompactor:
         self.config: CompactionConfig = config
 
     def commit_rewrites(self, uri: str, rewrite_jsons: list[str], telemetry: Telemetry) -> dict[str, Any]:
-        """Commit serialized rewrites, retrying conflicts to coexist with writers.
+        """Commit serialized rewrites with a deliberately small retry budget.
 
         The commit remaps every index touching the rewritten fragments inline, since the Python binding commits with
-        default compaction options.
+        default compaction options. Retrying the commit cannot resolve a semantic conflict: the conflict scan is pinned
+        to the plan version, so the same conflicting transaction is found on every attempt. The small
+        ``large_commit_retries`` budget only covers the raw manifest-write race. Semantic conflicts escape to
+        :meth:`compact_one`, whose re-plan loop is the productive retry.
 
         Args:
             uri: Dataset URI.
@@ -299,9 +348,45 @@ class LanceCompactor:
 
         return commit_with_retries(
             action,
-            config.commit_retries,
+            config.large_commit_retries,
             config.commit_backoff_seconds,
             lambda: telemetry.incr("dataset.commit_conflict"),
+        )
+
+    def execute_plan(self, spark: SparkSession, uri: str, plan_version: int, task_jsons: list[str]) -> list[str]:
+        """Fan one compaction plan's rewrite tasks out across executors.
+
+        Args:
+            spark: Active Spark session.
+            uri: Dataset URI.
+            plan_version: The dataset version the plan was built against.
+            task_jsons: Serialized compaction tasks from the plan.
+
+        Returns:
+            The serialized rewrite results, one per task.
+        """
+        config: CompactionConfig = self.config
+        storage_options: dict[str, Any] | None = config.storage_options
+
+        def execute_task(task_json: str) -> str:
+            """Execute one rewrite task on an executor and return its JSON.
+
+            Args:
+                task_json: The serialized compaction task.
+
+            Returns:
+                The serialized rewrite result.
+            """
+            shard_dataset: lance.LanceDataset = lance.dataset(
+                uri, version=plan_version, storage_options=storage_options
+            )
+            task: CompactionTask = CompactionTask.from_json(task_json)
+            return task.execute(shard_dataset).json()
+
+        return (
+            spark.sparkContext.parallelize(task_jsons, min(len(task_jsons), config.max_tasks))
+            .map(execute_task)
+            .collect()
         )
 
     def compact_one(self, spark: SparkSession, uri: str, telemetry: Telemetry) -> dict[str, Any]:
@@ -313,67 +398,79 @@ class LanceCompactor:
         ``max_source_fragments`` set, each run consumes a bounded slice of the oldest fragments for incremental
         compaction. Spark jobs submitted from the calling thread are pinned to the configured FAIR scheduler pool.
 
+        A commit conflict means the rewrite results are stale, so the loop re-plans and re-executes against the latest
+        version instead of re-committing, which would re-fail deterministically. After ``replan_budget`` conflicting
+        cycles the dataset is skipped for this run with a hot-dataset metric and deferred to the next cycle.
+
         Args:
             spark: Active Spark session.
             uri: Dataset URI.
             telemetry: Driver telemetry facade.
 
         Returns:
-            A statistics dictionary for the dataset with ``tier`` set to ``"large"``.
+            A statistics dictionary for the dataset with ``tier`` set to ``"large"``. Skipped hot datasets carry a
+            ``"skipped"`` reason instead of commit metrics.
         """
         config: CompactionConfig = self.config
         try:
             spark.sparkContext.setLocalProperty("spark.scheduler.pool", config.scheduler_pool)
-            dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-            plan = Compaction.plan(dataset, options=config.plan_options())
-            task_jsons: list[str] = [task.json() for task in plan.tasks]
-            if not task_jsons:
-                bytes_removed: int = cleanup_dataset(uri, config, telemetry) if config.run_cleanup else 0
-                return {
+            tasks_attempted: int = 0
+            for cycle in range(1, config.replan_budget + 1):
+                dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+                plan = Compaction.plan(dataset, options=config.plan_options())
+                task_jsons: list[str] = [task.json() for task in plan.tasks]
+                if not task_jsons:
+                    bytes_removed: int = cleanup_dataset(uri, config, telemetry) if config.run_cleanup else 0
+                    return {
+                        "uri": uri,
+                        "tier": "large",
+                        "tasks": 0,
+                        "fragments_removed": 0,
+                        "bytes_removed": bytes_removed,
+                    }
+
+                tasks_attempted = len(task_jsons)
+                with telemetry.timed("dataset.rewrite_ms"):
+                    rewrite_jsons: list[str] = self.execute_plan(spark, uri, plan.read_version, task_jsons)
+                try:
+                    with telemetry.timed("dataset.commit_ms"):
+                        metrics: dict[str, Any] = self.commit_rewrites(uri, rewrite_jsons, telemetry)
+                except (OSError, RuntimeError) as exc:
+                    if not is_commit_conflict_error(exc):
+                        raise
+                    telemetry.incr("dataset.replanned", tags=[f"uri:{uri}"])
+                    logger.warning(
+                        "compaction commit conflicted for %s (cycle %d/%d); re-planning at the latest version",
+                        uri,
+                        cycle,
+                        config.replan_budget,
+                    )
+                    continue
+
+                bytes_removed = cleanup_dataset(uri, config, telemetry) if config.run_cleanup else 0
+                telemetry.incr("dataset.compacted")
+                result: dict[str, Any] = {
                     "uri": uri,
                     "tier": "large",
-                    "tasks": 0,
-                    "fragments_removed": 0,
+                    "tasks": tasks_attempted,
                     "bytes_removed": bytes_removed,
                 }
+                result.update(metrics)
+                return result
 
-            plan_version: int = plan.read_version
-            storage_options: dict[str, Any] | None = config.storage_options
-
-            def execute_task(task_json: str) -> str:
-                """Execute one rewrite task on an executor and return its JSON.
-
-                Args:
-                    task_json: The serialized compaction task.
-
-                Returns:
-                    The serialized rewrite result.
-                """
-                shard_dataset: lance.LanceDataset = lance.dataset(
-                    uri, version=plan_version, storage_options=storage_options
-                )
-                task: CompactionTask = CompactionTask.from_json(task_json)
-                return task.execute(shard_dataset).json()
-
-            with telemetry.timed("dataset.rewrite_ms"):
-                rewrite_jsons: list[str] = (
-                    spark.sparkContext.parallelize(task_jsons, min(len(task_jsons), config.max_tasks))
-                    .map(execute_task)
-                    .collect()
-                )
-            with telemetry.timed("dataset.commit_ms"):
-                metrics: dict[str, Any] = self.commit_rewrites(uri, rewrite_jsons, telemetry)
-
-            bytes_removed = cleanup_dataset(uri, config, telemetry) if config.run_cleanup else 0
-            telemetry.incr("dataset.compacted")
-            result: dict[str, Any] = {
+            telemetry.incr("dataset.hot_skipped", tags=[f"uri:{uri}"])
+            logger.warning(
+                "skipping compaction of hot dataset %s: commit conflicted on all %d plan/execute/commit cycles",
+                uri,
+                config.replan_budget,
+            )
+            return {
                 "uri": uri,
                 "tier": "large",
-                "tasks": len(task_jsons),
-                "bytes_removed": bytes_removed,
+                "tasks": tasks_attempted,
+                "bytes_removed": 0,
+                "skipped": f"commit conflicted on all {config.replan_budget} re-plan cycles; deferred to the next run",
             }
-            result.update(metrics)
-            return result
         finally:
             spark.sparkContext.setLocalProperty("spark.scheduler.pool", None)
 

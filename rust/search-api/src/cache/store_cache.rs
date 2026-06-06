@@ -23,7 +23,7 @@ use object_store::{
 };
 use serde_json::Value;
 
-use crate::cache::layout::{SweepStats, atomic_write, dir_stats, hash_hex, sweep_tier, touch_file};
+use crate::cache::layout::{SweepStats, atomic_write, dir_stats, gauge_sub, hash_hex, sweep_tier, touch_file};
 use crate::telemetry::{CacheName, EvictionReason, Metrics, Tier};
 
 /// File name for cached full-object bytes.
@@ -104,12 +104,8 @@ impl StoreCacheState {
         let dir = self.object_dir(store_prefix, location);
         let (bytes, entries) = dir_stats(&dir);
         let _ = tokio::fs::remove_dir_all(&dir).await;
-        self.disk_bytes
-            .fetch_sub(bytes.min(self.disk_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
-        self.disk_entries.fetch_sub(
-            entries.min(self.disk_entries.load(Ordering::Relaxed)),
-            Ordering::Relaxed,
-        );
+        gauge_sub(&self.disk_bytes, bytes);
+        gauge_sub(&self.disk_entries, entries);
     }
 }
 

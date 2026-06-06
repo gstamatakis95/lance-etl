@@ -25,10 +25,9 @@ import lance
 
 from bench.config import BenchConfig
 from bench.datasets import adapter_for
-from bench.indexes import bench_telemetry_config
 from bench.prepare import BASE_DAY, MINUTES_PER_DAY
 from bench.results import save_phase
-from bench.spark_session import build_spark
+from bench.spark_session import bench_telemetry_config, build_spark
 from lance_etl.arrow_types import resolve_type_map
 from lance_etl.etl import ETLConfig, IcebergToLanceETL
 

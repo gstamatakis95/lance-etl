@@ -168,9 +168,6 @@ def stats_spark_ddl(routing_cols: list[str]) -> str:
     return f"{columns}, `upserted` bigint, `deleted` bigint"
 
 
-STATS_SCHEMA: pa.Schema = stats_schema(list(DEFAULT_PARTITION_COLS))
-
-
 @dataclass
 class ETLConfig:
     """Configuration for :class:`IcebergToLanceETL`.
@@ -674,7 +671,6 @@ class IcebergToLanceETL:
             collapsed: DataFrame = self.collapse(self.flatten_maps(prepared))
             routing: list[str] = config.routing_cols()
             routed: DataFrame = collapsed.repartition(config.num_partitions, *[F.col(c) for c in routing])
-            etl_config: ETLConfig = config
             partition_stats_schema: pa.Schema = stats_schema(routing)
 
             def merge_partition(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
@@ -689,13 +685,13 @@ class IcebergToLanceETL:
                 collected: list[pa.RecordBatch] = [b for b in batches if b.num_rows]
                 if not collected:
                     return
-                telemetry: Telemetry = Telemetry.create(etl_config.telemetry)
+                telemetry: Telemetry = Telemetry.create(config.telemetry)
                 table: pa.Table = pa.Table.from_batches(collected)
                 results: list[tuple[Any, ...]] = []
                 with telemetry.span("lance.etl.partition"):
                     try:
-                        for key, group in group_by_routing(table, etl_config.routing_cols()):
-                            upserted, deleted = apply_merge(etl_config, telemetry, key, group)
+                        for key, group in group_by_routing(table, routing):
+                            upserted, deleted = apply_merge(config, telemetry, key, group)
                             results.append((*key, upserted, deleted))
                     except Exception:
                         telemetry.error("etl partition failed")

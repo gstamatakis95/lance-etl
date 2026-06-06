@@ -28,11 +28,11 @@ pub use backend::SearchBackend;
 pub use clusters::{ClusterReader, ClusterReport, ClusterSpec};
 pub use error::SearchError;
 pub use filter::{CompareOp, Filter, Literal};
-pub use fusion::{Fusion, FusionSpec, RrfFusion};
+pub use fusion::FusionSpec;
 pub use merge::{MergeOutcome, ScoreOrder, merge_hits};
 pub use prewarm::{PrewarmReport, PrewarmSpec, PrewarmedIndex, Prewarmer};
 pub use query::{
     DistanceKind, FilterMode, FusedHit, Fuzziness, Hit, HybridQuery, MatchSpec, PhraseSpec, TextOperator, TextQuery,
-    TextQueryNode, VectorQuery,
+    TextQueryNode, VectorQuery, VectorSearchOutcome,
 };
 pub use target::{DatasetTarget, DateRange, MAX_DATE_RANGE_DAYS};

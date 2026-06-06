@@ -17,7 +17,7 @@ use tracing::Instrument;
 
 use crate::domain::{
     DatasetTarget, DistanceKind, FilterMode, FusedHit, Hit, HybridQuery, ScoreOrder, SearchBackend, SearchError,
-    TextQuery, VectorQuery, merge_hits,
+    TextQuery, VectorQuery, VectorSearchOutcome, merge_hits,
 };
 use crate::lance::error::classify_lance_error;
 use crate::lance::filter::filter_to_expr;
@@ -182,10 +182,18 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
             fanout.dedup_dropped = tracing::field::Empty,
         )
     )]
-    async fn vector_search(&self, target: &DatasetTarget, mut query: VectorQuery) -> Result<Vec<Hit>, SearchError> {
+    async fn vector_search(
+        &self,
+        target: &DatasetTarget,
+        mut query: VectorQuery,
+    ) -> Result<VectorSearchOutcome, SearchError> {
         let Some(range) = target.date_range else {
             let dataset = self.provider.dataset(target, None).await?;
-            return run_vector_query(&dataset, &query).await;
+            let hits = run_vector_query(&dataset, &query).await?;
+            return Ok(VectorSearchOutcome {
+                hits,
+                dataset_version: Some(dataset.version_id()),
+            });
         };
         validate_k(query.k)?;
         let strip_id = self.ensure_id_projected(&mut query.projection);
@@ -195,7 +203,10 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
                 run_vector_query(&dataset, query).await
             })
             .await?;
-        Ok(self.merge_fanout_legs(legs, ScoreOrder::LowerIsBetter, query.k, FanoutLeg::Vector, strip_id))
+        Ok(VectorSearchOutcome {
+            hits: self.merge_fanout_legs(legs, ScoreOrder::LowerIsBetter, query.k, FanoutLeg::Vector, strip_id),
+            dataset_version: None,
+        })
     }
 
     #[tracing::instrument(
@@ -237,9 +248,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
         )
     )]
     async fn hybrid_search(&self, target: &DatasetTarget, query: HybridQuery) -> Result<Vec<FusedHit>, SearchError> {
-        if query.k == 0 {
-            return Err(SearchError::invalid_argument("k must be a positive integer"));
-        }
+        validate_k(query.k)?;
         let mut vector_query = query.vector;
         if vector_query.k == 0 {
             vector_query.k = query.k;
@@ -248,7 +257,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
         if text_query.k == 0 {
             text_query.k = query.k;
         }
-        let fusion = query.fusion.build();
+        let fusion = query.fusion;
         let Some(range) = target.date_range else {
             let dataset = self.provider.dataset(target, None).await?;
             let (vector_hits, text_hits) = tokio::join!(

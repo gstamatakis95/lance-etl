@@ -45,6 +45,9 @@ pub const DEFAULT_ID_COLUMN: &str = "vector_id";
 /// Default DogStatsD address when neither `SEARCH_API_STATSD_ADDR` nor `DD_AGENT_HOST` is set.
 pub const DEFAULT_STATSD_ADDR: &str = "127.0.0.1:8125";
 
+/// Default recall sample rate (0.0 disables sampled-query recall capture).
+pub const DEFAULT_RECALL_SAMPLE_RATE: f64 = 0.0;
+
 /// Runtime configuration for the search API.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -90,6 +93,10 @@ pub struct Config {
     /// Disables trace export and DogStatsD entirely (tests / local runs keep JSON logs only).
     /// Env: `SEARCH_API_TELEMETRY_DISABLED`.
     pub telemetry_disabled: bool,
+    /// Fraction of eligible VectorSearch requests whose query and served results are captured as
+    /// `recall.*` span attributes for offline recall scoring. Must lie in `[0, 1]`. Default 0.0
+    /// (disabled). Env: `SEARCH_API_RECALL_SAMPLE_RATE`.
+    pub recall_sample_rate: f64,
 }
 
 impl Config {
@@ -103,7 +110,8 @@ impl Config {
     /// `SEARCH_API_STORE_CACHE_MAX_RANGE_BYTES`, `SEARCH_API_DISK_CACHE_SWEEP_SECS`,
     /// `SEARCH_API_DISK_CACHE_DISABLED`, `SEARCH_API_PREWARM_CONCURRENCY`,
     /// `SEARCH_API_FANOUT_CONCURRENCY`, `SEARCH_API_ID_COLUMN`, `SEARCH_API_STATSD_ADDR`
-    /// (default honors `DD_AGENT_HOST`), and `SEARCH_API_TELEMETRY_DISABLED`.
+    /// (default honors `DD_AGENT_HOST`), `SEARCH_API_TELEMETRY_DISABLED`, and
+    /// `SEARCH_API_RECALL_SAMPLE_RATE` (must lie in `[0, 1]`).
     pub fn from_env() -> Result<Self, String> {
         let base_uri = std::env::var("LANCE_ETL_BASE_URI")
             .map_err(|_| "LANCE_ETL_BASE_URI must be set".to_string())?
@@ -133,6 +141,7 @@ impl Config {
             id_column: env_string("SEARCH_API_ID_COLUMN", DEFAULT_ID_COLUMN),
             statsd_addr: env_string("SEARCH_API_STATSD_ADDR", &default_statsd_addr()),
             telemetry_disabled: env_bool("SEARCH_API_TELEMETRY_DISABLED", false)?,
+            recall_sample_rate: env_unit_fraction("SEARCH_API_RECALL_SAMPLE_RATE", DEFAULT_RECALL_SAMPLE_RATE)?,
         })
     }
 }
@@ -153,6 +162,15 @@ fn env_number<T: FromStr>(name: &str, default: T) -> Result<T, String> {
             .map_err(|_| format!("{name} must be a valid number, got {raw:?}")),
         Err(_) => Ok(default),
     }
+}
+
+/// Reads an environment variable as an `f64` in `[0, 1]`, falling back to `default` when unset.
+fn env_unit_fraction(name: &str, default: f64) -> Result<f64, String> {
+    let value: f64 = env_number(name, default)?;
+    if !(0.0..=1.0).contains(&value) {
+        return Err(format!("{name} must lie in [0, 1], got {value}"));
+    }
+    Ok(value)
 }
 
 /// Reads an environment variable as a string, falling back to `default` when unset.
@@ -205,7 +223,7 @@ mod tests {
     }
 
     /// Env var names cleared so defaults apply in tests.
-    const OPTIONAL_VARS: [&str; 17] = [
+    const OPTIONAL_VARS: [&str; 18] = [
         "SEARCH_API_DATASET_CACHE_CAPACITY",
         "SEARCH_API_INDEX_CACHE_BYTES",
         "SEARCH_API_METADATA_CACHE_BYTES",
@@ -222,6 +240,7 @@ mod tests {
         "SEARCH_API_ID_COLUMN",
         "SEARCH_API_STATSD_ADDR",
         "SEARCH_API_TELEMETRY_DISABLED",
+        "SEARCH_API_RECALL_SAMPLE_RATE",
         "DD_AGENT_HOST",
     ];
 
@@ -244,6 +263,7 @@ mod tests {
             assert_eq!(config.id_column, DEFAULT_ID_COLUMN);
             assert_eq!(config.statsd_addr, DEFAULT_STATSD_ADDR);
             assert!(!config.telemetry_disabled);
+            assert_eq!(config.recall_sample_rate, DEFAULT_RECALL_SAMPLE_RATE);
         });
     }
 
@@ -287,6 +307,7 @@ mod tests {
                 ("SEARCH_API_DISK_INDEX_CACHE_BYTES", Some("4096")),
                 ("SEARCH_API_DISK_CACHE_DISABLED", Some("true")),
                 ("SEARCH_API_PREWARM_CONCURRENCY", Some("9")),
+                ("SEARCH_API_RECALL_SAMPLE_RATE", Some("0.25")),
             ],
             || {
                 let config = Config::from_env().unwrap();
@@ -294,8 +315,25 @@ mod tests {
                 assert_eq!(config.disk_index_cache_bytes, 4096);
                 assert!(config.disk_cache_disabled);
                 assert_eq!(config.prewarm_concurrency, 9);
+                assert_eq!(config.recall_sample_rate, 0.25);
             },
         );
+    }
+
+    #[test]
+    fn recall_sample_rate_outside_unit_interval_is_rejected() {
+        for bad in ["1.5", "-0.1", "rate"] {
+            with_env(
+                &[
+                    ("LANCE_ETL_BASE_URI", Some("/data/lance")),
+                    ("SEARCH_API_RECALL_SAMPLE_RATE", Some(bad)),
+                ],
+                || {
+                    let err = Config::from_env().unwrap_err();
+                    assert!(err.contains("SEARCH_API_RECALL_SAMPLE_RATE"), "unexpected error: {err}");
+                },
+            );
+        }
     }
 
     #[test]

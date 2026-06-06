@@ -20,9 +20,8 @@ from typing import Any
 import lance
 
 from bench.config import BenchConfig
-from bench.indexes import bench_telemetry_config
 from bench.results import save_phase
-from bench.spark_session import build_spark
+from bench.spark_session import bench_telemetry_config, build_spark
 from lance_etl.compaction import CompactionConfig, LanceCompactor
 
 logger: logging.Logger = logging.getLogger(__name__)

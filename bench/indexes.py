@@ -15,20 +15,10 @@ from typing import Any
 from bench.config import BenchConfig
 from bench.datasets import adapter_for
 from bench.results import save_phase
-from bench.spark_session import build_spark
+from bench.spark_session import bench_telemetry_config, build_spark
 from lance_etl.indexing import IndexJobConfig, LanceIndexer
-from lance_etl.telemetry import TelemetryConfig
 
 logger: logging.Logger = logging.getLogger(__name__)
-
-
-def bench_telemetry_config() -> TelemetryConfig:
-    """Build the offline-safe telemetry configuration for benchmark jobs.
-
-    Returns:
-        A ``TelemetryConfig``. DogStatsD sends are fire-and-forget UDP so no agent is required.
-    """
-    return TelemetryConfig(service="lance-bench", env="bench")
 
 
 def index_stages(config: BenchConfig) -> list[tuple[str, IndexJobConfig]]:
@@ -40,8 +30,7 @@ def index_stages(config: BenchConfig) -> list[tuple[str, IndexJobConfig]]:
     Returns:
         ``(stage_name, job_config)`` pairs in build order.
     """
-    telemetry: TelemetryConfig = bench_telemetry_config()
-    shared: dict[str, Any] = {"telemetry": telemetry, "num_shards": config.num_shards}
+    shared: dict[str, Any] = {"telemetry": bench_telemetry_config(), "num_shards": config.num_shards}
     return [
         (
             "vector_ivf_rq",

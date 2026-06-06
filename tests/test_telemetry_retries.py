@@ -4,7 +4,24 @@ from __future__ import annotations
 
 import pytest
 
-from lance_etl.telemetry import commit_with_retries
+from lance_etl.telemetry import commit_with_retries, is_commit_conflict_error
+
+
+def test_matcher_accepts_both_conflict_markers() -> None:
+    """Both Lance conflict display strings match, from either exception type."""
+    assert is_commit_conflict_error(OSError("LanceError(IO): Commit conflict for version 12")) is True
+    assert is_commit_conflict_error(RuntimeError("Retryable commit conflict for version 3: retry")) is True
+
+
+def test_matcher_rejects_hard_and_exhaustion_errors() -> None:
+    """Hard conflicts and contention exhaustion must never look retryable."""
+    assert is_commit_conflict_error(OSError("Incompatible transaction: dataset was overwritten")) is False
+    assert is_commit_conflict_error(RuntimeError("Too many concurrent writers: try again later")) is False
+
+
+def test_matcher_rejects_other_exception_types() -> None:
+    """Only OSError and RuntimeError carry Lance commit conflicts."""
+    assert is_commit_conflict_error(ValueError("Commit conflict")) is False
 
 
 def test_retries_oserror_commit_conflict() -> None:

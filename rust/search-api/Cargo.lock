@@ -6332,6 +6332,7 @@ dependencies = [
  "opentelemetry_sdk",
  "prost",
  "prost-types",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -6344,6 +6345,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

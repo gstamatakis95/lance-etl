@@ -1,9 +1,10 @@
 """Command-line entry point for the Lance vector pipeline jobs.
 
-Provides three subcommands. ``etl`` reads a time range from an Iceberg table and routes the changes into per-tenant
+Provides four subcommands. ``etl`` reads a time range from an Iceberg table and routes the changes into per-tenant
 Lance datasets. Backfills are catch-up replays of this same job over historical windows. ``compact`` runs distributed
 compaction over a set of datasets. ``index`` builds IVF_RQ vector, btree scalar, bitmap, and full-text BM25 indices over
-a set of datasets.
+a set of datasets. ``recall`` replays Datadog-sampled vector queries as exact brute-force scans against the dataset
+versions that served them and reports recall@k.
 
 Each subcommand builds a Spark session, runs the job, and exits non-zero on failure so an orchestrator can retry.
 """
@@ -12,7 +13,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 
 from pyspark.sql import SparkSession
@@ -22,6 +23,7 @@ from lance_etl.cloud_storage import discover_datasets
 from lance_etl.compaction import CompactionConfig, LanceCompactor
 from lance_etl.etl import DEFAULT_PARTITION_COLS, ETLConfig, IcebergToLanceETL, PartitionDerivation
 from lance_etl.indexing import IndexJobConfig, LanceIndexer
+from lance_etl.recall import DatadogSpanSource, RecallAuditJob, RecallJobConfig
 from lance_etl.telemetry import (
     LanceRuntimeConfig,
     TelemetryConfig,
@@ -69,6 +71,18 @@ def parse_key_values(pairs: Sequence[str] | None) -> dict[str, str]:
         key, value = pair.split("=", 1)
         result[key] = value
     return result
+
+
+def parse_storage_options(args: argparse.Namespace) -> dict[str, str] | None:
+    """Parse the repeated ``--storage-option`` arguments shared by every subcommand.
+
+    Args:
+        args: Parsed command-line arguments.
+
+    Returns:
+        The storage options for pylance, or None when none were given.
+    """
+    return parse_key_values(args.storage_option) or None
 
 
 def parse_partition_cols(value: str | None) -> list[str] | None:
@@ -180,7 +194,7 @@ def load_dataset_uris(args: argparse.Namespace) -> list[str]:
         with open(args.datasets_file, encoding="utf-8") as handle:
             uris.extend(line.strip() for line in handle if line.strip())
     if args.base_uri:
-        uris.extend(discover_datasets(args.base_uri, parse_key_values(args.storage_option) or None))
+        uris.extend(discover_datasets(args.base_uri, parse_storage_options(args)))
     if not uris:
         raise ValueError("no dataset URIs provided")
     return uris
@@ -205,7 +219,7 @@ def run_etl(args: argparse.Namespace, spark: SparkSession) -> None:
         op_col=args.op_col,
         delete_op_values=list(args.delete_op_value or ["delete", "DELETE", "d"]),
         column_types=resolve_type_map(parse_key_values(args.column_type)),
-        storage_options=parse_key_values(args.storage_option) or None,
+        storage_options=parse_storage_options(args),
         num_partitions=args.num_partitions,
         conflict_retries=args.conflict_retries,
         retry_timeout=timedelta(seconds=args.retry_timeout),
@@ -227,7 +241,7 @@ def run_compact(args: argparse.Namespace, spark: SparkSession) -> None:
     """
     config: CompactionConfig = CompactionConfig(
         telemetry=build_telemetry_config(args),
-        storage_options=parse_key_values(args.storage_option) or None,
+        storage_options=parse_storage_options(args),
         target_rows_per_fragment=args.target_rows_per_fragment,
         max_rows_per_group=args.max_rows_per_group,
         max_bytes_per_file=args.max_bytes_per_file,
@@ -246,6 +260,8 @@ def run_compact(args: argparse.Namespace, spark: SparkSession) -> None:
         retain_versions=args.retain_versions,
         commit_retries=args.commit_retries,
         commit_backoff_seconds=args.commit_backoff_seconds,
+        large_commit_retries=args.large_commit_retries,
+        replan_budget=args.replan_budget,
     )
     LanceCompactor(config).run(spark, load_dataset_uris(args))
 
@@ -259,7 +275,7 @@ def run_index(args: argparse.Namespace, spark: SparkSession) -> None:
     """
     config: IndexJobConfig = IndexJobConfig(
         telemetry=build_telemetry_config(args),
-        storage_options=parse_key_values(args.storage_option) or None,
+        storage_options=parse_storage_options(args),
         vector_column=args.vector_column,
         num_partitions=args.num_partitions,
         num_bits=args.num_bits,
@@ -281,6 +297,9 @@ def run_index(args: argparse.Namespace, spark: SparkSession) -> None:
         num_shards=args.num_shards,
         rebuild=args.rebuild,
         reuse_artifacts=not args.no_reuse_artifacts,
+        retrain_growth_factor=args.retrain_growth_factor,
+        max_index_deltas=args.max_index_deltas,
+        fts_max_unindexed_fragments=args.fts_max_unindexed_fragments,
         commit_retries=args.commit_retries,
         commit_backoff_seconds=args.commit_backoff_seconds,
         small_dataset_fragment_threshold=args.fragment_count_threshold,
@@ -288,6 +307,26 @@ def run_index(args: argparse.Namespace, spark: SparkSession) -> None:
         vector_min_rows=args.vector_index_row_floor,
     )
     LanceIndexer(config).run(spark, load_dataset_uris(args))
+
+
+def run_recall(args: argparse.Namespace, spark: SparkSession) -> None:
+    """Run the recall-audit subcommand.
+
+    Args:
+        args: Parsed command-line arguments.
+        spark: Active Spark session.
+    """
+    config: RecallJobConfig = RecallJobConfig(
+        base_uri=args.base_uri,
+        telemetry=build_telemetry_config(args),
+        storage_options=parse_storage_options(args),
+        id_column=args.id_column,
+        vector_column=args.vector_column,
+        max_samples=args.max_samples,
+        batch_size=args.batch_size,
+    )
+    source: DatadogSpanSource = DatadogSpanSource(site=args.dd_site)
+    RecallAuditJob(config).run(spark, source, parse_epoch_ms(args.from_ts), parse_epoch_ms(args.to_ts))
 
 
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -480,15 +519,45 @@ def build_parser() -> argparse.ArgumentParser:
     compact.add_argument("--batch-size", type=int, default=None)
     compact.add_argument(
         "--compaction-mode",
-        default=None,
-        choices=("reencode", "try_binary_copy", "force_binary_copy"),
+        default="try_binary_copy",
+        choices=("reencode", "try_binary_copy"),
+        help=(
+            "try_binary_copy skips decode/re-encode when fragments are compatible and falls back to reencode "
+            "per task otherwise. Default try_binary_copy."
+        ),
     )
     compact.add_argument("--max-tasks", type=int, default=256)
     compact.add_argument("--no-cleanup", action="store_true")
-    compact.add_argument("--cleanup-older-than-seconds", type=int, default=None)
+    compact.add_argument(
+        "--cleanup-older-than-seconds",
+        type=int,
+        default=None,
+        help=(
+            "Version-cleanup age horizon. Must comfortably exceed the longest concurrent job, so values below "
+            "the safe floor are rejected. Default: the Lance default."
+        ),
+    )
     compact.add_argument("--retain-versions", type=int, default=None)
     compact.add_argument("--commit-retries", type=int, default=20)
     compact.add_argument("--commit-backoff-seconds", type=float, default=0.5)
+    compact.add_argument(
+        "--large-commit-retries",
+        type=int,
+        default=2,
+        help=(
+            "Retry budget around the distributed Compaction.commit. Kept small: a semantic conflict re-fails "
+            "deterministically there and is resolved by re-planning instead. Default 2."
+        ),
+    )
+    compact.add_argument(
+        "--replan-budget",
+        type=int,
+        default=3,
+        help=(
+            "Plan/execute/commit cycles per large dataset before the run skips it as hot and defers it to the "
+            "next cycle. Default 3."
+        ),
+    )
     compact.add_argument(
         "--max-source-fragments",
         type=int,
@@ -523,8 +592,53 @@ def build_parser() -> argparse.ArgumentParser:
     index.add_argument("--num-shards", type=int, default=64)
     index.add_argument("--rebuild", action="store_true")
     index.add_argument("--no-reuse-artifacts", action="store_true")
+    index.add_argument(
+        "--retrain-growth-factor",
+        type=float,
+        default=4.0,
+        help=(
+            "Retrain the IVF artifacts (full rebuild) once the row count exceeds this factor times the "
+            "rows_at_train recorded in the artifact sidecar. Default 4.0."
+        ),
+    )
+    index.add_argument(
+        "--max-index-deltas",
+        type=int,
+        default=4,
+        help="Merge an index's accumulated deltas into one when it has more than this many. Default 4.",
+    )
+    index.add_argument(
+        "--fts-max-unindexed-fragments",
+        type=int,
+        default=32,
+        help=(
+            "Maintain an existing FTS index incrementally only while its unindexed backlog is at or below this "
+            "fragment count, otherwise run the distributed rebuild. Default 32."
+        ),
+    )
     index.add_argument("--commit-retries", type=int, default=20)
     index.add_argument("--commit-backoff-seconds", type=float, default=0.5)
+
+    recall: argparse.ArgumentParser = subparsers.add_parser(
+        "recall", help="Audit served recall@k by replaying Datadog-sampled vector queries as exact brute-force scans"
+    )
+    add_common_arguments(recall)
+    recall.add_argument("--from", dest="from_ts", required=True, help="Window start, ISO 8601 or epoch milliseconds")
+    recall.add_argument("--to", dest="to_ts", required=True, help="Window end, ISO 8601 or epoch milliseconds")
+    recall.add_argument(
+        "--base-uri",
+        required=True,
+        help="Root under which per-tenant datasets live as base/<org>/<tenant>/<namespace>.lance",
+    )
+    recall.add_argument(
+        "--dd-site",
+        default="datadoghq.com",
+        help="Datadog site domain for the Spans search API. DD_API_KEY and DD_APP_KEY must be in the environment.",
+    )
+    recall.add_argument("--max-samples", type=int, default=10_000, help="Cap on sampled spans fetched. Default 10000.")
+    recall.add_argument("--id-column", default="vector_id", help="Unique id column matched against served result ids")
+    recall.add_argument("--vector-column", default="vector", help="Fixed-size-list vector column to scan")
+    recall.add_argument("--batch-size", type=int, default=8192, help="Scanner batch size for the brute-force scan")
     return parser
 
 
@@ -545,13 +659,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     for variable_name, variable_value in lance_env.items():
         builder = builder.config(f"spark.executorEnv.{variable_name}", variable_value)
     spark: SparkSession = builder.getOrCreate()
+    runners: dict[str, Callable[[argparse.Namespace, SparkSession], None]] = {
+        "etl": run_etl,
+        "compact": run_compact,
+        "index": run_index,
+        "recall": run_recall,
+    }
     try:
-        if args.command == "etl":
-            run_etl(args, spark)
-        elif args.command == "compact":
-            run_compact(args, spark)
-        else:
-            run_index(args, spark)
+        runners[args.command](args, spark)
         return 0
     except Exception:
         logger.exception("job failed")

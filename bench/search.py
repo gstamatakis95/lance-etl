@@ -119,8 +119,8 @@ def measure_first_queries(stub: Any, pb2: Any, config: BenchConfig, queries: np.
         request = pb2.VectorSearchRequest(
             target=dataset_target(pb2, org), query=vector_query(pb2, queries[0], 10, config.load_nprobes, None)
         )
-        unused, cold_ms = timed_call(stub.VectorSearch, request)
-        unused, warm_ms = timed_call(stub.VectorSearch, request)
+        cold_ms = timed_call(stub.VectorSearch, request)[1]
+        warm_ms = timed_call(stub.VectorSearch, request)[1]
         timings[org] = {"cold_ms": round(cold_ms, 3), "warm_ms": round(warm_ms, 3), "prewarmed": config.prewarm}
         if prewarm_outcome is not None:
             timings[org]["prewarm"] = prewarm_outcome

@@ -63,7 +63,11 @@ async fn cold_process_serves_searches_from_disk_caches() {
         .await
         .unwrap();
     assert_eq!(hits.len(), 1);
-    let hits = backend_a.vector_search(&test_target(), vector_query()).await.unwrap();
+    let hits = backend_a
+        .vector_search(&test_target(), vector_query())
+        .await
+        .unwrap()
+        .hits;
     assert_eq!(hits.len(), 2);
     let (_, _, data_a) = counts_a.snapshot();
     assert!(
@@ -98,7 +102,11 @@ async fn cold_process_serves_searches_from_disk_caches() {
         "cold process must serve manifest bytes from the disk cache"
     );
 
-    let hits = backend_b.vector_search(&test_target(), vector_query()).await.unwrap();
+    let hits = backend_b
+        .vector_search(&test_target(), vector_query())
+        .await
+        .unwrap()
+        .hits;
     assert_eq!(hits.len(), 2);
     let (_, _, data_b) = counts_b.snapshot();
     assert!(data_b > 0, "flat vector scans must read data/ from the real store");
@@ -151,6 +159,10 @@ async fn tiny_budget_sweep_keeps_cache_within_bounds_and_searches_correct() {
         1,
         "searches must still be correct after eviction (misses reload)"
     );
-    let hits = backend.vector_search(&test_target(), vector_query()).await.unwrap();
+    let hits = backend
+        .vector_search(&test_target(), vector_query())
+        .await
+        .unwrap()
+        .hits;
     assert_eq!(hits.len(), 2);
 }
