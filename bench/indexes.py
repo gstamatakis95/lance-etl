@@ -26,7 +26,7 @@ def bench_telemetry_config() -> TelemetryConfig:
     """Build the offline-safe telemetry configuration for benchmark jobs.
 
     Returns:
-        A ``TelemetryConfig``; DogStatsD sends are fire-and-forget UDP so no agent is required.
+        A ``TelemetryConfig``. DogStatsD sends are fire-and-forget UDP so no agent is required.
     """
     return TelemetryConfig(service="lance-bench", env="bench")
 

@@ -15,7 +15,7 @@ const MAX_FILTER_DEPTH: usize = 32;
 
 /// Translates a domain filter into a DataFusion expression against the given schema columns.
 ///
-/// `allowed_columns` is the set of top-level column names of the dataset schema; any reference
+/// `allowed_columns` is the set of top-level column names of the dataset schema. Any reference
 /// outside it (or outside the `[A-Za-z_][A-Za-z0-9_]*` identifier shape) is rejected.
 pub fn filter_to_expr(filter: &Filter, allowed_columns: &HashSet<String>) -> Result<Expr, SearchError> {
     translate(filter, allowed_columns, 0)
@@ -86,7 +86,7 @@ fn combine(
 
 /// Builds a validated column reference expression.
 ///
-/// The name must look like a plain identifier and exist in the dataset schema; the reference is
+/// The name must look like a plain identifier and exist in the dataset schema. The reference is
 /// constructed as an unqualified [`Column`] so the name is never parsed as an expression.
 fn column_ref(name: &str, allowed_columns: &HashSet<String>) -> Result<Expr, SearchError> {
     if !is_plain_identifier(name) {

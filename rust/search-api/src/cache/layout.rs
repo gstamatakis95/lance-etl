@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-/// Version of our on-disk cache schema; bump on any layout or format change.
+/// Version of our on-disk cache schema. Bump on any layout or format change.
 pub const CACHE_SCHEMA_VERSION: u32 = 1;
 
-/// Lance crate version baked into the stamp; bump together with the `lance` path dependency
+/// Lance crate version baked into the stamp. Bump together with the `lance` path dependency
 /// because the cache codec format is explicitly unstable across lance releases.
 pub const LANCE_CACHE_STAMP: &str = "8.0.0-beta.6";
 
@@ -49,8 +49,8 @@ pub fn hash_hex(input: &str, hex_len: usize) -> String {
 
 /// Writes `bytes` to `path` atomically: temp file in the same directory, then rename.
 ///
-/// Concurrent writers of the same key race benignly (last rename wins, both contents are valid);
-/// readers never observe partial files.
+/// Concurrent writers of the same key race benignly (last rename wins, both contents are valid).
+/// Readers never observe partial files.
 pub async fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path
         .parent()

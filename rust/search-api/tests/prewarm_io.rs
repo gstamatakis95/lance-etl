@@ -6,7 +6,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{CountingWrapper, ReadCounts, build_indexed_dataset, test_config};
+use common::{CountingWrapper, ReadCounts, TEST_DATASET_PATH, build_indexed_dataset, test_config, test_target};
 use search_api::domain::{FusionSpec, HybridQuery, PrewarmSpec, Prewarmer, SearchBackend, TextQuery, VectorQuery};
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
 use tempfile::TempDir;
@@ -15,9 +15,10 @@ use tempfile::TempDir;
 async fn searches_after_prewarm_do_no_index_or_manifest_io() {
     let data_tmp = TempDir::new().unwrap();
     let cache_tmp = TempDir::new().unwrap();
-    let uri = format!("file-object-store://{}/org1.lance", data_tmp.path().display());
+    let uri = format!("file-object-store://{}/{TEST_DATASET_PATH}", data_tmp.path().display());
     build_indexed_dataset(&uri).await;
     let config = test_config(data_tmp.path(), cache_tmp.path());
+    let target = test_target();
 
     let counts = Arc::new(ReadCounts::default());
     let provider = CachingDatasetProvider::with_inner_store_wrapper(
@@ -27,7 +28,7 @@ async fn searches_after_prewarm_do_no_index_or_manifest_io() {
     let backend = LanceSearchBackend::new(provider);
     let report = backend
         .prewarm(
-            "org1",
+            &target,
             PrewarmSpec {
                 metadata: true,
                 all_indexes: true,
@@ -48,13 +49,16 @@ async fn searches_after_prewarm_do_no_index_or_manifest_io() {
         k: 2,
         ..Default::default()
     };
-    let hits = backend.vector_search("org1", vector.clone()).await.unwrap();
+    let hits = backend.vector_search(&target, vector.clone()).await.unwrap();
     assert_eq!(hits.len(), 2);
-    let hits = backend.text_search("org1", TextQuery::simple("pear", 3)).await.unwrap();
+    let hits = backend
+        .text_search(&target, TextQuery::simple("pear", 3))
+        .await
+        .unwrap();
     assert_eq!(hits.len(), 1);
     let fused = backend
         .hybrid_search(
-            "org1",
+            &target,
             HybridQuery {
                 vector,
                 text: TextQuery::simple("pear", 0),

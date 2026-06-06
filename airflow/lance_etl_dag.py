@@ -31,11 +31,12 @@ always receives a well-defined window.
 
 Backfill usage
 --------------
-With ``catchup=True`` and a real data interval per run, Airflow-native backfill works out of the box::
+Scheduled catchup is disabled (``catchup=False`` with a fixed ``start_date``) so re-parsing the DAG never triggers a
+surprise backfill. With a real data interval per run, explicit Airflow-native backfill still works out of the box::
 
     airflow dags backfill lance_etl_pipeline --start-date 2024-01-01 --end-date 2024-02-01
 
-Each interval slot is submitted as an independent DAG run; the ETL's idempotent ``merge_insert`` ensures that
+Each interval slot is submitted as an independent DAG run. The ETL's idempotent ``merge_insert`` ensures that
 replaying a slot converges rather than duplicating rows.  Parallelism is controlled by ``max_active_runs`` on the DAG
 (set to 3 here) so backfills do not overwhelm the cluster while keeping throughput reasonable.
 
@@ -76,12 +77,12 @@ Airflow Variables (all optional — defaults are listed in ``dag_params`` below)
     lance_etl_window_column          Iceberg timestamp column used for the window pushdown
                                      filter (default: updated_at).
     lance_etl_partition_by           Comma-separated partition columns forwarded as
-                                     ``--partition-by``; empty (the default) omits the flag so the
+                                     ``--partition-by``. Empty (the default) omits the flag so the
                                      ETL keeps the current org_id/tenant_id/namespace routing.
     lance_etl_partition_derive       Comma-separated ``NAME=SOURCE:FORMAT`` specs forwarded as
                                      repeated ``--partition-derive`` flags (FORMAT is a Python
                                      strftime pattern, e.g.
-                                     ``event_date=processing_timestamp:%Y-%m-%d``); empty (the
+                                     ``event_date=processing_timestamp:%Y-%m-%d``). Empty (the
                                      default) omits the flag.
 """
 
@@ -89,11 +90,10 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 from airflow.models import Variable
 from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
-from airflow.utils.dates import days_ago
 
 from airflow import DAG
 
@@ -288,8 +288,8 @@ def build_index_application_args(params: dict) -> list[str]:
 def build_compact_application_args(params: dict) -> list[str]:
     """Build the CLI argument list for the ``compact`` subcommand.
 
-    Compaction includes version cleanup (``run_cleanup`` is True by default in ``LanceCompactor``; no ``--no-cleanup``
-    flag is passed here).
+    Compaction includes version cleanup (``run_cleanup`` is True by default in ``LanceCompactor``). No ``--no-cleanup``
+    flag is passed here.
 
     Args:
         params: DAG-run ``params`` dict.
@@ -331,8 +331,8 @@ with DAG(
     dag_id=DAG_ID,
     description="Iceberg → Lance ETL: etl → index → compact (schedule driven by lance_etl_schedule Variable)",
     schedule=dag_schedule,
-    start_date=days_ago(1),
-    catchup=True,
+    start_date=datetime(2026, 6, 1, tzinfo=UTC),
+    catchup=False,
     max_active_runs=3,
     default_args=default_args,
     params=dag_params,

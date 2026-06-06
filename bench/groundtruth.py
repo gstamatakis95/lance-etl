@@ -21,14 +21,14 @@ def brute_force_topk(
 ) -> np.ndarray:
     """Compute the exact k nearest base vectors per query under L2 distance.
 
-    Distances are expanded as ``|q|^2 - 2 q.b + |b|^2`` over query and base chunks so memory stays bounded; per-chunk
+    Distances are expanded as ``|q|^2 - 2 q.b + |b|^2`` over query and base chunks so memory stays bounded. Per-chunk
     candidates are merged into a running top-k and fully sorted at the end.
 
     Args:
         base: The ``(rows, dim)`` base vectors.
         base_ids: Global id per base row, returned in the result.
         queries: The ``(num_queries, dim)`` query vectors.
-        k: Neighbors per query; clamped to the base size.
+        k: Neighbors per query. Clamped to the base size.
         base_chunk: Base rows per distance chunk.
         query_chunk: Queries per distance chunk.
 

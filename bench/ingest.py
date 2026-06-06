@@ -4,7 +4,7 @@ Drives the production :meth:`lance_etl.etl.IcebergToLanceETL.run` end to end, so
 configuration the ``lance-etl etl`` CLI would build (routing columns, last-write-wins collapse on ``updated_at``, the
 fixed-size-list vector cast, the routing shuffle, and the executor-side ``merge_insert``) plus the production
 ``apply_window_filter`` pushdown. ``read_increment`` resolves the snapshot window through the ``{table}.snapshots``
-metadata table; the benchmark passes a snapshot window of ``[0, now]`` that brackets the table's entire history, so no
+metadata table. The benchmark passes a snapshot window of ``[0, now]`` that brackets the table's entire history, so no
 snapshot precedes the window start and the read takes the production first-run fallback — a full batch scan pinned to
 the window's last snapshot via the ``snapshot-id`` option. The source table is written once by prepare, so the
 ``updated_at`` window filter is the per-batch slicer.

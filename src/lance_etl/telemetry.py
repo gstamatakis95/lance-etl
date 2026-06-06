@@ -176,7 +176,8 @@ def commit_with_retries(
             if on_conflict is not None:
                 on_conflict()
             time.sleep(backoff_seconds * (2 ** min(attempt, 6)))
-    raise last_exc  # type: ignore[misc]
+    assert last_exc is not None
+    raise last_exc
 
 
 def build_lance_event_callback(telemetry: Telemetry) -> object:

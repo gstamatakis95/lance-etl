@@ -7,9 +7,9 @@ use crate::domain::error::SearchError;
 /// What a prewarm call should pull into the local caches.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PrewarmSpec {
-    /// Warm dataset metadata (manifest, transaction, index listing); implied by warming any index.
+    /// Warm dataset metadata (manifest, transaction, index listing). Implied by warming any index.
     pub metadata: bool,
-    /// Warm all indexes of the dataset; ignored when `index_names` is non-empty.
+    /// Warm all indexes of the dataset. Ignored when `index_names` is non-empty.
     pub all_indexes: bool,
     /// Warm only these named indexes.
     pub index_names: Vec<String>,
@@ -26,8 +26,8 @@ impl PrewarmSpec {
     /// Resolves the index names to warm against the names available in the dataset.
     ///
     /// Explicit `index_names` win (deduplicated, original order preserved, unknown names kept so
-    /// the caller can report a per-index error); otherwise `all_indexes` selects every available
-    /// name; otherwise nothing is warmed.
+    /// the caller can report a per-index error). Otherwise `all_indexes` selects every available
+    /// name. Otherwise nothing is warmed.
     pub fn resolve_targets(&self, available: &[String]) -> Vec<String> {
         if !self.index_names.is_empty() {
             let mut seen = std::collections::HashSet::new();
@@ -57,7 +57,7 @@ pub struct PrewarmedIndex {
     pub name: String,
     /// Time spent prewarming this index (all delta segments).
     pub duration: Duration,
-    /// `None` on success; a client-safe reason when this index was skipped or failed.
+    /// `None` on success. A client-safe reason when this index was skipped or failed.
     pub error: Option<String>,
 }
 
@@ -76,12 +76,15 @@ pub struct PrewarmReport {
     pub index_cache_size_bytes: u64,
 }
 
-/// Cache prewarming abstraction; transports stay generic over this trait next to `SearchBackend`.
+/// Cache prewarming abstraction. Transports stay generic over this trait next to `SearchBackend`.
 pub trait Prewarmer: Send + Sync + 'static {
-    /// Warms the given organization's caches and reports what was loaded.
+    /// Warms the targeted dataset's caches and reports what was loaded.
+    ///
+    /// The target must address exactly one dataset: a date range, when present, has to cover a
+    /// single day.
     fn prewarm(
         &self,
-        org_id: &str,
+        target: &crate::domain::target::DatasetTarget,
         spec: PrewarmSpec,
     ) -> impl Future<Output = Result<PrewarmReport, SearchError>> + Send;
 }

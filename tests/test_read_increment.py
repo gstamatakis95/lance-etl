@@ -102,7 +102,7 @@ class TestSnapshotIdBounds:
         spark: MagicMock = spark_with_snapshots(snapshot_rows())
         start_ms: int = epoch_ms(SNAPSHOT_TIMES[0]) + 1
         end_ms: int = epoch_ms(SNAPSHOT_TIMES[1]) + 1
-        assert snapshot_id_bounds(spark, "db.t", start_ms, end_ms) == (101, 102)
+        assert snapshot_id_bounds(spark, "db.t", start_ms, end_ms) == (101, 102, True)
         spark.read.format.return_value.load.assert_called_once_with("db.t.snapshots")
 
     def test_snapshot_at_window_start_is_read(self) -> None:
@@ -110,25 +110,32 @@ class TestSnapshotIdBounds:
         spark: MagicMock = spark_with_snapshots(snapshot_rows())
         start_ms: int = epoch_ms(SNAPSHOT_TIMES[1])
         end_ms: int = epoch_ms(SNAPSHOT_TIMES[2]) + 1
-        assert snapshot_id_bounds(spark, "db.t", start_ms, end_ms) == (101, 103)
+        assert snapshot_id_bounds(spark, "db.t", start_ms, end_ms) == (101, 103, True)
 
     def test_snapshot_at_window_end_is_read(self) -> None:
         """A snapshot committed exactly at the window end is the inclusive end bound."""
         spark: MagicMock = spark_with_snapshots(snapshot_rows())
         start_ms: int = epoch_ms(SNAPSHOT_TIMES[0]) + 1
         end_ms: int = epoch_ms(SNAPSHOT_TIMES[2])
-        assert snapshot_id_bounds(spark, "db.t", start_ms, end_ms) == (101, 103)
+        assert snapshot_id_bounds(spark, "db.t", start_ms, end_ms) == (101, 103, True)
 
     def test_no_snapshot_before_window_start(self) -> None:
         """A window opening before the first snapshot has no start bound (first run)."""
         spark: MagicMock = spark_with_snapshots(snapshot_rows())
         end_ms: int = epoch_ms(SNAPSHOT_TIMES[2]) + 1
-        assert snapshot_id_bounds(spark, "db.t", 0, end_ms) == (None, 103)
+        assert snapshot_id_bounds(spark, "db.t", 0, end_ms) == (None, 103, True)
 
     def test_empty_snapshots_table(self) -> None:
         """A table without snapshots yields no bounds at all."""
         spark: MagicMock = spark_with_snapshots([])
-        assert snapshot_id_bounds(spark, "db.t", 0, epoch_ms(SNAPSHOT_TIMES[2])) == (None, None)
+        assert snapshot_id_bounds(spark, "db.t", 0, epoch_ms(SNAPSHOT_TIMES[2])) == (None, None, False)
+
+    def test_window_after_last_snapshot_has_no_new_snapshots(self) -> None:
+        """A window opening after every snapshot resolves equal bound ids and no new snapshots."""
+        spark: MagicMock = spark_with_snapshots(snapshot_rows())
+        start_ms: int = epoch_ms(SNAPSHOT_TIMES[2]) + 1
+        end_ms: int = start_ms + 1000
+        assert snapshot_id_bounds(spark, "db.t", start_ms, end_ms) == (103, 103, False)
 
 
 class TestReadIncrement:
@@ -138,7 +145,7 @@ class TestReadIncrement:
         self, etl: IcebergToLanceETL, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """With both bounds resolved the read sets start-snapshot-id (exclusive) and end-snapshot-id (inclusive)."""
-        monkeypatch.setattr(etl_module, "snapshot_id_bounds", MagicMock(return_value=(11, 22)))
+        monkeypatch.setattr(etl_module, "snapshot_id_bounds", MagicMock(return_value=(11, 22, True)))
         spark, reader = reader_spark()
         result = etl.read_increment(spark, "db.t", 100, 200)
         assert result is reader.load.return_value
@@ -150,7 +157,7 @@ class TestReadIncrement:
         self, etl: IcebergToLanceETL, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Without a snapshot before the window start the read is a full batch scan pinned with snapshot-id."""
-        monkeypatch.setattr(etl_module, "snapshot_id_bounds", MagicMock(return_value=(None, 22)))
+        monkeypatch.setattr(etl_module, "snapshot_id_bounds", MagicMock(return_value=(None, 22, True)))
         spark, reader = reader_spark()
         result = etl.read_increment(spark, "db.t", 100, 200)
         assert result is reader.load.return_value
@@ -159,7 +166,7 @@ class TestReadIncrement:
 
     def test_no_snapshots_returns_empty_frame(self, etl: IcebergToLanceETL, monkeypatch: pytest.MonkeyPatch) -> None:
         """A window with no resolvable end snapshot returns the current schema with zero rows."""
-        monkeypatch.setattr(etl_module, "snapshot_id_bounds", MagicMock(return_value=(None, None)))
+        monkeypatch.setattr(etl_module, "snapshot_id_bounds", MagicMock(return_value=(None, None, False)))
         spark, reader = reader_spark()
         result = etl.read_increment(spark, "db.t", 100, 200)
         assert result is reader.load.return_value.limit.return_value
@@ -169,8 +176,8 @@ class TestReadIncrement:
     def test_no_new_snapshots_in_window_returns_empty_frame(
         self, etl: IcebergToLanceETL, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Equal start and end bounds mean nothing was committed in the window, so zero rows are returned."""
-        monkeypatch.setattr(etl_module, "snapshot_id_bounds", MagicMock(return_value=(22, 22)))
+        """A window containing no newly committed snapshot returns zero rows even with resolved bound ids."""
+        monkeypatch.setattr(etl_module, "snapshot_id_bounds", MagicMock(return_value=(22, 22, False)))
         spark, reader = reader_spark()
         result = etl.read_increment(spark, "db.t", 100, 200)
         assert result is reader.load.return_value.limit.return_value
@@ -180,7 +187,7 @@ class TestReadIncrement:
     def test_iceberg_read_options_are_merged(self, etl: IcebergToLanceETL, monkeypatch: pytest.MonkeyPatch) -> None:
         """Configured extra Iceberg read options reach the non-empty read alongside the snapshot bounds."""
         etl.config.iceberg_read_options = {"split-size": "134217728"}
-        monkeypatch.setattr(etl_module, "snapshot_id_bounds", MagicMock(return_value=(11, 22)))
+        monkeypatch.setattr(etl_module, "snapshot_id_bounds", MagicMock(return_value=(11, 22, True)))
         spark, reader = reader_spark()
         etl.read_increment(spark, "db.t", 100, 200)
         options: set[tuple[str, str]] = {call.args for call in reader.option.call_args_list}

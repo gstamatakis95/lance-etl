@@ -14,7 +14,7 @@ spreads rows deterministically over one synthetic day (minute ``index % 1440``) 
 into ``--batches`` windows through the ETL's real ``--window-start`` / ``--window-end`` pushdown flags.
 
 Ground truth: the dataset's published ground truth is used verbatim for the canonical full single-tenant run when the
-adapter provides one; any ``--limit`` subset, multi-tenant split, or adapter without published truth triggers an exact
+adapter provides one. Any ``--limit`` subset, multi-tenant split, or adapter without published truth triggers an exact
 batched numpy brute-force recomputation per tenant so the benchmark stays self-consistent.
 
 All corpus access goes through the :class:`bench.datasets.DatasetAdapter` resolved from ``--dataset``: the driver reads
@@ -242,7 +242,7 @@ def tenant_ground_truth(
 ) -> tuple[dict[str, np.ndarray], str]:
     """Compute or load the per-tenant ground truth as global vector ids.
 
-    The adapter's published ground truth is used verbatim for the canonical full single-tenant run; any subset,
+    The adapter's published ground truth is used verbatim for the canonical full single-tenant run. Any subset,
     multi-tenant split, or adapter without published truth triggers an exact brute-force recomputation per tenant.
 
     Args:

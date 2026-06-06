@@ -1,10 +1,13 @@
-//! Thin gRPC transport: proto <-> domain mapping over any [`SearchBackend`].
+//! Thin gRPC transport: proto <-> domain mapping over the domain service traits.
 //!
-//! This layer never references Lance types; it converts protobuf requests into domain queries,
-//! delegates to the backend, and converts domain hits and errors back to protobuf. Per-RPC
+//! This layer never references Lance types. It converts protobuf requests into domain queries,
+//! delegates to the backend, and converts domain results and errors back to protobuf. Per-RPC
 //! observability lives here: the tower layer in `main` opens the server span, and the handlers
-//! annotate it with `org_id` and the gRPC status, emit one request/latency metric per call, and
-//! log failures with the org context.
+//! annotate it with the dataset target and the gRPC status, emit one request/latency metric per
+//! call, and log failures with the target context.
+//!
+//! Submodules:
+//! - [`convert`]: pure conversions between protobuf messages and domain types.
 
 pub mod convert;
 
@@ -14,15 +17,16 @@ use std::time::Instant;
 use tonic::{Code, Request, Response, Status};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::domain::{Prewarmer, SearchBackend, SearchError};
+use crate::domain::{ClusterReader, DatasetTarget, Prewarmer, SearchBackend, SearchError};
 use crate::grpc::convert::{
-    fused_hit_to_proto, hybrid_query_from_proto, prewarm_report_to_proto, prewarm_spec_from_proto, text_hit_to_proto,
+    cluster_report_to_proto, cluster_spec_from_proto, dataset_target_from_proto, fused_hit_to_proto,
+    hybrid_query_from_proto, prewarm_report_to_proto, prewarm_spec_from_proto, text_hit_to_proto,
     text_query_from_proto, vector_hit_to_proto, vector_query_from_proto,
 };
 use crate::pb::search_service_server::SearchService;
 use crate::pb::{
-    HybridSearchRequest, HybridSearchResponse, PrewarmRequest, PrewarmResponse, TextSearchRequest, TextSearchResponse,
-    VectorSearchRequest, VectorSearchResponse,
+    ClustersRequest, ClustersResponse, HybridSearchRequest, HybridSearchResponse, PrewarmRequest, PrewarmResponse,
+    TextSearchRequest, TextSearchResponse, VectorSearchRequest, VectorSearchResponse,
 };
 use crate::telemetry::{Metrics, Rpc};
 
@@ -80,19 +84,43 @@ fn code_tag(code: Code) -> &'static str {
     }
 }
 
-/// Annotates the current (server) span with the canonical request attributes.
+/// Annotates the current (server) span with the canonical dataset-target attributes.
 ///
-/// `org_id` is allowed on traces and logs but never on metrics; `set_attribute` writes through
-/// the OpenTelemetry layer, so it works even though the tower layer's span does not declare these
-/// tracing fields, and degrades to a no-op when telemetry is disabled.
-fn annotate_request_span(org_id: &str) {
+/// Target identifiers are allowed on traces and logs but never on metrics. `set_attribute`
+/// writes through the OpenTelemetry layer, so it works even though the tower layer's span does
+/// not declare these tracing fields, and degrades to a no-op when telemetry is disabled.
+fn annotate_request_span(target: &DatasetTarget) {
     let span = tracing::Span::current();
-    span.set_attribute("org_id", org_id.to_string());
+    span.set_attribute("org_id", target.org_id.clone());
+    span.set_attribute("tenant_id", target.tenant_id.clone());
+    span.set_attribute("namespace", target.namespace.clone());
+    if let Some(range) = &target.date_range {
+        span.set_attribute("date_range.start", range.start.to_string());
+        span.set_attribute("date_range.end", range.end.to_string());
+        span.set_attribute("date_range.days", range.days().len() as i64);
+    }
+}
+
+/// Renders the target for failure logs.
+fn target_label(target: &DatasetTarget) -> String {
+    match &target.date_range {
+        None => format!("{}/{}/{}", target.org_id, target.tenant_id, target.namespace),
+        Some(range) => format!(
+            "{}/{}/{}@{}..{}",
+            target.org_id, target.tenant_id, target.namespace, range.start, range.end
+        ),
+    }
 }
 
 /// Records the RPC outcome: gRPC status code on the span, request/latency/error metrics, and a
-/// warn-level event with the org context on failure.
-fn record_outcome<T>(metrics: &Metrics, rpc: Rpc, org_id: &str, started: Instant, result: &Result<T, Status>) {
+/// warn-level event with the target context on failure.
+fn record_outcome<T>(
+    metrics: &Metrics,
+    rpc: Rpc,
+    target: Option<&DatasetTarget>,
+    started: Instant,
+    result: &Result<T, Status>,
+) {
     let code = match result {
         Ok(_) => Code::Ok,
         Err(status) => status.code(),
@@ -102,7 +130,7 @@ fn record_outcome<T>(metrics: &Metrics, rpc: Rpc, org_id: &str, started: Instant
     metrics.rpc(rpc, code_tag(code), started.elapsed());
     if let Err(status) = result {
         tracing::warn!(
-            org_id = %org_id,
+            target = target.map(target_label).unwrap_or_default(),
             rpc = rpc.as_tag(),
             status = code_tag(code),
             message = status.message(),
@@ -111,30 +139,42 @@ fn record_outcome<T>(metrics: &Metrics, rpc: Rpc, org_id: &str, started: Instant
     }
 }
 
+/// Converts the request target, annotating the span on success.
+fn take_target(target: Option<crate::pb::DatasetTarget>) -> Result<DatasetTarget, Status> {
+    let target = dataset_target_from_proto(target).map_err(status_from_error)?;
+    annotate_request_span(&target);
+    Ok(target)
+}
+
 #[tonic::async_trait]
-impl<B: SearchBackend + Prewarmer> SearchService for SearchGrpc<B> {
-    /// Nearest-neighbor search on a vector column of the org dataset.
+impl<B: SearchBackend + Prewarmer + ClusterReader> SearchService for SearchGrpc<B> {
+    /// Nearest-neighbor search on a vector column of the target dataset(s).
     async fn vector_search(
         &self,
         request: Request<VectorSearchRequest>,
     ) -> Result<Response<VectorSearchResponse>, Status> {
         let started = Instant::now();
         let request = request.into_inner();
-        annotate_request_span(&request.org_id);
-        let result = async {
-            let query = vector_query_from_proto(request.query).map_err(status_from_error)?;
-            tracing::Span::current().set_attribute("search.k", query.k as i64);
-            let hits = self
-                .backend
-                .vector_search(&request.org_id, query)
+        let target = take_target(request.target);
+        let result = match &target {
+            Err(status) => Err(status.clone()),
+            Ok(target) => {
+                async {
+                    let query = vector_query_from_proto(request.query).map_err(status_from_error)?;
+                    tracing::Span::current().set_attribute("search.k", query.k as i64);
+                    let hits = self
+                        .backend
+                        .vector_search(target, query)
+                        .await
+                        .map_err(status_from_error)?;
+                    Ok(Response::new(VectorSearchResponse {
+                        results: hits.into_iter().map(vector_hit_to_proto).collect(),
+                    }))
+                }
                 .await
-                .map_err(status_from_error)?;
-            Ok(Response::new(VectorSearchResponse {
-                results: hits.into_iter().map(vector_hit_to_proto).collect(),
-            }))
-        }
-        .await;
-        record_outcome(&self.metrics, Rpc::VectorSearch, &request.org_id, started, &result);
+            }
+        };
+        record_outcome(&self.metrics, Rpc::VectorSearch, target.as_ref().ok(), started, &result);
         result
     }
 
@@ -142,21 +182,26 @@ impl<B: SearchBackend + Prewarmer> SearchService for SearchGrpc<B> {
     async fn text_search(&self, request: Request<TextSearchRequest>) -> Result<Response<TextSearchResponse>, Status> {
         let started = Instant::now();
         let request = request.into_inner();
-        annotate_request_span(&request.org_id);
-        let result = async {
-            let query = text_query_from_proto(request.query).map_err(status_from_error)?;
-            tracing::Span::current().set_attribute("search.k", query.k as i64);
-            let hits = self
-                .backend
-                .text_search(&request.org_id, query)
+        let target = take_target(request.target);
+        let result = match &target {
+            Err(status) => Err(status.clone()),
+            Ok(target) => {
+                async {
+                    let query = text_query_from_proto(request.query).map_err(status_from_error)?;
+                    tracing::Span::current().set_attribute("search.k", query.k as i64);
+                    let hits = self
+                        .backend
+                        .text_search(target, query)
+                        .await
+                        .map_err(status_from_error)?;
+                    Ok(Response::new(TextSearchResponse {
+                        results: hits.into_iter().map(text_hit_to_proto).collect(),
+                    }))
+                }
                 .await
-                .map_err(status_from_error)?;
-            Ok(Response::new(TextSearchResponse {
-                results: hits.into_iter().map(text_hit_to_proto).collect(),
-            }))
-        }
-        .await;
-        record_outcome(&self.metrics, Rpc::TextSearch, &request.org_id, started, &result);
+            }
+        };
+        record_outcome(&self.metrics, Rpc::TextSearch, target.as_ref().ok(), started, &result);
         result
     }
 
@@ -166,45 +211,71 @@ impl<B: SearchBackend + Prewarmer> SearchService for SearchGrpc<B> {
         request: Request<HybridSearchRequest>,
     ) -> Result<Response<HybridSearchResponse>, Status> {
         let started = Instant::now();
-        let request = request.into_inner();
-        let org_id = request.org_id.clone();
-        annotate_request_span(&org_id);
+        let mut request = request.into_inner();
+        let target = take_target(request.target.take());
         let span = tracing::Span::current();
         span.set_attribute("search.hybrid", true);
-        let result = async {
-            let query = hybrid_query_from_proto(request).map_err(status_from_error)?;
-            span.set_attribute("search.k", query.k as i64);
-            let hits = self
-                .backend
-                .hybrid_search(&org_id, query)
+        let result = match &target {
+            Err(status) => Err(status.clone()),
+            Ok(target) => {
+                async {
+                    let query = hybrid_query_from_proto(request).map_err(status_from_error)?;
+                    span.set_attribute("search.k", query.k as i64);
+                    let hits = self
+                        .backend
+                        .hybrid_search(target, query)
+                        .await
+                        .map_err(status_from_error)?;
+                    Ok(Response::new(HybridSearchResponse {
+                        results: hits.into_iter().map(fused_hit_to_proto).collect(),
+                    }))
+                }
                 .await
-                .map_err(status_from_error)?;
-            Ok(Response::new(HybridSearchResponse {
-                results: hits.into_iter().map(fused_hit_to_proto).collect(),
-            }))
-        }
-        .await;
-        record_outcome(&self.metrics, Rpc::HybridSearch, &org_id, started, &result);
+            }
+        };
+        record_outcome(&self.metrics, Rpc::HybridSearch, target.as_ref().ok(), started, &result);
         result
     }
 
-    /// Proactively pulls one org's metadata and index structures into the local caches.
+    /// Proactively pulls one dataset's metadata and index structures into the local caches.
     async fn prewarm(&self, request: Request<PrewarmRequest>) -> Result<Response<PrewarmResponse>, Status> {
         let started = Instant::now();
-        let request = request.into_inner();
-        annotate_request_span(&request.org_id);
-        let result = async {
-            let spec = prewarm_spec_from_proto(&request);
-            let report = self
-                .backend
-                .prewarm(&request.org_id, spec)
+        let mut request = request.into_inner();
+        let target = take_target(request.target.take());
+        let result = match &target {
+            Err(status) => Err(status.clone()),
+            Ok(target) => {
+                async {
+                    let spec = prewarm_spec_from_proto(&request);
+                    let report = self.backend.prewarm(target, spec).await.map_err(status_from_error)?;
+                    tracing::Span::current().set_attribute("prewarm.index_count", report.indexes.len() as i64);
+                    Ok(Response::new(prewarm_report_to_proto(report)))
+                }
                 .await
-                .map_err(status_from_error)?;
-            tracing::Span::current().set_attribute("prewarm.index_count", report.indexes.len() as i64);
-            Ok(Response::new(prewarm_report_to_proto(report)))
-        }
-        .await;
-        record_outcome(&self.metrics, Rpc::Prewarm, &request.org_id, started, &result);
+            }
+        };
+        record_outcome(&self.metrics, Rpc::Prewarm, target.as_ref().ok(), started, &result);
+        result
+    }
+
+    /// Reads the IVF cluster centroids of a vector index from the target dataset.
+    async fn clusters(&self, request: Request<ClustersRequest>) -> Result<Response<ClustersResponse>, Status> {
+        let started = Instant::now();
+        let mut request = request.into_inner();
+        let target = take_target(request.target.take());
+        let result = match &target {
+            Err(status) => Err(status.clone()),
+            Ok(target) => {
+                async {
+                    let spec = cluster_spec_from_proto(&request);
+                    let report = self.backend.clusters(target, spec).await.map_err(status_from_error)?;
+                    tracing::Span::current().set_attribute("clusters.count", report.num_partitions() as i64);
+                    Ok(Response::new(cluster_report_to_proto(report)))
+                }
+                .await
+            }
+        };
+        record_outcome(&self.metrics, Rpc::Clusters, target.as_ref().ok(), started, &result);
         result
     }
 }

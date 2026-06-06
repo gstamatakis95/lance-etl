@@ -64,7 +64,9 @@ class CompactionConfig:
         materialize_deletions_threshold: Deletion fraction above which a fragment is rewritten to drop deleted rows.
         defer_index_remap: Defer index remap instead of rewriting indices inline. Honored only on the small-dataset
             tier, where ``Compaction.execute`` parses all options. The large-dataset tier ignores it because the Python
-            ``Compaction.commit`` binding commits with default options and always remaps indices inline.
+            ``Compaction.commit`` binding commits with default options and always remaps indices inline. Defaults to
+            ``False``: on the pinned lance build a deferred remap leaves indexed vector queries failing with a missing
+            fragment-id error until the remap runs, so deferral is opt-in for pipelines that remap before serving.
         max_source_fragments: Cap on source fragments consumed per run, oldest first, for incremental compaction of
             large datasets. ``None`` means no limit. ``0`` is rejected: it is not a disable sentinel and would be
             refused by Lance's option parser.
@@ -91,7 +93,7 @@ class CompactionConfig:
     max_bytes_per_file: int | None = None
     materialize_deletions: bool | None = True
     materialize_deletions_threshold: float | None = None
-    defer_index_remap: bool = True
+    defer_index_remap: bool = False
     max_source_fragments: int | None = None
     num_threads: int | None = None
     batch_size: int | None = None
@@ -136,13 +138,21 @@ class CompactionConfig:
         """Build the options dict for the distributed ``Compaction.plan`` path.
 
         ``defer_index_remap`` is excluded because the distributed commit uses default options and remaps indices inline
-        regardless of the plan-time setting.
+        regardless of the plan-time setting. A non-default ``defer_index_remap=False`` therefore has no effect on this
+        tier, and a warning is logged so operators are not silently surprised. It still applies on the small-dataset
+        tier, where ``Compaction.execute`` parses all options.
 
         Returns:
             Options accepted by ``Compaction.plan``, omitting unset values.
         """
         options: dict[str, Any] = self.execute_options()
         options.pop("defer_index_remap", None)
+        if not self.defer_index_remap:
+            logger.warning(
+                "defer_index_remap=False is ignored on the large-dataset tier: the distributed Compaction.commit "
+                "binding uses default options and remaps indices inline. The setting only affects the "
+                "small-dataset tier."
+            )
         return options
 
 
@@ -312,8 +322,8 @@ class LanceCompactor:
             A statistics dictionary for the dataset with ``tier`` set to ``"large"``.
         """
         config: CompactionConfig = self.config
-        spark.sparkContext.setLocalProperty("spark.scheduler.pool", config.scheduler_pool)
         try:
+            spark.sparkContext.setLocalProperty("spark.scheduler.pool", config.scheduler_pool)
             dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
             plan = Compaction.plan(dataset, options=config.plan_options())
             task_jsons: list[str] = [task.json() for task in plan.tasks]

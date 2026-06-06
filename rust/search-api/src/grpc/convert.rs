@@ -3,19 +3,68 @@
 use prost_types::value::Kind;
 use serde_json::{Map, Value};
 
+use crate::domain::target::parse_date;
 use crate::domain::{
-    CompareOp, DistanceKind, Filter, FilterMode, FusedHit, FusionSpec, Fuzziness, Hit, HybridQuery, Literal, MatchSpec,
-    PhraseSpec, PrewarmReport, PrewarmSpec, SearchError, TextOperator, TextQuery, TextQueryNode, VectorQuery,
+    ClusterReport, ClusterSpec, CompareOp, DatasetTarget, DateRange, DistanceKind, Filter, FilterMode, FusedHit,
+    FusionSpec, Fuzziness, Hit, HybridQuery, Literal, MatchSpec, PhraseSpec, PrewarmReport, PrewarmSpec, SearchError,
+    TextOperator, TextQuery, TextQueryNode, VectorQuery,
 };
 use crate::pb;
 
-/// Converts a proto prewarm request into the domain spec (org id travels separately).
+/// Converts an optional proto dataset target into the validated domain target.
+pub fn dataset_target_from_proto(target: Option<pb::DatasetTarget>) -> Result<DatasetTarget, SearchError> {
+    let target = target.ok_or_else(|| SearchError::invalid_argument("target is required"))?;
+    let date_range = target
+        .date_range
+        .map(|range| {
+            let start = parse_date(&range.start_date, "date_range.start_date")?;
+            let end = parse_date(&range.end_date, "date_range.end_date")?;
+            DateRange::new(start, end)
+        })
+        .transpose()?;
+    let target = DatasetTarget {
+        org_id: target.org_id,
+        tenant_id: target.tenant_id,
+        namespace: target.namespace,
+        date_range,
+    };
+    target.validate()?;
+    Ok(target)
+}
+
+/// Converts a proto prewarm request into the domain spec (the target travels separately).
 pub fn prewarm_spec_from_proto(request: &pb::PrewarmRequest) -> PrewarmSpec {
     PrewarmSpec {
         metadata: request.metadata,
         all_indexes: request.all_indexes,
         index_names: request.index_names.clone(),
         fts_with_position: request.fts_with_position,
+    }
+}
+
+/// Converts a proto clusters request into the domain spec (the target travels separately).
+pub fn cluster_spec_from_proto(request: &pb::ClustersRequest) -> ClusterSpec {
+    ClusterSpec {
+        index_name: request.index_name.clone().filter(|name| !name.is_empty()),
+    }
+}
+
+/// Converts a domain cluster report into the proto response.
+pub fn cluster_report_to_proto(report: ClusterReport) -> pb::ClustersResponse {
+    let num_partitions = report.num_partitions() as u32;
+    pb::ClustersResponse {
+        clusters: report
+            .centroids
+            .into_iter()
+            .enumerate()
+            .map(|(id, centroid)| pb::Cluster {
+                id: id as u32,
+                centroid,
+            })
+            .collect(),
+        dimension: report.dimension as u32,
+        index_name: report.index_name,
+        num_partitions,
     }
 }
 
@@ -230,7 +279,7 @@ fn compare_op_from_proto(op: i32) -> Result<CompareOp, SearchError> {
     }
 }
 
-/// Converts the proto distance type enum; unspecified keeps the index metric.
+/// Converts the proto distance type enum. Unspecified keeps the index metric.
 fn distance_from_proto(distance: i32) -> Result<Option<DistanceKind>, SearchError> {
     match pb::DistanceType::try_from(distance) {
         Ok(pb::DistanceType::Unspecified) => Ok(None),
@@ -242,7 +291,7 @@ fn distance_from_proto(distance: i32) -> Result<Option<DistanceKind>, SearchErro
     }
 }
 
-/// Converts the proto filter mode enum; unspecified defaults to prefilter.
+/// Converts the proto filter mode enum. Unspecified defaults to prefilter.
 fn filter_mode_from_proto(mode: i32) -> Result<FilterMode, SearchError> {
     match pb::FilterMode::try_from(mode) {
         Ok(pb::FilterMode::Unspecified) | Ok(pb::FilterMode::Prefilter) => Ok(FilterMode::Prefilter),
@@ -251,7 +300,7 @@ fn filter_mode_from_proto(mode: i32) -> Result<FilterMode, SearchError> {
     }
 }
 
-/// Converts the proto text operator enum; unspecified defaults to OR.
+/// Converts the proto text operator enum. Unspecified defaults to OR.
 fn text_operator_from_proto(operator: i32) -> Result<TextOperator, SearchError> {
     match pb::TextOperator::try_from(operator) {
         Ok(pb::TextOperator::Unspecified) | Ok(pb::TextOperator::Or) => Ok(TextOperator::Or),
@@ -260,7 +309,7 @@ fn text_operator_from_proto(operator: i32) -> Result<TextOperator, SearchError> 
     }
 }
 
-/// Converts the proto fuzziness oneof; absent means exact matching.
+/// Converts the proto fuzziness oneof. Absent means exact matching.
 fn fuzziness_from_proto(fuzziness: Option<pb::match_query::Fuzziness>) -> Fuzziness {
     match fuzziness {
         Some(pb::match_query::Fuzziness::AutoFuzziness(true)) => Fuzziness::Auto,

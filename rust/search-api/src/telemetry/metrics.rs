@@ -1,221 +1,12 @@
-//! Datadog observability: OTLP trace export, structured JSON logs with trace correlation, and a
-//! typed DogStatsD metrics facade.
-//!
-//! This module references neither Lance nor protobuf types, so both the `lance` and `grpc` layers
-//! may depend on it without violating the crate layering; `domain` stays telemetry-free.
-//!
-//! Every emitter here is infallible by construction: an unreachable Datadog Agent never panics
-//! and never fails a request. Trace export uses the SDK batch processor (bounded queue, drops on
-//! overflow, lazy gRPC connect with internal retries); metrics use a bounded queuing DogStatsD
-//! sink over non-blocking UDP. Setup failures degrade to no-op emitters with a warning.
+//! The typed DogStatsD metrics facade and its low-cardinality tag enums.
 
 use std::fmt;
 use std::time::Duration;
 
 use cadence::{Counted, Distributed, Gauged, MetricSink, NopMetricSink, QueuingMetricSink, StatsdClient};
-use opentelemetry::trace::{TraceContextExt, TracerProvider};
-use opentelemetry::{KeyValue, global};
-use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::propagation::TraceContextPropagator;
-use opentelemetry_sdk::trace::SdkTracerProvider;
-use serde_json::{Map, Value};
-use tracing::field::{Field, Visit};
-use tracing::{Event, Subscriber};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
-use tracing_subscriber::fmt::format::{JsonFields, Writer};
-use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, FormattedFields};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::util::SubscriberInitExt;
 
-/// Service name reported when neither `OTEL_SERVICE_NAME` nor `DD_SERVICE` is set.
-pub const DEFAULT_SERVICE_NAME: &str = "search-api";
-
-/// Bound on the number of metric packets queued for the DogStatsD sink; overflow is dropped.
+/// Bound on the number of metric packets queued for the DogStatsD sink. Overflow is dropped.
 const METRICS_QUEUE_CAPACITY: usize = 8192;
-
-/// Resolves the service name from `OTEL_SERVICE_NAME`, then `DD_SERVICE`, then the default.
-fn service_name() -> String {
-    std::env::var("OTEL_SERVICE_NAME")
-        .or_else(|_| std::env::var("DD_SERVICE"))
-        .unwrap_or_else(|_| DEFAULT_SERVICE_NAME.to_string())
-}
-
-/// Owns the tracer provider so spans are flushed to the agent on shutdown.
-///
-/// Dropping the guard shuts the provider down (best effort); keep it alive for the process
-/// lifetime in `main`.
-#[derive(Debug, Default)]
-pub struct TelemetryGuard {
-    tracer_provider: Option<SdkTracerProvider>,
-}
-
-impl Drop for TelemetryGuard {
-    fn drop(&mut self) {
-        if let Some(provider) = self.tracer_provider.take() {
-            let _ = provider.shutdown();
-        }
-    }
-}
-
-/// Installs the global tracing subscriber: `RUST_LOG`-driven filtering, JSON logs on stdout with
-/// Datadog trace/span correlation fields, and (unless disabled) an OTLP gRPC span exporter
-/// pointed at the Datadog Agent.
-///
-/// Endpoint resolution honors `OTEL_EXPORTER_OTLP_ENDPOINT` first and falls back to
-/// `http://{DD_AGENT_HOST}:4317`; sampling honors `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG`.
-/// The function never panics and never fails: exporter setup errors degrade to log-only mode, and
-/// calling it when a subscriber is already installed (tests) is a no-op.
-pub fn init_tracing(telemetry_disabled: bool) -> TelemetryGuard {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .fmt_fields(JsonFields::new())
-        .event_format(DatadogJsonFormat);
-    let tracer_provider = if telemetry_disabled { None } else { build_tracer_provider() };
-    match &tracer_provider {
-        Some(provider) => {
-            global::set_text_map_propagator(TraceContextPropagator::new());
-            let tracer = provider.tracer(DEFAULT_SERVICE_NAME);
-            let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-            let _ = tracing_subscriber::registry()
-                .with(filter)
-                .with(otel_layer)
-                .with(fmt_layer)
-                .try_init();
-        }
-        None => {
-            let _ = tracing_subscriber::registry().with(filter).with(fmt_layer).try_init();
-        }
-    }
-    TelemetryGuard { tracer_provider }
-}
-
-/// Builds the OTLP tonic tracer provider; any failure returns `None` (log-only mode).
-///
-/// Must run inside a tokio runtime because the lazy tonic channel spawns its background task at
-/// creation time; outside a runtime this degrades instead of panicking.
-fn build_tracer_provider() -> Option<SdkTracerProvider> {
-    if tokio::runtime::Handle::try_current().is_err() {
-        eprintln!("search-api: telemetry: no tokio runtime available, traces disabled");
-        return None;
-    }
-    let mut exporter_builder = opentelemetry_otlp::SpanExporter::builder().with_tonic();
-    let endpoint_from_env = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok()
-        || std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").is_ok();
-    if !endpoint_from_env && let Ok(agent_host) = std::env::var("DD_AGENT_HOST") {
-        exporter_builder = exporter_builder.with_endpoint(format!("http://{agent_host}:4317"));
-    }
-    let exporter = match exporter_builder.build() {
-        Ok(exporter) => exporter,
-        Err(error) => {
-            eprintln!("search-api: telemetry: failed to build OTLP exporter, traces disabled: {error}");
-            return None;
-        }
-    };
-    let mut attributes = vec![KeyValue::new("service.name", service_name())];
-    if let Ok(env_name) = std::env::var("DD_ENV") {
-        attributes.push(KeyValue::new("deployment.environment.name", env_name));
-    }
-    if let Ok(version) = std::env::var("DD_VERSION") {
-        attributes.push(KeyValue::new("service.version", version));
-    }
-    let resource = Resource::builder().with_attributes(attributes).build();
-    Some(
-        SdkTracerProvider::builder()
-            .with_batch_exporter(exporter)
-            .with_resource(resource)
-            .build(),
-    )
-}
-
-/// Flat JSON log formatter with Datadog trace correlation.
-///
-/// Each line carries `timestamp`, `level`, `target`, `message`, the event's fields, the fields of
-/// every span in scope (inner spans override outer, the event overrides both), and — when a
-/// sampled OpenTelemetry span is active — `trace_id` (32 hex chars) and `span_id` (16 hex chars)
-/// in the OTel convention Datadog ingests directly.
-struct DatadogJsonFormat;
-
-impl<S> FormatEvent<S, JsonFields> for DatadogJsonFormat
-where
-    S: Subscriber + for<'a> LookupSpan<'a>,
-{
-    fn format_event(&self, ctx: &FmtContext<'_, S, JsonFields>, mut writer: Writer<'_>, event: &Event<'_>) -> fmt::Result {
-        let mut fields = Map::new();
-        fields.insert(
-            "timestamp".to_string(),
-            Value::String(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)),
-        );
-        let metadata = event.metadata();
-        fields.insert("level".to_string(), Value::String(metadata.level().to_string()));
-        fields.insert("target".to_string(), Value::String(metadata.target().to_string()));
-        if let Some(scope) = ctx.event_scope() {
-            for span in scope.from_root() {
-                let extensions = span.extensions();
-                if let Some(formatted) = extensions.get::<FormattedFields<JsonFields>>()
-                    && let Ok(Value::Object(span_fields)) = serde_json::from_str::<Value>(formatted.fields.as_str())
-                {
-                    for (key, value) in span_fields {
-                        fields.insert(key, value);
-                    }
-                }
-            }
-        }
-        let mut visitor = JsonEventVisitor { fields: &mut fields };
-        event.record(&mut visitor);
-        let otel_context = tracing::Span::current().context();
-        let span_context = otel_context.span().span_context().clone();
-        if span_context.is_valid() {
-            fields.insert(
-                "trace_id".to_string(),
-                Value::String(format!("{:032x}", span_context.trace_id())),
-            );
-            fields.insert(
-                "span_id".to_string(),
-                Value::String(format!("{:016x}", span_context.span_id())),
-            );
-        }
-        writeln!(writer, "{}", Value::Object(fields))
-    }
-}
-
-/// Records the fields of one event into a JSON map; `message` lands under the `message` key.
-struct JsonEventVisitor<'a> {
-    fields: &'a mut Map<String, Value>,
-}
-
-impl Visit for JsonEventVisitor<'_> {
-    fn record_f64(&mut self, field: &Field, value: f64) {
-        self.fields.insert(field.name().to_string(), Value::from(value));
-    }
-
-    fn record_i64(&mut self, field: &Field, value: i64) {
-        self.fields.insert(field.name().to_string(), Value::from(value));
-    }
-
-    fn record_u64(&mut self, field: &Field, value: u64) {
-        self.fields.insert(field.name().to_string(), Value::from(value));
-    }
-
-    fn record_bool(&mut self, field: &Field, value: bool) {
-        self.fields.insert(field.name().to_string(), Value::from(value));
-    }
-
-    fn record_str(&mut self, field: &Field, value: &str) {
-        self.fields.insert(field.name().to_string(), Value::from(value));
-    }
-
-    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
-        self.fields.insert(field.name().to_string(), Value::from(value.to_string()));
-    }
-
-    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        self.fields
-            .insert(field.name().to_string(), Value::from(format!("{value:?}")));
-    }
-}
 
 /// RPC names used as the `rpc` metric tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +19,8 @@ pub enum Rpc {
     HybridSearch,
     /// `SearchService/Prewarm`.
     Prewarm,
+    /// `SearchService/Clusters`.
+    Clusters,
 }
 
 impl Rpc {
@@ -238,6 +31,7 @@ impl Rpc {
             Self::TextSearch => "text_search",
             Self::HybridSearch => "hybrid_search",
             Self::Prewarm => "prewarm",
+            Self::Clusters => "clusters",
         }
     }
 }
@@ -349,11 +143,33 @@ impl PrewarmIndexKind {
     }
 }
 
+/// Search leg families used as the `leg` metric tag on fan-out timings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanoutLeg {
+    /// Nearest-neighbor leg.
+    Vector,
+    /// Full-text leg.
+    Text,
+    /// Combined vector + text leg of one hybrid fan-out.
+    Hybrid,
+}
+
+impl FanoutLeg {
+    /// Tag value for this leg.
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            Self::Vector => "vector",
+            Self::Text => "text",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
+
 /// Typed facade over the DogStatsD client so call sites cannot invent metric names or tags.
 ///
-/// Tag policy: only `rpc`, `status`, `cold`, `cache`, `tier`, `outcome`, `reason`, and `kind` —
-/// `org_id` never appears on metrics (30k orgs would explode the timeseries count); org-level
-/// visibility comes from traces and logs.
+/// Tag policy: only `rpc`, `status`, `cold`, `cache`, `tier`, `outcome`, `reason`, `kind`, and
+/// `leg` — `org_id` never appears on metrics (30k orgs would explode the timeseries count).
+/// Org-level visibility comes from traces and logs.
 pub struct Metrics {
     client: StatsdClient,
 }
@@ -365,7 +181,7 @@ impl fmt::Debug for Metrics {
 }
 
 impl Metrics {
-    /// Metric name prefix; cadence joins it to every key with a dot.
+    /// Metric name prefix. cadence joins it to every key with a dot.
     const PREFIX: &'static str = "search_api";
 
     /// No-op metrics for tests, local runs, and the disabled mode.
@@ -375,8 +191,8 @@ impl Metrics {
         }
     }
 
-    /// Metrics over an arbitrary sink; used by unit tests with cadence's `SpyMetricSink`.
-    pub fn from_sink<S: MetricSink + Send + Sync + 'static>(sink: S) -> Self {
+    /// Metrics over an arbitrary sink. Used by unit tests with cadence's `SpyMetricSink`.
+    pub fn from_sink<S: MetricSink + Send + Sync + std::panic::RefUnwindSafe + 'static>(sink: S) -> Self {
         Self {
             client: with_default_tags(StatsdClient::builder(Self::PREFIX, sink)).build(),
         }
@@ -386,7 +202,7 @@ impl Metrics {
     ///
     /// Constant tags `env`, `service`, and `version` are taken from `DD_ENV`, `DD_SERVICE` (or
     /// `OTEL_SERVICE_NAME`), and `DD_VERSION` when set. Any socket or sink failure degrades to
-    /// the no-op client with a warning; metric emission never blocks and never fails requests.
+    /// the no-op client with a warning. Metric emission never blocks and never fails requests.
     pub fn dogstatsd(addr: &str) -> Self {
         let sink = match build_udp_sink(addr) {
             Ok(sink) => sink,
@@ -422,7 +238,7 @@ impl Metrics {
         }
     }
 
-    /// Latency of one dataset resolution; `cold` marks resolutions that actually opened the
+    /// Latency of one dataset resolution. `cold` marks resolutions that actually opened the
     /// dataset instead of hitting the handle cache.
     pub fn dataset_open(&self, cold: bool, duration: Duration) {
         self.client
@@ -433,9 +249,7 @@ impl Metrics {
 
     /// Current size of the open-dataset-handle LRU.
     pub fn dataset_handles(&self, entries: u64) {
-        self.client
-            .gauge_with_tags("cache.handles.entries", entries)
-            .send();
+        self.client.gauge_with_tags("cache.handles.entries", entries).send();
     }
 
     /// One cache lookup outcome.
@@ -507,12 +321,53 @@ impl Metrics {
 
     /// Indexes successfully warmed by one Prewarm call.
     pub fn prewarm_indexes_warmed(&self, count: u64) {
-        self.client.count_with_tags("prewarm.indexes_warmed", count as i64).send();
+        self.client
+            .count_with_tags("prewarm.indexes_warmed", count as i64)
+            .send();
     }
 
     /// Approximate bytes resident in the index cache after one Prewarm call.
     pub fn prewarm_warmed_bytes(&self, bytes: u64) {
         self.client.distribution_with_tags("prewarm.warmed_bytes", bytes).send();
+    }
+
+    /// Width of one date-range fan-out: how many per-day datasets actually served the query.
+    pub fn fanout_legs(&self, leg: FanoutLeg, legs: u64) {
+        self.client
+            .distribution_with_tags("fanout.legs", legs)
+            .with_tag("leg", leg.as_tag())
+            .send();
+    }
+
+    /// Latency of one per-day leg of a fan-out search.
+    pub fn fanout_leg_duration(&self, leg: FanoutLeg, duration: Duration) {
+        self.client
+            .distribution_with_tags("fanout.leg.duration_ms", millis(duration))
+            .with_tag("leg", leg.as_tag())
+            .send();
+    }
+
+    /// Duplicate hits folded into a surviving hit by the dedup merge of one fan-out search.
+    pub fn fanout_dedup_dropped(&self, leg: FanoutLeg, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.client
+            .count_with_tags("fanout.dedup.dropped", count as i64)
+            .with_tag("leg", leg.as_tag())
+            .send();
+    }
+
+    /// Duration of reading the IVF centroids for one Clusters call.
+    pub fn clusters_read(&self, duration: Duration) {
+        self.client
+            .distribution_with_tags("clusters.read.duration_ms", millis(duration))
+            .send();
+    }
+
+    /// Number of centroids returned by one Clusters call.
+    pub fn clusters_centroids(&self, count: u64) {
+        self.client.distribution_with_tags("clusters.centroids", count).send();
     }
 }
 
@@ -535,7 +390,7 @@ fn with_default_tags(mut builder: cadence::StatsdClientBuilder) -> cadence::Stat
     builder
 }
 
-/// Builds the buffered UDP sink behind a bounded queue; emission never blocks the caller.
+/// Builds the buffered UDP sink behind a bounded queue. Emission never blocks the caller.
 fn build_udp_sink(addr: &str) -> std::io::Result<QueuingMetricSink> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
     socket.set_nonblocking(true)?;
@@ -569,6 +424,8 @@ mod tests {
         metrics.cache_lookup(CacheName::Index, Tier::Disk, true);
         metrics.cache_disk_gauges(CacheName::Store, 10, 2);
         metrics.prewarm(PrewarmStatus::Partial, Duration::from_millis(5));
+        metrics.fanout_legs(FanoutLeg::Vector, 3);
+        metrics.clusters_read(Duration::from_millis(2));
     }
 
     #[test]
@@ -577,11 +434,9 @@ mod tests {
         metrics.rpc(Rpc::HybridSearch, "ok", Duration::from_millis(12));
         let lines = drain();
         assert!(
-            lines
-                .iter()
-                .any(|line| line.starts_with("search_api.rpc.requests:1|c")
-                    && line.contains("rpc:hybrid_search")
-                    && line.contains("status:ok")),
+            lines.iter().any(|line| line.starts_with("search_api.rpc.requests:1|c")
+                && line.contains("rpc:hybrid_search")
+                && line.contains("status:ok")),
             "unexpected lines: {lines:?}"
         );
         assert!(
@@ -624,7 +479,10 @@ mod tests {
         metrics.prewarm_warmed_bytes(1024);
         let lines = drain();
         let expect = [
-            ("search_api.cache.lookup:1|c", vec!["cache:index", "tier:memory", "outcome:miss"]),
+            (
+                "search_api.cache.lookup:1|c",
+                vec!["cache:index", "tier:memory", "outcome:miss"],
+            ),
             ("search_api.cache.insert_bytes:256|c", vec!["cache:store", "tier:disk"]),
             ("search_api.cache.evictions:3|c", vec!["cache:index", "reason:ttl"]),
             ("search_api.cache.serialize_errors:1|c", vec!["cache:index"]),
@@ -649,22 +507,50 @@ mod tests {
     }
 
     #[test]
+    fn fanout_and_clusters_metrics_render_expected_tags() {
+        let (metrics, drain) = spy_metrics();
+        metrics.fanout_legs(FanoutLeg::Vector, 3);
+        metrics.fanout_leg_duration(FanoutLeg::Hybrid, Duration::from_millis(6));
+        metrics.fanout_dedup_dropped(FanoutLeg::Text, 4);
+        metrics.fanout_dedup_dropped(FanoutLeg::Text, 0);
+        metrics.clusters_read(Duration::from_millis(9));
+        metrics.clusters_centroids(256);
+        let lines = drain();
+        let expect = [
+            ("search_api.fanout.legs:3|d", vec!["leg:vector"]),
+            ("search_api.fanout.leg.duration_ms:6|d", vec!["leg:hybrid"]),
+            ("search_api.fanout.dedup.dropped:4|c", vec!["leg:text"]),
+            ("search_api.clusters.read.duration_ms:9|d", vec![]),
+            ("search_api.clusters.centroids:256|d", vec![]),
+        ];
+        for (head, tags) in expect {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.starts_with(head) && tags.iter().all(|tag| line.contains(tag))),
+                "missing {head} with {tags:?} in {lines:?}"
+            );
+        }
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("fanout.dedup.dropped"))
+                .count(),
+            1,
+            "zero-count dedup drops must not be emitted: {lines:?}"
+        );
+    }
+
+    #[test]
     fn tag_enums_render_expected_strings() {
         assert_eq!(Rpc::VectorSearch.as_tag(), "vector_search");
         assert_eq!(Rpc::Prewarm.as_tag(), "prewarm");
+        assert_eq!(Rpc::Clusters.as_tag(), "clusters");
         assert_eq!(CacheName::Handles.as_tag(), "handles");
         assert_eq!(Tier::Disk.as_tag(), "disk");
         assert_eq!(EvictionReason::Corrupt.as_tag(), "corrupt");
         assert_eq!(PrewarmStatus::Partial.as_tag(), "partial");
         assert_eq!(PrewarmIndexKind::Scalar.as_tag(), "scalar");
-    }
-
-    #[test]
-    fn init_tracing_disabled_is_idempotent_and_panic_free() {
-        let first = init_tracing(true);
-        let second = init_tracing(true);
-        tracing::info!(org_id = "org-test", "telemetry smoke event");
-        drop(second);
-        drop(first);
+        assert_eq!(FanoutLeg::Hybrid.as_tag(), "hybrid");
     }
 }

@@ -20,7 +20,7 @@ pub enum CompareOp {
     Ge,
 }
 
-/// A typed literal used in filter predicates; never interpreted as an expression.
+/// A typed literal used in filter predicates. Never interpreted as an expression.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     /// Boolean literal.
@@ -38,7 +38,7 @@ pub enum Literal {
 pub enum Filter {
     /// `column <op> value`.
     Compare {
-        /// Column name; validated against the dataset schema at translation time.
+        /// Column name. Validated against the dataset schema at translation time.
         column: String,
         /// Comparison operator.
         op: CompareOp,
@@ -47,35 +47,35 @@ pub enum Filter {
     },
     /// `column IN (values)` or, when negated, `column NOT IN (values)`.
     InList {
-        /// Column name; validated against the dataset schema at translation time.
+        /// Column name. Validated against the dataset schema at translation time.
         column: String,
-        /// Candidate values; must be non-empty.
+        /// Candidate values. Must be non-empty.
         values: Vec<Literal>,
         /// When true, the predicate is `NOT IN`.
         negated: bool,
     },
     /// `column IS NULL`.
     IsNull {
-        /// Column name; validated against the dataset schema at translation time.
+        /// Column name. Validated against the dataset schema at translation time.
         column: String,
     },
     /// `column IS NOT NULL`.
     IsNotNull {
-        /// Column name; validated against the dataset schema at translation time.
+        /// Column name. Validated against the dataset schema at translation time.
         column: String,
     },
     /// `low <= column <= high` (inclusive bounds).
     Between {
-        /// Column name; validated against the dataset schema at translation time.
+        /// Column name. Validated against the dataset schema at translation time.
         column: String,
         /// Inclusive lower bound.
         low: Literal,
         /// Inclusive upper bound.
         high: Literal,
     },
-    /// All child filters must hold; must be non-empty.
+    /// All child filters must hold. Must be non-empty.
     And(Vec<Filter>),
-    /// At least one child filter must hold; must be non-empty.
+    /// At least one child filter must hold. Must be non-empty.
     Or(Vec<Filter>),
     /// The child filter must not hold.
     Not(Box<Filter>),

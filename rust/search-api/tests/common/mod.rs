@@ -21,9 +21,18 @@ use object_store::{
     PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
 };
 use search_api::config::Config;
+use search_api::domain::DatasetTarget;
 
 /// Vector dimension of the test dataset.
 pub const DIM: i32 = 4;
+
+/// The org/tenant/namespace every disk-cache test dataset lives under.
+pub fn test_target() -> DatasetTarget {
+    DatasetTarget::new("org1", "tenant1", "ns1")
+}
+
+/// Relative dataset path of [`test_target`] under the base URI.
+pub const TEST_DATASET_PATH: &str = "org1/tenant1/ns1.lance";
 
 /// Reads that reached the real (wrapped) object store, bucketed by path class.
 #[derive(Debug, Default)]
@@ -47,7 +56,7 @@ impl ReadCounts {
     }
 }
 
-/// Wrapper installing a [`CountingStore`] around the real store; chain it *inside* the metadata
+/// Wrapper installing a [`CountingStore`] around the real store. Chain it *inside* the metadata
 /// byte cache so it only sees reads that the cache did not serve from disk.
 #[derive(Debug)]
 pub struct CountingWrapper {
@@ -219,7 +228,7 @@ pub async fn build_indexed_dataset(uri: &str) {
 /// optimized paths that bypass them).
 pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) -> Config {
     Config {
-        base_uri_template: format!("file-object-store://{}/{{org_id}}.lance", dataset_root.display()),
+        base_uri: format!("file-object-store://{}", dataset_root.display()),
         dataset_cache_capacity: 16,
         index_cache_bytes: 64 * 1024 * 1024,
         metadata_cache_bytes: 64 * 1024 * 1024,
@@ -232,6 +241,10 @@ pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) 
         disk_cache_sweep_secs: 300,
         disk_cache_disabled: false,
         prewarm_concurrency: 4,
+        fanout_concurrency: 8,
+        id_column: "vector_id".to_string(),
+        statsd_addr: "127.0.0.1:8125".to_string(),
+        telemetry_disabled: true,
     }
 }
 

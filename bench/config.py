@@ -2,7 +2,7 @@
 
 Defines :class:`BenchConfig`, the single dataclass shared by every benchmark phase, and the argparse parser for the
 ``python -m bench`` entry point. Every subcommand accepts the full flag set so one flag vector can drive the whole
-``all`` chain; each phase simply reads the fields it needs.
+``all`` chain. Each phase simply reads the fields it needs.
 """
 
 from __future__ import annotations
@@ -75,11 +75,11 @@ class BenchConfig:
 
     Attributes:
         command: The subcommand being executed.
-        dataset: Name of the registered dataset adapter driving the run; defaults to the canonical SIFT1M corpus.
+        dataset: Name of the registered dataset adapter driving the run. Defaults to the canonical SIFT1M corpus.
         workspace: Directory holding downloaded data, prepared artifacts, the Iceberg warehouse, and Lance datasets.
         results_root: Directory under which per-run result directories are created.
-        run_id: Identifier of the current run; one run directory aggregates every phase's artifacts.
-        limit: Number of base vectors to benchmark; the full corpus is 1M.
+        run_id: Identifier of the current run. One run directory aggregates every phase's artifacts.
+        limit: Number of base vectors to benchmark. The full corpus is 1M.
         tenants: Number of org datasets the vectors are split into round-robin.
         seed: Master seed for k-means sampling, vocabulary, and text generation.
         num_clusters: Coarse k-means cluster count driving the synthetic text vocabularies.
@@ -87,14 +87,14 @@ class BenchConfig:
         common_words: Size of the shared common-word pool mixed into every document.
         words_per_text: Cluster-specific words per document.
         rows_per_slice: Base vectors generated per Spark task during prepare.
-        batches: Sequential ETL merge batches during ingest; values above 1 create extra fragments for compaction.
+        batches: Sequential ETL merge batches during ingest. Values above 1 create extra fragments for compaction.
         etl_partitions: Shuffle partition count handed to the ETL job.
-        ivf_partitions: Explicit IVF partition count; ``None`` uses the indexer's size-aware policy.
+        ivf_partitions: Explicit IVF partition count. ``None`` uses the indexer's size-aware policy.
         num_shards: Parallel segment builders per dataset during indexing.
-        vector_row_floor: Row floor below which the vector index is skipped; lowered from the production default so
+        vector_row_floor: Row floor below which the vector index is skipped. Lowered from the production default so
             small ``--limit`` runs still build an index.
         fts_with_position: Store token positions in the inverted index.
-        compact_target_rows: Target rows per fragment for compaction; ``None`` uses the Lance default.
+        compact_target_rows: Target rows per fragment for compaction. ``None`` uses the Lance default.
         iceberg_package: Maven coordinates of the Iceberg Spark runtime resolved at session start.
         spark_master: Spark master URL.
         driver_memory: Spark driver memory for the local-mode JVM.
@@ -102,9 +102,9 @@ class BenchConfig:
         table_name: Bare Iceberg table name under ``<catalog>.db``.
         endpoint: gRPC endpoint of the Rust search service.
         nprobes: Probed-partition sweep values for the recall mode.
-        refine_factors: Refine-factor sweep values; ``None`` disables re-ranking.
-        search_k: Neighbors requested per query; must cover the deepest recall cut-off.
-        max_queries: Cap on query vectors per sweep point; ``None`` sends all 10k.
+        refine_factors: Refine-factor sweep values. ``None`` disables re-ranking.
+        search_k: Neighbors requested per query. Must cover the deepest recall cut-off.
+        max_queries: Cap on query vectors per sweep point. ``None`` sends all 10k.
         fts_query_count: Synthetic full-text queries in the FTS leg.
         hybrid_query_count: Queries in the hybrid (vector + text, RRF) leg.
         concurrency: ghz concurrency levels for the load mode.
@@ -113,7 +113,7 @@ class BenchConfig:
         prewarm: Call the prewarm hook before timing first queries.
         sha256: Optional pinned checksum for the downloaded sift archive.
         force: Rebuild prepared artifacts even when a manifest already exists.
-        warmup_queries: Queries issued at the maximum nprobes before the timed sweep; set to 0 to skip warmup.
+        warmup_queries: Queries issued at the maximum nprobes before the timed sweep. Set to 0 to skip warmup.
     """
 
     command: str
@@ -203,7 +203,7 @@ class BenchConfig:
     def prepared_key(self) -> str:
         """Return the cache key identifying one prepared corpus shape.
 
-        The default ``sift1m`` dataset keeps its historical un-prefixed key; other datasets are prefixed with their
+        The default ``sift1m`` dataset keeps its historical un-prefixed key. Other datasets are prefixed with their
         adapter name so prepared artifacts never collide across datasets.
 
         Returns:

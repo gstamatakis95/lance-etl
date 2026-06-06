@@ -1,36 +1,40 @@
 //! Lance implementation of the domain [`Prewarmer`] trait.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use lance::Dataset;
 use lance::index::DatasetIndexExt;
 use lance_index::{FtsPrewarmOptions, PrewarmOptions, is_system_index};
 use tracing::Instrument;
 
-use crate::domain::{PrewarmReport, PrewarmSpec, PrewarmedIndex, Prewarmer, SearchError};
+use crate::domain::{DatasetTarget, PrewarmReport, PrewarmSpec, PrewarmedIndex, Prewarmer, SearchError};
 use crate::lance::backend::LanceSearchBackend;
 use crate::lance::error::classify_lance_error;
 use crate::lance::provider::DatasetProvider;
 use crate::telemetry::{Metrics, PrewarmIndexKind, PrewarmStatus};
 
 /// Type-URL suffix marking inverted (FTS) index segments in the manifest.
-const INVERTED_DETAILS_SUFFIX: &str = "InvertedIndexDetails";
+pub(crate) const INVERTED_DETAILS_SUFFIX: &str = "InvertedIndexDetails";
 
 /// Type-URL suffix marking vector index segments in the manifest.
-const VECTOR_DETAILS_SUFFIX: &str = "VectorIndexDetails";
+pub(crate) const VECTOR_DETAILS_SUFFIX: &str = "VectorIndexDetails";
 
-/// Warms one org's caches by opening the dataset through the shared session (manifest,
-/// transaction, and index-listing metadata) and then prewarming the requested indexes.
+/// Warms one dataset's caches by opening it through the shared session (manifest, transaction,
+/// and index-listing metadata) and then prewarming the requested indexes.
+///
+/// The target must address exactly one dataset: a date range, when present, has to cover a
+/// single day.
 ///
 /// Memory budget note: BTree/IVF prewarm loads every page/partition. With the disk index cache
 /// backend the in-memory hot tier evicts under its Moka budget while the serialized copies stay
 /// on disk, which is exactly the desired outcome for cold-process warmups.
 impl<P: DatasetProvider> Prewarmer for LanceSearchBackend<P> {
-    #[tracing::instrument(name = "backend.prewarm", skip_all, fields(org_id = %org_id))]
-    async fn prewarm(&self, org_id: &str, spec: PrewarmSpec) -> Result<PrewarmReport, SearchError> {
+    #[tracing::instrument(name = "backend.prewarm", skip_all, fields(org_id = %target.org_id))]
+    async fn prewarm(&self, target: &DatasetTarget, spec: PrewarmSpec) -> Result<PrewarmReport, SearchError> {
         let total_start = Instant::now();
-        let dataset = match self.provider.dataset(org_id).await {
+        let date = target.single_date()?;
+        let dataset = match self.provider.dataset(target, date).await {
             Ok(dataset) => dataset,
             Err(error) => {
                 self.metrics.prewarm(PrewarmStatus::Error, total_start.elapsed());
@@ -65,7 +69,7 @@ impl<P: DatasetProvider> Prewarmer for LanceSearchBackend<P> {
         self.metrics.prewarm_indexes_warmed(warmed);
         self.metrics.prewarm_warmed_bytes(report.index_cache_size_bytes);
         tracing::info!(
-            org_id = %org_id,
+            org_id = %target.org_id,
             status = status.as_tag(),
             indexes_warmed = warmed,
             duration_ms = report.total_duration.as_millis() as u64,
@@ -84,7 +88,7 @@ fn index_kind(details_type_url: Option<&str>) -> PrewarmIndexKind {
     }
 }
 
-/// Prewarms the indexes selected by the spec with bounded concurrency; per-index failures are
+/// Prewarms the indexes selected by the spec with bounded concurrency. Per-index failures are
 /// reported in the result instead of failing the whole org.
 async fn prewarm_indexes(
     dataset: &Arc<Dataset>,
@@ -112,7 +116,16 @@ async fn prewarm_indexes(
         let span = tracing::info_span!("prewarm.index", index.name = %name, index.kind = kind.as_tag());
         tasks.spawn(
             async move {
-                let permit = semaphore.acquire_owned().await;
+                let permit = match semaphore.acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        return PrewarmedIndex {
+                            name,
+                            duration: Duration::ZERO,
+                            error: Some("prewarm semaphore closed before the index could be warmed".to_string()),
+                        };
+                    }
+                };
                 let start = Instant::now();
                 let outcome = if with_position {
                     dataset

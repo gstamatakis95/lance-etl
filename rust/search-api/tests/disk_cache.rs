@@ -7,7 +7,9 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{CountingWrapper, ReadCounts, bin_file_count, build_indexed_dataset, test_config};
+use common::{
+    CountingWrapper, ReadCounts, TEST_DATASET_PATH, bin_file_count, build_indexed_dataset, test_config, test_target,
+};
 use search_api::domain::{PrewarmSpec, Prewarmer, SearchBackend, TextQuery, VectorQuery};
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
 use tempfile::TempDir;
@@ -35,14 +37,14 @@ fn vector_query() -> VectorQuery {
 async fn cold_process_serves_searches_from_disk_caches() {
     let data_tmp = TempDir::new().unwrap();
     let cache_tmp = TempDir::new().unwrap();
-    let uri = format!("file-object-store://{}/org1.lance", data_tmp.path().display());
+    let uri = format!("file-object-store://{}/{TEST_DATASET_PATH}", data_tmp.path().display());
     build_indexed_dataset(&uri).await;
     let config = test_config(data_tmp.path(), cache_tmp.path());
 
     let (backend_a, counts_a) = build_backend(&config);
     let report = backend_a
         .prewarm(
-            "org1",
+            &test_target(),
             PrewarmSpec {
                 metadata: true,
                 all_indexes: true,
@@ -57,11 +59,11 @@ async fn cold_process_serves_searches_from_disk_caches() {
     assert!(report.indexes.iter().all(|index| index.error.is_none()), "{report:?}");
 
     let hits = backend_a
-        .text_search("org1", TextQuery::simple("lemon", 3))
+        .text_search(&test_target(), TextQuery::simple("lemon", 3))
         .await
         .unwrap();
     assert_eq!(hits.len(), 1);
-    let hits = backend_a.vector_search("org1", vector_query()).await.unwrap();
+    let hits = backend_a.vector_search(&test_target(), vector_query()).await.unwrap();
     assert_eq!(hits.len(), 2);
     let (_, _, data_a) = counts_a.snapshot();
     assert!(
@@ -71,7 +73,7 @@ async fn cold_process_serves_searches_from_disk_caches() {
 
     let index_tier = cache_tmp
         .path()
-        .join(search_api::lance::cache_layout::stamp_dir_name())
+        .join(search_api::cache::layout::stamp_dir_name())
         .join("index");
     assert!(
         bin_file_count(&index_tier) > 0,
@@ -82,7 +84,7 @@ async fn cold_process_serves_searches_from_disk_caches() {
 
     let (backend_b, counts_b) = build_backend(&config);
     let hits = backend_b
-        .text_search("org1", TextQuery::simple("lemon", 3))
+        .text_search(&test_target(), TextQuery::simple("lemon", 3))
         .await
         .unwrap();
     assert_eq!(hits.len(), 1);
@@ -96,7 +98,7 @@ async fn cold_process_serves_searches_from_disk_caches() {
         "cold process must serve manifest bytes from the disk cache"
     );
 
-    let hits = backend_b.vector_search("org1", vector_query()).await.unwrap();
+    let hits = backend_b.vector_search(&test_target(), vector_query()).await.unwrap();
     assert_eq!(hits.len(), 2);
     let (_, _, data_b) = counts_b.snapshot();
     assert!(data_b > 0, "flat vector scans must read data/ from the real store");
@@ -106,7 +108,7 @@ async fn cold_process_serves_searches_from_disk_caches() {
 async fn tiny_budget_sweep_keeps_cache_within_bounds_and_searches_correct() {
     let data_tmp = TempDir::new().unwrap();
     let cache_tmp = TempDir::new().unwrap();
-    let uri = format!("file-object-store://{}/org1.lance", data_tmp.path().display());
+    let uri = format!("file-object-store://{}/{TEST_DATASET_PATH}", data_tmp.path().display());
     build_indexed_dataset(&uri).await;
     let mut config = test_config(data_tmp.path(), cache_tmp.path());
     config.disk_index_cache_bytes = 4096;
@@ -119,7 +121,7 @@ async fn tiny_budget_sweep_keeps_cache_within_bounds_and_searches_correct() {
     let backend = LanceSearchBackend::new(provider);
     backend
         .prewarm(
-            "org1",
+            &test_target(),
             PrewarmSpec {
                 metadata: true,
                 all_indexes: true,
@@ -141,7 +143,7 @@ async fn tiny_budget_sweep_keeps_cache_within_bounds_and_searches_correct() {
     );
 
     let hits = backend
-        .text_search("org1", TextQuery::simple("lemon", 3))
+        .text_search(&test_target(), TextQuery::simple("lemon", 3))
         .await
         .unwrap();
     assert_eq!(
@@ -149,6 +151,6 @@ async fn tiny_budget_sweep_keeps_cache_within_bounds_and_searches_correct() {
         1,
         "searches must still be correct after eviction (misses reload)"
     );
-    let hits = backend.vector_search("org1", vector_query()).await.unwrap();
+    let hits = backend.vector_search(&test_target(), vector_query()).await.unwrap();
     assert_eq!(hits.len(), 2);
 }

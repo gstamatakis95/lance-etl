@@ -23,7 +23,7 @@ pub trait Fusion: Send + Sync {
 pub enum FusionSpec {
     /// Reciprocal-rank fusion with the given rank-smoothing constant.
     Rrf {
-        /// Rank-smoothing constant; must be positive.
+        /// Rank-smoothing constant. Must be positive.
         rrf_k: f64,
     },
 }
@@ -35,7 +35,7 @@ impl Default for FusionSpec {
 }
 
 impl FusionSpec {
-    /// Instantiates the strategy described by this spec; new strategies slot in here.
+    /// Instantiates the strategy described by this spec. New strategies slot in here.
     pub fn build(&self) -> Box<dyn Fusion> {
         match self {
             Self::Rrf { rrf_k } => Box::new(RrfFusion { rrf_k: *rrf_k }),

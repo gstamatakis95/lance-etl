@@ -2,17 +2,22 @@
 
 Four legs run against the per-tenant datasets through the real server:
 
-- recall: the SIFT query vectors sweep ``nprobes x refine_factor``; recall@1/@10/@100 is computed against the prepared
+- recall: the SIFT query vectors sweep ``nprobes x refine_factor``. Recall@1/@10/@100 is computed against the prepared
   ground truth and per-config latency statistics are recorded.
 - fts: deterministic synthetic text queries drawn from the cluster vocabularies measure BM25 latency and the
   cluster-consistency hit rate (the fraction of hits whose vector belongs to the queried cluster).
-- hybrid: vector + text legs fused with reciprocal-rank fusion; latency and fused recall@10 are recorded.
+- hybrid: vector + text legs fused with reciprocal-rank fusion. Latency and fused recall@10 are recorded.
 - load: when the external ``ghz`` binary is on PATH, sustained QPS and p50/p95/p99 latency are measured per
-  ``--concurrency`` level with the raw ghz JSON written into the run directory; absent ghz the leg is skipped with a
+  ``--concurrency`` level with the raw ghz JSON written into the run directory. Absent ghz the leg is skipped with a
   clear message.
+- clusters: the ``Clusters`` rpc is probed once per org, checking that the centroid count equals the reported
+  ``num_partitions`` and that the centroid dimension equals the dataset's vector dimension.
 
-Cold-vs-warm first-query latency is always recorded per org; ``--prewarm`` additionally calls the prewarm hook (a
-documented no-op until the proto grows a Prewarm rpc).
+Every request addresses its dataset through a ``DatasetTarget`` (org, fixed tenant, fixed namespace) matching the
+layout ingest writes. Cold-vs-warm first-query latency is always recorded per org. With ``--prewarm`` the real
+``Prewarm`` rpc runs before each org's first timed query, so ``cold_ms`` then measures the first query against
+prewarmed caches rather than a raw cold start. A true cold-vs-prewarmed comparison therefore needs two fresh server
+processes with empty cache directories: one search run without ``--prewarm`` and one with it.
 """
 
 from __future__ import annotations
@@ -26,9 +31,11 @@ from typing import Any
 
 import numpy as np
 
-from bench.config import PROTO_PATH, BenchConfig
+from bench.config import NAMESPACE, PROTO_PATH, TENANT_ID, BenchConfig
 from bench.groundtruth import recall_at
 from bench.grpc_client import (
+    dataset_target,
+    fetch_clusters,
     generate_stubs,
     load_stubs,
     open_stub,
@@ -100,18 +107,23 @@ def measure_first_queries(stub: Any, pb2: Any, config: BenchConfig, queries: np.
         queries: The query matrix.
 
     Returns:
-        Per-org cold and warm latencies in milliseconds.
+        Per-org cold and warm latencies in milliseconds, plus the prewarm rpc outcome when ``--prewarm`` is set.
+        ``cold_ms`` is the first query this client sends per org. On a fresh server with an empty cache directory it
+        measures a raw cold start without ``--prewarm`` and a post-Prewarm first query with it.
     """
     timings: dict[str, Any] = {}
     for org in config.org_ids():
+        prewarm_outcome: dict[str, Any] | None = None
         if config.prewarm:
-            prewarm_dataset(stub, pb2, org)
+            prewarm_outcome = prewarm_dataset(stub, pb2, org, fts_with_position=config.fts_with_position)
         request = pb2.VectorSearchRequest(
-            org_id=org, query=vector_query(pb2, queries[0], 10, config.load_nprobes, None)
+            target=dataset_target(pb2, org), query=vector_query(pb2, queries[0], 10, config.load_nprobes, None)
         )
         unused, cold_ms = timed_call(stub.VectorSearch, request)
         unused, warm_ms = timed_call(stub.VectorSearch, request)
         timings[org] = {"cold_ms": round(cold_ms, 3), "warm_ms": round(warm_ms, 3), "prewarmed": config.prewarm}
+        if prewarm_outcome is not None:
+            timings[org]["prewarm"] = prewarm_outcome
     return timings
 
 
@@ -144,7 +156,7 @@ def sweep_point(
         retrieved: list[np.ndarray] = []
         for query in queries:
             request = pb2.VectorSearchRequest(
-                org_id=org, query=vector_query(pb2, query, config.search_k, nprobes, refine_factor)
+                target=dataset_target(pb2, org), query=vector_query(pb2, query, config.search_k, nprobes, refine_factor)
             )
             response, elapsed_ms = timed_call(stub.VectorSearch, request)
             latencies.append(elapsed_ms)
@@ -203,7 +215,8 @@ def run_fts_leg(stub: Any, pb2: Any, config: BenchConfig, artifacts: dict[str, A
         cluster: int = query_index % len(cluster_vocab)
         org: str = orgs[query_index % len(orgs)]
         request = pb2.TextSearchRequest(
-            org_id=org, query=text_query(pb2, fts_terms(config, cluster_vocab, query_index, cluster), 10)
+            target=dataset_target(pb2, org),
+            query=text_query(pb2, fts_terms(config, cluster_vocab, query_index, cluster), 10),
         )
         response, elapsed_ms = timed_call(stub.TextSearch, request)
         latencies.append(elapsed_ms)
@@ -247,7 +260,7 @@ def run_hybrid_leg(stub: Any, pb2: Any, config: BenchConfig, artifacts: dict[str
         expected: np.ndarray = ground_truth[org][query_index]
         cluster: int = int(clusters[int(expected[0])])
         request = pb2.HybridSearchRequest(
-            org_id=org,
+            target=dataset_target(pb2, org),
             vector=vector_query(pb2, queries[query_index], 0, config.load_nprobes, None),
             text=text_query(pb2, fts_terms(config, cluster_vocab, query_index, cluster), 0),
             k=10,
@@ -259,6 +272,73 @@ def run_hybrid_leg(stub: Any, pb2: Any, config: BenchConfig, artifacts: dict[str
         "queries": count,
         "recall_at_10": round(float(np.mean(recalls)), 4) if recalls else 0.0,
         **latency_stats(latencies),
+    }
+
+
+def run_clusters_probe(stub: Any, pb2: Any, config: BenchConfig, dimension: int) -> dict[str, Any]:
+    """Probe the ``Clusters`` rpc once per org and validate the reported IVF geometry.
+
+    For each org the probe checks that the centroid count equals the response's ``num_partitions``, that the reported
+    ``dimension`` equals the dataset's vector dimension, and that every centroid carries that many components.
+
+    Args:
+        stub: The connected service stub.
+        pb2: The generated proto module.
+        config: Benchmark configuration.
+        dimension: The dataset's vector dimension.
+
+    Returns:
+        Per-org probe outcomes and an overall ``ok`` flag.
+    """
+    orgs: dict[str, Any] = {}
+    overall_ok: bool = True
+    for org in config.org_ids():
+        try:
+            response, elapsed_ms = fetch_clusters(stub, pb2, org)
+        except Exception as error:
+            overall_ok = False
+            orgs[org] = {"ok": False, "error": str(error)[:500]}
+            continue
+        count_matches: bool = len(response.clusters) == int(response.num_partitions)
+        dimension_matches: bool = int(response.dimension) == dimension
+        centroid_lengths_match: bool = all(len(cluster.centroid) == dimension for cluster in response.clusters)
+        ok: bool = count_matches and dimension_matches and centroid_lengths_match
+        overall_ok = overall_ok and ok
+        orgs[org] = {
+            "ok": ok,
+            "index_name": response.index_name,
+            "num_partitions": int(response.num_partitions),
+            "clusters": len(response.clusters),
+            "dimension": int(response.dimension),
+            "expected_dimension": dimension,
+            "count_matches": count_matches,
+            "dimension_matches": dimension_matches,
+            "centroid_lengths_match": centroid_lengths_match,
+            "duration_ms": round(elapsed_ms, 3),
+        }
+    return {"ok": overall_ok, "orgs": orgs}
+
+
+def ghz_payload(sample_vector: np.ndarray, nprobes: int, org_id: str = "org0") -> dict[str, Any]:
+    """Build the JSON body ghz replays against ``VectorSearch``.
+
+    Args:
+        sample_vector: The query vector replayed by every request.
+        nprobes: Probed IVF partitions.
+        org_id: The targeted org.
+
+    Returns:
+        The protojson-compatible request body with the full ``DatasetTarget``.
+    """
+    return {
+        "target": {"org_id": org_id, "tenant_id": TENANT_ID, "namespace": NAMESPACE},
+        "query": {
+            "vector": [float(value) for value in sample_vector],
+            "k": 10,
+            "column": "vector",
+            "nprobes": nprobes,
+            "projection": ["vector_id"],
+        },
     }
 
 
@@ -299,18 +379,7 @@ def run_load_leg(config: BenchConfig, sample_vector: np.ndarray) -> dict[str, An
         logger.warning(message)
         return {"skipped": message}
     run_directory: Path = ensure_dir(config.run_dir())
-    payload: str = json.dumps(
-        {
-            "org_id": "org0",
-            "query": {
-                "vector": [float(value) for value in sample_vector],
-                "k": 10,
-                "column": "vector",
-                "nprobes": config.load_nprobes,
-                "projection": ["vector_id"],
-            },
-        }
-    )
+    payload: str = json.dumps(ghz_payload(sample_vector, config.load_nprobes))
     levels: list[dict[str, Any]] = []
     for concurrency in config.concurrency:
         output: Path = run_directory / f"ghz_c{concurrency}.json"
@@ -346,7 +415,7 @@ def run_load_leg(config: BenchConfig, sample_vector: np.ndarray) -> dict[str, An
 
 
 def run_search(config: BenchConfig) -> dict[str, Any]:
-    """Run the recall sweep and the FTS, hybrid, and load legs.
+    """Run the recall sweep, the FTS, hybrid, and load legs, and the clusters probe.
 
     Args:
         config: Benchmark configuration.
@@ -369,7 +438,7 @@ def run_search(config: BenchConfig) -> dict[str, Any]:
         for org in config.org_ids():
             for query in queries[:warmup_count]:
                 request = pb2.VectorSearchRequest(
-                    org_id=org, query=vector_query(pb2, query, config.search_k, max_nprobes, None)
+                    target=dataset_target(pb2, org), query=vector_query(pb2, query, config.search_k, max_nprobes, None)
                 )
                 timed_call(stub.VectorSearch, request)
     sweep: list[dict[str, Any]] = []
@@ -379,6 +448,7 @@ def run_search(config: BenchConfig) -> dict[str, Any]:
             sweep.append(sweep_point(stub, pb2, config, queries, artifacts["ground_truth"], nprobes, refine_factor))
     fts: dict[str, Any] = run_fts_leg(stub, pb2, config, artifacts)
     hybrid: dict[str, Any] = run_hybrid_leg(stub, pb2, config, artifacts)
+    clusters: dict[str, Any] = run_clusters_probe(stub, pb2, config, int(artifacts["queries"].shape[1]))
     load: dict[str, Any] = run_load_leg(config, queries[0])
     return save_phase(
         config,
@@ -389,6 +459,7 @@ def run_search(config: BenchConfig) -> dict[str, Any]:
             "sweep": sweep,
             "fts": fts,
             "hybrid": hybrid,
+            "clusters": clusters,
             "load": load,
         },
     )

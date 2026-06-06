@@ -22,7 +22,7 @@ def generate_words(rng: np.random.Generator, count: int, taken: set[str]) -> lis
     Args:
         rng: The seeded generator to draw letters from.
         count: Number of unique words to produce.
-        taken: Words already in use; extended in place with the new words.
+        taken: Words already in use. Extended in place with the new words.
 
     Returns:
         The freshly generated words.
@@ -127,7 +127,7 @@ def train_centroids(
 
     Args:
         sample: A ``(rows, dim)`` sample of the corpus vectors.
-        num_clusters: Desired centroid count; clamped to the sample size.
+        num_clusters: Desired centroid count. Clamped to the sample size.
         seed: Seed for initialization and minibatch sampling.
         iterations: Minibatch update rounds.
         batch_size: Rows per minibatch.

@@ -14,7 +14,7 @@ use lance_core::Result as LanceResult;
 use lance_core::cache::{CacheBackend, CacheCodec, CacheEntry, InternalCacheKey, MokaCacheBackend};
 use serde_json::Value;
 
-use crate::lance::cache_layout::{SweepStats, atomic_write, dir_stats, hash_hex, sweep_tier, touch_file};
+use crate::cache::layout::{SweepStats, atomic_write, dir_stats, hash_hex, sweep_tier, touch_file};
 use crate::telemetry::{CacheName, EvictionReason, Metrics, Tier};
 
 /// Sidecar file mapping full cache-key prefixes to their hashed directory names, enabling
@@ -24,7 +24,7 @@ const PREFIXES_FILE: &str = "prefixes.json";
 /// Hybrid disk + memory cache backend for the Lance index cache.
 ///
 /// Entries whose key carries a [`CacheCodec`] are serialized to files under the cache root and
-/// also kept in an in-memory hot tier; codec-less entries are delegated entirely to the inner
+/// also kept in an in-memory hot tier. Codec-less entries are delegated entirely to the inner
 /// Moka backend, as the [`CacheBackend`] contract requires. On-disk names bind the full
 /// `(prefix, key, type_name)` triple via blake3 hashes, so 30k org datasets share one cache
 /// without collision risk and per-dataset purges stay O(#prefixes-for-dataset).
@@ -128,7 +128,7 @@ impl DiskIndexCacheBackend {
         let _ = tokio::fs::remove_file(path).await;
     }
 
-    /// Reads and deserializes a disk entry; any failure deletes the file and reports a miss.
+    /// Reads and deserializes a disk entry. Any failure deletes the file and reports a miss.
     async fn read_disk_entry(&self, key: &InternalCacheKey, codec: &CacheCodec) -> Option<(CacheEntry, usize)> {
         let path = self.entry_path(key, false);
         let buf = match tokio::fs::read(&path).await {
@@ -138,22 +138,32 @@ impl DiskIndexCacheBackend {
         let size = buf.len();
         match codec.deserialize(&Bytes::from(buf)) {
             Ok(entry) => {
-                touch_file(&path);
+                drop(tokio::task::spawn_blocking(move || touch_file(&path)));
                 Some((entry, size))
             }
             Err(_) => {
                 self.drop_corrupt_entry(&path).await;
-                self.metrics.cache_evictions(CacheName::Index, EvictionReason::Corrupt, 1);
+                self.metrics
+                    .cache_evictions(CacheName::Index, EvictionReason::Corrupt, 1);
                 None
             }
         }
     }
 
-    /// Serializes and persists one entry; failures are swallowed so cache writes never fail loads.
+    /// Serializes and persists one entry. Failures are swallowed so cache writes never fail loads.
+    ///
+    /// Size accounting re-stats the file after the rename rather than trusting the buffer length.
+    /// On overwrite the old size is subtracted before the new size is added: the two atomics are
+    /// not updated as one transaction, so the ordering bounds the transient error to an undercount
+    /// (the janitor briefly under-evicts) instead of an overcount that could suppress eviction
+    /// while the tier is over budget. The janitor sweep fully reconciles any residual drift.
     async fn write_disk_entry(&self, key: &InternalCacheKey, entry: &CacheEntry, codec: &CacheCodec) {
         let mut buf = Vec::new();
         if codec.serialize(entry, &mut buf).is_err() {
-            tracing::warn!(cache.key_type = key.type_name(), "index cache entry failed to serialize, kept memory-only");
+            tracing::warn!(
+                cache.key_type = key.type_name(),
+                "index cache entry failed to serialize, kept memory-only"
+            );
             self.metrics.cache_serialize_error(CacheName::Index);
             return;
         }
@@ -161,14 +171,18 @@ impl DiskIndexCacheBackend {
         let old_len = tokio::fs::metadata(&path).await.map(|meta| meta.len()).ok();
         if atomic_write(&path, &buf).await.is_ok() {
             self.metrics.cache_insert_bytes(CacheName::Index, buf.len() as u64);
+            let new_on_disk = tokio::fs::metadata(&path)
+                .await
+                .map(|meta| meta.len())
+                .unwrap_or(buf.len() as u64);
             match old_len {
                 Some(old) => {
-                    self.disk_bytes.fetch_add(buf.len() as u64, Ordering::Relaxed);
                     self.disk_bytes
                         .fetch_sub(old.min(self.disk_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
+                    self.disk_bytes.fetch_add(new_on_disk, Ordering::Relaxed);
                 }
                 None => {
-                    self.disk_bytes.fetch_add(buf.len() as u64, Ordering::Relaxed);
+                    self.disk_bytes.fetch_add(new_on_disk, Ordering::Relaxed);
                     self.disk_entries.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -179,12 +193,8 @@ impl DiskIndexCacheBackend {
     /// then reconciles accounting and rewrites the prefix sidecar dropping empty directories.
     pub fn sweep(&self, ttl: Duration, budget_bytes: u64) -> SweepStats {
         let prefixes_path = self.root.join(PREFIXES_FILE);
-        let sidecar = std::fs::read(&prefixes_path).ok();
         let _ = std::fs::remove_file(&prefixes_path);
         let stats = sweep_tier(&self.root, ttl, budget_bytes, &self.disk_bytes, &self.disk_entries);
-        if let Some(bytes) = sidecar {
-            let _ = std::fs::write(&prefixes_path, bytes);
-        }
         let snapshot = {
             let mut map = self
                 .prefix_index
@@ -210,7 +220,8 @@ impl CacheBackend for DiskIndexCacheBackend {
         let span = tracing::Span::current();
         let Some(codec) = codec else {
             let entry = self.memory_tier.get(key, None).await;
-            self.metrics.cache_lookup(CacheName::Index, Tier::Memory, entry.is_some());
+            self.metrics
+                .cache_lookup(CacheName::Index, Tier::Memory, entry.is_some());
             span.record("cache.tier", "memory");
             span.record("cache.hit", entry.is_some());
             return entry;
@@ -245,6 +256,15 @@ impl CacheBackend for DiskIndexCacheBackend {
         }
     }
 
+    /// Single-flights the loader per key through an `inflight` map of per-key mutexes.
+    ///
+    /// The cleanup after `drop(guard)` relies on a strong-count invariant: the count is exactly 2
+    /// when only the `inflight` map entry and this task's local `lock` hold the Arc, and every
+    /// other task clones the Arc only while holding the `inflight` mutex — the same mutex held
+    /// here — so the count cannot change between the check and the `remove`. The local `lock` is
+    /// dropped only after `inflight.remove(key)`, intentionally, so the map entry is gone before
+    /// the Arc refcount can reach zero and any concurrent caller inserts a fresh entry instead of
+    /// resurrecting a dying one.
     #[tracing::instrument(
         name = "index_cache.get_or_insert",
         level = "trace",
@@ -356,7 +376,7 @@ impl CacheBackend for DiskIndexCacheBackend {
     }
 }
 
-/// Loads the prefix sidecar; missing or malformed files yield an empty map.
+/// Loads the prefix sidecar. Missing or malformed files yield an empty map.
 fn load_prefixes(path: &Path) -> HashMap<String, String> {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return HashMap::new();
@@ -370,7 +390,7 @@ fn load_prefixes(path: &Path) -> HashMap<String, String> {
         .collect()
 }
 
-/// Persists the prefix sidecar; failures are swallowed (the map is rebuilt on demand).
+/// Persists the prefix sidecar. Failures are swallowed (the map is rebuilt on demand).
 fn persist_prefixes(path: &Path, map: &HashMap<String, String>) {
     let object: serde_json::Map<String, Value> = map
         .iter()
@@ -438,7 +458,8 @@ mod tests {
     #[tokio::test]
     async fn insert_get_round_trip_persists_and_survives_reopen() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let backend = DiskIndexCacheBackend::open(tmp.path().to_path_buf(), 1024 * 1024, Arc::new(Metrics::disabled())).unwrap();
+        let backend =
+            DiskIndexCacheBackend::open(tmp.path().to_path_buf(), 1024 * 1024, Arc::new(Metrics::disabled())).unwrap();
         let codec = CacheCodec::from_impl::<Payload>();
         let cache_key = key("s3://bucket/ds.lance/", "page-0");
         let entry: CacheEntry = Arc::new(Payload(vec![7u8; 32]));
@@ -447,7 +468,8 @@ mod tests {
         let fetched = backend.get(&cache_key, Some(codec)).await.unwrap();
         assert_eq!(fetched.downcast_ref::<Payload>().unwrap().0, vec![7u8; 32]);
         drop(backend);
-        let reopened = DiskIndexCacheBackend::open(tmp.path().to_path_buf(), 1024 * 1024, Arc::new(Metrics::disabled())).unwrap();
+        let reopened =
+            DiskIndexCacheBackend::open(tmp.path().to_path_buf(), 1024 * 1024, Arc::new(Metrics::disabled())).unwrap();
         let fetched = reopened.get(&cache_key, Some(codec)).await.unwrap();
         assert_eq!(fetched.downcast_ref::<Payload>().unwrap().0, vec![7u8; 32]);
         assert!(reopened.approx_num_entries() >= 1);
@@ -456,7 +478,8 @@ mod tests {
     #[tokio::test]
     async fn codec_less_entries_stay_memory_only() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let backend = DiskIndexCacheBackend::open(tmp.path().to_path_buf(), 1024 * 1024, Arc::new(Metrics::disabled())).unwrap();
+        let backend =
+            DiskIndexCacheBackend::open(tmp.path().to_path_buf(), 1024 * 1024, Arc::new(Metrics::disabled())).unwrap();
         let cache_key = key("s3://bucket/ds.lance/", "opened-index");
         backend
             .insert(&cache_key, Arc::new(Payload(vec![1, 2, 3])), 3, None)
@@ -468,7 +491,8 @@ mod tests {
     #[tokio::test]
     async fn corrupt_file_is_a_miss_and_gets_deleted() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let backend = DiskIndexCacheBackend::open(tmp.path().to_path_buf(), 1024 * 1024, Arc::new(Metrics::disabled())).unwrap();
+        let backend =
+            DiskIndexCacheBackend::open(tmp.path().to_path_buf(), 1024 * 1024, Arc::new(Metrics::disabled())).unwrap();
         let codec = CacheCodec::new(
             |_, writer| {
                 writer.write_all(b"valid")?;
@@ -495,7 +519,8 @@ mod tests {
             })
             .unwrap();
         std::fs::write(bin, b"garbage").unwrap();
-        let fresh = DiskIndexCacheBackend::open(tmp.path().to_path_buf(), 1024 * 1024, Arc::new(Metrics::disabled())).unwrap();
+        let fresh =
+            DiskIndexCacheBackend::open(tmp.path().to_path_buf(), 1024 * 1024, Arc::new(Metrics::disabled())).unwrap();
         assert!(fresh.get(&cache_key, Some(codec)).await.is_none());
         assert_eq!(entry_file_count(tmp.path()), 0);
     }
@@ -503,7 +528,8 @@ mod tests {
     #[tokio::test]
     async fn invalidate_prefix_removes_dataset_and_index_scoped_entries() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let backend = DiskIndexCacheBackend::open(tmp.path().to_path_buf(), 1024 * 1024, Arc::new(Metrics::disabled())).unwrap();
+        let backend =
+            DiskIndexCacheBackend::open(tmp.path().to_path_buf(), 1024 * 1024, Arc::new(Metrics::disabled())).unwrap();
         let codec = CacheCodec::from_impl::<Payload>();
         let dataset_key = key("s3://bucket/ds.lance/", "manifest/3");
         let index_key = key("s3://bucket/ds.lance/uuid-1/", "page-0");
@@ -524,7 +550,9 @@ mod tests {
     #[tokio::test]
     async fn get_or_insert_runs_loader_at_most_once_under_concurrency() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let backend = Arc::new(DiskIndexCacheBackend::open(tmp.path().to_path_buf(), 1024 * 1024, Arc::new(Metrics::disabled())).unwrap());
+        let backend = Arc::new(
+            DiskIndexCacheBackend::open(tmp.path().to_path_buf(), 1024 * 1024, Arc::new(Metrics::disabled())).unwrap(),
+        );
         let codec = CacheCodec::from_impl::<Payload>();
         let cache_key = key("s3://bucket/ds.lance/", "page-shared");
         let loader_runs = Arc::new(AtomicUsize::new(0));
@@ -550,7 +578,8 @@ mod tests {
     #[tokio::test]
     async fn accounting_matches_directory_walk() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let backend = DiskIndexCacheBackend::open(tmp.path().to_path_buf(), 1024 * 1024, Arc::new(Metrics::disabled())).unwrap();
+        let backend =
+            DiskIndexCacheBackend::open(tmp.path().to_path_buf(), 1024 * 1024, Arc::new(Metrics::disabled())).unwrap();
         let codec = CacheCodec::from_impl::<Payload>();
         for index in 0..4 {
             backend

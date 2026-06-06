@@ -4,22 +4,50 @@ package lance_etl.search.v1;
 
 import "google/protobuf/struct.proto";
 
-// Search over per-organization Lance datasets: nearest-neighbor, full-text, and hybrid fusion.
+// Search over per-tenant Lance datasets: nearest-neighbor, full-text, and hybrid fusion.
 service SearchService {
-  // Nearest-neighbor search on a vector column of the org dataset.
+  // Nearest-neighbor search on a vector column of the target dataset(s).
   rpc VectorSearch(VectorSearchRequest) returns (VectorSearchResponse);
   // Full-text search via the INVERTED index.
   rpc TextSearch(TextSearchRequest) returns (TextSearchResponse);
   // Runs a vector leg and a text leg, then fuses the ranked lists with the configured strategy.
   rpc HybridSearch(HybridSearchRequest) returns (HybridSearchResponse);
-  // Proactively pulls one org's metadata and index structures into the local caches.
+  // Proactively pulls one dataset's metadata and index structures into the local caches.
   rpc Prewarm(PrewarmRequest) returns (PrewarmResponse);
+  // Reads the IVF cluster centroids of a vector index from the target dataset.
+  rpc Clusters(ClustersRequest) returns (ClustersResponse);
+}
+
+// An inclusive calendar-day range over date-partitioned datasets.
+message DateRange {
+  // First day, formatted YYYY-MM-DD (inclusive).
+  string start_date = 1;
+  // Last day, formatted YYYY-MM-DD (inclusive).
+  string end_date = 2;
+}
+
+// Addresses the dataset(s) a request operates on.
+//
+// Without date_range the target resolves to the single dataset at
+// {base}/{org_id}/{tenant_id}/{namespace}.lance. With date_range it resolves to one
+// date-partitioned dataset per day at {base}/{org_id}/{tenant_id}/{namespace}/{date}.lance,
+// skipping days whose dataset does not exist. Prewarm and Clusters accept at most a single-day
+// range.
+message DatasetTarget {
+  // Organization id. Must match [A-Za-z0-9_-]+.
+  string org_id = 1;
+  // Tenant id. Must match [A-Za-z0-9_-]+.
+  string tenant_id = 2;
+  // Namespace. Must match [A-Za-z0-9_-]+.
+  string namespace = 3;
+  // Optional day range selecting date-partitioned datasets.
+  DateRange date_range = 4;
 }
 
 // Request for SearchService.Prewarm.
 message PrewarmRequest {
-  // Organization whose dataset is prewarmed.
-  string org_id = 1;
+  // Dataset to prewarm. A date_range, when present, must cover exactly one day.
+  DatasetTarget target = 1;
   // Warm dataset metadata (manifest, transaction, index listing). Implied by warming any index.
   bool metadata = 2;
   // Warm all indexes of the dataset; ignored when index_names is non-empty.
@@ -28,6 +56,34 @@ message PrewarmRequest {
   repeated string index_names = 4;
   // Also pull FTS position data for inverted indexes (needed for phrase queries).
   bool fts_with_position = 5;
+}
+
+// Request for SearchService.Clusters.
+message ClustersRequest {
+  // Dataset whose vector index is read. A date_range, when present, must cover exactly one day.
+  DatasetTarget target = 1;
+  // Vector index to read. Defaults to the dataset's vector index when omitted.
+  optional string index_name = 2;
+}
+
+// Response for SearchService.Clusters.
+message ClustersResponse {
+  // IVF partitions in partition order.
+  repeated Cluster clusters = 1;
+  // Vector dimension of every centroid.
+  uint32 dimension = 2;
+  // Name of the index the centroids were read from.
+  string index_name = 3;
+  // Number of IVF partitions (equals the number of clusters).
+  uint32 num_partitions = 4;
+}
+
+// One IVF partition centroid.
+message Cluster {
+  // Partition id (0-based, in partition order).
+  uint32 id = 1;
+  // Centroid vector.
+  repeated float centroid = 2;
 }
 
 // Response for SearchService.Prewarm.
@@ -354,8 +410,8 @@ message RrfFusion {
 
 // Request for SearchService.VectorSearch.
 message VectorSearchRequest {
-  // Organization whose dataset is searched.
-  string org_id = 1;
+  // Dataset(s) to search.
+  DatasetTarget target = 1;
   // Nearest-neighbor query parameters.
   VectorQuery query = 2;
 }
@@ -376,8 +432,8 @@ message VectorSearchResult {
 
 // Request for SearchService.TextSearch.
 message TextSearchRequest {
-  // Organization whose dataset is searched.
-  string org_id = 1;
+  // Dataset(s) to search.
+  DatasetTarget target = 1;
   // Full-text query parameters.
   TextQuery query = 2;
 }
@@ -398,8 +454,8 @@ message TextSearchResult {
 
 // Request for SearchService.HybridSearch.
 message HybridSearchRequest {
-  // Organization whose dataset is searched.
-  string org_id = 1;
+  // Dataset(s) to search.
+  DatasetTarget target = 1;
   // Vector leg parameters.
   VectorQuery vector = 2;
   // Text leg parameters.

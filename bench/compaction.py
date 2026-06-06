@@ -2,8 +2,13 @@
 
 Records total wall time plus the fragment count of every dataset before and after the run. The fine-grained
 plan/execute/commit stage timings are emitted by ``lance_etl.compaction`` itself as Datadog distributions
-(``dataset.rewrite_ms``, ``dataset.commit_ms``); this phase records the end-to-end wall time and the per-dataset
+(``dataset.rewrite_ms``, ``dataset.commit_ms``). This phase records the end-to-end wall time and the per-dataset
 metrics dictionary the compactor returns (fragments removed/added, files removed/added, bytes reclaimed).
+
+Compaction runs with ``defer_index_remap=False`` so covering indices are remapped inline during the commit. The
+benchmark searches the datasets right after compacting, and on the pinned lance build the deferred
+``__lance_frag_reuse`` path leaves indexed vector queries failing with a missing-fragment take error, so the search
+phase must run against fully remapped indices.
 """
 
 from __future__ import annotations
@@ -49,6 +54,7 @@ def run_compact(config: BenchConfig) -> dict[str, Any]:
     compaction_config = CompactionConfig(
         telemetry=bench_telemetry_config(),
         target_rows_per_fragment=config.compact_target_rows,
+        defer_index_remap=False,
     )
     spark = build_spark(config, "bench-compact")
     try:

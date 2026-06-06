@@ -2,12 +2,13 @@
 
 Client stubs are generated at runtime with ``grpcio-tools`` from the repository's proto file. The proto is copied flat
 into a generation directory before compilation because its natural package path (``lance_etl/search/v1``) would
-collide with the installed ``lance_etl`` Python package; the flattened modules (``search_pb2`` / ``search_pb2_grpc``)
+collide with the installed ``lance_etl`` Python package. The flattened modules (``search_pb2`` / ``search_pb2_grpc``)
 are imported off ``sys.path`` instead. This is simpler and more deterministic than server reflection, which would make
 the benchmark depend on the server having reflection enabled.
 
-The proto currently has no Prewarm rpc; :func:`prewarm_dataset` is the clearly named hook to fill in when one lands,
-and the search phase always records cold-vs-warm first-query latency regardless.
+Every request message addresses its dataset through a ``DatasetTarget`` built by :func:`dataset_target`, matching the
+``{base}/{org_id}/{tenant_id}/{namespace}.lance`` layout the benchmark ingest phase writes. :func:`prewarm_dataset`
+drives the real ``Prewarm`` rpc and returns the server-reported warm-up timings.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import grpc
 import numpy as np
 from grpc_tools import protoc
 
-from bench.config import PROTO_PATH
+from bench.config import NAMESPACE, PROTO_PATH, TENANT_ID
 
 
 def generate_stubs(gen_dir: Path) -> Path:
@@ -97,13 +98,31 @@ def open_stub(endpoint: str, pb2_grpc: ModuleType, lance_root: str, timeout_seco
     try:
         grpc.channel_ready_future(channel).result(timeout=timeout_seconds)
     except grpc.FutureTimeoutError as error:
-        template: str = f"{lance_root}/{{org_id}}/tenant0/ns.lance"
         raise RuntimeError(
             f"search server unreachable at {endpoint}; start it with "
-            f'LANCE_ETL_BASE_URI="{template}" SEARCH_API_PORT={endpoint.rsplit(":", 1)[-1]} '
+            f'LANCE_ETL_BASE_URI="{lance_root}" SEARCH_API_PORT={endpoint.rsplit(":", 1)[-1]} '
             f"./rust/search-api/target/release/search-api"
         ) from error
     return pb2_grpc.SearchServiceStub(channel)
+
+
+def dataset_target(pb2: ModuleType, org_id: str, tenant_id: str = TENANT_ID, namespace: str = NAMESPACE) -> Any:
+    """Build the ``DatasetTarget`` addressing one per-tenant benchmark dataset.
+
+    The server resolves the target to ``{LANCE_ETL_BASE_URI}/{org_id}/{tenant_id}/{namespace}.lance``, which is
+    exactly the layout the benchmark ingest phase writes (see ``BenchConfig.dataset_uris``). No ``date_range`` is set
+    because the benchmark datasets are not date-partitioned.
+
+    Args:
+        pb2: The generated proto module.
+        org_id: The organization id.
+        tenant_id: The tenant id. Defaults to the fixed benchmark tenant.
+        namespace: The namespace. Defaults to the fixed benchmark namespace.
+
+    Returns:
+        The populated ``DatasetTarget`` message.
+    """
+    return pb2.DatasetTarget(org_id=org_id, tenant_id=tenant_id, namespace=namespace)
 
 
 def vector_query(
@@ -120,7 +139,7 @@ def vector_query(
     Args:
         pb2: The generated proto module.
         vector: The query vector.
-        k: Neighbors to return; 0 inherits the fused k in a hybrid request.
+        k: Neighbors to return. 0 inherits the fused k in a hybrid request.
         nprobes: Probed IVF partitions, or ``None`` to leave unset.
         refine_factor: Re-ranking factor, or ``None`` to leave unset.
         column: The vector column name.
@@ -144,7 +163,7 @@ def text_query(pb2: ModuleType, terms: str, k: int, projection: tuple[str, ...] 
     Args:
         pb2: The generated proto module.
         terms: The space-separated query terms.
-        k: Hits to return; 0 inherits the fused k in a hybrid request.
+        k: Hits to return. 0 inherits the fused k in a hybrid request.
         projection: Columns to return.
 
     Returns:
@@ -188,16 +207,49 @@ def timed_call(callable_rpc: Any, request: Any) -> tuple[Any, float]:
     return response, (time.perf_counter() - started) * 1000.0
 
 
-def prewarm_dataset(stub: Any, pb2: ModuleType, org_id: str) -> None:
-    """Prewarm hook for the search service.
+def prewarm_dataset(stub: Any, pb2: ModuleType, org_id: str, fts_with_position: bool = False) -> dict[str, Any]:
+    """Prewarm one org's dataset through the real ``Prewarm`` rpc.
 
-    The proto exposed no Prewarm rpc when these stubs were generated, so this is a documented no-op. When a Prewarm rpc
-    is added to ``SearchService``, call it here with ``org_id`` so ``--prewarm`` exercises it before any timing starts;
-    the search phase already records cold-vs-warm first-query latency either way.
+    Warms the dataset metadata and every index, and returns the server-reported timings together with the
+    client-measured rpc latency.
 
     Args:
         stub: The connected service stub.
         pb2: The generated proto module.
-        org_id: The organization whose dataset should be prewarmed.
+        org_id: The organization whose dataset is prewarmed.
+        fts_with_position: Also pull FTS position data for inverted indexes.
+
+    Returns:
+        The prewarm outcome: server-side metadata/total durations, per-index durations and errors, the index cache
+        size after the call, and the client-side rpc latency in milliseconds.
     """
-    del stub, pb2, org_id
+    request = pb2.PrewarmRequest(
+        target=dataset_target(pb2, org_id), metadata=True, all_indexes=True, fts_with_position=fts_with_position
+    )
+    response, rpc_ms = timed_call(stub.Prewarm, request)
+    return {
+        "rpc_ms": round(rpc_ms, 3),
+        "metadata_warmed": response.metadata_warmed,
+        "metadata_duration_ms": int(response.metadata_duration_ms),
+        "total_duration_ms": int(response.total_duration_ms),
+        "index_cache_size_bytes": int(response.index_cache_size_bytes),
+        "indexes": [
+            {"name": entry.name, "duration_ms": int(entry.duration_ms), "error": entry.error}
+            for entry in response.indexes
+        ],
+    }
+
+
+def fetch_clusters(stub: Any, pb2: ModuleType, org_id: str) -> tuple[Any, float]:
+    """Read the IVF cluster centroids of one org's vector index through the ``Clusters`` rpc.
+
+    Args:
+        stub: The connected service stub.
+        pb2: The generated proto module.
+        org_id: The organization whose vector index is read.
+
+    Returns:
+        The ``ClustersResponse`` and the rpc latency in milliseconds.
+    """
+    request = pb2.ClustersRequest(target=dataset_target(pb2, org_id))
+    return timed_call(stub.Clusters, request)

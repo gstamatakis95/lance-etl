@@ -1,8 +1,9 @@
-//! Dataset resolution: the provider trait and the caching base-URI-template implementation.
+//! Dataset resolution: the provider trait and the caching base-URI implementation.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::NaiveDate;
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::session::Session;
@@ -10,24 +11,32 @@ use lance_core::cache::CacheBackend;
 use lance_io::object_store::{ChainedWrappingObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore};
 use moka::future::Cache;
 
+use crate::cache::disk_cache::DiskIndexCacheBackend;
+use crate::cache::janitor::CacheJanitor;
+use crate::cache::layout::prepare_cache_root;
+use crate::cache::store_cache::MetadataByteCache;
 use crate::config::Config;
-use crate::domain::SearchError;
-use crate::lance::cache_layout::prepare_cache_root;
-use crate::lance::disk_cache::DiskIndexCacheBackend;
+use crate::domain::{DatasetTarget, SearchError};
 use crate::lance::error::classify_lance_error;
-use crate::lance::janitor::CacheJanitor;
-use crate::lance::store_cache::MetadataByteCache;
 use crate::telemetry::{CacheName, Metrics, Tier};
 
-/// Resolves an organization id to an open Lance dataset handle.
+/// Resolves a dataset target (plus an optional day partition) to an open Lance dataset handle.
 ///
-/// This is the seam for swapping dataset resolution strategies (URI templates, catalogs,
+/// This is the seam for swapping dataset resolution strategies (URI layouts, catalogs,
 /// per-tenant registries) without touching the search backend.
 pub trait DatasetProvider: Send + Sync + 'static {
-    /// Returns an open dataset handle for one organization.
-    fn dataset(&self, org_id: &str) -> impl Future<Output = Result<Arc<Dataset>, SearchError>> + Send;
+    /// Returns an open dataset handle for one target.
+    ///
+    /// `date` of `None` resolves the rangeless dataset
+    /// (`{base}/{org}/{tenant}/{namespace}.lance`). `Some(day)` resolves that day's partition
+    /// (`{base}/{org}/{tenant}/{namespace}/{day}.lance`).
+    fn dataset(
+        &self,
+        target: &DatasetTarget,
+        date: Option<NaiveDate>,
+    ) -> impl Future<Output = Result<Arc<Dataset>, SearchError>> + Send;
 
-    /// Approximate bytes resident in the shared index cache; providers without one report 0.
+    /// Approximate bytes resident in the shared index cache. Providers without one report 0.
     fn index_cache_size_bytes(&self) -> u64 {
         0
     }
@@ -37,9 +46,9 @@ pub trait DatasetProvider: Send + Sync + 'static {
 ///
 /// Index and metadata cache entries are URI- and index-UUID-prefixed inside the session, so one
 /// global cache safely spans tens of thousands of datasets. When a disk backend is given, the
-/// index cache persists codec-bearing entries to local disk; the metadata cache always uses the
+/// index cache persists codec-bearing entries to local disk. The metadata cache always uses the
 /// in-memory Moka backend sized by `metadata_cache_bytes` (lance exposes no metadata-cache
-/// backend injection; persistent metadata comes from the [`MetadataByteCache`] store wrapper).
+/// backend injection, persistent metadata comes from the [`MetadataByteCache`] store wrapper).
 pub fn build_session(config: &Config, disk_backend: Option<Arc<DiskIndexCacheBackend>>) -> Arc<Session> {
     match disk_backend {
         Some(backend) => Arc::new(Session::with_index_cache_backend(
@@ -55,25 +64,10 @@ pub fn build_session(config: &Config, disk_backend: Option<Arc<DiskIndexCacheBac
     }
 }
 
-/// Rejects org ids that are empty or contain characters outside `[A-Za-z0-9_-]`.
-pub fn validate_org_id(org_id: &str) -> Result<(), SearchError> {
-    let valid = !org_id.is_empty()
-        && org_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if valid {
-        Ok(())
-    } else {
-        Err(SearchError::invalid_argument(
-            "org_id must be non-empty and match [A-Za-z0-9_-]+",
-        ))
-    }
-}
-
-/// Default provider: base-URI template, one shared Lance session with optional disk-backed
-/// caches, and an LRU of open handles.
+/// Default provider: base-URI layout, one shared Lance session with optional disk-backed caches,
+/// and an LRU of open handles.
 pub struct CachingDatasetProvider {
-    base_uri_template: String,
+    base_uri: String,
     session: Arc<Session>,
     datasets: Cache<String, Arc<Dataset>>,
     store_params: Option<ObjectStoreParams>,
@@ -131,7 +125,7 @@ impl CachingDatasetProvider {
             })
         };
         Self {
-            base_uri_template: config.base_uri_template.clone(),
+            base_uri: config.base_uri.clone(),
             session: build_session(config, disk_index_cache.clone()),
             datasets: Cache::new(config.dataset_cache_capacity),
             store_params,
@@ -141,7 +135,7 @@ impl CachingDatasetProvider {
         }
     }
 
-    /// Builds the janitor over both disk tiers; `None` when disk caching is disabled.
+    /// Builds the janitor over both disk tiers. `None` when disk caching is disabled.
     pub fn janitor(&self, config: &Config) -> Option<CacheJanitor> {
         Some(CacheJanitor::new(
             self.disk_index_cache.clone()?,
@@ -163,9 +157,14 @@ impl CachingDatasetProvider {
         self.store_cache.as_ref()
     }
 
-    /// Resolves the dataset URI for one organization by substituting the `{org_id}` placeholder.
-    fn dataset_uri(&self, org_id: &str) -> String {
-        self.base_uri_template.replace("{org_id}", org_id)
+    /// Resolves the dataset URI of one target, optionally selecting one day partition.
+    fn dataset_uri(&self, target: &DatasetTarget, date: Option<NaiveDate>) -> String {
+        let base = &self.base_uri;
+        let (org, tenant, namespace) = (&target.org_id, &target.tenant_id, &target.namespace);
+        match date {
+            None => format!("{base}/{org}/{tenant}/{namespace}.lance"),
+            Some(day) => format!("{base}/{org}/{tenant}/{namespace}/{day}.lance"),
+        }
     }
 }
 
@@ -181,18 +180,24 @@ fn build_disk_caches(config: &Config, metrics: Arc<Metrics>) -> std::io::Result<
 }
 
 impl DatasetProvider for CachingDatasetProvider {
-    /// Returns an open dataset handle for one organization, opening and caching it on a miss.
+    /// Returns an open dataset handle for one target, opening and caching it on a miss.
     ///
-    /// Concurrent requests for the same org coalesce onto a single open via the Moka future cache.
+    /// Concurrent requests for the same URI coalesce onto a single open via the Moka future
+    /// cache.
     #[tracing::instrument(
         name = "provider.dataset",
         skip_all,
-        fields(org_id = %org_id, cache.dataset_handle_hit = tracing::field::Empty)
+        fields(
+            org_id = %target.org_id,
+            tenant_id = %target.tenant_id,
+            namespace = %target.namespace,
+            cache.dataset_handle_hit = tracing::field::Empty,
+        )
     )]
-    async fn dataset(&self, org_id: &str) -> Result<Arc<Dataset>, SearchError> {
-        validate_org_id(org_id)?;
+    async fn dataset(&self, target: &DatasetTarget, date: Option<NaiveDate>) -> Result<Arc<Dataset>, SearchError> {
+        target.validate()?;
         let started = std::time::Instant::now();
-        let uri = self.dataset_uri(org_id);
+        let uri = self.dataset_uri(target, date);
         let session = self.session.clone();
         let open_uri = uri.clone();
         let store_params = self.store_params.clone();

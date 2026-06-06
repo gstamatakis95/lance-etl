@@ -21,29 +21,29 @@ pub enum DistanceKind {
 /// Whether a filter runs before or after the index search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FilterMode {
-    /// Apply the filter before the index search; exact but potentially more expensive.
+    /// Apply the filter before the index search. Exact but potentially more expensive.
     #[default]
     Prefilter,
-    /// Apply the filter to the index results; may return fewer rows than requested.
+    /// Apply the filter to the index results. May return fewer rows than requested.
     Postfilter,
 }
 
 /// One nearest-neighbor query.
 #[derive(Debug, Clone, Default)]
 pub struct VectorQuery {
-    /// Query vector; its length must match the vector column dimension.
+    /// Query vector. Its length must match the vector column dimension.
     pub vector: Vec<f32>,
     /// Number of nearest neighbors to return.
     pub k: usize,
-    /// Vector column name; `None` selects the first fixed-size-list column in the schema.
+    /// Vector column name. `None` selects the first fixed-size-list column in the schema.
     pub column: Option<String>,
-    /// Distance metric override; `None` keeps the index metric.
+    /// Distance metric override. `None` keeps the index metric.
     pub distance: Option<DistanceKind>,
     /// Sets minimum and maximum probed partitions to the same value (IVF indexes).
     pub nprobes: Option<usize>,
-    /// Minimum number of index partitions to probe; ignored when `nprobes` is set.
+    /// Minimum number of index partitions to probe. Ignored when `nprobes` is set.
     pub minimum_nprobes: Option<usize>,
-    /// Maximum number of index partitions to probe; only effective with a prefilter.
+    /// Maximum number of index partitions to probe. Only effective with a prefilter.
     pub maximum_nprobes: Option<usize>,
     /// Read `refine_factor * k` candidates and re-rank them with the raw vectors.
     pub refine_factor: Option<u32>,
@@ -57,7 +57,7 @@ pub struct VectorQuery {
     pub filter: Option<Filter>,
     /// Whether the filter runs before or after the index search.
     pub filter_mode: FilterMode,
-    /// Columns to return; empty selects all non-vector columns.
+    /// Columns to return. Empty selects all non-vector columns.
     pub projection: Vec<String>,
     /// Include the stable row id in each returned row.
     pub with_row_id: bool,
@@ -92,7 +92,7 @@ pub enum Fuzziness {
 pub struct MatchSpec {
     /// Query terms, tokenized by the index tokenizer.
     pub terms: String,
-    /// Column to search; `None` defers to the enclosing query columns or the index.
+    /// Column to search. `None` defers to the enclosing query columns or the index.
     pub column: Option<String>,
     /// Score multiplier for this query.
     pub boost: f32,
@@ -100,7 +100,7 @@ pub struct MatchSpec {
     pub operator: TextOperator,
     /// Fuzzy-matching behavior.
     pub fuzziness: Fuzziness,
-    /// Maximum number of expanded terms for fuzzy matching; `None` keeps the engine default.
+    /// Maximum number of expanded terms for fuzzy matching. `None` keeps the engine default.
     pub max_expansions: Option<usize>,
     /// Number of beginning characters kept unchanged for fuzzy matching.
     pub prefix_length: u32,
@@ -121,12 +121,12 @@ impl MatchSpec {
     }
 }
 
-/// Exact phrase query; the index must store positions.
+/// Exact phrase query. The index must store positions.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhraseSpec {
     /// Phrase terms in order.
     pub terms: String,
-    /// Column to search; `None` defers to the enclosing query columns or the index.
+    /// Column to search. `None` defers to the enclosing query columns or the index.
     pub column: Option<String>,
     /// Maximum number of intervening unmatched positions allowed.
     pub slop: u32,
@@ -152,20 +152,20 @@ pub enum TextQueryNode {
     MultiMatch {
         /// Query terms.
         terms: String,
-        /// Columns to search; must be non-empty.
+        /// Columns to search. Must be non-empty.
         columns: Vec<String>,
-        /// Per-column boosts; empty means 1.0 everywhere, otherwise one boost per column.
+        /// Per-column boosts. Empty means 1.0 everywhere, otherwise one boost per column.
         boosts: Vec<f32>,
         /// How terms combine within each column.
         operator: TextOperator,
     },
     /// Boolean combination of sub-queries.
     Boolean {
-        /// Optional clauses; matching them increases the score.
+        /// Optional clauses. Matching them increases the score.
         should: Vec<TextQueryNode>,
-        /// Required clauses; every hit must match all of them.
+        /// Required clauses. Every hit must match all of them.
         must: Vec<TextQueryNode>,
-        /// Excluding clauses; hits matching any of them are dropped.
+        /// Excluding clauses. Hits matching any of them are dropped.
         must_not: Vec<TextQueryNode>,
     },
 }
@@ -179,13 +179,13 @@ pub struct TextQuery {
     pub columns: Vec<String>,
     /// Maximum number of hits to return.
     pub k: usize,
-    /// WAND ranking factor; `None` keeps the engine default.
+    /// WAND ranking factor. `None` keeps the engine default.
     pub wand_factor: Option<f32>,
     /// Optional typed predicate applied to the search.
     pub filter: Option<Filter>,
     /// Whether the filter runs before or after the index search.
     pub filter_mode: FilterMode,
-    /// Columns to return; empty selects all non-vector columns.
+    /// Columns to return. Empty selects all non-vector columns.
     pub projection: Vec<String>,
     /// Include the stable row id in each returned row.
     pub with_row_id: bool,
@@ -213,9 +213,9 @@ impl TextQuery {
 /// One hybrid query: a vector leg, a text leg, and a fusion strategy.
 #[derive(Debug, Clone)]
 pub struct HybridQuery {
-    /// Vector leg parameters; `k == 0` inherits the fused `k`.
+    /// Vector leg parameters. `k == 0` inherits the fused `k`.
     pub vector: VectorQuery,
-    /// Text leg parameters; `k == 0` inherits the fused `k`.
+    /// Text leg parameters. `k == 0` inherits the fused `k`.
     pub text: TextQuery,
     /// Number of fused results to return.
     pub k: usize,

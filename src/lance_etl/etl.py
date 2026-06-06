@@ -23,7 +23,8 @@ instead of duplicating, so no separate bulk path is needed.
 
 An optional timestamp window filter (``window_start`` / ``window_end`` / ``window_column`` on :class:`ETLConfig`) can
 narrow the rows that reach the collapse and merge steps to those whose ``window_column`` value falls within
-``[window_start, window_end)``.  Both bounds are ISO-8601 strings. An absent bound means the bound is open (full-table). The
+``[window_start, window_end)``.  Both bounds are ISO-8601 strings. An absent bound means the bound is open
+(no filter on that side). The
 filter is applied as a Spark ``DataFrame.filter`` call immediately after the Iceberg read so Spark can push it down into
 the Iceberg scan for partition pruning.
 
@@ -431,13 +432,18 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
     return upserted, deleted
 
 
-def snapshot_id_bounds(spark: SparkSession, table: str, start_ms: int, end_ms: int) -> tuple[int | None, int | None]:
+def snapshot_id_bounds(
+    spark: SparkSession, table: str, start_ms: int, end_ms: int
+) -> tuple[int | None, int | None, bool]:
     """Resolve a wall-clock window to Iceberg snapshot-id bounds via the snapshots metadata table.
 
     Queries ``{table}.snapshots`` and walks the snapshots in ``committed_at`` order. The start bound is the last
     snapshot committed strictly before ``start_ms`` — the state the previous window already processed, used as the
     exclusive ``start-snapshot-id`` of an incremental append scan. The end bound is the last snapshot committed at or
-    before ``end_ms`` — the inclusive ``end-snapshot-id``. Either bound is None when no snapshot satisfies it.
+    before ``end_ms`` — the inclusive ``end-snapshot-id``. Either bound is None when no snapshot satisfies it. The
+    third element reports whether any snapshot was committed inside the window itself (``start_ms <= committed_at <=
+    end_ms``). Callers must gate the empty-window short circuit on that flag rather than on ``start_id == end_id``,
+    which conflates a genuinely empty window with bound ids that merely resolve to the same historical snapshot.
 
     Args:
         spark: Active Spark session.
@@ -446,7 +452,8 @@ def snapshot_id_bounds(spark: SparkSession, table: str, start_ms: int, end_ms: i
         end_ms: Window end in epoch milliseconds.
 
     Returns:
-        ``(start_id, end_id)`` snapshot ids, each None when no snapshot satisfies the bound.
+        ``(start_id, end_id, has_new_snapshots)`` where the ids are None when no snapshot satisfies the bound and
+        ``has_new_snapshots`` is True when at least one snapshot was committed within the window.
     """
     snapshots: DataFrame = spark.read.format("iceberg").load(f"{table}.snapshots")
     committed: list[tuple[int, int]] = sorted(
@@ -455,12 +462,15 @@ def snapshot_id_bounds(spark: SparkSession, table: str, start_ms: int, end_ms: i
     )
     start_id: int | None = None
     end_id: int | None = None
+    has_new_snapshots: bool = False
     for committed_ms, snapshot_id in committed:
         if committed_ms < start_ms:
             start_id = snapshot_id
         if committed_ms <= end_ms:
             end_id = snapshot_id
-    return start_id, end_id
+            if committed_ms >= start_ms:
+                has_new_snapshots = True
+    return start_id, end_id, has_new_snapshots
 
 
 def build_stats_batch(rows: list[tuple[Any, ...]], schema: pa.Schema) -> pa.RecordBatch:
@@ -501,9 +511,10 @@ class IcebergToLanceETL:
         :func:`snapshot_id_bounds` over the ``{table}.snapshots`` metadata table. When a snapshot exists strictly
         before the window start, the read is an incremental append scan bounded by ``start-snapshot-id`` (exclusive)
         and ``end-snapshot-id`` (inclusive). When the table has no snapshot before the window start (first run), the
-        read falls back to a full batch scan pinned to the window's last snapshot via ``snapshot-id``. When the
-        window resolves to no snapshots at all, an empty DataFrame with the current table schema is returned.
-        ``iceberg_read_options`` are merged into every non-empty read.
+        read falls back to a full batch scan pinned to the window's last snapshot via ``snapshot-id``. When no
+        snapshot at all resolves the end bound, or when no snapshot was committed inside the window, an empty
+        DataFrame with the current table schema is returned. ``iceberg_read_options`` are merged into every
+        non-empty read.
 
         Args:
             spark: Active Spark session.
@@ -514,8 +525,8 @@ class IcebergToLanceETL:
         Returns:
             The incremental rows as a DataFrame.
         """
-        start_id, end_id = snapshot_id_bounds(spark, table, start_ms, end_ms)
-        if end_id is None or start_id == end_id:
+        start_id, end_id, has_new_snapshots = snapshot_id_bounds(spark, table, start_ms, end_ms)
+        if end_id is None or not has_new_snapshots:
             return spark.read.format("iceberg").load(table).limit(0)
         reader = spark.read.format("iceberg")
         if start_id is None:

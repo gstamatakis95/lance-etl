@@ -1,6 +1,6 @@
 """Download phase: acquire and verify the selected corpus through its dataset adapter.
 
-All acquisition mechanics live on the adapter (see :mod:`bench.datasets`); this phase resolves the adapter from the
+All acquisition mechanics live on the adapter (see :mod:`bench.datasets`). This phase resolves the adapter from the
 ``--dataset`` flag, hands it the workspace and the optional pinned archive digest, and records the returned payload as
 the phase document.
 """

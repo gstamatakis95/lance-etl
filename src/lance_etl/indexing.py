@@ -417,10 +417,10 @@ def lance_field_id(dataset: lance.LanceDataset, column: str) -> int:
     Raises:
         ValueError: If the column is not present in the Lance schema.
     """
-    field = dataset._ds.lance_schema.field_case_insensitive(column)
-    if field is None:
+    lance_field = dataset._ds.lance_schema.field_case_insensitive(column)
+    if lance_field is None:
         raise ValueError(f"column {column!r} not found in Lance schema")
-    return field.id()
+    return lance_field.id()
 
 
 class IndexHandler:
@@ -855,7 +855,7 @@ class BTreeIndexHandler(IndexHandler):
         Args:
             dataset: A dataset handle pinned to the build version.
             fragment_ids: The fragment ids for this shard.
-            artifacts: Unused; btree builds need no broadcast artifact.
+            artifacts: Unused. Btree builds need no broadcast artifact.
 
         Returns:
             The uncommitted segment metadata.
@@ -899,7 +899,7 @@ class BitmapIndexHandler(IndexHandler):
         Args:
             dataset: A dataset handle pinned to the build version.
             fragment_ids: The fragment ids for this shard.
-            artifacts: Unused; bitmap builds need no broadcast artifact.
+            artifacts: Unused. Bitmap builds need no broadcast artifact.
 
         Returns:
             The uncommitted segment metadata.
@@ -941,7 +941,7 @@ class FtsIndexHandler(IndexHandler):
 
         Args:
             uri: Dataset URI.
-            dataset: The dataset handle at the build version.
+            dataset: A dataset handle refreshed to the latest version after the executor build.
             index_uuid: The shared index id the shards built under.
             fragment_ids: The fragments the index covers.
             telemetry: Driver telemetry facade.
@@ -980,6 +980,9 @@ class FtsIndexHandler(IndexHandler):
 
     def build(self, spark: SparkSession, uri: str, telemetry: Telemetry) -> dict[str, Any]:
         """Build and commit the inverted index across executors.
+
+        The dataset handle is refreshed after the executor build so the metadata merge and the publish commit both
+        operate against the latest committed version rather than the snapshot captured before the Spark job ran.
 
         Args:
             spark: Active Spark session.
@@ -1042,6 +1045,7 @@ class FtsIndexHandler(IndexHandler):
             counts: list[int] = (
                 spark.sparkContext.parallelize(groups, len(groups)).mapPartitions(build_partition).collect()
             )
+        dataset = lance.dataset(uri, storage_options=config.storage_options)
         with telemetry.timed("index.merge_ms", tags=[f"index:{index_name}"]):
             dataset.merge_index_metadata(index_uuid, index_type="INVERTED")
         with telemetry.timed("index.commit_ms", tags=[f"index:{index_name}"]):
@@ -1211,7 +1215,7 @@ class LanceIndexer:
     def run_small_tier(self, spark: SparkSession, uris: list[str], telemetry: Telemetry) -> list[dict[str, Any]]:
         """Index many small datasets in one batched Spark job.
 
-        Each executor task indexes one whole dataset end-to-end with plain non-distributed index builds; the driver only
+        Each executor task indexes one whole dataset end-to-end with plain non-distributed index builds. The driver only
         collects statistics.
 
         Args:
@@ -1246,7 +1250,7 @@ class LanceIndexer:
 
         Each dataset keeps its distributed per-segment build, but multiple datasets are driven concurrently from a
         driver thread pool. Every submission is tagged with the configured Spark FAIR scheduler pool so concurrent jobs
-        share the cluster fairly; ``spark.scheduler.mode=FAIR`` must be set on the session for the pools to take effect.
+        share the cluster fairly. ``spark.scheduler.mode=FAIR`` must be set on the session for the pools to take effect.
 
         Args:
             spark: Active Spark session.
@@ -1267,8 +1271,8 @@ class LanceIndexer:
             Returns:
                 The dataset's statistics dictionary.
             """
-            spark.sparkContext.setLocalProperty("spark.scheduler.pool", config.scheduler_pool)
             try:
+                spark.sparkContext.setLocalProperty("spark.scheduler.pool", config.scheduler_pool)
                 with telemetry.timed("dataset.total_ms", tags=[f"uri:{uri}"]):
                     stats: dict[str, Any] = self.build(spark, uri, telemetry)
             except Exception:

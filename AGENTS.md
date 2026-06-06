@@ -14,28 +14,68 @@ lance-etl/
     indexing.py           LanceIndexer + per-type handlers (VectorIndex, BTree, Bitmap, Fts)
     compaction.py         LanceCompactor: Compaction.plan / Compaction.commit
     telemetry.py          Telemetry, TelemetryConfig, LanceRuntimeConfig, commit_with_retries
-    cloud_storage.py      resolve_filesystem for pyarrow (driver-only artifact I/O)
+    cloud_storage.py      resolve_filesystem + discover_datasets for pyarrow filesystem I/O
     arrow_types.py        resolve_arrow_type / resolve_type_map (CLI type specs)
     cli.py                Entry point: etl / compact / index subcommands
+  bench/                  Benchmark package (python -m bench)
+    cli.py                Subcommand dispatch: download / prepare / ingest / index / compact
+                          / search / report / all
+    config.py             BenchConfig dataclass + full flag set
+    datasets.py           DatasetAdapter registry: Sift1mAdapter, SyntheticAdapter
+    download.py           Corpus acquisition + checksum verification
+    prepare.py            Iceberg table + prepared artifacts (queries, ground truth, vocab)
+    ingest.py             Real ETL run via LanceIndexer / IcebergToLanceETL
+    indexes.py            Index build phase
+    compaction.py         Compaction phase
+    search.py             Recall / FTS / hybrid / load / clusters / prewarm search legs
+    report.py             summary.md, recall.csv, results.csv, pareto.png aggregation
+    grpc_client.py        gRPC stub helpers for the search legs
+    results.py            Phase artifact I/O (save_phase, load_phase, read_json, write_json)
   rust/search-api/        Rust gRPC search service (tonic, lance crate)
     proto/                lance_etl/search/v1/search.proto
     src/domain/           Transport-agnostic types and traits
-    src/lance/            Lance backend, DatasetProvider, filter -> DataFusion Expr
-    src/grpc/             Tonic adapter (proto <-> domain)
+      target.rs           DatasetTarget, DateRange — dataset addressing
+      query.rs            VectorQuery, TextQuery, HybridQuery, Hit, FusedHit
+      filter.rs           Typed predicate AST (no raw SQL)
+      backend.rs          SearchBackend trait
+      prewarm.rs          PrewarmSpec, PrewarmReport, Prewarmer trait
+      clusters.rs         ClusterSpec, ClusterReport, ClusterReader trait
+      fusion.rs           FusionSpec, RrfFusion
+      merge.rs            Dedup-by-id fan-out merge
+      error.rs            SearchError
+    src/cache/            Persistent two-tier caching layer
+      layout.rs           Versioned stamp dir, key hashing, atomic writes, TTL/budget sweep
+      disk_cache.rs       Hybrid disk + Moka CacheBackend for the Lance index cache
+      store_cache.rs      Read-through byte cache for immutable metadata of wrapped stores
+      janitor.rs          Periodic TTL + budget sweep over both cache tiers
+    src/lance/            Lance backend implementations
+      backend.rs          LanceSearchBackend — date-range fan-out, dedup, RRF
+      provider.rs         DatasetProvider trait, CachingDatasetProvider (shared session + LRU)
+      filter.rs           filter_to_expr: domain Filter -> DataFusion Expr
+      text.rs             Domain text query tree -> Lance FTS parameters
+      rows.rs             Arrow record batch -> JSON row conversion
+      prewarm.rs          Prewarmer impl over Lance prewarm APIs
+      index_reader.rs     IVF centroid extraction, ClusterReader impl
+      error.rs            Lance error classification into SearchError
+    src/grpc/             Tonic transport
+      mod.rs              SearchGrpc<B>: tonic service adapter
+      convert.rs          Proto <-> domain conversion
+    src/telemetry/        Datadog observability
+      traces.rs           OTLP span export, JSON stdout logs with trace correlation
+      metrics.rs          Typed DogStatsD facade (Metrics struct + tag enums)
     src/config.rs         Config from env vars
+    src/lib.rs            Crate root
+    src/main.rs           Binary entry point
     Cargo.toml            Workspace root for the crate
   airflow/
-    lance_etl_dag.py      Daily Airflow DAG (etl -> index -> compact)
+    lance_etl_dag.py      Configurable-schedule Airflow DAG (etl -> index -> compact)
   tests/                  pytest suite (conftest.py + test_*.py)
-  docs/
-    verification-report.md  API verification against lance main @ 466405f47 — read this
-                             to understand why APIs are used the way they are
   claude/                 Original reference artifacts — IMMUTABLE, never edit
   pyproject.toml          Build, dependencies, ruff config
 ```
 
 The lance checkout at `/Users/gstamatakis/IdeaProjects/lance` is the API ground truth. When you
-are unsure whether a pylance API exists or what its signature is, read that checkout; do not guess.
+are unsure whether a pylance API exists or what its signature is, read that checkout. Do not guess.
 
 ---
 
@@ -50,11 +90,11 @@ Do not define names that begin with `_` or `__` anywhere in `src/`, `tests/`, or
 Third-party internals accessed through a leading underscore (e.g. `dataset._ds`) must go through a
 single, documented helper function. Never scatter bare `_attr` accesses across the codebase.
 
-### 2. No inline comments; use docstrings only
+### 2. No inline comments — use docstrings only
 
 Python: every module, class, and function must have a Google-style docstring. No `# ...` inline
 comments anywhere — if code needs explanation, restructure it or put the explanation in the
-docstring. Rust: `///` doc comments only on public items; no `//` inline comments in production
+docstring. Rust: `///` doc comments only on public items. No `//` inline comments in production
 code paths.
 
 ### 3. Type hints on every signature
@@ -64,7 +104,7 @@ builtin generics (`list[str]`, `dict[str, int]`, `tuple[str, ...]`) — never `L
 `Tuple` from `typing`. Use `X | None` instead of `Optional[X]`. `from __future__ import
 annotations` is required in every module.
 
-### 4. ruff is the formatter and linter; line length is 120
+### 4. ruff is the formatter and linter — line length is 120
 
 ALWAYS run both commands after any Python change (a PostToolUse hook in `.claude/settings.json`
 also runs them automatically after every file edit):
@@ -81,8 +121,14 @@ description.
 ### 4b. All imports at the top of the file, always
 
 No imports inside functions, methods, or conditional branches — enforced by `E402` and `PLC0415`.
-Lazy imports for optional dependencies are not an accepted exception; put the dependency in the
+Lazy imports for optional dependencies are not an accepted exception. Put the dependency in the
 appropriate dependency group instead.
+
+### 4c. No prose semicolons in documentation
+
+In any Markdown file (README.md, AGENTS.md, CLAUDE.md, or docs/) do not use `;` as a prose
+punctuation character. Split compound sentences into two sentences instead. Code spans and code
+blocks are exempt.
 
 ### 5. Spark: heavy work in executors only
 
@@ -115,12 +161,12 @@ Same shard/commit flow but no `index_uuid`. Do not call `create_scalar_index(fra
 3. Driver: `dataset.merge_index_metadata(index_uuid, index_type="INVERTED")`.
 4. Driver: `LanceDataset.commit(uri, LanceOperation.CreateIndex(...), read_version=...)`.
 
-Never call `merge_index_metadata` for BTREE, BITMAP, or vector types; the call raises.
+Never call `merge_index_metadata` for BTREE, BITMAP, or vector types. The call raises.
 
 ### 7. No raw SQL strings in the gRPC filter API
 
 The `Filter` type in `src/domain/filter.rs` is a typed AST. Column names are validated against the
-dataset schema and the allowlist `[A-Za-z_][A-Za-z0-9_]*`; literals become typed DataFusion `lit`
+dataset schema and the allowlist `[A-Za-z_][A-Za-z0-9_]*`. Literals become typed DataFusion `lit`
 expressions via `filter_to_expr`. Do not accept, construct, or pass raw SQL strings anywhere in
 the gRPC or domain layers.
 
@@ -139,9 +185,12 @@ implementation. Never edit, delete, or add files there. They are checked into gi
 # Install (editable) with dev dependencies
 uv pip install -e ".[dev]"
 
+# Install bench extras
+uv pip install --group bench
+
 # Lint and format (must pass before any commit)
-uvx ruff format src/ tests/ airflow/
-uvx ruff check src/ tests/ airflow/
+uvx ruff format src/ tests/ airflow/ bench/
+uvx ruff check src/ tests/ airflow/ bench/
 
 # Run tests
 .venv/bin/pytest
@@ -172,27 +221,31 @@ The lance crates are sourced via path dependencies pointing at
 
 ## API ground truth and known API notes
 
-See `docs/verification-report.md` for a detailed, line-cited verification of every API used by
-this project against lance main @ `466405f47` (pylance `8.0.0-beta.6`). Key facts to internalize:
+Key facts to internalize:
 
 - `lance.lance.indices.build_rq_model(dimension, num_bits=1, dtype="float32")` is a real API
   returning a JSON string. The vector dimension must be divisible by 8.
-- `create_index_uncommitted(..., rabitq_model=str)` is validated; passing a wrong JSON raises
+- `create_index_uncommitted(..., rabitq_model=str)` is validated. Passing a wrong JSON raises
   `ValueError`. The same string must reach every executor shard.
-- `CommitConflictError` is not reliably importable from `lance` directly; use the fallback chain
+- `CommitConflictError` is not reliably importable from `lance` directly. Use the fallback chain
   in `telemetry.py`. Conflicts surface as `OSError` or `RuntimeError` from lance internals.
-- `defer_index_remap=True` in compaction builds a `__lance_frag_reuse` index via
-  `compact_files`/`Compaction.execute` (the small-dataset tier), but is currently ignored by the
-  distributed `Compaction.commit` binding (see `optimize.rs:566-568` TODO).
+- `defer_index_remap=True` on the small-dataset tier builds a `__lance_frag_reuse` system index.
+  On the current lance build this leaves indexed vector queries failing with a missing fragment-id
+  error until the remap runs. The production default is `False` (opt-in via `--defer-index-remap`).
+  The large-dataset tier ignores `defer_index_remap` entirely because the Python `Compaction.commit`
+  binding hard-codes default options and always remaps inline.
 - The FTS path requires a Lance field id (not a pyarrow schema index) for `Index(fields=[...])`.
   Resolve it with `dataset._ds.lance_schema.field_case_insensitive(col).id()`.
+- Iceberg 1.10 rejects `start-timestamp` / `end-timestamp` outside changelog scans. Use
+  `snapshot_id_bounds` in `etl.py` to resolve wall-clock windows to `start-snapshot-id` /
+  `end-snapshot-id` from the `{table}.snapshots` metadata table before reading.
 
 ---
 
 ## Telemetry conventions
 
 - `Telemetry.create(config)` must be called once per process (driver and each executor). Never
-  pickle a `Telemetry` object into a closure; pickle only the `TelemetryConfig` dataclass.
+  pickle a `Telemetry` object into a closure. Pickle only the `TelemetryConfig` dataclass.
 - Metrics are namespaced under `config.metric_prefix` (default `lance.pipeline`) and tagged with
   `env:`, `service:`, and optional constant tags.
 - Lance trace events are bridged to Datadog automatically on the first `Telemetry.create` call per

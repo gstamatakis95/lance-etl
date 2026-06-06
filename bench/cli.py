@@ -1,40 +1,46 @@
 """Command-line dispatch for the SIFT1M benchmark phases.
 
-Each subcommand maps to one phase module; ``all`` chains the full pipeline. Phase modules are resolved through
-``importlib`` at dispatch time so the lightweight subcommands (and the test suite) do not pay for Spark or matplotlib
-imports. The search phase in the ``all`` chain is skipped with a recorded reason when the gRPC server is unreachable so
-the rest of the report still materializes; the standalone ``search`` subcommand fails loudly instead.
+Each subcommand maps to one phase runner imported at module load, per the repository rule that all imports live at the
+top of the file. ``all`` chains the full pipeline. The search phase in the ``all`` chain is skipped with a recorded
+reason when the gRPC server is unreachable. The standalone ``search`` subcommand fails loudly instead.
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import logging
 import os
+from collections.abc import Callable
 from typing import Any
 
 import grpc
 
+from bench.compaction import run_compact
 from bench.config import BenchConfig, build_parser
+from bench.download import run_download
+from bench.indexes import run_index
+from bench.ingest import run_ingest
+from bench.prepare import run_prepare
+from bench.report import run_report
 from bench.results import save_phase
+from bench.search import run_search
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-PHASE_MODULES: dict[str, tuple[str, str]] = {
-    "download": ("bench.download", "run_download"),
-    "prepare": ("bench.prepare", "run_prepare"),
-    "ingest": ("bench.ingest", "run_ingest"),
-    "index": ("bench.indexes", "run_index"),
-    "compact": ("bench.compaction", "run_compact"),
-    "search": ("bench.search", "run_search"),
-    "report": ("bench.report", "run_report"),
+PHASE_RUNNERS: dict[str, Callable[[BenchConfig], dict[str, Any]]] = {
+    "download": run_download,
+    "prepare": run_prepare,
+    "ingest": run_ingest,
+    "index": run_index,
+    "compact": run_compact,
+    "search": run_search,
+    "report": run_report,
 }
 
 
 def run_phase(config: BenchConfig, phase: str) -> dict[str, Any]:
-    """Import and execute one phase.
+    """Execute one phase.
 
     Args:
         config: Benchmark configuration.
@@ -43,10 +49,7 @@ def run_phase(config: BenchConfig, phase: str) -> dict[str, Any]:
     Returns:
         The phase result document.
     """
-    module_name, function_name = PHASE_MODULES[phase]
-    module = importlib.import_module(module_name)
-    runner = getattr(module, function_name)
-    return runner(config)
+    return PHASE_RUNNERS[phase](config)
 
 
 def server_reachable(config: BenchConfig) -> bool:
@@ -71,7 +74,7 @@ def server_reachable(config: BenchConfig) -> bool:
 def run_all(config: BenchConfig) -> dict[str, Any]:
     """Run the full benchmark chain under one run id.
 
-    Compaction is skipped when ``--batches`` is 1 since single-batch ingest produces nothing to merge; the search
+    Compaction is skipped when ``--batches`` is 1 since single-batch ingest produces nothing to merge. The search
     phase is skipped with a recorded reason when the server is unreachable.
 
     Args:
@@ -101,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
     """Parse arguments and run the selected benchmark subcommand.
 
     Args:
-        argv: Optional argument vector; defaults to ``sys.argv``.
+        argv: Optional argument vector. Defaults to ``sys.argv``.
 
     Returns:
         A process exit code.

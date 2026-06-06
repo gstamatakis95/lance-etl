@@ -36,14 +36,22 @@ pub const DEFAULT_DISK_CACHE_SWEEP_SECS: u64 = 300;
 /// Default number of indexes prewarmed concurrently per Prewarm RPC.
 pub const DEFAULT_PREWARM_CONCURRENCY: usize = 4;
 
+/// Default number of per-day datasets queried concurrently by one date-range fan-out.
+pub const DEFAULT_FANOUT_CONCURRENCY: usize = 8;
+
+/// Default logical id column used to deduplicate fan-out results across date partitions.
+pub const DEFAULT_ID_COLUMN: &str = "vector_id";
+
 /// Default DogStatsD address when neither `SEARCH_API_STATSD_ADDR` nor `DD_AGENT_HOST` is set.
 pub const DEFAULT_STATSD_ADDR: &str = "127.0.0.1:8125";
 
 /// Runtime configuration for the search API.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Dataset URI template containing an `{org_id}` placeholder, e.g. `s3://bucket/lance/{org_id}.lance`.
-    pub base_uri_template: String,
+    /// Base URI under which all datasets live, e.g. `s3://bucket/lance`. Datasets resolve to
+    /// `{base}/{org_id}/{tenant_id}/{namespace}.lance` and date-partitioned ones to
+    /// `{base}/{org_id}/{tenant_id}/{namespace}/{event_date}.lance`.
+    pub base_uri: String,
     /// Maximum number of open `Dataset` handles kept in the LRU map.
     pub dataset_cache_capacity: u64,
     /// Byte budget for the in-memory tier of the shared session index cache.
@@ -61,7 +69,7 @@ pub struct Config {
     pub disk_store_cache_bytes: u64,
     /// TTL in seconds for disk cache entries (default 7 days). Env: `SEARCH_API_DISK_CACHE_TTL_SECS`.
     pub disk_cache_ttl_secs: u64,
-    /// Largest single byte-range under `_indices/` that the byte cache stores (default 4 MiB); larger ranges
+    /// Largest single byte-range under `_indices/` that the byte cache stores (default 4 MiB). Larger ranges
     /// (bulk partition payloads) pass through. Env: `SEARCH_API_STORE_CACHE_MAX_RANGE_BYTES`.
     pub store_cache_max_range_bytes: u64,
     /// Janitor sweep interval in seconds (default 300). Env: `SEARCH_API_DISK_CACHE_SWEEP_SECS`.
@@ -70,6 +78,12 @@ pub struct Config {
     pub disk_cache_disabled: bool,
     /// Max indexes prewarmed concurrently per Prewarm RPC (default 4). Env: `SEARCH_API_PREWARM_CONCURRENCY`.
     pub prewarm_concurrency: usize,
+    /// Max per-day datasets queried concurrently by one date-range fan-out (default 8).
+    /// Env: `SEARCH_API_FANOUT_CONCURRENCY`.
+    pub fanout_concurrency: usize,
+    /// Logical id column deduplicating fan-out results across date partitions (default
+    /// `vector_id`). Env: `SEARCH_API_ID_COLUMN`.
+    pub id_column: String,
     /// DogStatsD (UDP) address metrics are sent to. Defaults to `{DD_AGENT_HOST}:8125` when
     /// `DD_AGENT_HOST` is set, else `127.0.0.1:8125`. Env: `SEARCH_API_STATSD_ADDR`.
     pub statsd_addr: String,
@@ -81,22 +95,25 @@ pub struct Config {
 impl Config {
     /// Builds a configuration from environment variables.
     ///
-    /// `LANCE_ETL_BASE_URI` is required and must contain an `{org_id}` placeholder. Optional
-    /// overrides: `SEARCH_API_DATASET_CACHE_CAPACITY`, `SEARCH_API_INDEX_CACHE_BYTES`,
-    /// `SEARCH_API_METADATA_CACHE_BYTES`, `SEARCH_API_PORT`, `SEARCH_API_CACHE_DIR`,
-    /// `SEARCH_API_DISK_INDEX_CACHE_BYTES`, `SEARCH_API_DISK_STORE_CACHE_BYTES`,
-    /// `SEARCH_API_DISK_CACHE_TTL_SECS`, `SEARCH_API_STORE_CACHE_MAX_RANGE_BYTES`,
-    /// `SEARCH_API_DISK_CACHE_SWEEP_SECS`, `SEARCH_API_DISK_CACHE_DISABLED`,
-    /// `SEARCH_API_PREWARM_CONCURRENCY`, `SEARCH_API_STATSD_ADDR` (default honors
-    /// `DD_AGENT_HOST`), and `SEARCH_API_TELEMETRY_DISABLED`.
+    /// `LANCE_ETL_BASE_URI` is required: the base URI all dataset paths are resolved under
+    /// (a trailing slash is stripped). Optional overrides: `SEARCH_API_DATASET_CACHE_CAPACITY`,
+    /// `SEARCH_API_INDEX_CACHE_BYTES`, `SEARCH_API_METADATA_CACHE_BYTES`, `SEARCH_API_PORT`,
+    /// `SEARCH_API_CACHE_DIR`, `SEARCH_API_DISK_INDEX_CACHE_BYTES`,
+    /// `SEARCH_API_DISK_STORE_CACHE_BYTES`, `SEARCH_API_DISK_CACHE_TTL_SECS`,
+    /// `SEARCH_API_STORE_CACHE_MAX_RANGE_BYTES`, `SEARCH_API_DISK_CACHE_SWEEP_SECS`,
+    /// `SEARCH_API_DISK_CACHE_DISABLED`, `SEARCH_API_PREWARM_CONCURRENCY`,
+    /// `SEARCH_API_FANOUT_CONCURRENCY`, `SEARCH_API_ID_COLUMN`, `SEARCH_API_STATSD_ADDR`
+    /// (default honors `DD_AGENT_HOST`), and `SEARCH_API_TELEMETRY_DISABLED`.
     pub fn from_env() -> Result<Self, String> {
-        let base_uri_template =
-            std::env::var("LANCE_ETL_BASE_URI").map_err(|_| "LANCE_ETL_BASE_URI must be set".to_string())?;
-        if !base_uri_template.contains("{org_id}") {
-            return Err("LANCE_ETL_BASE_URI must contain an {org_id} placeholder".to_string());
+        let base_uri = std::env::var("LANCE_ETL_BASE_URI")
+            .map_err(|_| "LANCE_ETL_BASE_URI must be set".to_string())?
+            .trim_end_matches('/')
+            .to_string();
+        if base_uri.is_empty() {
+            return Err("LANCE_ETL_BASE_URI must be a non-empty base URI".to_string());
         }
         Ok(Self {
-            base_uri_template,
+            base_uri,
             dataset_cache_capacity: env_number("SEARCH_API_DATASET_CACHE_CAPACITY", DEFAULT_DATASET_CACHE_CAPACITY)?,
             index_cache_bytes: env_number("SEARCH_API_INDEX_CACHE_BYTES", DEFAULT_INDEX_CACHE_BYTES)?,
             metadata_cache_bytes: env_number("SEARCH_API_METADATA_CACHE_BYTES", DEFAULT_METADATA_CACHE_BYTES)?,
@@ -112,14 +129,11 @@ impl Config {
             disk_cache_sweep_secs: env_number("SEARCH_API_DISK_CACHE_SWEEP_SECS", DEFAULT_DISK_CACHE_SWEEP_SECS)?,
             disk_cache_disabled: env_bool("SEARCH_API_DISK_CACHE_DISABLED", false)?,
             prewarm_concurrency: env_number("SEARCH_API_PREWARM_CONCURRENCY", DEFAULT_PREWARM_CONCURRENCY)?,
+            fanout_concurrency: env_number("SEARCH_API_FANOUT_CONCURRENCY", DEFAULT_FANOUT_CONCURRENCY)?,
+            id_column: env_string("SEARCH_API_ID_COLUMN", DEFAULT_ID_COLUMN),
             statsd_addr: env_string("SEARCH_API_STATSD_ADDR", &default_statsd_addr()),
             telemetry_disabled: env_bool("SEARCH_API_TELEMETRY_DISABLED", false)?,
         })
-    }
-
-    /// Resolves the dataset URI for one organization by substituting the `{org_id}` placeholder.
-    pub fn dataset_uri(&self, org_id: &str) -> String {
-        self.base_uri_template.replace("{org_id}", org_id)
     }
 }
 
@@ -164,7 +178,7 @@ fn env_bool(name: &str, default: bool) -> Result<bool, String> {
 mod tests {
     use super::*;
 
-    /// Serializes env-mutating tests; the process environment is shared across threads.
+    /// Serializes env-mutating tests. The process environment is shared across threads.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Runs `body` with the given env vars set, restoring the previous state afterwards.
@@ -191,7 +205,7 @@ mod tests {
     }
 
     /// Env var names cleared so defaults apply in tests.
-    const OPTIONAL_VARS: [&str; 14] = [
+    const OPTIONAL_VARS: [&str; 17] = [
         "SEARCH_API_DATASET_CACHE_CAPACITY",
         "SEARCH_API_INDEX_CACHE_BYTES",
         "SEARCH_API_METADATA_CACHE_BYTES",
@@ -203,6 +217,9 @@ mod tests {
         "SEARCH_API_STORE_CACHE_MAX_RANGE_BYTES",
         "SEARCH_API_DISK_CACHE_SWEEP_SECS",
         "SEARCH_API_DISK_CACHE_DISABLED",
+        "SEARCH_API_PREWARM_CONCURRENCY",
+        "SEARCH_API_FANOUT_CONCURRENCY",
+        "SEARCH_API_ID_COLUMN",
         "SEARCH_API_STATSD_ADDR",
         "SEARCH_API_TELEMETRY_DISABLED",
         "DD_AGENT_HOST",
@@ -210,10 +227,11 @@ mod tests {
 
     #[test]
     fn defaults_apply_when_env_unset() {
-        let mut vars: Vec<(&str, Option<&str>)> = vec![("LANCE_ETL_BASE_URI", Some("/data/{org_id}.lance"))];
+        let mut vars: Vec<(&str, Option<&str>)> = vec![("LANCE_ETL_BASE_URI", Some("/data/lance/"))];
         vars.extend(OPTIONAL_VARS.iter().map(|name| (*name, None)));
         with_env(&vars, || {
             let config = Config::from_env().unwrap();
+            assert_eq!(config.base_uri, "/data/lance", "trailing slash must be stripped");
             assert_eq!(config.cache_dir, PathBuf::from(DEFAULT_CACHE_DIR));
             assert_eq!(config.disk_index_cache_bytes, DEFAULT_DISK_INDEX_CACHE_BYTES);
             assert_eq!(config.disk_store_cache_bytes, DEFAULT_DISK_STORE_CACHE_BYTES);
@@ -222,6 +240,8 @@ mod tests {
             assert_eq!(config.disk_cache_sweep_secs, DEFAULT_DISK_CACHE_SWEEP_SECS);
             assert!(!config.disk_cache_disabled);
             assert_eq!(config.prewarm_concurrency, DEFAULT_PREWARM_CONCURRENCY);
+            assert_eq!(config.fanout_concurrency, DEFAULT_FANOUT_CONCURRENCY);
+            assert_eq!(config.id_column, DEFAULT_ID_COLUMN);
             assert_eq!(config.statsd_addr, DEFAULT_STATSD_ADDR);
             assert!(!config.telemetry_disabled);
         });
@@ -230,7 +250,7 @@ mod tests {
     #[test]
     fn statsd_default_honors_dd_agent_host_and_env_overrides_win() {
         let mut vars: Vec<(&str, Option<&str>)> = vec![
-            ("LANCE_ETL_BASE_URI", Some("/data/{org_id}.lance")),
+            ("LANCE_ETL_BASE_URI", Some("/data/lance")),
             ("DD_AGENT_HOST", Some("agent.internal")),
         ];
         vars.extend(
@@ -245,7 +265,7 @@ mod tests {
         });
         with_env(
             &[
-                ("LANCE_ETL_BASE_URI", Some("/data/{org_id}.lance")),
+                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
                 ("DD_AGENT_HOST", Some("agent.internal")),
                 ("SEARCH_API_STATSD_ADDR", Some("10.0.0.5:9125")),
                 ("SEARCH_API_TELEMETRY_DISABLED", Some("true")),
@@ -262,7 +282,7 @@ mod tests {
     fn env_overrides_apply() {
         with_env(
             &[
-                ("LANCE_ETL_BASE_URI", Some("/data/{org_id}.lance")),
+                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
                 ("SEARCH_API_CACHE_DIR", Some("/var/cache/search")),
                 ("SEARCH_API_DISK_INDEX_CACHE_BYTES", Some("4096")),
                 ("SEARCH_API_DISK_CACHE_DISABLED", Some("true")),
@@ -283,7 +303,7 @@ mod tests {
         for (raw, expected) in [("1", true), ("Yes", true), ("off", false), ("FALSE", false)] {
             with_env(
                 &[
-                    ("LANCE_ETL_BASE_URI", Some("/data/{org_id}.lance")),
+                    ("LANCE_ETL_BASE_URI", Some("/data/lance")),
                     ("SEARCH_API_DISK_CACHE_DISABLED", Some(raw)),
                 ],
                 || {
@@ -293,7 +313,7 @@ mod tests {
         }
         with_env(
             &[
-                ("LANCE_ETL_BASE_URI", Some("/data/{org_id}.lance")),
+                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
                 ("SEARCH_API_DISK_CACHE_DISABLED", Some("maybe")),
             ],
             || {
@@ -306,7 +326,7 @@ mod tests {
     fn invalid_numbers_are_rejected() {
         with_env(
             &[
-                ("LANCE_ETL_BASE_URI", Some("/data/{org_id}.lance")),
+                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
                 ("SEARCH_API_DISK_INDEX_CACHE_BYTES", Some("lots")),
             ],
             || {

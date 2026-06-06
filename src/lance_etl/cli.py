@@ -1,7 +1,7 @@
 """Command-line entry point for the Lance vector pipeline jobs.
 
 Provides three subcommands. ``etl`` reads a time range from an Iceberg table and routes the changes into per-tenant
-Lance datasets; backfills are catch-up replays of this same job over historical windows. ``compact`` runs distributed
+Lance datasets. Backfills are catch-up replays of this same job over historical windows. ``compact`` runs distributed
 compaction over a set of datasets. ``index`` builds IVF_RQ vector, btree scalar, bitmap, and full-text BM25 indices over
 a set of datasets.
 
@@ -233,7 +233,7 @@ def run_compact(args: argparse.Namespace, spark: SparkSession) -> None:
         max_bytes_per_file=args.max_bytes_per_file,
         materialize_deletions=not args.no_materialize_deletions,
         materialize_deletions_threshold=args.materialize_deletions_threshold,
-        defer_index_remap=not args.no_defer_index_remap,
+        defer_index_remap=args.defer_index_remap,
         num_threads=args.num_threads,
         batch_size=args.batch_size,
         compaction_mode=args.compaction_mode,
@@ -475,7 +475,7 @@ def build_parser() -> argparse.ArgumentParser:
     compact.add_argument("--max-bytes-per-file", type=int, default=None)
     compact.add_argument("--no-materialize-deletions", action="store_true")
     compact.add_argument("--materialize-deletions-threshold", type=float, default=None)
-    compact.add_argument("--no-defer-index-remap", action="store_true")
+    compact.add_argument("--defer-index-remap", action="store_true")
     compact.add_argument("--num-threads", type=int, default=None)
     compact.add_argument("--batch-size", type=int, default=None)
     compact.add_argument(

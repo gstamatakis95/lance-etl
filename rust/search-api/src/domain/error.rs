@@ -4,7 +4,7 @@ use std::fmt;
 
 /// Domain error classifying every failure the search core can produce.
 ///
-/// The transport layer owns the mapping onto wire status codes; the domain only records the
+/// The transport layer owns the mapping onto wire status codes. The domain only records the
 /// failure class and a client-safe message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchError {

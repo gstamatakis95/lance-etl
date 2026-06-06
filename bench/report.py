@@ -2,9 +2,8 @@
 
 Reads every ``<phase>.json`` present in the run directory and writes ``summary.md`` (markdown tables), ``recall.csv``
 (the recall/latency sweep), ``results.csv`` (a long-format combination of every phase's headline metrics), and
-``pareto.png`` (recall@10 versus QPS per sweep point, one line per refine factor). The benchmark CLI defaults
-``MPLBACKEND`` to ``Agg`` before this module loads; :func:`plot_pareto` additionally forces the Agg backend right
-before drawing so direct imports of this module never touch a GUI toolkit either.
+``pareto.png`` (recall@10 versus QPS per sweep point, one line per refine factor). :func:`plot_pareto` forces the Agg
+backend right before drawing so importing this module never touches a GUI toolkit.
 """
 
 from __future__ import annotations
@@ -198,19 +197,36 @@ def summary_sections(config: BenchConfig, phases: dict[str, dict[str, Any] | Non
         sections.append(markdown_table(list(search["fts"].keys()), [list(search["fts"].values())]))
         sections.append("## Hybrid leg (RRF)")
         sections.append(markdown_table(list(search["hybrid"].keys()), [list(search["hybrid"].values())]))
+        clusters: dict[str, Any] = search.get("clusters", {})
+        if "orgs" in clusters:
+            sections.append("## Clusters probe")
+            headers: list[str] = ["org", "ok", "index_name", "num_partitions", "clusters", "dimension", "duration_ms"]
+            sections.append(
+                markdown_table(
+                    headers, [[org, *[probe.get(h) for h in headers[1:]]] for org, probe in clusters["orgs"].items()]
+                )
+            )
         load: dict[str, Any] = search.get("load", {})
         sections.append("## Load (ghz)")
         if "levels" in load:
-            headers: list[str] = ["concurrency", "qps", "mean_ms", "p50_ms", "p95_ms", "p99_ms"]
-            sections.append(markdown_table(headers, [[level.get(h) for h in headers] for level in load["levels"]]))
+            load_headers: list[str] = ["concurrency", "qps", "mean_ms", "p50_ms", "p95_ms", "p99_ms"]
+            sections.append(
+                markdown_table(load_headers, [[level.get(h) for h in load_headers] for level in load["levels"]])
+            )
         else:
             sections.append(load.get("skipped", "not run"))
         sections.append("## First-query latency (cold vs warm)")
         sections.append(
             markdown_table(
-                ["org", "cold_ms", "warm_ms", "prewarmed"],
+                ["org", "cold_ms", "warm_ms", "prewarmed", "prewarm_rpc_ms"],
                 [
-                    [org, timing["cold_ms"], timing["warm_ms"], timing["prewarmed"]]
+                    [
+                        org,
+                        timing["cold_ms"],
+                        timing["warm_ms"],
+                        timing["prewarmed"],
+                        timing.get("prewarm", {}).get("rpc_ms", "-"),
+                    ]
                     for org, timing in search["first_queries"].items()
                 ],
             )

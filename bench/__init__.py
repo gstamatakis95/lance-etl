@@ -6,7 +6,7 @@ into per-tenant Lance datasets by ``IcebergToLanceETL`` (including the productio
 filter), indexed with ``LanceIndexer`` (IVF_RQ, BTREE, BITMAP, INVERTED), optionally compacted with ``LanceCompactor``,
 and finally searched through the Rust gRPC search service to measure recall, latency, and sustained QPS.
 
-This package is a top-level development tool like ``airflow/``; it is not part of the shipped wheel. Run it with
+This package is a top-level development tool like ``airflow/``. It is not part of the shipped wheel. Run it with
 ``python -m bench <subcommand>`` from the repository root.
 """
 

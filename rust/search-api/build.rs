@@ -1,6 +1,6 @@
 //! Compiles the gRPC protobuf definitions with `tonic-prost-build`.
 //!
-//! `prost-build` resolves `protoc` from `PATH` (or a `PROTOC` env override); the build host
+//! `prost-build` resolves `protoc` from `PATH` (or a `PROTOC` env override). The build host
 //! provides protoc, keeping the crate free of a vendored protobuf toolchain.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

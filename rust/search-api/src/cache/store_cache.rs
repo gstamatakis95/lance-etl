@@ -23,7 +23,7 @@ use object_store::{
 };
 use serde_json::Value;
 
-use crate::lance::cache_layout::{SweepStats, atomic_write, dir_stats, hash_hex, sweep_tier, touch_file};
+use crate::cache::layout::{SweepStats, atomic_write, dir_stats, hash_hex, sweep_tier, touch_file};
 use crate::telemetry::{CacheName, EvictionReason, Metrics, Tier};
 
 /// File name for cached full-object bytes.
@@ -51,13 +51,13 @@ enum PathKind {
     Manifest,
     /// An immutable `_transactions/...` file.
     Transaction,
-    /// A file under `_indices/`; only reads up to the configured byte limit are cached, so
+    /// A file under `_indices/`. Only reads up to the configured byte limit are cached, so
     /// re-open inputs (headers, footers, small token/doc files) persist while bulk partition
     /// payloads pass through (their decoded form lives in the disk index cache instead).
     Index,
 }
 
-/// Classifies a path; `None` means the path must always pass through (notably `data/`).
+/// Classifies a path. `None` means the path must always pass through (notably `data/`).
 fn classify(location: &ObjectPath) -> Option<PathKind> {
     let mut kind = None;
     for part in location.parts() {
@@ -113,7 +113,7 @@ impl StoreCacheState {
     }
 }
 
-/// Path-filtered read-through disk cache; inject via `ObjectStoreParams::object_store_wrapper`.
+/// Path-filtered read-through disk cache. Inject via `ObjectStoreParams::object_store_wrapper`.
 pub struct MetadataByteCache {
     state: Arc<StoreCacheState>,
 }
@@ -128,7 +128,7 @@ impl std::fmt::Debug for MetadataByteCache {
 }
 
 impl MetadataByteCache {
-    /// Opens (or creates) the byte cache under `root`; `max_index_range_bytes` bounds the largest
+    /// Opens (or creates) the byte cache under `root`. `max_index_range_bytes` bounds the largest
     /// single `_indices/` byte range stored on disk.
     pub fn open(root: PathBuf, max_index_range_bytes: u64, metrics: Arc<Metrics>) -> std::io::Result<Self> {
         std::fs::create_dir_all(&root)?;
@@ -228,7 +228,7 @@ fn synthesize_result(bytes: Bytes, meta: ObjectMeta, start: u64) -> GetResult {
     }
 }
 
-/// Fallback metadata when the sidecar is missing; only `.bytes()`-style consumption relies on it.
+/// Fallback metadata when the sidecar is missing. Only `.bytes()`-style consumption relies on it.
 fn fallback_meta(location: &ObjectPath, size: u64) -> ObjectMeta {
     ObjectMeta {
         location: location.clone(),
@@ -256,7 +256,7 @@ fn meta_to_json(meta: &ObjectMeta) -> String {
     Value::Object(object).to_string()
 }
 
-/// Deserializes an `ObjectMeta` sidecar; malformed content yields `None`.
+/// Deserializes an `ObjectMeta` sidecar. Malformed content yields `None`.
 fn meta_from_json(raw: &str, location: &ObjectPath) -> Option<ObjectMeta> {
     let Value::Object(object) = serde_json::from_str::<Value>(raw).ok()? else {
         return None;
@@ -309,7 +309,8 @@ impl CachedStore {
                     .metrics
                     .cache_evictions(CacheName::Store, EvictionReason::Corrupt, 1);
             } else {
-                touch_file(&entry_path);
+                let touch_path = entry_path.clone();
+                drop(tokio::task::spawn_blocking(move || touch_file(&touch_path)));
                 self.state.metrics.cache_lookup(CacheName::Store, Tier::Disk, true);
                 tracing::Span::current().record("cache.hit", true);
                 let meta = match tokio::fs::read_to_string(object_dir.join(META_FILE)).await {
@@ -341,7 +342,9 @@ impl CachedStore {
             }
             if atomic_write(&entry_path, &bytes).await.is_ok() {
                 self.state.record_insert(bytes.len() as u64);
-                self.state.metrics.cache_insert_bytes(CacheName::Store, bytes.len() as u64);
+                self.state
+                    .metrics
+                    .cache_insert_bytes(CacheName::Store, bytes.len() as u64);
             }
         }
         Ok(synthesize_result(bytes, meta, start))
@@ -543,7 +546,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let cache = MetadataByteCache::open(tmp.path().to_path_buf(), max_range, Arc::new(Metrics::disabled())).unwrap();
+        let cache =
+            MetadataByteCache::open(tmp.path().to_path_buf(), max_range, Arc::new(Metrics::disabled())).unwrap();
         let wrapped = cache.wrap("test$store", counting.clone());
         (tmp, counting, wrapped)
     }

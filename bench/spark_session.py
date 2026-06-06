@@ -1,6 +1,6 @@
 """Spark session construction with a local Hadoop Iceberg catalog.
 
-The Iceberg Spark runtime is resolved at session start via ``spark.jars.packages``; the default coordinates target the
+The Iceberg Spark runtime is resolved at session start via ``spark.jars.packages``. The default coordinates target the
 newest Iceberg release with a Spark 4 runtime and can be overridden with ``--iceberg-package`` if the installed Spark
 minor version needs a different artifact. The session timezone is pinned to UTC so the ETL's ``TIMESTAMP`` window
 literals compare deterministically against the generated ``updated_at`` values. The worker Python is pinned to the

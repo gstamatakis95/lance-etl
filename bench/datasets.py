@@ -79,7 +79,7 @@ def fetch_url(url: str, destination: Path) -> None:
     """Stream a URL to a local file.
 
     Args:
-        url: The source URL; http, https, and ftp schemes are supported by urllib.
+        url: The source URL. HTTP, HTTPS, and FTP schemes are supported by urllib.
         destination: The local target path, written atomically via a temp suffix.
     """
     partial: Path = destination.with_suffix(destination.suffix + ".partial")
@@ -151,7 +151,7 @@ class DatasetAdapter(ABC):
 
     @abstractmethod
     def base_vector_slice(self, workspace: Path, start: int, count: int) -> np.ndarray:
-        """Return one contiguous base-vector slice; called inside Spark executor tasks.
+        """Return one contiguous base-vector slice, called inside Spark executor tasks.
 
         Args:
             workspace: The benchmark workspace directory.
@@ -195,7 +195,7 @@ class DatasetAdapter(ABC):
         seed: int,
         cluster_terms: int,
     ) -> str:
-        """Return the document text of one row; defaults to the synthetic cluster-seeded corpus.
+        """Return the document text of one row. Defaults to the synthetic cluster-seeded corpus.
 
         Datasets with real document text (text corpora) override this and ignore the synthetic vocabularies.
 
@@ -217,10 +217,10 @@ class DatasetAdapter(ABC):
 class Sift1mAdapter(DatasetAdapter):
     """The canonical SIFT1M corpus from the IRISA TexMex collection.
 
-    The canonical distribution is ``sift.tar.gz``, historically served over FTP; the HTTP URL is tried first, urllib
+    The canonical distribution is ``sift.tar.gz``, historically served over FTP. The HTTP URL is tried first, urllib
     falls back to the FTP mirror, then to per-file HuggingFace mirrors. Verification is two-fold: structural (every
     file must parse as fvecs/ivecs with the published SIFT1M shapes) and a sha256 manifest recorded on first success
-    and compared on later runs; a pinned archive digest may be supplied because IRISA publishes no authoritative
+    and compared on later runs. A pinned archive digest may be supplied because IRISA publishes no authoritative
     checksum.
     """
 
@@ -473,7 +473,7 @@ class SyntheticAdapter(DatasetAdapter):
 
     Attributes:
         dataset_name: The registry name.
-        vector_dimension: The vector dimension; must be divisible by 8 for the IVF_RQ index build.
+        vector_dimension: The vector dimension. Must be divisible by 8 for the IVF_RQ index build.
         base_rows: Number of base vectors.
         query_rows: Number of query vectors.
         seed: Seed of the deterministic generation.
@@ -518,8 +518,8 @@ class SyntheticAdapter(DatasetAdapter):
         """Report that a synthetic corpus needs no acquisition.
 
         Args:
-            workspace: The benchmark workspace directory; unused.
-            sha256: Ignored; nothing is fetched.
+            workspace: The benchmark workspace directory. Unused.
+            sha256: Ignored. Nothing is fetched.
 
         Returns:
             A skip payload.
@@ -531,7 +531,7 @@ class SyntheticAdapter(DatasetAdapter):
         """Return base vectors from the start of the generated corpus.
 
         Args:
-            workspace: The benchmark workspace directory; unused.
+            workspace: The benchmark workspace directory. Unused.
             limit: Optional cap on rows returned.
 
         Returns:
@@ -545,7 +545,7 @@ class SyntheticAdapter(DatasetAdapter):
         """Return one contiguous slice of the generated corpus.
 
         Args:
-            workspace: The benchmark workspace directory; unused.
+            workspace: The benchmark workspace directory. Unused.
             start: First global row index of the slice.
             count: Rows in the slice.
 
@@ -559,7 +559,7 @@ class SyntheticAdapter(DatasetAdapter):
         """Return the deterministic query matrix.
 
         Args:
-            workspace: The benchmark workspace directory; unused.
+            workspace: The benchmark workspace directory. Unused.
 
         Returns:
             A float32 ``(query_rows, dimension)`` array.
@@ -572,7 +572,7 @@ class SyntheticAdapter(DatasetAdapter):
         """Return ``None``: the prepare phase computes exact brute-force ground truth.
 
         Args:
-            workspace: The benchmark workspace directory; unused.
+            workspace: The benchmark workspace directory. Unused.
 
         Returns:
             Always ``None``.

@@ -3,9 +3,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::lance::cache_layout::SweepStats;
-use crate::lance::disk_cache::DiskIndexCacheBackend;
-use crate::lance::store_cache::MetadataByteCache;
+use crate::cache::disk_cache::DiskIndexCacheBackend;
+use crate::cache::layout::SweepStats;
+use crate::cache::store_cache::MetadataByteCache;
 use crate::telemetry::{CacheName, EvictionReason, Metrics};
 
 /// Sweeps the index and store cache tiers on a fixed interval.
@@ -66,7 +66,8 @@ impl CacheJanitor {
     fn publish(&self, cache: CacheName, stats: SweepStats) {
         self.metrics
             .cache_disk_gauges(cache, stats.remaining_bytes, stats.remaining_entries);
-        self.metrics.cache_evictions(cache, EvictionReason::Ttl, stats.ttl_evicted);
+        self.metrics
+            .cache_evictions(cache, EvictionReason::Ttl, stats.ttl_evicted);
         self.metrics
             .cache_evictions(cache, EvictionReason::Size, stats.size_evicted);
         if stats.ttl_evicted > 0 || stats.size_evicted > 0 {
@@ -80,7 +81,7 @@ impl CacheJanitor {
         }
     }
 
-    /// Spawns the periodic sweep loop; dropping the returned handle aborts nothing, callers
+    /// Spawns the periodic sweep loop. Dropping the returned handle aborts nothing, callers
     /// should `abort()` it on shutdown if needed.
     pub fn spawn(self, interval: Duration) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
