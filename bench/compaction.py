@@ -1,0 +1,71 @@
+"""Compact the benchmark datasets with the project's real ``LanceCompactor``.
+
+Records total wall time plus the fragment count of every dataset before and after the run. The fine-grained
+plan/execute/commit stage timings are emitted by ``lance_etl.compaction`` itself as Datadog distributions
+(``dataset.rewrite_ms``, ``dataset.commit_ms``); this phase records the end-to-end wall time and the per-dataset
+metrics dictionary the compactor returns (fragments removed/added, files removed/added, bytes reclaimed).
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from typing import Any
+
+import lance
+
+from bench.config import BenchConfig
+from bench.indexes import bench_telemetry_config
+from bench.results import save_phase
+from bench.spark_session import build_spark
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+def fragment_counts(uris: list[str]) -> dict[str, int]:
+    """Count the fragments of each dataset.
+
+    Args:
+        uris: Dataset URIs.
+
+    Returns:
+        Fragment count per URI.
+    """
+    return {uri: len(lance.dataset(uri).get_fragments()) for uri in uris}
+
+
+def run_compact(config: BenchConfig) -> dict[str, Any]:
+    """Compact every dataset and record fragment counts before and after.
+
+    Args:
+        config: Benchmark configuration.
+
+    Returns:
+        The phase result document.
+    """
+    from lance_etl.compaction import CompactionConfig, LanceCompactor
+
+    uris: list[str] = config.dataset_uris()
+    before: dict[str, int] = fragment_counts(uris)
+    compaction_config = CompactionConfig(
+        telemetry=bench_telemetry_config(),
+        target_rows_per_fragment=config.compact_target_rows,
+    )
+    spark = build_spark(config, "bench-compact")
+    try:
+        started: float = time.perf_counter()
+        stats: list[dict[str, Any]] = LanceCompactor(compaction_config).run(spark, uris)
+        elapsed: float = time.perf_counter() - started
+    finally:
+        spark.stop()
+    after: dict[str, int] = fragment_counts(uris)
+    return save_phase(
+        config,
+        "compact",
+        {
+            "total_seconds": round(elapsed, 3),
+            "fragments_before": before,
+            "fragments_after": after,
+            "datasets": stats,
+        },
+    )
