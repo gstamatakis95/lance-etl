@@ -508,19 +508,26 @@ Proto RPCs on `lance_etl.v1.SearchService`:
 |---|---|---|
 | `VectorSearch` | `target`, `query`, `rerank`, `time_range` | Nearest-neighbor search with optional rerank and optional event-time window |
 | `TextSearch` | `target`, `query`, `rerank`, `time_range` | BM25 full-text search with optional rerank and optional event-time window |
-| `HybridSearch` | `target`, `vector`, `text`, `k`, `fusion`, `rerank`, `time_range` | Fused vector + text (RRF or weighted) with optional event-time window |
+| `HybridSearch` | `target`, `vector`, `text`, `k`, `fusion`, `rerank`, `time_range`, `filter`, `filter_mode` | Fused vector + text (RRF or weighted) with optional event-time window and optional request-level typed filter applied to both legs |
 | `Prewarm` | `target`, `metadata`, `all_indexes`, `index_names`, `version`/`tag` | Pull caches at a version or tag |
 | `Clusters` | `target`, `index_name` | Read IVF centroid vectors of the vector index |
 
 All requests carry a `DatasetTarget` (`org_id`, `tenant_id`, `namespace`), which resolves to the
 single dataset at `{base}/{org}/{tenant}/{namespace}.lance`. Filters are typed AST nodes (`Filter`
-oneof) — raw SQL strings are never accepted. Event-time windowing is expressed as an optional
+oneof) — raw SQL strings are never accepted. String equality (`column = "value"`) is supported and
+injection-safe: the literal is transported verbatim and becomes a typed DataFusion expression,
+never SQL. Event-time windowing is expressed as an optional
 `TimeRange { optional int64 start_ms; optional int64 end_ms }` (epoch milliseconds, start
 inclusive, end exclusive, either bound optional). The window always applies to the event-timestamp
 column (name from `SEARCH_API_EVENT_TIMESTAMP_COLUMN`, default `event_timestamp`) and is
 translated to a typed range predicate ANDed with any `Filter`, pruned by a BTREE or zone-map on
 that column. A `TimeRange` absent from the request leaves every search path behaving exactly as
 before.
+
+`HybridSearch` also accepts a request-level `filter` (field 8) and `filter_mode` (field 9) that
+are ANDed into both the vector leg and the text leg independently. When a leg already carries its
+own filter the two predicates are combined with a typed `AND` node. Absent means no additional
+predicate beyond what each leg specifies.
 
 Proto RPCs on `lance_etl.v1.IntakeService`:
 

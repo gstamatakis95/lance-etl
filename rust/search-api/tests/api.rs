@@ -299,6 +299,8 @@ async fn search_rpcs_return_sensible_results() {
             text: Some(simple_text_query("pear", 0)),
             k: 2,
             fusion: None,
+            filter: None,
+            filter_mode: 0,
         })
         .await
         .unwrap()
@@ -513,6 +515,8 @@ async fn hybrid_fusion_config_is_applied() {
             fusion: Some(Fusion {
                 strategy: Some(fusion::Strategy::Rrf(RrfFusion { rrf_k: Some(1.0) })),
             }),
+            filter: None,
+            filter_mode: 0,
         })
         .await
         .unwrap()
@@ -532,6 +536,8 @@ async fn hybrid_fusion_config_is_applied() {
             fusion: Some(Fusion {
                 strategy: Some(fusion::Strategy::Rrf(RrfFusion { rrf_k: Some(-3.0) })),
             }),
+            filter: None,
+            filter_mode: 0,
         })
         .await
         .unwrap_err();
@@ -922,6 +928,8 @@ async fn recall_capture_samples_text_and_hybrid_with_new_attributes() {
                     vector_weight: Some(0.7),
                 })),
             }),
+            filter: None,
+            filter_mode: 0,
         })
         .await
         .unwrap();
@@ -1088,6 +1096,156 @@ async fn instrumented_server_emits_rpc_metrics_and_passes_requests_through() {
     );
 }
 
+/// Builds a string literal for use in filter predicates.
+fn string_literal(text: &str) -> LiteralValue {
+    LiteralValue {
+        kind: Some(literal_value::Kind::StringValue(text.to_string())),
+    }
+}
+
+/// Builds a `column = "string"` equality filter.
+fn string_eq_filter(column: &str, value: &str) -> Filter {
+    Filter {
+        predicate: Some(filter::Predicate::Comparison(Comparison {
+            column: column.to_string(),
+            op: CompareOp::Eq as i32,
+            value: Some(string_literal(value)),
+        })),
+    }
+}
+
+#[tokio::test]
+async fn vector_search_string_equality_filter_returns_matching_rows_only() {
+    let tmp = TempDir::new().unwrap();
+    build_test_dataset(&org1_uri(&tmp)).await;
+    let channel = serve(&tmp).await;
+    let mut client = SearchServiceClient::new(channel);
+
+    let mut query = vector_query(vec![0.0, 1.0, 0.0, 0.0], 4);
+    query.filter = Some(string_eq_filter("text", "red apple pie"));
+    let response = client
+        .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            target: target("org1"),
+            query: Some(query),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        response.results.len(),
+        1,
+        "string equality filter must return only the matching row"
+    );
+    assert_eq!(
+        row_number(&response.results[0].row, "id"),
+        1.0,
+        "only row 1 has text = 'red apple pie'"
+    );
+
+    let mut query = vector_query(vec![1.0, 0.0, 0.0, 0.0], 4);
+    query.filter = Some(string_eq_filter("text", "no such text value"));
+    let response = client
+        .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            target: target("org1"),
+            query: Some(query),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        response.results.is_empty(),
+        "a string equality filter with no matching value must return zero hits"
+    );
+}
+
+#[tokio::test]
+async fn hybrid_request_level_filter_applies_to_both_legs() {
+    let tmp = TempDir::new().unwrap();
+    build_test_dataset(&org1_uri(&tmp)).await;
+    let channel = serve(&tmp).await;
+    let mut client = SearchServiceClient::new(channel);
+
+    let response = client
+        .hybrid_search(HybridSearchRequest {
+            rerank: None,
+            time_range: None,
+            target: target("org1"),
+            vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
+            text: Some(simple_text_query("pear", 0)),
+            k: 4,
+            fusion: None,
+            filter: Some(string_eq_filter("text", "green pear tart")),
+            filter_mode: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        response.results.len(),
+        1,
+        "request-level string equality filter must restrict both legs to the matching row"
+    );
+    assert_eq!(
+        row_number(&response.results[0].row, "id"),
+        2.0,
+        "only row 2 has text = 'green pear tart'"
+    );
+
+    let unfiltered = client
+        .hybrid_search(HybridSearchRequest {
+            rerank: None,
+            time_range: None,
+            target: target("org1"),
+            vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
+            text: Some(simple_text_query("pear", 0)),
+            k: 4,
+            fusion: None,
+            filter: None,
+            filter_mode: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        unfiltered.results.len() >= response.results.len(),
+        "removing the request-level filter must not reduce the result count"
+    );
+
+    let response_combined = client
+        .hybrid_search(HybridSearchRequest {
+            rerank: None,
+            time_range: None,
+            target: target("org1"),
+            vector: Some({
+                let mut q = vector_query(vec![0.0, 1.0, 0.0, 0.0], 0);
+                q.filter = Some(compare_filter("id", CompareOp::Le, 3));
+                q
+            }),
+            text: Some(simple_text_query("pear", 0)),
+            k: 4,
+            fusion: None,
+            filter: Some(string_eq_filter("text", "green pear tart")),
+            filter_mode: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        response_combined.results.len(),
+        1,
+        "per-leg filter ANDed with request-level filter must still return only the matching row"
+    );
+    assert_eq!(
+        row_number(&response_combined.results[0].row, "id"),
+        2.0,
+        "the combined AND predicate must resolve to row 2 only"
+    );
+}
+
 /// A reranker that reverses the candidate order, used to prove the post-fusion seam is exercised.
 struct ReverseReranker;
 
@@ -1239,6 +1397,8 @@ async fn weighted_fusion_proto_variant_is_applied() {
                     vector_weight: Some(1.0),
                 })),
             }),
+            filter: None,
+            filter_mode: 0,
         })
         .await
         .unwrap()
@@ -1264,6 +1424,8 @@ async fn weighted_fusion_proto_variant_is_applied() {
                     vector_weight: Some(1.5),
                 })),
             }),
+            filter: None,
+            filter_mode: 0,
         })
         .await
         .unwrap_err();

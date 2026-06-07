@@ -536,6 +536,16 @@ message HybridSearchRequest {
   // Optional event-time window. When set, both legs restrict results to rows whose event-timestamp
   // column falls in the window, ANDed with any per-leg filter. Absent searches all event times.
   TimeRange time_range = 7;
+  // Optional typed predicate applied to both legs of the hybrid query. The filter is ANDed into
+  // each leg independently before the index search. When a leg already carries its own filter,
+  // the request-level filter is ANDed with it so both constraints apply. String-equality
+  // predicates (column = "value") are safe: literals are transported verbatim and never
+  // interpreted as SQL. Absent means no additional predicate beyond what each leg specifies.
+  Filter filter = 8;
+  // Whether the request-level filter runs before or after the index search on both legs.
+  // Applies only when filter is set. When a leg has its own filter_mode and no request-level
+  // filter is present, the leg's own mode is used unchanged.
+  FilterMode filter_mode = 9;
 }
 
 // Response for SearchService.HybridSearch.

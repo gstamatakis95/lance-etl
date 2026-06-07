@@ -34,3 +34,13 @@ The `SearchService` and the later `IntakeService` ([0017](0017-rust-intake-servi
 subsequently consolidated into one proto file, `proto/lance_etl/v1/lance_etl.proto` (package
 `lance_etl.v1`), with a single shared `DatasetTarget` message referenced by both services. The
 layering above is unchanged: `grpc` remains the only place proto and tonic types appear.
+
+**Amendment: hybrid request-level typed filter (fields 8 and 9).**
+`HybridSearchRequest` now accepts an optional `Filter filter = 8` and `FilterMode filter_mode = 9`
+at the request level. The filter is ANDed into both legs independently before either index search
+runs. When a leg already carries its own filter the two are combined with `Filter::And`. String
+equality predicates (`column = "value"`) are fully supported and injection-safe: the string
+literal is transported verbatim through `LiteralValue.string_value` and becomes a typed DataFusion
+`lit` expression, never raw SQL. The existing per-leg `filter` and `filter_mode` fields on
+`VectorQuery` and `TextQuery` remain unchanged. Integration tests cover string equality on a
+vector search leg and a request-level filter on a hybrid search that restricts both legs.

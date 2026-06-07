@@ -162,15 +162,43 @@ pub fn text_query_from_proto(
 /// Converts a proto hybrid request into the domain query.
 ///
 /// The request-level time range is applied to both legs, so the vector and text legs filter the
-/// same event-time window.
+/// same event-time window. When a request-level filter is present it is ANDed into both legs:
+/// if a leg already has its own filter the two are combined with [`Filter::And`]; if only one
+/// side is present that side is used alone. The request-level `filter_mode` is applied to both
+/// legs when a request-level filter is present, leaving each leg's own mode unchanged otherwise.
 pub fn hybrid_query_from_proto(request: pb::HybridSearchRequest) -> Result<HybridQuery, SearchError> {
     let time_range = time_range_from_proto(request.time_range);
+    let request_filter = request.filter.map(filter_from_proto).transpose()?;
+    let request_filter_mode = filter_mode_from_proto(request.filter_mode)?;
+    let mut vector = vector_query_from_proto(request.vector, time_range)?;
+    let mut text = text_query_from_proto(request.text, time_range)?;
+    if let Some(req_filter) = request_filter {
+        vector.filter = Some(combine_filters(vector.filter, req_filter.clone()));
+        vector.filter_mode = request_filter_mode;
+        text.filter = Some(combine_filters(text.filter, req_filter));
+        text.filter_mode = request_filter_mode;
+    }
     Ok(HybridQuery {
-        vector: vector_query_from_proto(request.vector, time_range)?,
-        text: text_query_from_proto(request.text, time_range)?,
+        vector,
+        text,
         k: request.k as usize,
         fusion: fusion_from_proto(request.fusion)?,
     })
+}
+
+/// ANDs a request-level filter with an optional per-leg filter.
+///
+/// When both are present the result is `Filter::And([leg_filter, request_filter])`. When only
+/// one side is present it is returned unchanged. The caller guarantees at least `request_filter`
+/// is `Some` before calling this helper.
+fn combine_filters(
+    leg_filter: Option<crate::domain::Filter>,
+    request_filter: crate::domain::Filter,
+) -> crate::domain::Filter {
+    match leg_filter {
+        Some(leg) => crate::domain::Filter::And(vec![leg, request_filter]),
+        None => request_filter,
+    }
 }
 
 /// Converts a proto fusion config into the domain spec, defaulting to RRF with `rrf_k = 60`.
