@@ -65,11 +65,6 @@ cache (`DiskIndexCacheBackend` + `MetadataByteCache`) extends the session caches
 directory (default `/tmp/rust-search/cache`), so cold restarts skip the network for recently read
 indexes and metadata. Raw data bytes are never cached.
 
-Date-range fan-out: when `DatasetTarget` carries a `DateRange`, each day resolves to one dataset at
-`{base}/{org_id}/{tenant_id}/{namespace}/{YYYY-MM-DD}.lance`. Days whose dataset does not exist are
-skipped. Concurrent day-legs are bounded by `SEARCH_API_FANOUT_CONCURRENCY`. Results are deduped by
-`SEARCH_API_ID_COLUMN` (keeping the best per-leg score) then re-fused.
-
 Blue-green serving: a `prod` tag (or any named tag) is updated atomically with `tags.update`. When
 `SEARCH_API_SERVE_BY_TAG=true`, the provider resolves the tag to a concrete version, keys its LRU
 and caches on that version, and re-reads the tag after `SEARCH_API_SERVE_TAG_TTL_SECS` seconds so
@@ -105,12 +100,11 @@ prewarm every replica against the green version explicitly (use the `version` or
 | `domain/clusters.rs` | `ClusterSpec`, `ClusterReport`, `ClusterReader` trait |
 | `domain/fusion.rs` | `FusionSpec` (Rrf and Weighted variants) and fusion logic |
 | `domain/rerank.rs` | `Reranker` seam, `IdentityReranker` (no-op default) |
-| `domain/merge.rs` | Dedup-by-id fan-out merge, keep-best policy |
 | `cache/disk_cache.rs` | Hybrid disk + Moka `CacheBackend` for the Lance index cache |
 | `cache/store_cache.rs` | Read-through byte cache for immutable metadata |
 | `cache/layout.rs` | Versioned stamp dir, key hashing, atomic writes, TTL/budget sweep |
 | `cache/janitor.rs` | Periodic TTL + byte-budget sweep loop |
-| `lance/backend.rs` | `LanceSearchBackend<P>` — date-range fan-out, dedup, post-fusion rerank |
+| `lance/backend.rs` | `LanceSearchBackend<P>` — single-dataset dispatch, post-fusion rerank |
 | `lance/provider.rs` | `DatasetProvider` trait, `CachingDatasetProvider`, tag-version TTL cache |
 | `lance/filter.rs` | `filter_to_expr`: domain filter -> DataFusion `Expr` |
 | `lance/text.rs` | FTS query node tree -> Lance FTS parameters |
@@ -145,10 +139,11 @@ can drive the entire `all` chain.
 
 ### Documentation (`docs/`)
 
-- `docs/adr/` — 13 Architecture Decision Records (0001 through 0013) covering distributed indexing,
-  two-tier compaction, snapshot-id bounds, dynamic partition routing, gRPC layering, date-range
-  fan-out, disk cache and prewarm, observability and recall audit, compaction/index coexistence,
-  stable-row-id rejection, ingested-at column, V2 manifest paths, and blue-green serving.
+- `docs/adr/` — 15 Architecture Decision Records (0001 through 0015) covering distributed indexing,
+  two-tier compaction, snapshot-id bounds, dynamic partition routing, gRPC layering, disk cache and
+  prewarm, observability and recall audit, compaction/index coexistence, stable-row-id rejection,
+  ingested-at column, V2 manifest paths, blue-green serving, by-date partitioning removal, and
+  CLI and config knob reduction.
 - `docs/FINDINGS.md` — narrative companion to the ADRs: verified APIs, production patterns,
   scale design, coexistence results, and open items.
 - `market-research/` — detailed evaluation notes, plans, and evidence underlying the ADRs.
@@ -179,11 +174,12 @@ Once `pylance>=8.0.0b6` is published to PyPI, a plain `uv pip install -e ".[dev]
 
 The CLI is deliberately small and opinionated. It exposes only the arguments that are genuinely
 per-deployment: the data and identity contract (which table, which window, where datasets live,
-Datadog service) and what to build (key/vector/metadata columns, partition routing, which index
-types and their tokenizer knobs). Every tuning knob — shuffle partitions, retry budgets, compaction
-fragment sizing, IVF training parameters, two-tier thresholds — is set to an opinionated default in
-the configuration dataclasses (`ETLConfig`, `IndexJobConfig`, `CompactionConfig`) and stays tunable
-in code, not from the command line.
+Datadog service) and what to build (partition routing, which index types, the distance metric, and
+the FTS base tokenizer and language). Every tuning knob — the schema column names, shuffle
+partitions, retry budgets, compaction fragment sizing, IVF training parameters, fine-grained FTS
+tokenizer toggles, and two-tier thresholds — is set to an opinionated default in the configuration
+dataclasses (`ETLConfig`, `IndexJobConfig`, `CompactionConfig`) and stays tunable in code, not from
+the command line.
 
 The entry point is installed as `lance-etl`.
 
@@ -195,8 +191,6 @@ lance-etl etl \
   --start 2024-01-15T00:00:00 \
   --end 2024-01-16T00:00:00 \
   --base-uri s3://my-bucket/lance \
-  --key-col vector_id \
-  --vectors-col vectors \
   --column-type vectors=fixed_size_list<float16,768> \
   --dd-service lance-pipeline --dd-env prod
 ```
@@ -204,25 +198,23 @@ lance-etl etl \
 `--start` / `--end` accept ISO 8601 strings or epoch milliseconds and resolve to Iceberg
 snapshot-id bounds. `--column-type` can be repeated for each column needing a type cast.
 
-Partition routing and derived columns:
+Partition routing:
 
 ```bash
 lance-etl etl ... \
-  --partition-by org_id,tenant_id,namespace \
-  --partition-derive event_date=processing_timestamp:%Y-%m-%d
+  --partition-by org_id,tenant_id,namespace
 ```
 
 `--partition-by` (default `org_id,tenant_id,namespace`) sets the columns that build the dataset
-path `base_uri/<val1>/.../<valN>.lance`. `--partition-derive NAME=SOURCE:FORMAT` derives a column
-from a source timestamp column using a Python strftime pattern before routing.
+path `base_uri/<val1>/.../<valN>.lance`. Every column must exist in the source table. Each key
+lives in exactly one dataset, so the per-dataset `merge_insert` is the sole dedup mechanism.
 
 Window pushdown filter (applied after the Iceberg read):
 
 ```bash
 lance-etl etl ... \
   --window-start 2024-01-15T06:00:00 \
-  --window-end 2024-01-15T12:00:00 \
-  --window-column updated_at
+  --window-end 2024-01-15T12:00:00
 ```
 
 Full `etl` flag reference:
@@ -233,20 +225,11 @@ Full `etl` flag reference:
 | `--start` | (required) | Iceberg snapshot window start (ISO 8601 or epoch ms) |
 | `--end` | (required) | Iceberg snapshot window end (ISO 8601 or epoch ms) |
 | `--base-uri` | (required) | Root URI for per-tenant Lance datasets |
-| `--key-col` | `vector_id` | Unique row key for merge_insert dedup |
 | `--partition-by` | `org_id,tenant_id,namespace` | Comma-separated routing columns |
-| `--partition-derive` | none | Repeatable `NAME=SOURCE:FORMAT` derived column |
-| `--vectors-col` | `vectors` | Vector column name |
-| `--metadata-col` | `metadata` | Metadata column name |
-| `--ts-col` | `timestamp` | Timestamp column name |
-| `--op-col` | `op` | CDC operation column name |
-| `--delete-op-value` | `delete,DELETE,d` | Repeatable delete sentinel values |
 | `--column-type` | none | Repeatable `name=arrow_type` cast |
 | `--iceberg-option` | none | Repeatable `key=value` Iceberg read option |
 | `--window-start` | none | Inclusive lower bound for the window pushdown filter |
 | `--window-end` | none | Exclusive upper bound for the window pushdown filter |
-| `--window-column` | `updated_at` | Column used for the window pushdown filter |
-| `--ingested-at-col` | `_ingested_at` | Ingestion-timestamp column stamped on every row |
 | `--storage-option` | none | Repeatable `key=value` passed to pylance |
 | `--dd-service` | `lance-pipeline` | Datadog service tag |
 | `--dd-env` | `prod` | Datadog env tag |
@@ -290,10 +273,6 @@ Full `index` flag reference (data-shape flags only — tuning knobs use `IndexJo
 | `--fts-with-position` | off | Store token positions for phrase queries |
 | `--fts-base-tokenizer` | none | FTS base tokenizer name |
 | `--fts-language` | none | Stemming and stop-word language |
-| `--fts-lower-case` | none | Enable lowercase normalisation |
-| `--fts-stem` | none | Enable stemming |
-| `--fts-remove-stop-words` | none | Enable stop-word removal |
-| `--fts-ascii-folding` | none | Enable ASCII folding |
 | `--rebuild` | off | Reindex every fragment (use after tokenizer or parameter changes) |
 
 #### `recall` — offline recall audit
@@ -402,16 +381,9 @@ Environment variables (`LANCE_ETL_BASE_URI` is required. All others are optional
 | `SEARCH_API_CACHE_DIR` | `/tmp/rust-search/cache` | Root directory for persistent disk caches |
 | `SEARCH_API_DISK_INDEX_CACHE_BYTES` | `8589934592` (8 GiB) | Disk budget for the index cache tier |
 | `SEARCH_API_DISK_STORE_CACHE_BYTES` | `2147483648` (2 GiB) | Disk budget for the metadata byte cache |
-| `SEARCH_API_DISK_CACHE_TTL_SECS` | `604800` (7 days) | TTL for disk cache entries |
-| `SEARCH_API_STORE_CACHE_MAX_RANGE_BYTES` | `4194304` (4 MiB) | Max byte-range cached per metadata read |
-| `SEARCH_API_DISK_CACHE_SWEEP_SECS` | `300` | Janitor sweep interval in seconds |
 | `SEARCH_API_DISK_CACHE_DISABLED` | `false` | Set to `true` for pure in-memory fallback |
 | `SEARCH_API_PREWARM_CONCURRENCY` | `4` | Indexes warmed concurrently per Prewarm RPC |
-| `SEARCH_API_FANOUT_CONCURRENCY` | `8` | Per-day datasets queried concurrently per fan-out |
-| `SEARCH_API_ID_COLUMN` | `vector_id` | Logical id column for deduplication across date legs |
 | `SEARCH_API_IO_CONCURRENCY` | `256` | Parallel in-flight object-store requests per dataset |
-| `SEARCH_API_IO_BLOCK_SIZE_BYTES` | `262144` (256 KiB) | Minimum object-store request size |
-| `SEARCH_API_OBJECT_STORE_TIMEOUT_SECS` | `120` | Total retry-window timeout per cloud request |
 | `SEARCH_API_RECALL_SAMPLE_RATE` | `0.0` (off) | Fraction of requests sampled for offline recall |
 | `SEARCH_API_SERVE_BY_TAG` | `false` | Resolve the serve tag instead of opening latest |
 | `SEARCH_API_SERVE_TAG` | `prod` | Tag name resolved when `SEARCH_API_SERVE_BY_TAG=true` |
@@ -432,10 +404,10 @@ Proto RPCs on `lance_etl.search.v1.SearchService`:
 | `Prewarm` | `target`, `metadata`, `all_indexes`, `index_names`, `version`/`tag` | Pull caches at a version or tag |
 | `Clusters` | `target`, `index_name` | Read IVF centroid vectors of the vector index |
 
-All requests carry a `DatasetTarget` (`org_id`, `tenant_id`, `namespace`, optional `DateRange`).
-Without a `DateRange` the target resolves to `{base}/{org}/{tenant}/{namespace}.lance`. With one it
-fans out over one dataset per calendar day, skipping missing days. Filters are typed AST nodes
-(`Filter` oneof) — raw SQL strings are never accepted.
+All requests carry a `DatasetTarget` (`org_id`, `tenant_id`, `namespace`), which resolves to the
+single dataset at `{base}/{org}/{tenant}/{namespace}.lance`. Filters are typed AST nodes (`Filter`
+oneof) — raw SQL strings are never accepted. Time-bounded queries are expressed as scalar filters on
+a timestamp column rather than as a multi-dataset fan-out.
 
 The `Prewarm` RPC accepts `version` (explicit committed version id) or `tag` (resolves the named
 tag at call time) and returns `resolved_version`, enabling the safe green-before-flip workflow.
@@ -468,9 +440,7 @@ Configure via Airflow Variables:
 | `lance_etl_dd_service` | `lance-pipeline` | Datadog service tag |
 | `lance_etl_dd_env` | `prod` | Datadog env tag |
 | `lance_etl_dd_tags` | empty | Comma-separated `key:value` constant tags |
-| `lance_etl_window_column` | `updated_at` | Iceberg timestamp column for window pushdown |
 | `lance_etl_partition_by` | empty | Comma-separated partition columns for `--partition-by` |
-| `lance_etl_partition_derive` | empty | Comma-separated `NAME=SOURCE:FORMAT` derivation specs |
 
 `lance_etl_index_flags` is required when index maintenance is desired. Without it the `index` step
 configures zero handlers and is a silent no-op. Example value:

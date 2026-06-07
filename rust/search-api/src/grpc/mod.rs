@@ -153,22 +153,11 @@ fn annotate_request_span(target: &DatasetTarget) {
     span.set_attribute("org_id", target.org_id.clone());
     span.set_attribute("tenant_id", target.tenant_id.clone());
     span.set_attribute("namespace", target.namespace.clone());
-    if let Some(range) = &target.date_range {
-        span.set_attribute("date_range.start", range.start.to_string());
-        span.set_attribute("date_range.end", range.end.to_string());
-        span.set_attribute("date_range.days", range.days().len() as i64);
-    }
 }
 
 /// Renders the target for failure logs.
 fn target_label(target: &DatasetTarget) -> String {
-    match &target.date_range {
-        None => format!("{}/{}/{}", target.org_id, target.tenant_id, target.namespace),
-        Some(range) => format!(
-            "{}/{}/{}@{}..{}",
-            target.org_id, target.tenant_id, target.namespace, range.start, range.end
-        ),
-    }
+    format!("{}/{}/{}", target.org_id, target.tenant_id, target.namespace)
 }
 
 /// Records the RPC outcome: gRPC status code on the span, request/latency/error metrics, and a

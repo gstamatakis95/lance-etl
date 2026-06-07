@@ -1,9 +1,9 @@
 """Tests for V2 manifest paths on dataset bootstrap and the one-shot migration entry point.
 
-V2 manifest paths are now an opinionated always-on default with no CLI flag: the :class:`ETLConfig` default is the
-only knob and it is tunable in code. Covers that default, the real-Lance bootstrap layout (a dataset created through
-:func:`apply_merge` carries V2 manifest names ``_versions/{u64::MAX - version}.manifest`` zero-padded to 20 digits,
-while an opted-out config keeps the legacy V1 names), and the migration: :func:`migrate_dataset_manifest_paths`
+V2 manifest paths are now baked on with no knob: the ETL always bootstraps datasets with V2 names. Covers the
+real-Lance bootstrap layout (a dataset created through :func:`apply_merge` carries V2 manifest names
+``_versions/{u64::MAX - version}.manifest`` zero-padded to 20 digits, while a dataset written with the legacy V1
+names via a direct Lance call discriminates the detector), and the migration: :func:`migrate_dataset_manifest_paths`
 upgrades a V1 dataset to V2 in place and the ``migrate-manifests`` CLI subcommand is wired.
 """
 
@@ -57,15 +57,6 @@ def upsert_group() -> pa.Table:
     return pa.table({"vector_id": pa.array(["v1"]), "op": pa.array(["insert"])})
 
 
-class TestETLConfigDefault:
-    """ETLConfig defaults V2 manifest paths on."""
-
-    def test_default_is_true(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
-        """enable_v2_manifest_paths defaults to True."""
-        config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config)
-        assert config.enable_v2_manifest_paths is True
-
-
 class TestCliWiring:
     """The etl subcommand parses without a V2 flag, and migrate-manifests is wired."""
 
@@ -93,17 +84,6 @@ class TestBootstrapLayout:
         config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config, retry_backoff_seconds=0.0)
         apply_merge(config, MagicMock(), ("o1", "t1", "n1"), upsert_group())
         assert manifest_scheme(f"{tmp_path}/o1/t1/n1.lance") == "V2"
-
-    def test_opt_out_creates_v1(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
-        """Opting out bootstraps a dataset with the legacy V1 manifest paths, proving the test discriminates."""
-        config: ETLConfig = ETLConfig(
-            base_uri=str(tmp_path),
-            telemetry=telemetry_config,
-            enable_v2_manifest_paths=False,
-            retry_backoff_seconds=0.0,
-        )
-        apply_merge(config, MagicMock(), ("o1", "t1", "n1"), upsert_group())
-        assert manifest_scheme(f"{tmp_path}/o1/t1/n1.lance") == "V1"
 
 
 @pytest.mark.integration

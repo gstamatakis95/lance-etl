@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::NaiveDate;
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::session::Session;
@@ -38,8 +37,7 @@ pub fn handle_weight(dataset: &Dataset) -> u32 {
     (dataset.count_fragments() as u64).clamp(1, MAX_HANDLE_WEIGHT as u64) as u32
 }
 
-/// Resolves a dataset target (plus an optional day partition and a version selector) to an open
-/// Lance dataset handle.
+/// Resolves a dataset target (plus a version selector) to an open Lance dataset handle.
 ///
 /// This is the seam for swapping dataset resolution strategies (URI layouts, catalogs,
 /// per-tenant registries, alternative blue-green schemes) without touching the search backend.
@@ -48,9 +46,7 @@ pub fn handle_weight(dataset: &Dataset) -> u32 {
 pub trait DatasetProvider: Send + Sync + 'static {
     /// Returns an open dataset handle for one target at the selected version.
     ///
-    /// `date` of `None` resolves the rangeless dataset
-    /// (`{base}/{org}/{tenant}/{namespace}.lance`). `Some(day)` resolves that day's partition
-    /// (`{base}/{org}/{tenant}/{namespace}/{day}.lance`).
+    /// The target resolves to `{base}/{org}/{tenant}/{namespace}.lance`.
     ///
     /// `reference` selects the committed version: [`DatasetRef::Serve`] follows the provider's
     /// configured serve policy (a resolved serve tag, or latest), [`DatasetRef::Latest`] always
@@ -61,7 +57,6 @@ pub trait DatasetProvider: Send + Sync + 'static {
     fn dataset(
         &self,
         target: &DatasetTarget,
-        date: Option<NaiveDate>,
         reference: DatasetRef,
     ) -> impl Future<Output = Result<Arc<Dataset>, SearchError>> + Send;
 
@@ -159,7 +154,7 @@ impl CachingDatasetProvider {
         if let Some(store_cache) = &store_cache {
             wrappers.push(store_cache.clone());
         }
-        let block_size = Some(config.io_block_size_bytes);
+        let block_size = Some(crate::config::DEFAULT_IO_BLOCK_SIZE_BYTES);
         let store_params = if wrappers.is_empty() {
             Some(ObjectStoreParams {
                 block_size,
@@ -212,7 +207,7 @@ impl CachingDatasetProvider {
         Some(CacheJanitor::new(
             self.disk_index_cache.clone()?,
             self.store_cache.clone()?,
-            Duration::from_secs(config.disk_cache_ttl_secs),
+            Duration::from_secs(crate::config::DEFAULT_DISK_CACHE_TTL_SECS),
             config.disk_index_cache_bytes,
             config.disk_store_cache_bytes,
             self.metrics.clone(),
@@ -229,14 +224,11 @@ impl CachingDatasetProvider {
         self.store_cache.as_ref()
     }
 
-    /// Resolves the dataset URI of one target, optionally selecting one day partition.
-    fn dataset_uri(&self, target: &DatasetTarget, date: Option<NaiveDate>) -> String {
+    /// Resolves the dataset URI of one target.
+    fn dataset_uri(&self, target: &DatasetTarget) -> String {
         let base = &self.base_uri;
         let (org, tenant, namespace) = (&target.org_id, &target.tenant_id, &target.namespace);
-        match date {
-            None => format!("{base}/{org}/{tenant}/{namespace}.lance"),
-            Some(day) => format!("{base}/{org}/{tenant}/{namespace}/{day}.lance"),
-        }
+        format!("{base}/{org}/{tenant}/{namespace}.lance")
     }
 
     /// Resolves a [`DatasetRef`] to the concrete version to open and whether the open is a
@@ -333,7 +325,11 @@ type DiskCaches = (Option<Arc<DiskIndexCacheBackend>>, Option<Arc<MetadataByteCa
 fn build_disk_caches(config: &Config, metrics: Arc<Metrics>) -> std::io::Result<DiskCaches> {
     let root = prepare_cache_root(&config.cache_dir)?;
     let index_backend = DiskIndexCacheBackend::open(root.join("index"), config.index_cache_bytes, metrics.clone())?;
-    let store_cache = MetadataByteCache::open(root.join("store"), config.store_cache_max_range_bytes, metrics)?;
+    let store_cache = MetadataByteCache::open(
+        root.join("store"),
+        crate::config::DEFAULT_STORE_CACHE_MAX_RANGE_BYTES,
+        metrics,
+    )?;
     Ok((Some(Arc::new(index_backend)), Some(Arc::new(store_cache))))
 }
 
@@ -353,15 +349,10 @@ impl DatasetProvider for CachingDatasetProvider {
             cache.dataset_handle_hit = tracing::field::Empty,
         )
     )]
-    async fn dataset(
-        &self,
-        target: &DatasetTarget,
-        date: Option<NaiveDate>,
-        reference: DatasetRef,
-    ) -> Result<Arc<Dataset>, SearchError> {
+    async fn dataset(&self, target: &DatasetTarget, reference: DatasetRef) -> Result<Arc<Dataset>, SearchError> {
         target.validate()?;
         let started = std::time::Instant::now();
-        let uri = self.dataset_uri(target, date);
+        let uri = self.dataset_uri(target);
         let resolved = self.resolve_reference(&uri, reference).await?;
         let key = (uri.clone(), resolved.version);
         let session = self.session.clone();

@@ -110,8 +110,7 @@ def dataset_target(pb2: ModuleType, org_id: str, tenant_id: str = TENANT_ID, nam
     """Build the ``DatasetTarget`` addressing one per-tenant benchmark dataset.
 
     The server resolves the target to ``{LANCE_ETL_BASE_URI}/{org_id}/{tenant_id}/{namespace}.lance``, which is
-    exactly the layout the benchmark ingest phase writes (see ``BenchConfig.dataset_uris``). No ``date_range`` is set
-    because the benchmark datasets are not date-partitioned.
+    exactly the layout the benchmark ingest phase writes (see ``BenchConfig.dataset_uris``).
 
     Args:
         pb2: The generated proto module.

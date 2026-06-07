@@ -22,6 +22,7 @@ from pyspark.sql import SparkSession
 
 from lance_etl import etl as etl_module
 from lance_etl.etl import (
+    INGESTED_AT_COLUMN,
     ETLConfig,
     IcebergToLanceETL,
     apply_merge,
@@ -81,8 +82,8 @@ class TestFreshIngest:
         IcebergToLanceETL(config).run_on_dataframe(frame)
 
         table: pa.Table = lance.dataset(dataset_uri(config, "o1", "t1", "n1")).to_table()
-        assert config.ingested_at_col in table.column_names
-        stamped: pa.ChunkedArray = table[config.ingested_at_col]
+        assert INGESTED_AT_COLUMN in table.column_names
+        stamped: pa.ChunkedArray = table[INGESTED_AT_COLUMN]
         assert pat.is_timestamp(stamped.type)
         assert stamped.null_count == 0
 
@@ -104,14 +105,14 @@ class TestSchemaEvolution:
 
         uri: str = dataset_uri(config, "o1", "t1", "n1")
         dataset: lance.LanceDataset = lance.dataset(uri)
-        dataset.drop_columns([config.ingested_at_col])
-        assert config.ingested_at_col not in lance.dataset(uri).schema.names
+        dataset.drop_columns([INGESTED_AT_COLUMN])
+        assert INGESTED_AT_COLUMN not in lance.dataset(uri).schema.names
 
         etl.run_on_dataframe(spark.createDataFrame(sample_rows(), SOURCE_DDL))
 
         table: pa.Table = lance.dataset(uri).to_table()
-        assert config.ingested_at_col in table.column_names
-        stamped: pa.ChunkedArray = table[config.ingested_at_col]
+        assert INGESTED_AT_COLUMN in table.column_names
+        stamped: pa.ChunkedArray = table[INGESTED_AT_COLUMN]
         assert pat.is_timestamp(stamped.type)
         assert stamped.null_count == 0
 
@@ -151,7 +152,7 @@ class TestRoutingExclusion:
         source: MagicMock = MagicMock()
         source.columns = ["vector_id", "timestamp", "op", "vectors", "metadata", "org_id", "tenant_id", "namespace"]
         etl.validate_schema(source)
-        assert config.ingested_at_col not in config.routing_cols()
+        assert INGESTED_AT_COLUMN not in config.routing_cols()
 
 
 def fake_merge_dataset(execute_side_effect: list[Any]) -> MagicMock:

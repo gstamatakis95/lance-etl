@@ -51,13 +51,23 @@ import lance
 from lance.optimize import Compaction, CompactionMetrics, CompactionTask, RewriteResult
 from pyspark.sql import SparkSession
 
-from lance_etl.telemetry import Telemetry, TelemetryConfig, commit_with_retries, is_commit_conflict_error
+from lance_etl.telemetry import (
+    DEFAULT_COMMIT_RETRIES,
+    DEFAULT_LARGE_COMMIT_RETRIES,
+    Telemetry,
+    TelemetryConfig,
+    commit_with_retries,
+    is_commit_conflict_error,
+)
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-COMPACTION_MODES: tuple[str, ...] = ("reencode", "try_binary_copy")
-"""Accepted compaction modes. ``force_binary_copy`` is rejected because it errors instead of falling back when a
-fragment is incompatible with binary copy. It would fail whole rewrite tasks on deletion-bearing fragments."""
+COMPACTION_MODE: str = "try_binary_copy"
+"""The single production compaction mode, baked rather than exposed as a knob.
+
+``try_binary_copy`` skips decode and re-encode entirely when fragments are compatible and falls back to reencode per
+task otherwise, and fragments with deletion files fall back automatically. ``force_binary_copy`` is never used because
+it errors instead of falling back, which would fail whole rewrite tasks on deletion-bearing fragments."""
 
 MIN_CLEANUP_HORIZON_SECONDS: int = 6 * 3600
 """Floor for ``cleanup_older_than_seconds``. Version cleanup is not a transaction. An aggressive horizon can delete the
@@ -75,7 +85,6 @@ class CompactionConfig:
         target_rows_per_fragment: Desired rows per compacted fragment.
         max_rows_per_group: Maximum rows per group within a fragment.
         max_bytes_per_file: Maximum bytes per compacted file.
-        materialize_deletions: Whether to physically remove deleted rows.
         materialize_deletions_threshold: Deletion fraction above which a fragment is rewritten to drop deleted rows.
         defer_index_remap: Defer index remap instead of rewriting indices inline. Honored only on the small-dataset
             tier, where ``Compaction.execute`` parses all options. The large-dataset tier ignores it because the Python
@@ -87,17 +96,12 @@ class CompactionConfig:
             refused by Lance's option parser.
         num_threads: Worker threads inside a single rewrite task.
         batch_size: Rows per batch when rewriting.
-        compaction_mode: ``"reencode"`` or ``"try_binary_copy"``. Defaults to ``"try_binary_copy"``, which skips
-            decode and re-encode entirely when fragments are compatible and falls back to reencode per task otherwise.
-            Fragments with deletion files fall back automatically. ``"force_binary_copy"`` is rejected because it
-            errors instead of falling back.
         max_tasks: Maximum number of Spark tasks for one dataset's rewrites.
         large_dataset_fragment_threshold: Fragment count above which a dataset is compacted with the distributed plan
             instead of in one executor task.
         batch_partitions: Maximum Spark partitions for the small-dataset batch job.
         max_concurrent_large: Driver threads running large-dataset compactions concurrently.
         scheduler_pool: Spark FAIR scheduler pool for large-dataset jobs.
-        run_cleanup: Whether to prune old versions after committing.
         cleanup_older_than_seconds: Age threshold for version cleanup. ``None`` keeps the Lance default. Explicit
             values below :data:`MIN_CLEANUP_HORIZON_SECONDS` are rejected because cleanup is not a transaction and can
             delete the transaction files an in-flight committer needs to rebase.
@@ -117,51 +121,47 @@ class CompactionConfig:
     target_rows_per_fragment: int | None = None
     max_rows_per_group: int | None = None
     max_bytes_per_file: int | None = None
-    materialize_deletions: bool | None = True
     materialize_deletions_threshold: float | None = None
     defer_index_remap: bool = False
     max_source_fragments: int | None = None
     num_threads: int | None = None
     batch_size: int | None = None
-    compaction_mode: str = "try_binary_copy"
     max_tasks: int = 256
     large_dataset_fragment_threshold: int = 128
     batch_partitions: int = 512
     max_concurrent_large: int = 4
     scheduler_pool: str = "lance-compaction"
-    run_cleanup: bool = True
     cleanup_older_than_seconds: int | None = None
     retain_versions: int | None = None
-    commit_retries: int = 20
+    commit_retries: int = DEFAULT_COMMIT_RETRIES
     commit_backoff_seconds: float = 0.5
-    large_commit_retries: int = 2
+    large_commit_retries: int = DEFAULT_LARGE_COMMIT_RETRIES
     replan_budget: int = 3
 
     def execute_options(self) -> dict[str, Any]:
         """Build the full options dict for single-process ``Compaction.execute``.
 
+        Deleted rows are always materialized and the mode is always :data:`COMPACTION_MODE`, baked rather than exposed.
+
         Returns:
             Options accepted by ``Compaction.execute``, omitting unset values.
 
         Raises:
-            ValueError: If ``max_source_fragments`` is ``0`` (use ``None`` for unlimited) or if ``compaction_mode`` is
-                not one of :data:`COMPACTION_MODES`.
+            ValueError: If ``max_source_fragments`` is ``0`` (use ``None`` for unlimited).
         """
         if self.max_source_fragments == 0:
             raise ValueError("max_source_fragments=0 is not supported; use None to disable the limit")
-        if self.compaction_mode not in COMPACTION_MODES:
-            raise ValueError(f"compaction_mode must be one of {COMPACTION_MODES}, got {self.compaction_mode!r}")
         candidates: dict[str, Any] = {
             "target_rows_per_fragment": self.target_rows_per_fragment,
             "max_rows_per_group": self.max_rows_per_group,
             "max_bytes_per_file": self.max_bytes_per_file,
-            "materialize_deletions": self.materialize_deletions,
+            "materialize_deletions": True,
             "materialize_deletions_threshold": self.materialize_deletions_threshold,
             "defer_index_remap": self.defer_index_remap,
             "max_source_fragments": self.max_source_fragments,
             "num_threads": self.num_threads,
             "batch_size": self.batch_size,
-            "compaction_mode": self.compaction_mode,
+            "compaction_mode": COMPACTION_MODE,
         }
         return {name: value for name, value in candidates.items() if value is not None}
 
@@ -292,9 +292,9 @@ def migrate_dataset_manifest_paths(
 ) -> dict[str, Any]:
     """Migrate one existing dataset's manifest paths to the V2 naming scheme in place.
 
-    Datasets bootstrapped by the ETL now default to V2 manifest paths
-    (:attr:`lance_etl.etl.ETLConfig.enable_v2_manifest_paths`), which makes every open one object-store request instead
-    of a version-count-proportional LIST. Datasets created before that default still carry V1 names. This helper calls
+    Datasets bootstrapped by the ETL are always created with V2 manifest paths, which makes every open one
+    object-store request instead of a version-count-proportional LIST. Datasets created before that default still carry
+    V1 names. This helper calls
     ``LanceDataset.migrate_manifest_paths_v2`` (``python/python/lance/dataset.py:4592-4604``, backed by
     ``migrate_scheme_to_v2`` at ``rust/lance-table/src/io/commit.rs:175-197``), which renames every V1 manifest to the
     V2 inverted-version name. The call is idempotent, so re-running it on an already-migrated or freshly-bootstrapped
@@ -500,7 +500,7 @@ def compact_small_dataset(uri: str, config: CompactionConfig, telemetry: Telemet
             config.commit_backoff_seconds,
             lambda: telemetry.incr("dataset.commit_conflict"),
         )
-        bytes_removed: int = cleanup_dataset(uri, config, telemetry) if config.run_cleanup else 0
+        bytes_removed: int = cleanup_dataset(uri, config, telemetry)
     telemetry.incr("dataset.compacted")
     result: dict[str, Any] = {"uri": uri, "tier": "small", "tasks": 1, "bytes_removed": bytes_removed}
     result.update(metrics)
@@ -646,7 +646,7 @@ class LanceCompactor:
                 plan = Compaction.plan(dataset, options=config.plan_options())
                 task_jsons: list[str] = [task.json() for task in plan.tasks]
                 if not task_jsons:
-                    bytes_removed: int = cleanup_dataset(uri, config, telemetry) if config.run_cleanup else 0
+                    bytes_removed: int = cleanup_dataset(uri, config, telemetry)
                     return {
                         "uri": uri,
                         "tier": "large",
@@ -673,7 +673,7 @@ class LanceCompactor:
                     )
                     continue
 
-                bytes_removed = cleanup_dataset(uri, config, telemetry) if config.run_cleanup else 0
+                bytes_removed = cleanup_dataset(uri, config, telemetry)
                 telemetry.incr("dataset.compacted")
                 result: dict[str, Any] = {
                     "uri": uri,

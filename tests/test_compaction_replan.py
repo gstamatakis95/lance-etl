@@ -128,7 +128,6 @@ def replan_config(telemetry_config: TelemetryConfig, **overrides: object) -> Com
         "telemetry": telemetry_config,
         "target_rows_per_fragment": ROWS,
         "num_threads": 1,
-        "run_cleanup": False,
         "commit_backoff_seconds": 0.0,
         "replan_budget": 3,
     }
@@ -259,13 +258,6 @@ def test_compaction_mode_defaults_to_try_binary_copy(telemetry_config: Telemetry
     config: CompactionConfig = CompactionConfig(telemetry=telemetry_config)
     assert config.execute_options()["compaction_mode"] == "try_binary_copy"
     assert config.plan_options()["compaction_mode"] == "try_binary_copy"
-
-
-def test_force_binary_copy_is_rejected(telemetry_config: TelemetryConfig) -> None:
-    """force_binary_copy errors instead of falling back, so the config refuses it."""
-    config: CompactionConfig = CompactionConfig(telemetry=telemetry_config, compaction_mode="force_binary_copy")
-    with pytest.raises(ValueError, match="compaction_mode"):
-        config.execute_options()
 
 
 def test_cleanup_horizon_floor_is_enforced(

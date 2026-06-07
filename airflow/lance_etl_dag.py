@@ -89,16 +89,9 @@ Airflow Variables (all optional — defaults are listed in ``dag_params`` below)
     lance_etl_executor_instances     spark.executor.instances override (default: 8).
     lance_etl_executor_memory        spark.executor.memory override (default: 8g).
     lance_etl_driver_memory          spark.driver.memory override (default: 4g).
-    lance_etl_window_column          Iceberg timestamp column used for the window pushdown
-                                     filter (default: updated_at).
     lance_etl_partition_by           Comma-separated partition columns forwarded as
                                      ``--partition-by``. Empty (the default) omits the flag so the
                                      ETL keeps the current org_id/tenant_id/namespace routing.
-    lance_etl_partition_derive       Comma-separated ``NAME=SOURCE:FORMAT`` specs forwarded as
-                                     repeated ``--partition-derive`` flags (FORMAT is a Python
-                                     strftime pattern, e.g.
-                                     ``event_date=processing_timestamp:%Y-%m-%d``). Empty (the
-                                     default) omits the flag.
 """
 
 from __future__ import annotations
@@ -228,7 +221,6 @@ def build_etl_application_args(params: dict[str, str | int]) -> list[str]:
     Returns:
         Argument list starting with the ``etl`` subcommand token.
     """
-    window_column: str = Variable.get("lance_etl_window_column", default_var="updated_at")
     args = [
         "etl",
         "--table",
@@ -247,18 +239,10 @@ def build_etl_application_args(params: dict[str, str | int]) -> list[str]:
         "{{ dag_run.conf.get('start', data_interval_start) | string }}",
         "--window-end",
         "{{ dag_run.conf.get('end', data_interval_end) | string }}",
-        "--window-column",
-        window_column,
     ]
     partition_by: str = Variable.get("lance_etl_partition_by", default_var="").strip()
     if partition_by:
         args += ["--partition-by", partition_by]
-    partition_derive: str = Variable.get("lance_etl_partition_derive", default_var="").strip()
-    if partition_derive:
-        for raw_spec in partition_derive.split(","):
-            spec: str = raw_spec.strip()
-            if spec:
-                args += ["--partition-derive", spec]
     args += build_dd_tag_flags(params)
     return args
 

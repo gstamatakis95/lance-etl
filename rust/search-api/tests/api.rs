@@ -1,5 +1,5 @@
-//! Integration tests: builds tiny Lance datasets in a tempdir (single and date-partitioned),
-//! creates INVERTED and IVF vector indexes, serves the gRPC API on a local TCP port, and
+//! Integration tests: builds tiny Lance datasets in a tempdir, creates INVERTED and IVF vector
+//! indexes, serves the gRPC API on a local TCP port, and
 //! exercises every RPC plus the standard health service with a tonic client.
 
 use std::sync::Arc;
@@ -22,8 +22,8 @@ use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
 use search_api::pb::search_service_client::SearchServiceClient;
 use search_api::pb::search_service_server::SearchServiceServer;
 use search_api::pb::{
-    BooleanQuery, ClustersRequest, CompareOp, Comparison, DatasetTarget, DateRange, DistanceType, Filter, FtsQuery,
-    Fusion, HybridSearchRequest, IdentityRerank, InList, LiteralValue, MatchQuery, PhraseQuery, PrewarmRequest, Rerank,
+    BooleanQuery, ClustersRequest, CompareOp, Comparison, DatasetTarget, DistanceType, Filter, FtsQuery, Fusion,
+    HybridSearchRequest, IdentityRerank, InList, LiteralValue, MatchQuery, PhraseQuery, PrewarmRequest, Rerank,
     RrfFusion, TextQuery, TextSearchRequest, VectorQuery, VectorSearchRequest, WeightedFusion, filter, fts_query,
     fusion, literal_value, rerank, text_query,
 };
@@ -43,24 +43,12 @@ const DIM: i32 = 4;
 /// Backend type wired by the tests: Lance over the caching provider.
 type Backend = LanceSearchBackend<CachingDatasetProvider>;
 
-/// Builds the proto target for `{org}/tenant1/ns1` without a date range.
+/// Builds the proto target for `{org}/tenant1/ns1`.
 fn target(org: &str) -> Option<DatasetTarget> {
     Some(DatasetTarget {
         org_id: org.to_string(),
         tenant_id: "tenant1".to_string(),
         namespace: "ns1".to_string(),
-        date_range: None,
-    })
-}
-
-/// Builds the proto target for `{org}/tenant1/ns1` with an inclusive date range.
-fn dated_target(org: &str, start: &str, end: &str) -> Option<DatasetTarget> {
-    Some(DatasetTarget {
-        date_range: Some(DateRange {
-            start_date: start.to_string(),
-            end_date: end.to_string(),
-        }),
-        ..target(org).unwrap()
     })
 }
 
@@ -131,34 +119,6 @@ async fn build_test_dataset(uri: &str) {
         .unwrap();
 }
 
-/// Writes three day-partitioned datasets under `{root}/org1/tenant1/ns1/` where `vector_id = 1`
-/// recurs on every day with a different vector: an exact match for `[1,0,0,0]` on 2026-06-02 and
-/// progressively worse copies on the other days.
-async fn build_dated_datasets(root: &std::path::Path) {
-    let base = root.join("org1/tenant1/ns1");
-    write_rows(
-        &format!("{}/2026-06-01.lance", base.display()),
-        &[
-            (10, 1, "day one copy", [0.0, 1.0, 0.0, 0.0]),
-            (11, 2, "day one other", [0.0, 0.0, 1.0, 0.0]),
-        ],
-    )
-    .await;
-    write_rows(
-        &format!("{}/2026-06-02.lance", base.display()),
-        &[
-            (20, 1, "day two copy", [1.0, 0.0, 0.0, 0.0]),
-            (21, 3, "day two other", [0.0, 0.0, 0.0, 1.0]),
-        ],
-    )
-    .await;
-    write_rows(
-        &format!("{}/2026-06-03.lance", base.display()),
-        &[(30, 1, "day three copy", [0.5, 0.5, 0.0, 0.0])],
-    )
-    .await;
-}
-
 /// Serves the gRPC API on an ephemeral local port and returns a connected channel.
 ///
 /// The server stack mirrors production: telemetry is initialized in disabled (log-only) mode and
@@ -191,30 +151,18 @@ async fn serve_full(
         cache_dir: tmp.path().join("disk-cache"),
         disk_index_cache_bytes: 64 * 1024 * 1024,
         disk_store_cache_bytes: 64 * 1024 * 1024,
-        disk_cache_ttl_secs: 3600,
-        store_cache_max_range_bytes: 4 * 1024 * 1024,
-        disk_cache_sweep_secs: 300,
         disk_cache_disabled: false,
         prewarm_concurrency: 4,
-        fanout_concurrency: 4,
-        id_column: "vector_id".to_string(),
         statsd_addr: "127.0.0.1:8125".to_string(),
         telemetry_disabled: true,
         recall_sample_rate: 0.0,
         io_concurrency: search_api::config::DEFAULT_IO_CONCURRENCY,
-        io_block_size_bytes: search_api::config::DEFAULT_IO_BLOCK_SIZE_BYTES,
-        object_store_timeout_secs: search_api::config::DEFAULT_OBJECT_STORE_TIMEOUT_SECS,
         serve_by_tag: search_api::config::DEFAULT_SERVE_BY_TAG,
         serve_tag: search_api::config::DEFAULT_SERVE_TAG.to_string(),
         serve_tag_ttl_secs: search_api::config::DEFAULT_SERVE_TAG_TTL_SECS,
     };
     let provider = CachingDatasetProvider::with_telemetry(&config, metrics.clone());
-    let backend = Arc::new(
-        LanceSearchBackend::new(provider)
-            .with_fanout_concurrency(config.fanout_concurrency)
-            .with_id_column(config.id_column.clone())
-            .with_metrics(metrics.clone()),
-    );
+    let backend = Arc::new(LanceSearchBackend::new(provider).with_metrics(metrics.clone()));
     let mut service = SearchGrpc::with_metrics(backend, metrics);
     if let Some(recall) = recall {
         service = service.with_recall(recall);
@@ -578,118 +526,6 @@ async fn hybrid_fusion_config_is_applied() {
 }
 
 #[tokio::test]
-async fn date_range_fanout_dedups_by_best_score_and_skips_missing_days() {
-    let tmp = TempDir::new().unwrap();
-    build_dated_datasets(tmp.path()).await;
-    let channel = serve(&tmp).await;
-    let mut client = SearchServiceClient::new(channel);
-
-    let response = client
-        .vector_search(VectorSearchRequest {
-            rerank: None,
-            target: dated_target("org1", "2026-06-01", "2026-06-04"),
-            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 3)),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    let vids: Vec<f64> = response
-        .results
-        .iter()
-        .map(|hit| row_number(&hit.row, "vector_id"))
-        .collect();
-    assert_eq!(
-        vids.iter().filter(|vid| **vid == 1.0).count(),
-        1,
-        "duplicate vector_id must be deduplicated: {vids:?}"
-    );
-    assert_eq!(row_number(&response.results[0].row, "vector_id"), 1.0);
-    assert_eq!(
-        row_number(&response.results[0].row, "id"),
-        20.0,
-        "dedup must keep the best (minimum-distance) copy, which lives on 2026-06-02"
-    );
-    assert!(response.results[0].distance.abs() < 1e-6);
-    assert!(
-        response
-            .results
-            .windows(2)
-            .all(|pair| pair[0].distance <= pair[1].distance + 1e-6),
-        "merged results must stay ordered nearest-first"
-    );
-}
-
-#[tokio::test]
-async fn date_range_fanout_respects_explicit_projection_without_leaking_the_id_column() {
-    let tmp = TempDir::new().unwrap();
-    build_dated_datasets(tmp.path()).await;
-    let channel = serve(&tmp).await;
-    let mut client = SearchServiceClient::new(channel);
-
-    let mut query = vector_query(vec![1.0, 0.0, 0.0, 0.0], 3);
-    query.projection = vec!["id".to_string()];
-    let response = client
-        .vector_search(VectorSearchRequest {
-            rerank: None,
-            target: dated_target("org1", "2026-06-01", "2026-06-03"),
-            query: Some(query),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(
-        row_number(&response.results[0].row, "id"),
-        20.0,
-        "dedup must work even when the projection omits the id column"
-    );
-    for hit in &response.results {
-        let row = hit.row.as_ref().unwrap();
-        assert!(
-            !row.fields.contains_key("vector_id"),
-            "the internally projected id column must be stripped from responses"
-        );
-    }
-}
-
-#[tokio::test]
-async fn date_range_with_zero_existing_datasets_is_not_found() {
-    let tmp = TempDir::new().unwrap();
-    build_dated_datasets(tmp.path()).await;
-    let channel = serve(&tmp).await;
-    let mut client = SearchServiceClient::new(channel);
-
-    let status = client
-        .vector_search(VectorSearchRequest {
-            rerank: None,
-            target: dated_target("org1", "2026-07-01", "2026-07-03"),
-            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 2)),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(status.code(), Code::NotFound);
-
-    let status = client
-        .vector_search(VectorSearchRequest {
-            rerank: None,
-            target: dated_target("org1", "2026-06-03", "2026-06-01"),
-            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 2)),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(status.code(), Code::InvalidArgument, "inverted ranges are rejected");
-
-    let status = client
-        .vector_search(VectorSearchRequest {
-            rerank: None,
-            target: dated_target("org1", "2026-06-XX", "2026-06-03"),
-            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 2)),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(status.code(), Code::InvalidArgument, "malformed dates are rejected");
-}
-
-#[tokio::test]
 async fn prewarm_rpc_warms_metadata_and_indexes() {
     let tmp = TempDir::new().unwrap();
     build_test_dataset(&org1_uri(&tmp)).await;
@@ -775,23 +611,6 @@ async fn prewarm_rpc_reports_per_index_errors_and_status_codes() {
         .await
         .unwrap_err();
     assert_eq!(status.code(), Code::InvalidArgument);
-
-    let status = client
-        .prewarm(PrewarmRequest {
-            target: dated_target("org1", "2026-06-01", "2026-06-03"),
-            metadata: true,
-            all_indexes: false,
-            index_names: vec![],
-            fts_with_position: false,
-            version_ref: None,
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(
-        status.code(),
-        Code::InvalidArgument,
-        "prewarm must reject multi-day ranges"
-    );
 }
 
 #[tokio::test]
@@ -891,19 +710,6 @@ async fn clusters_rpc_not_found_and_invalid_cases() {
 
     let status = client
         .clusters(ClustersRequest {
-            target: dated_target("org1", "2026-06-01", "2026-06-03"),
-            index_name: None,
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(
-        status.code(),
-        Code::InvalidArgument,
-        "clusters must reject multi-day ranges"
-    );
-
-    let status = client
-        .clusters(ClustersRequest {
             target: target("org1"),
             index_name: Some("text_idx".to_string()),
         })
@@ -957,10 +763,9 @@ async fn missing_dataset_and_bad_target_return_proper_status_codes() {
 }
 
 #[tokio::test]
-async fn recall_capture_samples_vector_searches_and_skips_fanout() {
+async fn recall_capture_samples_vector_searches() {
     let tmp = TempDir::new().unwrap();
     build_test_dataset(&org1_uri(&tmp)).await;
-    build_dated_datasets(tmp.path()).await;
     let (receiver, sink) = cadence::SpyMetricSink::new();
     let metrics = Arc::new(Metrics::from_sink(sink));
     let captured: Arc<std::sync::Mutex<Vec<RecallRecord>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1016,20 +821,6 @@ async fn recall_capture_samples_vector_searches_and_skips_fanout() {
         assert_eq!(distances.len(), 2);
         assert!(distances[0] <= distances[1]);
     }
-
-    client
-        .vector_search(VectorSearchRequest {
-            rerank: None,
-            target: dated_target("org1", "2026-06-01", "2026-06-03"),
-            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 3)),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        captured.lock().unwrap().len(),
-        1,
-        "date-range fan-out requests must never be sampled"
-    );
 
     let response = client
         .vector_search(VectorSearchRequest {
@@ -1178,7 +969,6 @@ async fn recall_capture_samples_text_and_hybrid_with_new_attributes() {
 #[tokio::test]
 async fn instrumented_server_emits_rpc_metrics_and_passes_requests_through() {
     let tmp = TempDir::new().unwrap();
-    build_dated_datasets(tmp.path()).await;
     build_test_dataset(&org1_uri(&tmp)).await;
     let (receiver, sink) = cadence::SpyMetricSink::new();
     let channel = serve_with_metrics(&tmp, Arc::new(Metrics::from_sink(sink))).await;
@@ -1194,17 +984,6 @@ async fn instrumented_server_emits_rpc_metrics_and_passes_requests_through() {
         .unwrap()
         .into_inner();
     assert_eq!(response.results.len(), 2, "instrumentation must not alter results");
-
-    let response = client
-        .vector_search(VectorSearchRequest {
-            rerank: None,
-            target: dated_target("org1", "2026-06-01", "2026-06-04"),
-            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 3)),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(!response.results.is_empty());
 
     let status = client
         .text_search(TextSearchRequest {
@@ -1249,24 +1028,6 @@ async fn instrumented_server_emits_rpc_metrics_and_passes_requests_through() {
             && line.contains("rpc:text_search")
             && line.contains("status:not_found")),
         "missing error count: {lines:?}"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.starts_with("search_api.fanout.legs:3|d") && line.contains("leg:vector")),
-        "missing fan-out width distribution: {lines:?}"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.starts_with("search_api.fanout.leg.duration_ms:") && line.contains("leg:vector")),
-        "missing per-leg latency distribution: {lines:?}"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.starts_with("search_api.fanout.dedup.dropped:2|c") && line.contains("leg:vector")),
-        "missing dedup-drop counter: {lines:?}"
     );
     assert!(
         lines

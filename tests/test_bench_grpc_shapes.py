@@ -73,10 +73,6 @@ class TestDatasetTarget:
         assert target.tenant_id == "tenant0"
         assert target.namespace == "ns"
 
-    def test_no_date_range(self, pb2: ModuleType) -> None:
-        """No date_range is set: benchmark datasets are not date-partitioned."""
-        assert not dataset_target(pb2, "org0").HasField("date_range")
-
     def test_overrides(self, pb2: ModuleType) -> None:
         """Tenant and namespace can be overridden explicitly."""
         target: Any = dataset_target(pb2, "org0", tenant_id="t9", namespace="other")

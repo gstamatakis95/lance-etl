@@ -143,32 +143,10 @@ impl PrewarmIndexKind {
     }
 }
 
-/// Search leg families used as the `leg` metric tag on fan-out timings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FanoutLeg {
-    /// Nearest-neighbor leg.
-    Vector,
-    /// Full-text leg.
-    Text,
-    /// Combined vector + text leg of one hybrid fan-out.
-    Hybrid,
-}
-
-impl FanoutLeg {
-    /// Tag value for this leg.
-    pub fn as_tag(self) -> &'static str {
-        match self {
-            Self::Vector => "vector",
-            Self::Text => "text",
-            Self::Hybrid => "hybrid",
-        }
-    }
-}
-
 /// Typed facade over the DogStatsD client so call sites cannot invent metric names or tags.
 ///
 /// Tag policy: only `rpc`, `status`, `cold`, `cache`, `tier`, `outcome`, `reason`, `kind`,
-/// `leg`, `filtered`, `warmed`, and `changed` — `org_id`/`tenant_id`/`version` never appear on
+/// `filtered`, `warmed`, and `changed` — `org_id`/`tenant_id`/`version` never appear on
 /// metrics (30k orgs would explode the timeseries count). Org-, tenant-, and version-level detail
 /// lives on traces and logs instead.
 pub struct Metrics {
@@ -411,33 +389,6 @@ impl Metrics {
         self.client.distribution_with_tags("prewarm.warmed_bytes", bytes).send();
     }
 
-    /// Width of one date-range fan-out: how many per-day datasets actually served the query.
-    pub fn fanout_legs(&self, leg: FanoutLeg, legs: u64) {
-        self.client
-            .distribution_with_tags("fanout.legs", legs)
-            .with_tag("leg", leg.as_tag())
-            .send();
-    }
-
-    /// Latency of one per-day leg of a fan-out search.
-    pub fn fanout_leg_duration(&self, leg: FanoutLeg, duration: Duration) {
-        self.client
-            .distribution_with_tags("fanout.leg.duration_ms", millis(duration))
-            .with_tag("leg", leg.as_tag())
-            .send();
-    }
-
-    /// Duplicate hits folded into a surviving hit by the dedup merge of one fan-out search.
-    pub fn fanout_dedup_dropped(&self, leg: FanoutLeg, count: u64) {
-        if count == 0 {
-            return;
-        }
-        self.client
-            .count_with_tags("fanout.dedup.dropped", count as i64)
-            .with_tag("leg", leg.as_tag())
-            .send();
-    }
-
     /// One search captured for recall scoring, tagged by query type and whether it carried a
     /// filter. `query_type` is one of `vector`, `text`, or `hybrid` (low cardinality).
     pub fn recall_sample(&self, query_type: &'static str, filtered: bool) {
@@ -529,7 +480,6 @@ mod tests {
         metrics.cache_lookup(CacheName::Index, Tier::Disk, true);
         metrics.cache_disk_gauges(CacheName::Store, 10, 2);
         metrics.prewarm(PrewarmStatus::Partial, Duration::from_millis(5));
-        metrics.fanout_legs(FanoutLeg::Vector, 3);
         metrics.clusters_read(Duration::from_millis(2));
     }
 
@@ -662,38 +612,21 @@ mod tests {
     }
 
     #[test]
-    fn fanout_and_clusters_metrics_render_expected_tags() {
+    fn clusters_metrics_render_expected_tags() {
         let (metrics, drain) = spy_metrics();
-        metrics.fanout_legs(FanoutLeg::Vector, 3);
-        metrics.fanout_leg_duration(FanoutLeg::Hybrid, Duration::from_millis(6));
-        metrics.fanout_dedup_dropped(FanoutLeg::Text, 4);
-        metrics.fanout_dedup_dropped(FanoutLeg::Text, 0);
         metrics.clusters_read(Duration::from_millis(9));
         metrics.clusters_centroids(256);
         let lines = drain();
         let expect = [
-            ("search_api.fanout.legs:3|d", vec!["leg:vector"]),
-            ("search_api.fanout.leg.duration_ms:6|d", vec!["leg:hybrid"]),
-            ("search_api.fanout.dedup.dropped:4|c", vec!["leg:text"]),
-            ("search_api.clusters.read.duration_ms:9|d", vec![]),
-            ("search_api.clusters.centroids:256|d", vec![]),
+            "search_api.clusters.read.duration_ms:9|d",
+            "search_api.clusters.centroids:256|d",
         ];
-        for (head, tags) in expect {
+        for head in expect {
             assert!(
-                lines
-                    .iter()
-                    .any(|line| line.starts_with(head) && tags.iter().all(|tag| line.contains(tag))),
-                "missing {head} with {tags:?} in {lines:?}"
+                lines.iter().any(|line| line.starts_with(head)),
+                "missing {head} in {lines:?}"
             );
         }
-        assert_eq!(
-            lines
-                .iter()
-                .filter(|line| line.contains("fanout.dedup.dropped"))
-                .count(),
-            1,
-            "zero-count dedup drops must not be emitted: {lines:?}"
-        );
     }
 
     #[test]
@@ -782,6 +715,5 @@ mod tests {
         assert_eq!(EvictionReason::Corrupt.as_tag(), "corrupt");
         assert_eq!(PrewarmStatus::Partial.as_tag(), "partial");
         assert_eq!(PrewarmIndexKind::Scalar.as_tag(), "scalar");
-        assert_eq!(FanoutLeg::Hybrid.as_tag(), "hybrid");
     }
 }

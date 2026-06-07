@@ -46,7 +46,7 @@ async fn serve_by_tag_opens_tagged_version_and_observes_a_flip() {
 
     let config = serve_by_tag_config(data_tmp.path(), cache_tmp.path(), 1);
     let provider = CachingDatasetProvider::with_inner_store_wrapper(&config, None);
-    let backend = LanceSearchBackend::new(provider).with_id_column(config.id_column.clone());
+    let backend = LanceSearchBackend::new(provider);
     let target = test_target();
 
     let outcome = backend.vector_search(&target, probe()).await.unwrap();

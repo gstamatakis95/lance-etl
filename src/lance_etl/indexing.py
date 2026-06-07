@@ -24,9 +24,9 @@ and the inverted-index publish refuses to commit coverage of fragments that no l
 Incremental maintenance is bounded in two ways. Each incremental commit adds one index delta per run, so once an
 index accumulates more than ``max_index_deltas`` deltas they are merged into one with
 ``optimize_indices(num_indices_to_merge=...)``, which also permanently retires any deferred frag-reuse remap debt.
-IVF centroids are retrained, through the full rebuild path, once the dataset grows past ``retrain_growth_factor``
-times the row count persisted as ``rows_at_train`` in the artifact sidecar, so reused centroids cannot go stale
-forever as an org grows.
+IVF centroids are retrained, through the full rebuild path, once the dataset grows past
+:data:`RETRAIN_GROWTH_FACTOR` times the row count persisted as ``rows_at_train`` in the artifact sidecar, so reused
+centroids cannot go stale forever as an org grows.
 
 :class:`LanceIndexer.run` orchestrates many datasets in two tiers. Small datasets (fragment count below a configurable
 threshold) are batched into a single Spark job where each executor task indexes one whole dataset end-to-end: existing
@@ -62,13 +62,27 @@ from lance.lance import indices as native_indices
 from pyspark.sql import SparkSession
 
 from lance_etl.cloud_storage import object_exists, read_object, resolve_filesystem, write_object
-from lance_etl.telemetry import Telemetry, TelemetryConfig, commit_with_retries
+from lance_etl.telemetry import DEFAULT_COMMIT_RETRIES, Telemetry, TelemetryConfig, commit_with_retries
 
 logger: logging.Logger = logging.getLogger(__name__)
 
 METRIC_TO_DISTANCE: dict[str, str] = {"l2": "l2", "cosine": "cosine", "dot": "dot"}
 MIN_IVF_PARTITIONS: int = 16
 MAX_IVF_PARTITIONS: int = 4096
+
+IVF_RQ_NUM_BITS: int = 1
+"""RaBitQ bits per dimension. IVF_RQ only supports 1, so it is baked rather than exposed as a knob."""
+
+TRAIN_SAMPLE_RATE: int = 256
+"""Rows sampled per IVF partition when training centroids. A well-calibrated training constant."""
+
+TRAIN_MAX_ITERS: int = 50
+"""Maximum k-means iterations when training the IVF. Lance's k-means converges well within this bound."""
+
+RETRAIN_GROWTH_FACTOR: float = 4.0
+"""Retrain the IVF artifacts, through the full rebuild path, once the dataset's row count exceeds this factor times the
+``rows_at_train`` persisted in the artifact sidecar. Reused centroids otherwise stay pinned forever while the org
+grows, degrading recall and partition balance."""
 FTS_OPTIONAL_PARAMS: tuple[str, ...] = (
     "base_tokenizer",
     "language",
@@ -88,12 +102,9 @@ class IndexJobConfig:
         storage_options: Object-store options forwarded to pylance.
         vector_column: Vector column to index with IVF_RQ, if any.
         num_partitions: IVF partitions. Derived as ``clamp(round(sqrt(rows)), 16, 4096)`` when unset.
-        num_bits: RaBitQ bits per dimension. IVF_RQ uses 1.
         vector_min_rows: Skip the vector index below this row count. Flat KNN serves small datasets.
         metric: Distance metric, such as ``L2``, ``cosine``, or ``dot``.
         distance_type: IVF training distance. Derived from ``metric`` if unset.
-        train_sample_rate: Rows sampled per partition when training the IVF.
-        train_max_iters: Maximum k-means iterations when training the IVF.
         vector_index_name: Vector index name. Defaults to ``{vector_column}_idx``.
         scalar_columns: Columns to index with btree.
         bitmap_columns: Columns to index with bitmap.
@@ -108,10 +119,6 @@ class IndexJobConfig:
         num_shards: Number of parallel builders per dataset.
         rebuild: Reindex every fragment instead of only uncovered ones. Also forces the small tier and the FTS handler
             to rebuild instead of maintaining incrementally, which is the path for parameter changes.
-        reuse_artifacts: Reuse the dataset's persisted IVF_RQ artifacts.
-        retrain_growth_factor: Retrain the IVF artifacts, through the full rebuild path, once the dataset's row count
-            exceeds this factor times the ``rows_at_train`` persisted in the artifact sidecar. Reused centroids
-            otherwise stay pinned forever while the org grows, degrading recall and partition balance.
         max_index_deltas: Merge an index's accumulated deltas into one when ``index_stats`` reports more than this many
             ``num_indices``. Each incremental run otherwise adds one delta that every query must consult.
         fts_max_unindexed_fragments: Maintain an existing inverted index incrementally only while its unindexed backlog
@@ -128,12 +135,9 @@ class IndexJobConfig:
     storage_options: dict[str, Any] | None = None
     vector_column: str | None = None
     num_partitions: int | None = None
-    num_bits: int = 1
     vector_min_rows: int = 50_000
     metric: str = "L2"
     distance_type: str | None = None
-    train_sample_rate: int = 256
-    train_max_iters: int = 50
     vector_index_name: str | None = None
     scalar_columns: list[str] = field(default_factory=list)
     bitmap_columns: list[str] = field(default_factory=list)
@@ -147,11 +151,9 @@ class IndexJobConfig:
     fts_ascii_folding: bool | None = None
     num_shards: int = 64
     rebuild: bool = False
-    reuse_artifacts: bool = True
-    retrain_growth_factor: float = 4.0
     max_index_deltas: int = 4
     fts_max_unindexed_fragments: int = 32
-    commit_retries: int = 20
+    commit_retries: int = DEFAULT_COMMIT_RETRIES
     commit_backoff_seconds: float = 0.5
     small_dataset_fragment_threshold: int = 32
     small_tier_slices: int = 256
@@ -1235,10 +1237,8 @@ class VectorIndexHandler(IndexHandler):
             dataset: The dataset to validate against.
 
         Raises:
-            ValueError: If parameters or the dimension are unsupported.
+            ValueError: If the dimension is unsupported.
         """
-        if self.config.num_bits != 1:
-            raise ValueError("IVF_RQ supports num_bits=1; higher widths are gated")
         if self.dimension(dataset) % 8 != 0:
             raise ValueError("IVF_RQ requires the vector dimension to be divisible by 8")
 
@@ -1271,7 +1271,7 @@ class VectorIndexHandler(IndexHandler):
         rows_at_train: Any = manifest.get("rows_at_train")
         if rows_at_train is None:
             return True
-        return rows > self.config.retrain_growth_factor * int(rows_at_train)
+        return rows > RETRAIN_GROWTH_FACTOR * int(rows_at_train)
 
     def remap_requires_rebuild(self, manifest: dict[str, Any], dataset: lance.LanceDataset) -> bool:
         """Decide whether a compaction since the last build forces a full rebuild.
@@ -1331,7 +1331,7 @@ class VectorIndexHandler(IndexHandler):
             Every fragment when retraining, rebuilding, or repairing remap debt, otherwise only uncovered fragments.
         """
         config: IndexJobConfig = self.config
-        if config.reuse_artifacts and not config.rebuild:
+        if not config.rebuild:
             manifest: dict[str, Any] | None = self.load_manifest(dataset.uri)
             if manifest is not None and "rabitq_model" in manifest:
                 if self.growth_requires_retrain(manifest, dataset.count_rows()):
@@ -1364,7 +1364,7 @@ class VectorIndexHandler(IndexHandler):
         expected: dict[str, Any] = {
             "dimension": dimension,
             "metric": config.metric,
-            "num_bits": config.num_bits,
+            "num_bits": IVF_RQ_NUM_BITS,
         }
         for name, value in expected.items():
             if manifest.get(name) != value:
@@ -1380,7 +1380,7 @@ class VectorIndexHandler(IndexHandler):
         which is only safe for a single non-merged segment. The partition count follows the size-aware policy and is
         degraded when the dataset cannot supply ``num_partitions * sample_rate`` training rows.
 
-        Persisted artifacts are reused only while the dataset stays within ``retrain_growth_factor`` times the
+        Persisted artifacts are reused only while the dataset stays within :data:`RETRAIN_GROWTH_FACTOR` times the
         ``rows_at_train`` recorded at training time. Past that, the centroids are retrained and every fragment is
         rebuilt (see :meth:`target_fragments`), because stale centroids degrade recall and partition balance as an org
         grows.
@@ -1399,7 +1399,7 @@ class VectorIndexHandler(IndexHandler):
         rows: int = dataset.count_rows()
         filesystem, manifest_path, centroids_path = sidecar_locations(uri, self.column, config.storage_options)
 
-        if config.reuse_artifacts and not config.rebuild and object_exists(filesystem, manifest_path):
+        if not config.rebuild and object_exists(filesystem, manifest_path):
             manifest: dict[str, Any] = json.loads(read_object(filesystem, manifest_path))
             if "rabitq_model" not in manifest:
                 logger.info("sidecar manifest for %s has no rabitq_model; retraining artifacts", uri)
@@ -1409,7 +1409,7 @@ class VectorIndexHandler(IndexHandler):
                     "retraining IVF artifacts for %s: %d rows exceed %.1fx rows_at_train=%s",
                     uri,
                     rows,
-                    config.retrain_growth_factor,
+                    RETRAIN_GROWTH_FACTOR,
                     manifest.get("rows_at_train"),
                 )
             else:
@@ -1420,12 +1420,12 @@ class VectorIndexHandler(IndexHandler):
                 return (
                     read_object(filesystem, centroids_path),
                     manifest["rabitq_model"],
-                    config.num_bits,
+                    IVF_RQ_NUM_BITS,
                     self.num_partitions_used,
                 )
 
         planned: int = derive_num_partitions(rows, config.num_partitions)
-        partitions: int = degrade_num_partitions(planned, rows, config.train_sample_rate)
+        partitions: int = degrade_num_partitions(planned, rows, TRAIN_SAMPLE_RATE)
         if partitions < planned:
             telemetry.incr("artifacts.partitions_degraded")
             logger.info("degraded num_partitions %d -> %d for %s (%d rows)", planned, partitions, uri, rows)
@@ -1433,16 +1433,16 @@ class VectorIndexHandler(IndexHandler):
             ivf_model = IndicesBuilder(dataset, self.column).train_ivf(
                 num_partitions=partitions,
                 distance_type=config.resolved_distance_type(),
-                sample_rate=config.train_sample_rate,
-                max_iters=config.train_max_iters,
+                sample_rate=TRAIN_SAMPLE_RATE,
+                max_iters=TRAIN_MAX_ITERS,
             )
             centroids_bytes: bytes = centroids_to_ipc(ivf_model.centroids)
-            rabitq_model: str = native_indices.build_rq_model(dimension=dimension, num_bits=config.num_bits)
+            rabitq_model: str = native_indices.build_rq_model(dimension=dimension, num_bits=IVF_RQ_NUM_BITS)
         manifest = {
             "dimension": dimension,
             "metric": config.metric,
             "num_partitions": partitions,
-            "num_bits": config.num_bits,
+            "num_bits": IVF_RQ_NUM_BITS,
             "distance_type": config.resolved_distance_type(),
             "rabitq_model": rabitq_model,
             "rows_at_train": rows,
@@ -1453,7 +1453,7 @@ class VectorIndexHandler(IndexHandler):
         self.reused_artifacts = False
         self.num_partitions_used = partitions
         telemetry.incr("artifacts.trained")
-        return centroids_bytes, rabitq_model, config.num_bits, partitions
+        return centroids_bytes, rabitq_model, IVF_RQ_NUM_BITS, partitions
 
     def build_segment(self, dataset: lance.LanceDataset, fragment_ids: list[int], artifacts: object | None) -> Index:
         """Build one IVF_RQ segment over a shard of fragments.
@@ -1841,7 +1841,7 @@ def index_dataset_locally(uri: str, config: IndexJobConfig) -> dict[str, Any]:
                 indexes.append(maintained_stats(config.vector_column, index_name, fragments, merged))
             else:
                 planned: int = derive_num_partitions(rows, config.num_partitions)
-                partitions: int = degrade_num_partitions(planned, rows, config.train_sample_rate)
+                partitions: int = degrade_num_partitions(planned, rows, TRAIN_SAMPLE_RATE)
                 with telemetry.timed("index.build_ms", tags=[f"index:{index_name}"]):
                     dataset.create_index(
                         config.vector_column,
@@ -1850,7 +1850,7 @@ def index_dataset_locally(uri: str, config: IndexJobConfig) -> dict[str, Any]:
                         metric=config.metric,
                         replace=True,
                         num_partitions=partitions,
-                        num_bits=config.num_bits,
+                        num_bits=IVF_RQ_NUM_BITS,
                     )
                 telemetry.incr("index.committed", tags=[f"index:{index_name}"])
                 indexes.append(

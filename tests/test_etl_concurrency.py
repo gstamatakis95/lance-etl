@@ -119,7 +119,6 @@ def test_concurrent_merges_and_compaction(
     uri: str = dataset_uri(etl_config, *ROUTING_KEY)
     compaction_config: CompactionConfig = CompactionConfig(
         telemetry=telemetry_config,
-        run_cleanup=False,
         commit_retries=30,
         commit_backoff_seconds=0.05,
     )

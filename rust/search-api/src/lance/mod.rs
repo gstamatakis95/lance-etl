@@ -6,8 +6,7 @@
 //!
 //! Submodules:
 //! - [`provider`]: target-to-dataset resolution with the shared session and the handle LRU.
-//! - [`backend`]: [`SearchBackend`](crate::domain::SearchBackend) over Lance scanners, including
-//!   date-range fan-out.
+//! - [`backend`]: [`SearchBackend`](crate::domain::SearchBackend) over Lance scanners.
 //! - [`filter`]: typed filter AST to DataFusion expression translation.
 //! - [`text`]: domain text query tree to Lance FTS query translation.
 //! - [`rows`]: Arrow record batch to JSON row conversion.

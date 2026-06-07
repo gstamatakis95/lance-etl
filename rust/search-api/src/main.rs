@@ -36,7 +36,7 @@ fn apply_lance_io_env(config: &Config) {
         std::env::set_var("LANCE_IO_THREADS", config.io_concurrency.to_string());
         std::env::set_var(
             "OBJECT_STORE_CLIENT_RETRY_TIMEOUT",
-            config.object_store_timeout_secs.to_string(),
+            search_api::config::DEFAULT_OBJECT_STORE_TIMEOUT_SECS.to_string(),
         );
     }
 }
@@ -52,14 +52,14 @@ fn apply_lance_io_env(config: &Config) {
 ///   the number of parallel in-flight object-store requests.  Sourced from
 ///   `SEARCH_API_IO_CONCURRENCY` (default 256).
 /// - `OBJECT_STORE_CLIENT_RETRY_TIMEOUT` — picked up by S3/GCS/Azure client builders inside
-///   Lance; the total retry-window budget in seconds.  Sourced from
-///   `SEARCH_API_OBJECT_STORE_TIMEOUT_SECS` (default 120).
+///   Lance; the total retry-window budget in seconds.  Fixed at
+///   [`search_api::config::DEFAULT_OBJECT_STORE_TIMEOUT_SECS`] (120).
 /// - `LANCE_DEFAULT_IO_BUFFER_SIZE` is intentionally left at its Lance default (2 GiB) because
 ///   the search service issues random index reads rather than full sequential scans, so the
 ///   per-process backpressure buffer does not need tuning here.
 ///
-/// The per-open `block_size` (`SEARCH_API_IO_BLOCK_SIZE_BYTES`, default 256 KiB) is injected
-/// into `ObjectStoreParams` by the provider on each dataset cache miss.
+/// The per-open `block_size` (fixed at [`search_api::config::DEFAULT_IO_BLOCK_SIZE_BYTES`],
+/// 256 KiB) is injected into `ObjectStoreParams` by the provider on each dataset cache miss.
 ///
 /// Every RPC flows through the OpenTelemetry tower layer (health checks excluded), which extracts
 /// inbound trace context and opens the per-request server span. Telemetry failures never block or
@@ -83,16 +83,20 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = ([0, 0, 0, 0], config.port).into();
     let provider = CachingDatasetProvider::with_telemetry(&config, metrics.clone());
     if let Some(janitor) = provider.janitor(&config) {
-        janitor.spawn(std::time::Duration::from_secs(config.disk_cache_sweep_secs));
+        janitor.spawn(std::time::Duration::from_secs(
+            search_api::config::DEFAULT_DISK_CACHE_SWEEP_SECS,
+        ));
     }
     let backend = Arc::new(
         LanceSearchBackend::new(provider)
             .with_prewarm_concurrency(config.prewarm_concurrency)
-            .with_fanout_concurrency(config.fanout_concurrency)
-            .with_id_column(config.id_column.clone())
             .with_metrics(metrics.clone()),
     );
-    let recall = RecallCapture::new(config.recall_sample_rate, config.id_column.clone(), metrics.clone());
+    let recall = RecallCapture::new(
+        config.recall_sample_rate,
+        search_api::config::DEFAULT_ID_COLUMN,
+        metrics.clone(),
+    );
     let service = SearchGrpc::with_metrics(backend, metrics).with_recall(recall);
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter

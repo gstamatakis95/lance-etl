@@ -35,15 +35,14 @@ lance-etl/
   rust/search-api/        Rust gRPC search service (tonic, lance crate)
     proto/                lance_etl/search/v1/search.proto
     src/domain/           Transport-agnostic types and traits
-      target.rs           DatasetTarget, DateRange — dataset addressing
+      target.rs           DatasetTarget — dataset addressing (one dataset per request)
       query.rs            VectorQuery, TextQuery, HybridQuery, Hit, FusedHit
       filter.rs           Typed predicate AST (no raw SQL)
       backend.rs          SearchBackend trait
       prewarm.rs          PrewarmSpec, PrewarmReport, Prewarmer trait
       clusters.rs         ClusterSpec, ClusterReport, ClusterReader trait
-      fusion.rs           FusionSpec (Rrf and Weighted variants) and fusion logic
+      fusion.rs           FusionSpec (Rrf and Weighted variants) and within-dataset fusion logic
       rerank.rs           Reranker seam, IdentityReranker (no-op default)
-      merge.rs            Dedup-by-id fan-out merge
       error.rs            SearchError
     src/cache/            Persistent two-tier caching layer (index + metadata, no raw data)
       layout.rs           Versioned stamp dir, key hashing, atomic writes, TTL/budget sweep
@@ -51,7 +50,7 @@ lance-etl/
       store_cache.rs      Read-through byte cache for immutable metadata of wrapped stores
       janitor.rs          Periodic TTL + budget sweep over both cache tiers
     src/lance/            Lance backend implementations
-      backend.rs          LanceSearchBackend — date-range fan-out, dedup, post-fusion rerank
+      backend.rs          LanceSearchBackend — single-dataset dispatch, post-fusion rerank
       provider.rs         DatasetProvider trait, CachingDatasetProvider (shared session + LRU)
       filter.rs           filter_to_expr: domain Filter -> DataFusion Expr
       text.rs             Domain text query tree -> Lance FTS parameters
@@ -74,7 +73,7 @@ lance-etl/
     lance_etl_dag.py      Configurable-schedule Airflow DAG (etl >> compact >> index)
   tests/                  pytest suite (conftest.py + test_*.py)
   docs/
-    adr/                  13 Architecture Decision Records (0001-0013)
+    adr/                  15 Architecture Decision Records (0001-0015)
     FINDINGS.md           Narrative companion to the ADRs
   market-research/        Detailed evaluation notes, plans, and evidence underlying the ADRs
   claude/                 Original reference artifacts — IMMUTABLE, never edit
@@ -276,6 +275,7 @@ Key facts to internalize:
 ## Commit-conflict retry pattern
 
 All commits (ETL merge_insert, index commit, compaction commit) must go through
-`commit_with_retries` from `telemetry.py`. Default retry budgets: 10 for ETL, 20 for index and
-compaction. The retry loop re-reads the dataset before each attempt so it operates against the
-latest version.
+`commit_with_retries` from `telemetry.py`. Retry budgets are defined as named constants in
+`telemetry.py`: `DEFAULT_CONFLICT_RETRIES` (10) for ETL, `DEFAULT_COMMIT_RETRIES` (20) for index
+and compaction, and `DEFAULT_LARGE_COMMIT_RETRIES` (2) for the tier-B compaction commit. The retry
+loop re-reads the dataset before each attempt so it operates against the latest version.

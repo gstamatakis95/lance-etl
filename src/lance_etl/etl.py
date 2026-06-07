@@ -8,14 +8,12 @@ upsert plus a ``when_matched_delete``.
 
 Routing is dynamic: ``ETLConfig.partition_cols`` lists the columns whose values build the dataset path
 ``base_uri/<val1>/<val2>/.../<valN>.lance`` in order, and the collapse window, the routing repartition, and the
-per-partition Arrow ``group_by`` all derive from that one list. Partition columns may also be derived from source
-columns with ``ETLConfig.partition_derivations`` (for example an ``event_date`` day partition derived from a
-``processing_timestamp`` column). Derivations are materialized before the collapse and repartition so derived columns
-are usable in ``partition_cols``.
+per-partition Arrow ``group_by`` all derive from that one list. The default routing is the stable
+``(org_id, tenant_id, namespace)`` identity trio.
 
-Duplicate semantics across partitions are deliberately ALLOW: ``merge_insert`` stays keyed on ``key_col`` per dataset,
-so a key whose partition value changes between runs leaves a stale copy in the previously-routed dataset, and deletes
-only reach the currently-routed dataset. Readers and serving layers are responsible for deduplicating across datasets.
+Each key lives in exactly one dataset, so the ``merge_insert`` keyed on ``key_col`` is the sole dedup mechanism: a
+re-upsert of an existing key updates it in place and a delete reaches the one dataset that holds it. No cross-dataset
+reader deduplication is required.
 
 Backfills are catch-up replays: rerun this same incremental job over the historical windows with the orchestrator (for
 example Airflow). Because every window is an idempotent merge keyed by vector id, a replayed or retried window converges
@@ -65,92 +63,34 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import TimestampType
 from pyspark.sql.window import Window, WindowSpec
 
-from lance_etl.telemetry import Telemetry, TelemetryConfig, commit_with_retries
+from lance_etl.telemetry import (
+    DEFAULT_CONFLICT_RETRIES,
+    DEFAULT_RETRY_TIMEOUT,
+    Telemetry,
+    TelemetryConfig,
+    commit_with_retries,
+)
 
 logger: logging.Logger = logging.getLogger(__name__)
 
 DEFAULT_PARTITION_COLS: tuple[str, str, str] = ("org_id", "tenant_id", "namespace")
 
-STRFTIME_TO_SPARK: dict[str, str] = {
-    "Y": "yyyy",
-    "y": "yy",
-    "m": "MM",
-    "d": "dd",
-    "H": "HH",
-    "M": "mm",
-    "S": "ss",
-    "j": "DDD",
-    "%": "%",
-}
+INGESTED_AT_COLUMN: str = "_ingested_at"
+"""Name of the ingestion-timestamp payload column stamped on every row during a run.
 
+The column is a payload column, never a routing or key column: it is excluded from the collapse keys, from
+``partition_cols`` routing, and from partition validation. ``when_matched_update_all`` refreshes it on updates so the
+value reflects the most recent ingestion. The leading underscore is a data-column string value (filterable through the
+gRPC allowlist), not a Python identifier, so it does not violate the no-leading-underscore code rule.
+"""
 
-def strftime_to_spark_format(strftime_format: str) -> str:
-    """Translate a Python strftime pattern into a Spark ``date_format`` pattern.
+PATH_COMPONENT_PATTERN: str = r"^[A-Za-z0-9._-]+$"
+"""Allowed pattern for each routing-key path component.
 
-    Supported directives are ``%Y %y %m %d %H %M %S %j %%``. Any other directive raises so a typo cannot silently
-    produce wrong partition values. Literal letters are single-quoted because Spark treats bare letters as pattern
-    symbols. Other literal characters pass through unchanged.
-
-    Args:
-        strftime_format: The strftime pattern, for example ``%Y-%m-%d``.
-
-    Returns:
-        The equivalent Spark datetime pattern, for example ``yyyy-MM-dd``.
-
-    Raises:
-        ValueError: If the pattern ends with a bare ``%`` or uses an unsupported directive.
-    """
-    parts: list[str] = []
-    index: int = 0
-    while index < len(strftime_format):
-        char: str = strftime_format[index]
-        if char == "%":
-            if index + 1 >= len(strftime_format):
-                raise ValueError(f"strftime format {strftime_format!r} ends with a bare '%'")
-            directive: str = strftime_format[index + 1]
-            if directive not in STRFTIME_TO_SPARK:
-                raise ValueError(f"unsupported strftime directive %{directive} in {strftime_format!r}")
-            parts.append(STRFTIME_TO_SPARK[directive])
-            index += 2
-        elif char.isalpha():
-            parts.append(f"'{char}'")
-            index += 1
-        else:
-            parts.append(char)
-            index += 1
-    return "".join(parts)
-
-
-@dataclass(frozen=True)
-class PartitionDerivation:
-    """A partition column derived from a source column before routing.
-
-    The derivation is applied as ``F.date_format(F.col(source_col), spark_format).alias(name)`` before the collapse
-    and the routing repartition, so the derived column can appear in ``ETLConfig.partition_cols`` and also lands in
-    the written dataset as a regular payload column. The canonical use case is a ``processing_timestamp`` source
-    column deriving an ``event_date`` day partition.
-
-    Attributes:
-        name: Name of the derived column added to the DataFrame.
-        source_col: Source timestamp column the derivation reads.
-        strftime_format: Python strftime pattern (for example ``%Y-%m-%d``) translated to Spark's ``date_format``
-            pattern via :func:`strftime_to_spark_format`. Only ``%Y %y %m %d %H %M %S %j %%`` are supported.
-    """
-
-    name: str
-    source_col: str
-    strftime_format: str
-
-    def spark_format(self) -> str:
-        """Return the Spark ``date_format`` pattern for this derivation.
-
-        Returns:
-            The translated Spark datetime pattern.
-
-        Raises:
-            ValueError: If ``strftime_format`` uses an unsupported directive.
-        """
-        return strftime_to_spark_format(self.strftime_format)
+This is a security invariant baked as a constant rather than exposed as a config field so a caller cannot silently
+weaken the allowlist that confines every dataset URI to its routing-key prefix and prevents path traversal and routing
+collisions.
+"""
 
 
 def stats_schema(routing_cols: list[str]) -> pa.Schema:
@@ -190,15 +130,10 @@ class ETLConfig:
         key_col: Unique vector id column and per-dataset merge key.
         partition_cols: Columns whose values route each row to its dataset and build the dataset path
             ``base_uri/<val1>/<val2>/.../<valN>.lance`` in list order. Each path component is validated against
-            ``path_component_pattern``. Every entry must exist in the source or be produced by
-            ``partition_derivations``. Defaults to ``["org_id", "tenant_id", "namespace"]``, which is byte-identical
-            to the historical fixed routing. Duplicate semantics across partitions are deliberately ALLOW:
-            ``merge_insert`` stays keyed on ``key_col`` per dataset, so a key whose partition value changes between
-            runs leaves a stale copy in the previously-routed dataset, and deletes only reach the currently-routed
-            dataset. Readers and serving layers handle deduplication.
-        partition_derivations: Derived partition columns materialized with ``F.date_format`` before the collapse and
-            the routing repartition, so derived names are usable in ``partition_cols``. Formats are Python strftime
-            patterns translated via :func:`strftime_to_spark_format`.
+            :data:`PATH_COMPONENT_PATTERN`. Every entry must exist in the source. Defaults to
+            ``["org_id", "tenant_id", "namespace"]``, the stable identity trio. Each key lives in exactly one dataset,
+            so the per-dataset ``merge_insert`` keyed on ``key_col`` is the sole dedup mechanism: a re-upsert updates a
+            key in place and a delete reaches the one dataset that holds it. No cross-dataset reader dedup is needed.
         vectors_col: Map column of vectors flattened into parallel arrays.
         metadata_col: Map column of metadata flattened into parallel arrays.
         ts_col: Event timestamp column used for last-write-wins collapse.
@@ -212,26 +147,9 @@ class ETLConfig:
             headroom on hot multi-tenant datasets.
         guard_updates_by_ts: Enable the strict timestamp guard on updates.
         iceberg_read_options: Extra Iceberg reader options merged into the read.
-        path_component_pattern: Allowed pattern for each routing component.
         window_start: ISO-8601 lower bound (inclusive) for the source timestamp window filter. Absent means open.
         window_end: ISO-8601 upper bound (exclusive) for the source timestamp window filter. Absent means open.
         window_column: Column used for the timestamp window pushdown filter. Defaults to ``updated_at``.
-        ingested_at_col: Name of the ingestion-timestamp column stamped on every row during the run. The column is a
-            payload column, never a routing or key column: it is excluded from the collapse keys, from
-            ``partition_cols`` routing, and from partition validation. ``when_matched_update_all`` refreshes it on
-            updates so the value reflects the most recent ingestion. The leading underscore is a data-column string
-            value (filterable through the gRPC allowlist), not a Python identifier, so it does not violate the
-            no-leading-underscore code rule. Defaults to ``_ingested_at``.
-        enable_v2_manifest_paths: Create every dataset with the V2 manifest naming scheme. V1 names a manifest
-            ``_versions/{version}.manifest`` so locating the latest version costs a directory LIST that grows with the
-            version count, while V2 names it ``_versions/{u64::MAX - version}.manifest`` zero-padded to 20 digits
-            (``rust/lance-table/src/io/commit.rs:104-109``) so the latest version sorts first and is found with one
-            head/list, turning every dataset open into a single object-store request regardless of history depth. This
-            is honored only at dataset bootstrap and ignored on ``append`` once a dataset
-            exists; existing datasets migrate one-shot via :func:`lance_etl.compaction.migrate_dataset_manifest_paths`.
-            Defaults to ``True``: the only documented caveat is that a V2 dataset is unreadable by Lance prior to 0.17.0
-            (``python/python/lance/dataset.py:7095-7100``), which the pinned build is well past, and there is no
-            concurrency or correctness caveat on creation, unlike stable row ids.
         retry_backoff_seconds: Base backoff in seconds for the Python-side commit-conflict retry loop that observes the
             merge conflict count. Tests set this to ``0.0`` to avoid sleeping.
     """
@@ -240,7 +158,6 @@ class ETLConfig:
     telemetry: TelemetryConfig
     key_col: str = "vector_id"
     partition_cols: list[str] = field(default_factory=lambda: list(DEFAULT_PARTITION_COLS))
-    partition_derivations: list[PartitionDerivation] = field(default_factory=list)
     vectors_col: str = "vectors"
     metadata_col: str = "metadata"
     ts_col: str = "timestamp"
@@ -249,16 +166,13 @@ class ETLConfig:
     column_types: dict[str, pa.DataType] = field(default_factory=dict)
     storage_options: dict[str, Any] | None = None
     num_partitions: int = 512
-    conflict_retries: int = 10
-    retry_timeout: timedelta = field(default_factory=lambda: timedelta(seconds=120))
+    conflict_retries: int = DEFAULT_CONFLICT_RETRIES
+    retry_timeout: timedelta = DEFAULT_RETRY_TIMEOUT
     guard_updates_by_ts: bool = False
     iceberg_read_options: dict[str, str] = field(default_factory=dict)
-    path_component_pattern: str = r"^[A-Za-z0-9._-]+$"
     window_start: str | None = None
     window_end: str | None = None
     window_column: str = "updated_at"
-    ingested_at_col: str = "_ingested_at"
-    enable_v2_manifest_paths: bool = True
     retry_backoff_seconds: float = 0.5
 
     def routing_cols(self) -> list[str]:
@@ -270,33 +184,24 @@ class ETLConfig:
         return list(self.partition_cols)
 
 
-def validate_partition_spec(partition_cols: list[str], derivations: list[PartitionDerivation]) -> None:
+def validate_partition_spec(partition_cols: list[str]) -> None:
     """Validate the partition routing specification at configuration-build time.
 
-    Checks everything that does not require the source schema: at least one partition column, no duplicate partition
-    columns, unique derivation names, and translatable derivation formats. Whether every partition column actually
-    exists in the source (or is produced by a derivation) is checked against the real DataFrame by
+    Checks everything that does not require the source schema: at least one partition column and no duplicate partition
+    columns. Whether every partition column actually exists in the source is checked against the real DataFrame by
     :meth:`IcebergToLanceETL.validate_schema` before any work runs.
 
     Args:
         partition_cols: The partition columns in dataset-path order.
-        derivations: The configured derived partition columns.
 
     Raises:
-        ValueError: If the partition column list is empty or carries duplicates, a derivation name is duplicated, or a
-            derivation format uses an unsupported strftime directive.
+        ValueError: If the partition column list is empty or carries duplicates.
     """
     if not partition_cols:
         raise ValueError("partition_cols must list at least one column")
     duplicate_cols: list[str] = sorted({column for column in partition_cols if partition_cols.count(column) > 1})
     if duplicate_cols:
         raise ValueError(f"partition_cols carries duplicate columns: {duplicate_cols}")
-    names: list[str] = [derivation.name for derivation in derivations]
-    duplicate_names: list[str] = sorted({name for name in names if names.count(name) > 1})
-    if duplicate_names:
-        raise ValueError(f"partition_derivations carries duplicate names: {duplicate_names}")
-    for derivation in derivations:
-        derivation.spark_format()
 
 
 def dataset_uri(config: ETLConfig, *components: str) -> str:
@@ -319,7 +224,7 @@ def dataset_uri(config: ETLConfig, *components: str) -> str:
     routing: list[str] = config.routing_cols()
     if len(components) != len(routing):
         raise ValueError(f"expected {len(routing)} routing components for {routing}, got {len(components)}")
-    pattern: re.Pattern[str] = re.compile(config.path_component_pattern)
+    pattern: re.Pattern[str] = re.compile(PATH_COMPONENT_PATTERN)
     for component in components:
         if not isinstance(component, str) or not pattern.match(component):
             raise ValueError(f"invalid routing component: {component!r}")
@@ -404,23 +309,22 @@ def conflict_bucket(conflicts: int) -> str:
     return "2+"
 
 
-def ensure_ingested_at_column(dataset: lance.LanceDataset, source_schema: pa.Schema, column: str) -> None:
+def ensure_ingested_at_column(dataset: lance.LanceDataset, source_schema: pa.Schema) -> None:
     """Evolve a pre-existing dataset that predates the ingestion-timestamp column so the merge can populate it.
 
     Lance ``merge_insert`` rejects a source schema carrying a column the target lacks: ``check_compatible_schema``
     accepts only a full match or a subset of the target schema, so a source column absent from the target fails both
-    and raises. A dataset created before ``ingested_at_col`` existed would therefore break the merge. Adding the column
+    and raises. A dataset created before :data:`INGESTED_AT_COLUMN` existed would therefore break the merge. Adding it
     as an all-null nullable field via ``add_columns`` (a metadata-only commit) lets the subsequent merge upsert
     populate it. The call is a no-op once the column is present, so steady-state runs incur nothing.
 
     Args:
         dataset: The opened target dataset to evolve in place.
         source_schema: The schema of the upsert source table, supplying the column's Arrow type.
-        column: The ingestion-timestamp column name to ensure on the target.
     """
-    if column in dataset.schema.names:
+    if INGESTED_AT_COLUMN in dataset.schema.names:
         return
-    field_index: int = source_schema.get_field_index(column)
+    field_index: int = source_schema.get_field_index(INGESTED_AT_COLUMN)
     if field_index < 0:
         return
     source_field: pa.Field = source_schema.field(field_index)
@@ -432,8 +336,8 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
 
     Bootstrap strategy: when the dataset does not exist yet, an empty table is written with ``lance.write_dataset(...,
     mode='append')``, which creates the dataset if absent and is race-free for concurrent first writers on the same
-    routing key. ``enable_v2_manifest_paths`` is passed on this bootstrap write because V2 manifest paths are a
-    creation-time naming choice, so bootstrapping with the flag makes every later open of the dataset a single
+    routing key. ``enable_v2_manifest_paths=True`` is always passed on this bootstrap write because V2 manifest paths
+    are a creation-time naming choice, so bootstrapping with V2 names makes every later open of the dataset a single
     object-store request instead of a version-count-proportional LIST. The rows themselves always flow through
     ``merge_insert`` so a
     re-upsert of an existing key updates it in place instead of duplicating it.
@@ -441,9 +345,9 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
     The merge ``execute()`` return dict provides authoritative row counts (``num_inserted_rows``, ``num_updated_rows``,
     ``num_deleted_rows``). We report those rather than recomputing from the source table.
 
-    Schema evolution: a dataset created before ``ingested_at_col`` existed lacks that column, and ``merge_insert``
-    rejects a source carrying a column the target lacks. :func:`ensure_ingested_at_column` adds it as a metadata-only
-    nullable column before the merge so pre-existing datasets do not fail.
+    Schema evolution: a dataset created before :data:`INGESTED_AT_COLUMN` existed lacks that column, and
+    ``merge_insert`` rejects a source carrying a column the target lacks. :func:`ensure_ingested_at_column` adds it as a
+    metadata-only nullable column before the merge so pre-existing datasets do not fail.
 
     Conflict visibility: Lance does not surface its internal ``num_attempts`` through the pylance merge stats dict, so
     the retry count is captured by wrapping the merge in :func:`commit_with_retries`, whose ``on_conflict`` callback
@@ -489,10 +393,10 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
                     uri,
                     mode="append",
                     storage_options=config.storage_options,
-                    enable_v2_manifest_paths=config.enable_v2_manifest_paths,
+                    enable_v2_manifest_paths=True,
                 )
             else:
-                ensure_ingested_at_column(dataset_local, upserts.schema, config.ingested_at_col)
+                ensure_ingested_at_column(dataset_local, upserts.schema)
             builder = dataset_local.merge_insert(on=[config.key_col])
             if config.guard_updates_by_ts:
                 builder = builder.when_matched_update_all(condition=f"source.{config.ts_col} > target.{config.ts_col}")
@@ -614,9 +518,9 @@ class IcebergToLanceETL:
             config: ETL configuration.
 
         Raises:
-            ValueError: If the partition columns or derivations fail :func:`validate_partition_spec`.
+            ValueError: If the partition columns fail :func:`validate_partition_spec`.
         """
-        validate_partition_spec(config.routing_cols(), config.partition_derivations)
+        validate_partition_spec(config.routing_cols())
         self.config: ETLConfig = config
 
     def read_increment(self, spark: SparkSession, table: str, start_ms: int, end_ms: int) -> DataFrame:
@@ -682,8 +586,7 @@ class IcebergToLanceETL:
     def validate_schema(self, source: DataFrame) -> None:
         """Validate that the source carries every required column.
 
-        Every partition column must exist in the source or be produced by a configured derivation, and every
-        derivation's source column must exist in the source.
+        Every partition column must exist in the source.
 
         Args:
             source: The incremental source DataFrame.
@@ -692,42 +595,19 @@ class IcebergToLanceETL:
             ValueError: If a required column is missing.
         """
         config: ETLConfig = self.config
-        derived: set[str] = {derivation.name for derivation in config.partition_derivations}
         required: list[str] = [
             config.key_col,
             config.ts_col,
             config.op_col,
             config.vectors_col,
             config.metadata_col,
-            *(derivation.source_col for derivation in config.partition_derivations),
-            *(column for column in config.routing_cols() if column not in derived),
+            *config.routing_cols(),
         ]
         missing: list[str] = [c for c in required if c not in source.columns]
         if missing:
             raise ValueError(
-                f"source is missing required columns: {missing} "
-                "(every partition column must exist in the source or be produced by partition_derivations)"
+                f"source is missing required columns: {missing} (every partition column must exist in the source)"
             )
-
-    def derive_partition_columns(self, source: DataFrame) -> DataFrame:
-        """Materialize the configured derived partition columns.
-
-        Each derivation is applied as ``F.date_format`` over its source column before the collapse and the routing
-        repartition, so derived names are usable in ``partition_cols`` and land in the written datasets as regular
-        payload columns.
-
-        Args:
-            source: The incremental source DataFrame.
-
-        Returns:
-            The DataFrame with one extra string column per derivation, or the original when none are configured.
-        """
-        result: DataFrame = source
-        for derivation in self.config.partition_derivations:
-            result = result.withColumn(
-                derivation.name, F.date_format(F.col(derivation.source_col), derivation.spark_format())
-            )
-        return result
 
     def stamp_ingested_at(self, source: DataFrame) -> DataFrame:
         """Stamp every row with the ingestion timestamp before collapse and routing.
@@ -740,12 +620,12 @@ class IcebergToLanceETL:
         collapse key, a routing column, or a partition-validation target.
 
         Args:
-            source: The increment with derived partition columns materialized.
+            source: The incremental source DataFrame.
 
         Returns:
             The DataFrame with the ingestion-timestamp column added.
         """
-        return source.withColumn(self.config.ingested_at_col, F.current_timestamp().cast(TimestampType()))
+        return source.withColumn(INGESTED_AT_COLUMN, F.current_timestamp().cast(TimestampType()))
 
     def flatten_maps(self, source: DataFrame) -> DataFrame:
         """Flatten the vector and metadata maps into struct-free parallel arrays.
@@ -805,7 +685,7 @@ class IcebergToLanceETL:
         driver_telemetry: Telemetry = Telemetry.create(config.telemetry)
         with driver_telemetry.span("lance.etl.run") as run_span:
             self.validate_schema(source)
-            prepared: DataFrame = self.stamp_ingested_at(self.derive_partition_columns(source))
+            prepared: DataFrame = self.stamp_ingested_at(source)
             collapsed: DataFrame = self.collapse(self.flatten_maps(prepared))
             routing: list[str] = config.routing_cols()
             routed: DataFrame = collapsed.repartition(config.num_partitions, *[F.col(c) for c in routing])

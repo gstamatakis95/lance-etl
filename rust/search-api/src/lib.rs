@@ -2,8 +2,7 @@
 //!
 //! Serves nearest-neighbor, full-text, and hybrid (fused) search — plus cache prewarming and IVF
 //! cluster introspection — across tens of thousands of `{org}/{tenant}/{namespace}` datasets
-//! (optionally date-partitioned per day) through one shared Lance session and an LRU of open
-//! dataset handles.
+//! through one shared Lance session and an LRU of open dataset handles.
 //!
 //! Layering, bottom up:
 //! - [`domain`]: transport- and engine-agnostic request/response types, traits, and errors. It

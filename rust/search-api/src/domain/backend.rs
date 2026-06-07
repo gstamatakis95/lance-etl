@@ -9,11 +9,11 @@ use crate::domain::target::DatasetTarget;
 /// Search engine abstraction over per-tenant datasets.
 ///
 /// Implementations execute vector, full-text, and hybrid queries expressed purely in domain
-/// types. Transports stay generic over this trait and never see engine types. Targets carrying a
-/// date range fan the query out over every existing per-day dataset and merge the legs.
+/// types. Transports stay generic over this trait and never see engine types. Each target
+/// resolves to exactly one dataset.
 pub trait SearchBackend: Send + Sync + 'static {
     /// Runs a nearest-neighbor query, returning hits ordered nearest-first together with the
-    /// version of the dataset that served them (absent for date-range fan-out).
+    /// version of the dataset that served them.
     fn vector_search(
         &self,
         target: &DatasetTarget,
@@ -21,7 +21,7 @@ pub trait SearchBackend: Send + Sync + 'static {
     ) -> impl Future<Output = Result<VectorSearchOutcome, SearchError>> + Send;
 
     /// Runs a full-text query, returning hits ordered best-first together with the version of the
-    /// dataset that served them (absent for date-range fan-out).
+    /// dataset that served them.
     fn text_search(
         &self,
         target: &DatasetTarget,
@@ -29,7 +29,7 @@ pub trait SearchBackend: Send + Sync + 'static {
     ) -> impl Future<Output = Result<TextSearchOutcome, SearchError>> + Send;
 
     /// Runs both legs of a hybrid query and fuses them, returning fused hits ordered best-first
-    /// together with the version of the dataset that served them (absent for date-range fan-out).
+    /// together with the version of the dataset that served them.
     fn hybrid_search(
         &self,
         target: &DatasetTarget,

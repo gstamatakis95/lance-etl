@@ -66,14 +66,8 @@ async fn weigher_assigns_clamped_fragment_weight() {
     write_dataset(&uri_for(data_tmp.path(), "whale"), MAX_HANDLE_WEIGHT as usize + 8).await;
     let provider = CachingDatasetProvider::new(&config);
 
-    provider
-        .dataset(&target("tiny"), None, DatasetRef::Serve)
-        .await
-        .unwrap();
-    provider
-        .dataset(&target("whale"), None, DatasetRef::Serve)
-        .await
-        .unwrap();
+    provider.dataset(&target("tiny"), DatasetRef::Serve).await.unwrap();
+    provider.dataset(&target("whale"), DatasetRef::Serve).await.unwrap();
 
     let (entries, weighted) = provider.handle_cache_stats().await;
     assert_eq!(entries, 2, "both handles fit under the generous capacity");
@@ -98,7 +92,7 @@ async fn many_tiny_coexist_then_capacity_bounds_total_weight() {
 
     for index in 0..tiny_count {
         provider
-            .dataset(&target(&format!("tiny{index}")), None, DatasetRef::Serve)
+            .dataset(&target(&format!("tiny{index}")), DatasetRef::Serve)
             .await
             .unwrap();
     }
@@ -111,14 +105,11 @@ async fn many_tiny_coexist_then_capacity_bounds_total_weight() {
 
     for index in tiny_count..tiny_count + overflow {
         provider
-            .dataset(&target(&format!("tiny{index}")), None, DatasetRef::Serve)
+            .dataset(&target(&format!("tiny{index}")), DatasetRef::Serve)
             .await
             .unwrap();
     }
-    provider
-        .dataset(&target("whale"), None, DatasetRef::Serve)
-        .await
-        .unwrap();
+    provider.dataset(&target("whale"), DatasetRef::Serve).await.unwrap();
     let (entries_after, weighted_after) = provider.handle_cache_stats().await;
     assert!(
         weighted_after <= capacity,

@@ -294,7 +294,6 @@ def compact_fragments(uri: str, max_source_fragments: int | None, target_rows_pe
         target_rows_per_fragment=target_rows_per_fragment,
         max_source_fragments=max_source_fragments,
         num_threads=1,
-        run_cleanup=False,
     )
     Compaction.execute(lance.dataset(uri), config.execute_options())
 

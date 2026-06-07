@@ -2,10 +2,10 @@
 
 The CLI is deliberately small and opinionated. It exposes only the arguments that are genuinely
 per-deployment: the data and identity contract (which table, which window, where datasets live, which
-Datadog service) and what to build or what the data is (key/vector/metadata columns, partition routing,
-which index types and their tokenizer knobs). Every tuning knob — shuffle partitions, retry budgets,
-commit backoff, compaction fragment sizing, IVF training parameters, and two-tier thresholds — is set to a
-sensible opinionated default in the configuration dataclasses
+Datadog service) and what to build (partition routing, which index types, the distance metric, and the
+FTS base tokenizer and language). Every tuning knob — the schema column names, shuffle partitions, retry
+budgets, commit backoff, compaction fragment sizing, IVF training parameters, the fine-grained FTS
+tokenizer toggles, and two-tier thresholds — is set to a sensible opinionated default in the configuration dataclasses
 (:class:`lance_etl.etl.ETLConfig`, :class:`lance_etl.indexing.IndexJobConfig`,
 :class:`lance_etl.compaction.CompactionConfig`). Those fields stay tunable in code, just not from the
 command line.
@@ -39,7 +39,7 @@ from lance_etl.compaction import (
     migrate_manifest_paths,
     update_serving_tags,
 )
-from lance_etl.etl import DEFAULT_PARTITION_COLS, ETLConfig, IcebergToLanceETL, PartitionDerivation
+from lance_etl.etl import DEFAULT_PARTITION_COLS, ETLConfig, IcebergToLanceETL
 from lance_etl.indexing import IndexJobConfig, LanceIndexer
 from lance_etl.recall import DatadogSpanSource, RecallAuditJob, RecallJobConfig
 from lance_etl.telemetry import TelemetryConfig, configure_logging
@@ -121,35 +121,6 @@ def parse_partition_cols(value: str | None) -> list[str] | None:
     return columns
 
 
-def parse_partition_derivations(specs: Sequence[str] | None) -> list[PartitionDerivation]:
-    """Parse repeated ``--partition-derive NAME=SOURCE:FORMAT`` arguments.
-
-    ``FORMAT`` is a Python strftime pattern (supported directives ``%Y %y %m %d %H %M %S %j %%``) translated to
-    Spark's ``date_format`` pattern, for example ``event_date=processing_timestamp:%Y-%m-%d``.
-
-    Args:
-        specs: The raw ``NAME=SOURCE:FORMAT`` strings, or None.
-
-    Returns:
-        One :class:`PartitionDerivation` per argument.
-
-    Raises:
-        ValueError: If an argument is not in ``NAME=SOURCE:FORMAT`` form or any part is empty.
-    """
-    result: list[PartitionDerivation] = []
-    for spec in specs or []:
-        if "=" not in spec:
-            raise ValueError(f"expected NAME=SOURCE:FORMAT, got {spec!r}")
-        name, rest = spec.split("=", 1)
-        if ":" not in rest:
-            raise ValueError(f"expected NAME=SOURCE:FORMAT, got {spec!r}")
-        source_col, strftime_format = rest.split(":", 1)
-        if not name or not source_col or not strftime_format:
-            raise ValueError(f"expected NAME=SOURCE:FORMAT with non-empty parts, got {spec!r}")
-        result.append(PartitionDerivation(name=name, source_col=source_col, strftime_format=strftime_format))
-    return result
-
-
 def build_telemetry_config(args: argparse.Namespace) -> TelemetryConfig:
     """Build a telemetry configuration from the identity arguments.
 
@@ -201,9 +172,9 @@ def load_dataset_uris(args: argparse.Namespace) -> list[str]:
 def run_etl(args: argparse.Namespace, spark: SparkSession) -> None:
     """Run the ETL subcommand.
 
-    Only the data and identity contract is taken from the CLI. Shuffle partition count, conflict-retry budget,
-    retry timeout, the timestamp update guard, and the V2 manifest-path bootstrap take their opinionated
-    :class:`ETLConfig` defaults.
+    Only the data and identity contract is taken from the CLI. The key/timestamp/op column names, the delete-op
+    encodings, the map column names, the window column, shuffle partition count, conflict-retry budget, retry timeout,
+    and the timestamp update guard take their opinionated :class:`ETLConfig` defaults.
 
     Args:
         args: Parsed command-line arguments.
@@ -212,21 +183,12 @@ def run_etl(args: argparse.Namespace, spark: SparkSession) -> None:
     config: ETLConfig = ETLConfig(
         base_uri=args.base_uri,
         telemetry=build_telemetry_config(args),
-        key_col=args.key_col,
         partition_cols=parse_partition_cols(args.partition_by) or list(DEFAULT_PARTITION_COLS),
-        partition_derivations=parse_partition_derivations(args.partition_derive),
-        vectors_col=args.vectors_col,
-        metadata_col=args.metadata_col,
-        ts_col=args.ts_col,
-        op_col=args.op_col,
-        delete_op_values=list(args.delete_op_value or ["delete", "DELETE", "d"]),
         column_types=resolve_type_map(parse_key_values(args.column_type)),
         storage_options=parse_storage_options(args),
         iceberg_read_options=parse_key_values(args.iceberg_option),
         window_start=args.window_start,
         window_end=args.window_end,
-        window_column=args.window_column,
-        ingested_at_col=args.ingested_at_col,
     )
     IcebergToLanceETL(config).run(spark, args.table, parse_epoch_ms(args.start), parse_epoch_ms(args.end))
 
@@ -253,8 +215,9 @@ def run_index(args: argparse.Namespace, spark: SparkSession) -> None:
     """Run the indexing subcommand.
 
     The CLI selects what to build (which columns get which index type) and the data-shape knobs that cannot be
-    defaulted (the distance metric and the FTS tokenizer parameters). IVF training parameters, partition counts,
-    shard counts, the vector row floor, delta and retrain bounds, and retry budgets take their opinionated
+    defaulted (the distance metric, the FTS base tokenizer, and the FTS language). IVF training parameters, partition
+    counts, shard counts, the vector row floor, delta and retrain bounds, retry budgets, and the fine-grained FTS
+    tokenizer toggles (lower-case, stemming, stop-word removal, ASCII folding) take their opinionated
     :class:`IndexJobConfig` defaults. ``--rebuild`` remains as the operational escape hatch for tokenizer or
     parameter changes that need a full reindex.
 
@@ -273,10 +236,6 @@ def run_index(args: argparse.Namespace, spark: SparkSession) -> None:
         fts_with_position=args.fts_with_position,
         fts_base_tokenizer=args.fts_base_tokenizer,
         fts_language=args.fts_language,
-        fts_lower_case=args.fts_lower_case,
-        fts_stem=args.fts_stem,
-        fts_remove_stop_words=args.fts_remove_stop_words,
-        fts_ascii_folding=args.fts_ascii_folding,
         rebuild=args.rebuild,
     )
     LanceIndexer(config).run(spark, load_dataset_uris(args))
@@ -394,63 +353,31 @@ def build_parser() -> argparse.ArgumentParser:
     etl.add_argument("--start", required=True, help="ISO 8601 or epoch milliseconds")
     etl.add_argument("--end", required=True, help="ISO 8601 or epoch milliseconds")
     etl.add_argument("--base-uri", required=True)
-    etl.add_argument("--key-col", default="vector_id")
     etl.add_argument(
         "--partition-by",
         default=None,
         help=(
             "Comma-separated columns routing each row to its dataset. The path is base_uri/<val1>/.../<valN>.lance "
-            "in this order. Every column must exist in the source table or be produced by --partition-derive. "
-            "Default: org_id,tenant_id,namespace. A key whose partition value changes between runs leaves a stale "
-            "copy in the previously-routed dataset. Readers deduplicate."
+            "in this order. Every column must exist in the source table. Default: org_id,tenant_id,namespace. Each key "
+            "lives in exactly one dataset, so the per-dataset merge_insert is the sole dedup."
         ),
     )
-    etl.add_argument(
-        "--partition-derive",
-        action="append",
-        help=(
-            "Derived partition column as NAME=SOURCE:FORMAT, repeatable. FORMAT is a Python strftime pattern "
-            "(supported directives: %%Y %%y %%m %%d %%H %%M %%S %%j %%%%) translated to Spark's date_format and "
-            "applied to SOURCE before routing, e.g. event_date=processing_timestamp:%%Y-%%m-%%d."
-        ),
-    )
-    etl.add_argument("--vectors-col", default="vectors")
-    etl.add_argument("--metadata-col", default="metadata")
-    etl.add_argument("--ts-col", default="timestamp")
-    etl.add_argument("--op-col", default="op")
-    etl.add_argument("--delete-op-value", action="append")
     etl.add_argument("--column-type", action="append", help="Cast column as name=arrow_type")
     etl.add_argument("--iceberg-option", action="append", help="Iceberg read option key=value")
     etl.add_argument(
         "--window-start",
         default=None,
         help=(
-            "ISO-8601 lower bound (inclusive) for the source timestamp window pushdown filter applied to "
-            "--window-column after the Iceberg read.  Absent means the lower bound is open (no filter)."
+            "ISO-8601 lower bound (inclusive) for the source timestamp window pushdown filter applied to the "
+            "configured window column after the Iceberg read.  Absent means the lower bound is open (no filter)."
         ),
     )
     etl.add_argument(
         "--window-end",
         default=None,
         help=(
-            "ISO-8601 upper bound (exclusive) for the source timestamp window pushdown filter applied to "
-            "--window-column after the Iceberg read.  Absent means the upper bound is open (no filter)."
-        ),
-    )
-    etl.add_argument(
-        "--window-column",
-        default="updated_at",
-        help=(
-            "Iceberg column used for the timestamp window pushdown filter.  Must be a timestamp column "
-            "present in the source table.  Default: updated_at."
-        ),
-    )
-    etl.add_argument(
-        "--ingested-at-col",
-        default="_ingested_at",
-        help=(
-            "Name of the ingestion-timestamp payload column stamped on every row. Refreshed on updates so it reflects "
-            "the most recent ingestion. Never a routing or key column. Default: _ingested_at."
+            "ISO-8601 upper bound (exclusive) for the source timestamp window pushdown filter applied to the "
+            "configured window column after the Iceberg read.  Absent means the upper bound is open (no filter)."
         ),
     )
 
@@ -471,10 +398,6 @@ def build_parser() -> argparse.ArgumentParser:
     index.add_argument("--fts-with-position", action="store_true", help="Store token positions for phrase queries")
     index.add_argument("--fts-base-tokenizer", default=None, help="FTS base tokenizer name")
     index.add_argument("--fts-language", default=None, help="FTS stemming and stop-word language")
-    index.add_argument("--fts-lower-case", action="store_const", const=True, default=None)
-    index.add_argument("--fts-stem", action="store_const", const=True, default=None)
-    index.add_argument("--fts-remove-stop-words", action="store_const", const=True, default=None)
-    index.add_argument("--fts-ascii-folding", action="store_const", const=True, default=None)
     index.add_argument(
         "--rebuild",
         action="store_true",

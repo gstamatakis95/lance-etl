@@ -57,7 +57,6 @@ def fri_config(telemetry_config: TelemetryConfig) -> CompactionConfig:
         target_rows_per_fragment=2000,
         defer_index_remap=True,
         num_threads=1,
-        run_cleanup=False,
         commit_backoff_seconds=0.0,
     )
 

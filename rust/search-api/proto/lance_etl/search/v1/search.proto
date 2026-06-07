@@ -18,21 +18,10 @@ service SearchService {
   rpc Clusters(ClustersRequest) returns (ClustersResponse);
 }
 
-// An inclusive calendar-day range over date-partitioned datasets.
-message DateRange {
-  // First day, formatted YYYY-MM-DD (inclusive).
-  string start_date = 1;
-  // Last day, formatted YYYY-MM-DD (inclusive).
-  string end_date = 2;
-}
-
-// Addresses the dataset(s) a request operates on.
+// Addresses the dataset a request operates on.
 //
-// Without date_range the target resolves to the single dataset at
-// {base}/{org_id}/{tenant_id}/{namespace}.lance. With date_range it resolves to one
-// date-partitioned dataset per day at {base}/{org_id}/{tenant_id}/{namespace}/{date}.lance,
-// skipping days whose dataset does not exist. Prewarm and Clusters accept at most a single-day
-// range.
+// The target resolves to the single dataset at
+// {base}/{org_id}/{tenant_id}/{namespace}.lance.
 message DatasetTarget {
   // Organization id. Must match [A-Za-z0-9_-]+.
   string org_id = 1;
@@ -40,13 +29,11 @@ message DatasetTarget {
   string tenant_id = 2;
   // Namespace. Must match [A-Za-z0-9_-]+.
   string namespace = 3;
-  // Optional day range selecting date-partitioned datasets.
-  DateRange date_range = 4;
 }
 
 // Request for SearchService.Prewarm.
 message PrewarmRequest {
-  // Dataset to prewarm. A date_range, when present, must cover exactly one day.
+  // Dataset to prewarm.
   DatasetTarget target = 1;
   // Warm dataset metadata (manifest, transaction, index listing). Implied by warming any index,
   // since opening the dataset warms its metadata. When false with no index targets the prewarm is
@@ -73,7 +60,7 @@ message PrewarmRequest {
 
 // Request for SearchService.Clusters.
 message ClustersRequest {
-  // Dataset whose vector index is read. A date_range, when present, must cover exactly one day.
+  // Dataset whose vector index is read.
   DatasetTarget target = 1;
   // Vector index to read. Defaults to the dataset's vector index when omitted.
   optional string index_name = 2;
@@ -453,7 +440,7 @@ message IdentityRerank {
 
 // Request for SearchService.VectorSearch.
 message VectorSearchRequest {
-  // Dataset(s) to search.
+  // Dataset to search.
   DatasetTarget target = 1;
   // Nearest-neighbor query parameters.
   VectorQuery query = 2;
@@ -477,7 +464,7 @@ message VectorSearchResult {
 
 // Request for SearchService.TextSearch.
 message TextSearchRequest {
-  // Dataset(s) to search.
+  // Dataset to search.
   DatasetTarget target = 1;
   // Full-text query parameters.
   TextQuery query = 2;
@@ -501,7 +488,7 @@ message TextSearchResult {
 
 // Request for SearchService.HybridSearch.
 message HybridSearchRequest {
-  // Dataset(s) to search.
+  // Dataset to search.
   DatasetTarget target = 1;
   // Vector leg parameters.
   VectorQuery vector = 2;

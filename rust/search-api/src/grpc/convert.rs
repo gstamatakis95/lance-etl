@@ -3,30 +3,20 @@
 use prost_types::value::Kind;
 use serde_json::{Map, Value};
 
-use crate::domain::target::parse_date;
 use crate::domain::{
-    ClusterReport, ClusterSpec, CompareOp, DatasetRef, DatasetTarget, DateRange, DistanceKind, Filter, FilterMode,
-    FusedHit, FusionSpec, Fuzziness, Hit, HybridQuery, Literal, MatchSpec, PhraseSpec, PrewarmReport, PrewarmSpec,
-    RerankSpec, SearchError, TextOperator, TextQuery, TextQueryNode, VectorQuery,
+    ClusterReport, ClusterSpec, CompareOp, DatasetRef, DatasetTarget, DistanceKind, Filter, FilterMode, FusedHit,
+    FusionSpec, Fuzziness, Hit, HybridQuery, Literal, MatchSpec, PhraseSpec, PrewarmReport, PrewarmSpec, RerankSpec,
+    SearchError, TextOperator, TextQuery, TextQueryNode, VectorQuery,
 };
 use crate::pb;
 
 /// Converts an optional proto dataset target into the validated domain target.
 pub fn dataset_target_from_proto(target: Option<pb::DatasetTarget>) -> Result<DatasetTarget, SearchError> {
     let target = target.ok_or_else(|| SearchError::invalid_argument("target is required"))?;
-    let date_range = target
-        .date_range
-        .map(|range| {
-            let start = parse_date(&range.start_date, "date_range.start_date")?;
-            let end = parse_date(&range.end_date, "date_range.end_date")?;
-            DateRange::new(start, end)
-        })
-        .transpose()?;
     let target = DatasetTarget {
         org_id: target.org_id,
         tenant_id: target.tenant_id,
         namespace: target.namespace,
-        date_range,
     };
     target.validate()?;
     Ok(target)

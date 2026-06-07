@@ -23,9 +23,6 @@ pub(crate) const VECTOR_DETAILS_SUFFIX: &str = "VectorIndexDetails";
 /// Warms one dataset's caches by opening it through the shared session (manifest, transaction,
 /// and index-listing metadata) and then prewarming the requested indexes.
 ///
-/// The target must address exactly one dataset: a date range, when present, has to cover a
-/// single day.
-///
 /// A spec that requests neither metadata nor any index ([`PrewarmSpec::is_noop`]) short-circuits
 /// into an empty report without opening the dataset, since opening is the only thing that warms
 /// metadata.
@@ -57,8 +54,7 @@ impl<P: DatasetProvider> Prewarmer for LanceSearchBackend<P> {
                 resolved_version: 0,
             });
         }
-        let date = target.single_date()?;
-        let dataset = match self.provider.dataset(target, date, reference).await {
+        let dataset = match self.provider.dataset(target, reference).await {
             Ok(dataset) => dataset,
             Err(error) => {
                 self.metrics.prewarm(PrewarmStatus::Error, total_start.elapsed());

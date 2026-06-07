@@ -259,8 +259,8 @@ pub struct HybridQuery {
 pub struct VectorSearchOutcome {
     /// Hits ordered nearest-first.
     pub hits: Vec<Hit>,
-    /// The committed version of the Lance dataset that served the query. `None` for date-range
-    /// fan-out, where several per-day datasets (each with its own version) contribute.
+    /// The committed version of the Lance dataset that served the query. `None` when the
+    /// serving version was not recorded.
     pub dataset_version: Option<u64>,
 }
 
@@ -269,8 +269,8 @@ pub struct VectorSearchOutcome {
 pub struct TextSearchOutcome {
     /// Hits ordered best-first.
     pub hits: Vec<Hit>,
-    /// The committed version of the Lance dataset that served the query. `None` for date-range
-    /// fan-out, where several per-day datasets (each with its own version) contribute.
+    /// The committed version of the Lance dataset that served the query. `None` when the
+    /// serving version was not recorded.
     pub dataset_version: Option<u64>,
 }
 
@@ -279,8 +279,8 @@ pub struct TextSearchOutcome {
 pub struct HybridSearchOutcome {
     /// Fused hits ordered best-first.
     pub hits: Vec<FusedHit>,
-    /// The committed version of the Lance dataset that served the query. `None` for date-range
-    /// fan-out, where several per-day datasets (each with its own version) contribute.
+    /// The committed version of the Lance dataset that served the query. `None` when the
+    /// serving version was not recorded.
     pub dataset_version: Option<u64>,
 }
 

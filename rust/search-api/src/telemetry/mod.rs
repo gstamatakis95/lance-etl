@@ -41,11 +41,6 @@
 //!   open-handle LRU entry count), `cache.handles.weighted_size` (gauge: open-handle LRU total
 //!   weighted size against the configured weighted capacity).
 //!
-//! Date-range fan-out ([`metrics::Metrics::fanout_legs`], `fanout_leg_duration`,
-//! `fanout_dedup_dropped`):
-//! - `fanout.legs` (distribution: fan-out width), `fanout.leg.duration_ms` (distribution: per-day
-//!   leg latency), `fanout.dedup.dropped` (count), each tagged `leg`.
-//!
 //! Prewarm and blue-green ([`metrics::Metrics::prewarm`], `prewarm_index`,
 //! `prewarm_indexes_warmed`, `prewarm_warmed_bytes`, `prewarm_last_version`, `serve_cold_open`,
 //! `serve_tag_resolved`):
@@ -65,13 +60,13 @@
 //!   `rpc`. Emitted only when a request carries a rerank spec.
 //!
 //! Spans (via the OpenTelemetry layer) carry the high-cardinality detail: `org_id`, `tenant_id`,
-//! `namespace`, `dataset.version`, `prewarm.resolved_version`, `clusters.index`, the `fanout.*`
-//! widths, and the gRPC status code.
+//! `namespace`, `dataset.version`, `prewarm.resolved_version`, `clusters.index`, and the gRPC
+//! status code.
 
 pub mod metrics;
 pub mod recall;
 pub mod traces;
 
-pub use metrics::{CacheName, EvictionReason, FanoutLeg, Metrics, PrewarmIndexKind, PrewarmStatus, Rpc, Tier};
+pub use metrics::{CacheName, EvictionReason, Metrics, PrewarmIndexKind, PrewarmStatus, Rpc, Tier};
 pub use recall::{RecallCapture, RecallHook, RecallQueryType, RecallRecord};
 pub use traces::{TelemetryGuard, init_tracing};

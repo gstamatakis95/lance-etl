@@ -47,13 +47,7 @@ REQUIRED_ETL_ARGV: list[str] = [
 ]
 
 
-def test_etl_ingested_at_col_default() -> None:
-    """``--ingested-at-col`` defaults to ``_ingested_at``."""
+def test_etl_has_no_ingested_at_flag() -> None:
+    """The ingestion-timestamp column name is baked, so no ``--ingested-at-col`` flag is exposed."""
     args = build_parser().parse_args(REQUIRED_ETL_ARGV)
-    assert args.ingested_at_col == "_ingested_at"
-
-
-def test_etl_ingested_at_col_override() -> None:
-    """``--ingested-at-col`` overrides the ingestion-timestamp column name."""
-    args = build_parser().parse_args([*REQUIRED_ETL_ARGV, "--ingested-at-col", "_loaded_at"])
-    assert args.ingested_at_col == "_loaded_at"
+    assert not hasattr(args, "ingested_at_col")

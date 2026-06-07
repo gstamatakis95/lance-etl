@@ -1,8 +1,12 @@
 # 0006. Date-range fan-out search with dedup-keep-best
 
-Status: Accepted
+Status: Superseded by [0014](0014-drop-by-date-partitioning.md)
 
 ## Context
+
+This design was removed in [0014](0014-drop-by-date-partitioning.md). Each search target now resolves to exactly
+one dataset, and date-range queries are expressed as scalar filters on a timestamp column at the query layer rather
+than as multi-dataset fan-out in the server.
 
 With date-partitioned datasets ([0004](0004-dynamic-partition-targets.md)) one org maps to many
 `{org}/{tenant}/{namespace}/{date}.lance` datasets, and the same `vector_id` may exist in several date

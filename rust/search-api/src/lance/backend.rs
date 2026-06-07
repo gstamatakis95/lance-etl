@@ -1,30 +1,26 @@
-//! Lance-backed implementation of the [`SearchBackend`] trait, including date-range fan-out.
+//! Lance-backed implementation of the [`SearchBackend`] trait over single-dataset targets.
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
 
 use arrow_array::Float32Array;
 use arrow_schema::DataType;
-use chrono::NaiveDate;
-use futures::StreamExt;
 use lance::Dataset;
 use lance::dataset::scanner::{ExecutionStatsCallback, ExecutionSummaryCounts, Scanner};
 use lance_core::ROW_ID;
 use lance_linalg::distance::DistanceType;
 use serde_json::{Map, Value};
-use tracing::Instrument;
 
 use crate::domain::{
-    DatasetRef, DatasetTarget, DistanceKind, FilterMode, Hit, HybridQuery, HybridSearchOutcome, ScoreOrder,
-    SearchBackend, SearchError, TextQuery, TextSearchOutcome, VectorQuery, VectorSearchOutcome, merge_hits,
+    DatasetRef, DatasetTarget, DistanceKind, FilterMode, Hit, HybridQuery, HybridSearchOutcome, SearchBackend,
+    SearchError, TextQuery, TextSearchOutcome, VectorQuery, VectorSearchOutcome,
 };
 use crate::lance::error::classify_lance_error;
 use crate::lance::filter::filter_to_expr;
 use crate::lance::provider::DatasetProvider;
 use crate::lance::rows::batch_to_json_rows;
 use crate::lance::text::text_query_to_fts;
-use crate::telemetry::{FanoutLeg, Metrics, Rpc};
+use crate::telemetry::{Metrics, Rpc};
 
 /// Column key under which Lance reports vector distances.
 const DISTANCE_KEY: &str = "_distance";
@@ -36,20 +32,16 @@ const SCORE_KEY: &str = "_score";
 pub struct LanceSearchBackend<P: DatasetProvider> {
     pub(crate) provider: P,
     pub(crate) prewarm_concurrency: usize,
-    pub(crate) fanout_concurrency: usize,
-    pub(crate) id_column: String,
     pub(crate) metrics: Arc<crate::telemetry::Metrics>,
 }
 
 impl<P: DatasetProvider> LanceSearchBackend<P> {
-    /// Creates a backend over the given dataset provider with default concurrency knobs, the
-    /// default dedup id column, and telemetry disabled.
+    /// Creates a backend over the given dataset provider with the default prewarm concurrency and
+    /// telemetry disabled.
     pub fn new(provider: P) -> Self {
         Self {
             provider,
             prewarm_concurrency: crate::config::DEFAULT_PREWARM_CONCURRENCY,
-            fanout_concurrency: crate::config::DEFAULT_FANOUT_CONCURRENCY,
-            id_column: crate::config::DEFAULT_ID_COLUMN.to_string(),
             metrics: Arc::new(crate::telemetry::Metrics::disabled()),
         }
     }
@@ -60,113 +52,10 @@ impl<P: DatasetProvider> LanceSearchBackend<P> {
         self
     }
 
-    /// Sets how many per-day datasets one date-range fan-out queries concurrently.
-    pub fn with_fanout_concurrency(mut self, fanout_concurrency: usize) -> Self {
-        self.fanout_concurrency = fanout_concurrency.max(1);
-        self
-    }
-
-    /// Sets the logical id column used to deduplicate fan-out results across date partitions.
-    pub fn with_id_column(mut self, id_column: impl Into<String>) -> Self {
-        self.id_column = id_column.into();
-        self
-    }
-
-    /// Emits backend metrics (prewarm, fan-out, and clusters timings) through the given facade.
+    /// Emits backend metrics (prewarm and clusters timings) through the given facade.
     pub fn with_metrics(mut self, metrics: Arc<crate::telemetry::Metrics>) -> Self {
         self.metrics = metrics;
         self
-    }
-
-    /// Runs `run` against every existing per-day dataset of the range with bounded concurrency.
-    ///
-    /// Days whose dataset does not exist are skipped. Returns `NotFound` only when zero datasets
-    /// exist in the whole range. Any other per-leg failure fails the call. Each leg runs inside a
-    /// `fanout.leg` span and reports its latency to the `fanout.leg.duration_ms` distribution,
-    /// on failure as well as on success, so error storms stay visible in the latency breakdown.
-    async fn fan_out<T, F, Fut>(
-        &self,
-        target: &DatasetTarget,
-        days: Vec<NaiveDate>,
-        leg: FanoutLeg,
-        run: F,
-    ) -> Result<Vec<T>, SearchError>
-    where
-        F: Fn(Arc<Dataset>) -> Fut,
-        Fut: Future<Output = Result<T, SearchError>>,
-        T: Send,
-    {
-        let days_requested = days.len();
-        let run = &run;
-        let outcomes: Vec<Result<Option<T>, SearchError>> = futures::stream::iter(days.into_iter().map(|day| {
-            let span = tracing::info_span!("fanout.leg", leg.date = %day, leg.kind = leg.as_tag());
-            async move {
-                let started = Instant::now();
-                let dataset = match self.provider.dataset(target, Some(day), DatasetRef::Serve).await {
-                    Ok(dataset) => dataset,
-                    Err(SearchError::NotFound(_)) => {
-                        tracing::debug!(leg.date = %day, "fan-out leg skipped, dataset missing");
-                        return Ok(None);
-                    }
-                    Err(error) => return Err(error),
-                };
-                let result = run(dataset).await;
-                self.metrics.fanout_leg_duration(leg, started.elapsed());
-                Ok(Some(result?))
-            }
-            .instrument(span)
-        }))
-        .buffer_unordered(self.fanout_concurrency.max(1))
-        .collect()
-        .await;
-        let mut legs = Vec::new();
-        for outcome in outcomes {
-            if let Some(result) = outcome? {
-                legs.push(result);
-            }
-        }
-        if legs.is_empty() {
-            return Err(SearchError::not_found("no datasets exist in the requested date range"));
-        }
-        let span = tracing::Span::current();
-        span.record("fanout.days", days_requested as u64);
-        span.record("fanout.legs", legs.len() as u64);
-        self.metrics.fanout_legs(leg, legs.len() as u64);
-        Ok(legs)
-    }
-
-    /// Merges fan-out legs, recording dedup metrics and span attributes, then strips the id
-    /// column from the merged rows when it was added only for deduplication.
-    fn merge_fanout_legs(
-        &self,
-        legs: Vec<Vec<Hit>>,
-        order: ScoreOrder,
-        k: usize,
-        leg: FanoutLeg,
-        strip_id: bool,
-    ) -> Vec<Hit> {
-        let outcome = merge_hits(legs, &self.id_column, order, k);
-        tracing::Span::current().record("fanout.dedup_dropped", outcome.duplicates_dropped);
-        self.metrics.fanout_dedup_dropped(leg, outcome.duplicates_dropped);
-        let mut hits = outcome.hits;
-        if strip_id {
-            for hit in &mut hits {
-                hit.row.remove(&self.id_column);
-            }
-        }
-        hits
-    }
-
-    /// Ensures the dedup id column is part of an explicit projection during fan-out.
-    ///
-    /// Returns true when the column was added (and must be stripped from merged rows). Empty
-    /// projections already include every scalar column and are left untouched.
-    fn ensure_id_projected(&self, projection: &mut Vec<String>) -> bool {
-        if projection.is_empty() || projection.iter().any(|column| column == &self.id_column) {
-            return false;
-        }
-        projection.push(self.id_column.clone());
-        true
     }
 }
 
@@ -174,91 +63,41 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
     #[tracing::instrument(
         name = "backend.vector_search",
         skip_all,
-        fields(
-            org_id = %target.org_id,
-            search.k = query.k,
-            fanout.days = tracing::field::Empty,
-            fanout.legs = tracing::field::Empty,
-            fanout.dedup_dropped = tracing::field::Empty,
-        )
+        fields(org_id = %target.org_id, search.k = query.k)
     )]
     async fn vector_search(
         &self,
         target: &DatasetTarget,
-        mut query: VectorQuery,
+        query: VectorQuery,
     ) -> Result<VectorSearchOutcome, SearchError> {
         validate_k(query.k)?;
-        let Some(range) = target.date_range else {
-            let dataset = self.provider.dataset(target, None, DatasetRef::Serve).await?;
-            let hits = run_vector_query(&dataset, &query, &self.metrics, Rpc::VectorSearch).await?;
-            return Ok(VectorSearchOutcome {
-                hits,
-                dataset_version: Some(dataset.version_id()),
-            });
-        };
-        let strip_id = self.ensure_id_projected(&mut query.projection);
-        let query = &query;
-        let metrics = &self.metrics;
-        let legs = self
-            .fan_out(target, range.days(), FanoutLeg::Vector, |dataset| async move {
-                run_vector_query(&dataset, query, metrics, Rpc::VectorSearch).await
-            })
-            .await?;
+        let dataset = self.provider.dataset(target, DatasetRef::Serve).await?;
+        let hits = run_vector_query(&dataset, &query, &self.metrics, Rpc::VectorSearch).await?;
         Ok(VectorSearchOutcome {
-            hits: self.merge_fanout_legs(legs, ScoreOrder::LowerIsBetter, query.k, FanoutLeg::Vector, strip_id),
-            dataset_version: None,
+            hits,
+            dataset_version: Some(dataset.version_id()),
         })
     }
 
     #[tracing::instrument(
         name = "backend.text_search",
         skip_all,
-        fields(
-            org_id = %target.org_id,
-            search.k = query.k,
-            fanout.days = tracing::field::Empty,
-            fanout.legs = tracing::field::Empty,
-            fanout.dedup_dropped = tracing::field::Empty,
-        )
+        fields(org_id = %target.org_id, search.k = query.k)
     )]
-    async fn text_search(
-        &self,
-        target: &DatasetTarget,
-        mut query: TextQuery,
-    ) -> Result<TextSearchOutcome, SearchError> {
+    async fn text_search(&self, target: &DatasetTarget, query: TextQuery) -> Result<TextSearchOutcome, SearchError> {
         validate_k(query.k)?;
-        let Some(range) = target.date_range else {
-            let dataset = self.provider.dataset(target, None, DatasetRef::Serve).await?;
-            let hits = run_text_query(&dataset, &query, &self.metrics, Rpc::TextSearch).await?;
-            return Ok(TextSearchOutcome {
-                hits,
-                dataset_version: Some(dataset.version_id()),
-            });
-        };
-        let strip_id = self.ensure_id_projected(&mut query.projection);
-        let query = &query;
-        let metrics = &self.metrics;
-        let legs = self
-            .fan_out(target, range.days(), FanoutLeg::Text, |dataset| async move {
-                run_text_query(&dataset, query, metrics, Rpc::TextSearch).await
-            })
-            .await?;
+        let dataset = self.provider.dataset(target, DatasetRef::Serve).await?;
+        let hits = run_text_query(&dataset, &query, &self.metrics, Rpc::TextSearch).await?;
         Ok(TextSearchOutcome {
-            hits: self.merge_fanout_legs(legs, ScoreOrder::HigherIsBetter, query.k, FanoutLeg::Text, strip_id),
-            dataset_version: None,
+            hits,
+            dataset_version: Some(dataset.version_id()),
         })
     }
 
     #[tracing::instrument(
         name = "backend.hybrid_search",
         skip_all,
-        fields(
-            org_id = %target.org_id,
-            search.k = query.k,
-            fanout.days = tracing::field::Empty,
-            fanout.legs = tracing::field::Empty,
-            fanout.dedup_dropped = tracing::field::Empty,
-        )
+        fields(org_id = %target.org_id, search.k = query.k)
     )]
     async fn hybrid_search(
         &self,
@@ -275,58 +114,16 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
             text_query.k = query.k;
         }
         let fusion = query.fusion;
-        let Some(range) = target.date_range else {
-            let dataset = self.provider.dataset(target, None, DatasetRef::Serve).await?;
-            let (vector_hits, text_hits) = tokio::join!(
-                run_vector_query(&dataset, &vector_query, &self.metrics, Rpc::HybridSearch),
-                run_text_query(&dataset, &text_query, &self.metrics, Rpc::HybridSearch),
-            );
-            let (vector_hits, text_hits) = (vector_hits?, text_hits?);
-            let fuse_span = tracing::info_span!("fusion.fuse", search.k = query.k);
-            return Ok(HybridSearchOutcome {
-                hits: fuse_span.in_scope(|| fusion.fuse(vec![vector_hits, text_hits], query.k)),
-                dataset_version: Some(dataset.version_id()),
-            });
-        };
-        let strip_vector_id = self.ensure_id_projected(&mut vector_query.projection);
-        let strip_text_id = self.ensure_id_projected(&mut text_query.projection);
-        let strip_id = strip_vector_id || strip_text_id;
-        let (vector_query, text_query) = (&vector_query, &text_query);
-        let metrics = &self.metrics;
-        let legs: Vec<(Vec<Hit>, Vec<Hit>)> = self
-            .fan_out(target, range.days(), FanoutLeg::Hybrid, |dataset| async move {
-                let (vector_hits, text_hits) = tokio::join!(
-                    run_vector_query(&dataset, vector_query, metrics, Rpc::HybridSearch),
-                    run_text_query(&dataset, text_query, metrics, Rpc::HybridSearch),
-                );
-                Ok((vector_hits?, text_hits?))
-            })
-            .await?;
-        let (vector_legs, text_legs): (Vec<Vec<Hit>>, Vec<Vec<Hit>>) = legs.into_iter().unzip();
-        let merged_vector = self.merge_fanout_legs(
-            vector_legs,
-            ScoreOrder::LowerIsBetter,
-            vector_query.k,
-            FanoutLeg::Hybrid,
-            false,
+        let dataset = self.provider.dataset(target, DatasetRef::Serve).await?;
+        let (vector_hits, text_hits) = tokio::join!(
+            run_vector_query(&dataset, &vector_query, &self.metrics, Rpc::HybridSearch),
+            run_text_query(&dataset, &text_query, &self.metrics, Rpc::HybridSearch),
         );
-        let merged_text = self.merge_fanout_legs(
-            text_legs,
-            ScoreOrder::HigherIsBetter,
-            text_query.k,
-            FanoutLeg::Hybrid,
-            false,
-        );
+        let (vector_hits, text_hits) = (vector_hits?, text_hits?);
         let fuse_span = tracing::info_span!("fusion.fuse", search.k = query.k);
-        let mut fused = fuse_span.in_scope(|| fusion.fuse(vec![merged_vector, merged_text], query.k));
-        if strip_id {
-            for hit in &mut fused {
-                hit.row.remove(&self.id_column);
-            }
-        }
         Ok(HybridSearchOutcome {
-            hits: fused,
-            dataset_version: None,
+            hits: fuse_span.in_scope(|| fusion.fuse(vec![vector_hits, text_hits], query.k)),
+            dataset_version: Some(dataset.version_id()),
         })
     }
 }

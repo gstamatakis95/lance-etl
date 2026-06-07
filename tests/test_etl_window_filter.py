@@ -139,10 +139,13 @@ class TestApplyWindowFilterNoop:
 
 
 class TestCLIWindowFlags:
-    """The CLI parser exposes --window-start, --window-end, and --window-column on the etl subcommand."""
+    """The CLI parser exposes --window-start and --window-end on the etl subcommand.
+
+    The window column itself is no longer a CLI flag: it takes the :class:`ETLConfig` default and is tunable in code.
+    """
 
     def test_window_flags_have_correct_defaults(self) -> None:
-        """Parsing without window flags yields None/updated_at defaults."""
+        """Parsing without window flags yields None bounds and no window-column flag."""
         parser = build_parser()
         args = parser.parse_args(
             [
@@ -159,7 +162,7 @@ class TestCLIWindowFlags:
         )
         assert args.window_start is None
         assert args.window_end is None
-        assert args.window_column == "updated_at"
+        assert not hasattr(args, "window_column")
 
     def test_window_start_is_parsed(self) -> None:
         """--window-start is accepted and stored on the namespace."""
@@ -201,28 +204,8 @@ class TestCLIWindowFlags:
         )
         assert args.window_end == "2024-06-02T00:00:00Z"
 
-    def test_window_column_is_parsed(self) -> None:
-        """--window-column overrides the default column name."""
-        parser = build_parser()
-        args = parser.parse_args(
-            [
-                "etl",
-                "--table",
-                "db.t",
-                "--start",
-                "2024-01-01T00:00:00Z",
-                "--end",
-                "2024-01-02T00:00:00Z",
-                "--base-uri",
-                "s3://bucket/lance",
-                "--window-column",
-                "event_time",
-            ]
-        )
-        assert args.window_column == "event_time"
-
     def test_all_window_flags_together(self) -> None:
-        """All three window flags can be supplied together."""
+        """Both window bound flags can be supplied together."""
         parser = build_parser()
         args = parser.parse_args(
             [
@@ -239,13 +222,10 @@ class TestCLIWindowFlags:
                 "2024-06-01T00:00:00Z",
                 "--window-end",
                 "2024-06-02T00:00:00Z",
-                "--window-column",
-                "created_at",
             ]
         )
         assert args.window_start == "2024-06-01T00:00:00Z"
         assert args.window_end == "2024-06-02T00:00:00Z"
-        assert args.window_column == "created_at"
 
     def test_window_flags_not_present_on_compact(self) -> None:
         """The compact subcommand does not expose window flags."""

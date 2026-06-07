@@ -3,10 +3,9 @@
 //!
 //! # What is sampled
 //!
-//! `VectorSearch`, `TextSearch`, and `HybridSearch` requests without a `date_range` are eligible
-//! (fan-out replay is out of v1 scope). Requests carrying a typed filter are eligible and the
-//! vector capture records the filter, so the offline scorer can replay it. Each query type has its
-//! own deterministic sampler counter.
+//! `VectorSearch`, `TextSearch`, and `HybridSearch` requests are eligible. Requests carrying a
+//! typed filter are eligible and the vector capture records the filter, so the offline scorer can
+//! replay it. Each query type has its own deterministic sampler counter.
 //!
 //! # Sampler design
 //!
@@ -292,11 +291,8 @@ impl RecallCapture {
     }
 
     /// Decides whether this vector search is sampled, snapshotting the query when it is.
-    ///
-    /// Requests whose target carries a date range are never eligible and never advance the
-    /// sampler counter.
     pub fn begin(&self, target: &DatasetTarget, query: &VectorQuery) -> Option<PendingRecall> {
-        if target.date_range.is_some() || !self.vector_sampler.should_sample() {
+        if !self.vector_sampler.should_sample() {
             return None;
         }
         let (nprobes_min, nprobes_max) = nprobes_bounds(query);
@@ -323,10 +319,8 @@ impl RecallCapture {
     }
 
     /// Decides whether this text search is sampled, snapshotting the query when it is.
-    ///
-    /// Date-range targets are never eligible and never advance the sampler counter.
     pub fn begin_text(&self, target: &DatasetTarget, query: &TextQuery) -> Option<PendingRecall> {
-        if target.date_range.is_some() || !self.text_sampler.should_sample() {
+        if !self.text_sampler.should_sample() {
             return None;
         }
         Some(PendingRecall {
@@ -350,10 +344,9 @@ impl RecallCapture {
 
     /// Decides whether this hybrid search is sampled, snapshotting the query when it is.
     ///
-    /// Date-range targets are never eligible and never advance the sampler counter. `k` is the
-    /// fused result count.
+    /// `k` is the fused result count.
     pub fn begin_hybrid(&self, target: &DatasetTarget, query: &HybridQuery) -> Option<PendingRecall> {
-        if target.date_range.is_some() || !self.hybrid_sampler.should_sample() {
+        if !self.hybrid_sampler.should_sample() {
             return None;
         }
         Some(PendingRecall {
@@ -456,7 +449,7 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{CompareOp, DateRange, Filter, Literal, MatchSpec, TextQueryNode};
+    use crate::domain::{CompareOp, Filter, Literal, MatchSpec, TextQueryNode};
     use serde_json::Map;
     use std::sync::Mutex;
 
@@ -512,22 +505,10 @@ mod tests {
     }
 
     #[test]
-    fn begin_skips_date_ranges_and_finish_builds_the_record() {
+    fn begin_samples_and_finish_builds_the_record() {
         let captured: Arc<Mutex<Vec<RecallRecord>>> = Arc::new(Mutex::new(Vec::new()));
         let capture = capturing(captured.clone());
-        let (mut target, query) = fixture();
-        target.date_range = Some(
-            DateRange::new(
-                chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
-                chrono::NaiveDate::from_ymd_opt(2026, 6, 2).unwrap(),
-            )
-            .unwrap(),
-        );
-        assert!(
-            capture.begin(&target, &query).is_none(),
-            "date-range targets must never be sampled"
-        );
-        target.date_range = None;
+        let (target, query) = fixture();
         let pending = capture.begin(&target, &query).expect("rate 1.0 must sample");
         let mut row = Map::new();
         row.insert("vector_id".to_string(), Value::from(7));

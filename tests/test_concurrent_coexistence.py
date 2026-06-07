@@ -647,7 +647,6 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
         CompactionConfig(
             telemetry=telemetry_config,
             target_rows_per_fragment=HEAD_TARGET_ROWS_PER_FRAGMENT,
-            run_cleanup=False,
             commit_backoff_seconds=0.05,
             large_commit_retries=2,
             replan_budget=4,
@@ -655,7 +654,6 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
     )
     tail_compaction_config: CompactionConfig = CompactionConfig(
         telemetry=telemetry_config,
-        run_cleanup=False,
         commit_retries=30,
         commit_backoff_seconds=0.05,
     )
@@ -984,7 +982,6 @@ def test_vector_segment_commit_survives_compaction_orphan(tmp_path: Path, monkey
         "telemetry": telemetry_config,
         "vector_column": "vector",
         "num_partitions": 4,
-        "train_sample_rate": 4,
         "vector_min_rows": 10,
         "num_shards": 8,
         "commit_retries": 10,
@@ -1000,7 +997,6 @@ def test_vector_segment_commit_survives_compaction_orphan(tmp_path: Path, monkey
     compaction_config: CompactionConfig = CompactionConfig(
         telemetry=telemetry_config,
         target_rows_per_fragment=250,
-        run_cleanup=False,
         commit_retries=10,
         commit_backoff_seconds=0.0,
     )
@@ -1062,7 +1058,6 @@ def test_scalar_segment_commit_survives_compaction_orphan(tmp_path: Path, monkey
     compaction_config: CompactionConfig = CompactionConfig(
         telemetry=telemetry_config,
         target_rows_per_fragment=250,
-        run_cleanup=False,
         commit_retries=10,
         commit_backoff_seconds=0.0,
     )

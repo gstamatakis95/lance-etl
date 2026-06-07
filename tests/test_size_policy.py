@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import lance
-import pytest
 from conftest import make_vector_table, write_fragmented_dataset
 
 from lance_etl.indexing import (
@@ -102,13 +101,3 @@ def test_index_dataset_locally_skips_vector_below_floor(tmp_path: Path) -> None:
     names: list[str] = [item["name"] for item in dataset.list_indices()]
     assert "vector_idx" not in names
     assert "id_idx" in names
-
-
-def test_validate_rejects_unsupported_num_bits(tmp_path: Path) -> None:
-    """IVF_RQ validation rejects num_bits other than 1."""
-    uri: str = str(tmp_path / "bits.lance")
-    write_fragmented_dataset(uri, make_vector_table(rows=64, dim=8), max_rows_per_file=64)
-    config: IndexJobConfig = IndexJobConfig(telemetry=TelemetryConfig(), vector_column="vector", num_bits=4)
-    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    with pytest.raises(ValueError, match="num_bits"):
-        handler.validate(lance.dataset(uri))

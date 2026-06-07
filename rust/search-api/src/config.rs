@@ -39,22 +39,28 @@ pub const DEFAULT_DISK_INDEX_CACHE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Default disk budget for the metadata byte cache (2 GiB).
 pub const DEFAULT_DISK_STORE_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Default TTL for disk cache entries (7 days).
+/// Fixed TTL for disk cache entries (7 days).
+///
+/// Hardcoded: a 7-day TTL is universal across deployments, so this is no longer an env knob.
 pub const DEFAULT_DISK_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
-/// Default largest single byte-range under `_indices/` stored by the byte cache (4 MiB).
+/// Fixed largest single byte-range under `_indices/` stored by the byte cache (4 MiB).
+///
+/// Hardcoded: this is index page-size tuning that no deployment varies, so it is no longer an env
+/// knob.
 pub const DEFAULT_STORE_CACHE_MAX_RANGE_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Default janitor sweep interval in seconds.
+/// Fixed janitor sweep interval in seconds.
+///
+/// Hardcoded: the 300 s sweep cadence is an internal maintenance constant, no longer an env knob.
 pub const DEFAULT_DISK_CACHE_SWEEP_SECS: u64 = 300;
 
 /// Default number of indexes prewarmed concurrently per Prewarm RPC.
 pub const DEFAULT_PREWARM_CONCURRENCY: usize = 4;
 
-/// Default number of per-day datasets queried concurrently by one date-range fan-out.
-pub const DEFAULT_FANOUT_CONCURRENCY: usize = 8;
-
-/// Default logical id column used to deduplicate fan-out results across date partitions.
+/// Fixed logical id column captured for recall scoring.
+///
+/// Hardcoded: matches the standardized ETL and recall schema, so it is no longer an env knob.
 pub const DEFAULT_ID_COLUMN: &str = "vector_id";
 
 /// Default DogStatsD address when neither `SEARCH_API_STATSD_ADDR` nor `DD_AGENT_HOST` is set.
@@ -71,11 +77,12 @@ pub const DEFAULT_RECALL_SAMPLE_RATE: f64 = 0.0;
 /// not independent request opens.
 pub const DEFAULT_IO_CONCURRENCY: usize = 256;
 
-/// Default minimum object-store request size in bytes (IO buffer / block size) — 256 KiB.
+/// Fixed minimum object-store request size in bytes (IO buffer / block size) — 256 KiB.
 ///
 /// Passed as `ObjectStoreParams::block_size` when opening every dataset.  Larger values
 /// reduce round-trip count for sequential scans at the cost of over-fetching for small
 /// random reads.  256 KiB is a practical balance for S3 given typical index page sizes.
+/// Hardcoded: no deployment varies it, so it is no longer an env knob.
 pub const DEFAULT_IO_BLOCK_SIZE_BYTES: usize = 256 * 1024;
 
 /// Default for whether serving resolves the configured serve tag instead of opening latest.
@@ -93,20 +100,20 @@ pub const DEFAULT_SERVE_TAG: &str = "prod";
 /// zero extra manifest reads per request while flips propagate within roughly the TTL.
 pub const DEFAULT_SERVE_TAG_TTL_SECS: u64 = 10;
 
-/// Default object-store retry-window timeout in seconds — 120 s.
+/// Fixed object-store retry-window timeout in seconds — 120 s.
 ///
 /// This feeds `OBJECT_STORE_CLIENT_RETRY_TIMEOUT`, which is picked up by the S3/GCS/Azure
 /// client builders.  It is the total wall-clock budget across all retries for one cloud
 /// request, not a per-attempt connect timeout.  120 s is generous enough to survive S3
 /// throttle back-offs without exceeding a reasonable P99 SLO.
+/// Hardcoded: no deployment varies it, so it is no longer an env knob.
 pub const DEFAULT_OBJECT_STORE_TIMEOUT_SECS: u64 = 120;
 
 /// Runtime configuration for the search API.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Base URI under which all datasets live, e.g. `s3://bucket/lance`. Datasets resolve to
-    /// `{base}/{org_id}/{tenant_id}/{namespace}.lance` and date-partitioned ones to
-    /// `{base}/{org_id}/{tenant_id}/{namespace}/{event_date}.lance`.
+    /// Base URI under which all datasets live, e.g. `s3://bucket/lance`. Each dataset resolves to
+    /// `{base}/{org_id}/{tenant_id}/{namespace}.lance`.
     pub base_uri: String,
     /// Weighted capacity of the open-`Dataset` handle LRU (total resident handle weight, not a
     /// flat count). Handles are weighed by clamped open fragment count, so many cheap tiny handles
@@ -125,23 +132,10 @@ pub struct Config {
     pub disk_index_cache_bytes: u64,
     /// Disk budget in bytes for the metadata byte cache (default 2 GiB). Env: `SEARCH_API_DISK_STORE_CACHE_BYTES`.
     pub disk_store_cache_bytes: u64,
-    /// TTL in seconds for disk cache entries (default 7 days). Env: `SEARCH_API_DISK_CACHE_TTL_SECS`.
-    pub disk_cache_ttl_secs: u64,
-    /// Largest single byte-range under `_indices/` that the byte cache stores (default 4 MiB). Larger ranges
-    /// (bulk partition payloads) pass through. Env: `SEARCH_API_STORE_CACHE_MAX_RANGE_BYTES`.
-    pub store_cache_max_range_bytes: u64,
-    /// Janitor sweep interval in seconds (default 300). Env: `SEARCH_API_DISK_CACHE_SWEEP_SECS`.
-    pub disk_cache_sweep_secs: u64,
     /// Set to disable disk caching entirely (pure in-memory fallback). Env: `SEARCH_API_DISK_CACHE_DISABLED`.
     pub disk_cache_disabled: bool,
     /// Max indexes prewarmed concurrently per Prewarm RPC (default 4). Env: `SEARCH_API_PREWARM_CONCURRENCY`.
     pub prewarm_concurrency: usize,
-    /// Max per-day datasets queried concurrently by one date-range fan-out (default 8).
-    /// Env: `SEARCH_API_FANOUT_CONCURRENCY`.
-    pub fanout_concurrency: usize,
-    /// Logical id column deduplicating fan-out results across date partitions (default
-    /// `vector_id`). Env: `SEARCH_API_ID_COLUMN`.
-    pub id_column: String,
     /// DogStatsD (UDP) address metrics are sent to. Defaults to `{DD_AGENT_HOST}:8125` when
     /// `DD_AGENT_HOST` is set, else `127.0.0.1:8125`. Env: `SEARCH_API_STATSD_ADDR`.
     pub statsd_addr: String,
@@ -159,21 +153,6 @@ pub struct Config {
     /// AIMD ~5 000 req/s/process ceiling; beyond that the AIMD throttle layer absorbs excess.
     /// Env: `SEARCH_API_IO_CONCURRENCY`.
     pub io_concurrency: usize,
-    /// Minimum object-store request size in bytes (block size) passed to every dataset open
-    /// (default 256 KiB).
-    ///
-    /// Wired as `ObjectStoreParams::block_size` in the provider on each cache miss.  Larger
-    /// values cut round-trip count for sequential scans; 256 KiB fits typical Lance index page
-    /// sizes without wasteful over-fetching.  Env: `SEARCH_API_IO_BLOCK_SIZE_BYTES`.
-    pub io_block_size_bytes: usize,
-    /// Object-store retry-window timeout in seconds (default 120).
-    ///
-    /// Written to the process-global `OBJECT_STORE_CLIENT_RETRY_TIMEOUT` env var at startup,
-    /// which is picked up by the S3/GCS/Azure client builders inside Lance.  This is the total
-    /// wall-clock budget across all retries for one cloud request.  120 s comfortably outlasts
-    /// S3 throttle back-offs without breaching a typical search-service SLO.
-    /// Env: `SEARCH_API_OBJECT_STORE_TIMEOUT_SECS`.
-    pub object_store_timeout_secs: u64,
     /// Whether serving resolves the configured serve tag to a concrete version instead of opening
     /// the latest committed version (default false). When on, the provider keys its caches on the
     /// resolved version so blue and green coexist and a tag flip is observed within the serve-tag
@@ -196,16 +175,17 @@ impl Config {
     /// (a trailing slash is stripped). Optional overrides: `SEARCH_API_DATASET_CACHE_CAPACITY`,
     /// `SEARCH_API_INDEX_CACHE_BYTES`, `SEARCH_API_METADATA_CACHE_BYTES`, `SEARCH_API_PORT`,
     /// `SEARCH_API_CACHE_DIR`, `SEARCH_API_DISK_INDEX_CACHE_BYTES`,
-    /// `SEARCH_API_DISK_STORE_CACHE_BYTES`, `SEARCH_API_DISK_CACHE_TTL_SECS`,
-    /// `SEARCH_API_STORE_CACHE_MAX_RANGE_BYTES`, `SEARCH_API_DISK_CACHE_SWEEP_SECS`,
-    /// `SEARCH_API_DISK_CACHE_DISABLED`, `SEARCH_API_PREWARM_CONCURRENCY`,
-    /// `SEARCH_API_FANOUT_CONCURRENCY`, `SEARCH_API_ID_COLUMN`, `SEARCH_API_STATSD_ADDR`
+    /// `SEARCH_API_DISK_STORE_CACHE_BYTES`, `SEARCH_API_DISK_CACHE_DISABLED`,
+    /// `SEARCH_API_PREWARM_CONCURRENCY`, `SEARCH_API_STATSD_ADDR`
     /// (default honors `DD_AGENT_HOST`), `SEARCH_API_TELEMETRY_DISABLED`,
     /// `SEARCH_API_RECALL_SAMPLE_RATE` (must lie in `[0, 1]`),
-    /// `SEARCH_API_IO_CONCURRENCY` (default 256), `SEARCH_API_IO_BLOCK_SIZE_BYTES`
-    /// (default 256 KiB), `SEARCH_API_OBJECT_STORE_TIMEOUT_SECS` (default 120),
+    /// `SEARCH_API_IO_CONCURRENCY` (default 256),
     /// `SEARCH_API_SERVE_BY_TAG` (default false), `SEARCH_API_SERVE_TAG` (default `prod`), and
     /// `SEARCH_API_SERVE_TAG_TTL_SECS` (default 10).
+    ///
+    /// The disk cache TTL, byte-cache max range, janitor sweep interval, IO block size,
+    /// object-store retry timeout, and the recall id column are fixed constants (see
+    /// [`DEFAULT_DISK_CACHE_TTL_SECS`] and siblings) and are no longer env-configurable.
     pub fn from_env() -> Result<Self, String> {
         let base_uri = std::env::var("LANCE_ETL_BASE_URI")
             .map_err(|_| "LANCE_ETL_BASE_URI must be set".to_string())?
@@ -223,25 +203,12 @@ impl Config {
             cache_dir: PathBuf::from(env_string("SEARCH_API_CACHE_DIR", DEFAULT_CACHE_DIR)),
             disk_index_cache_bytes: env_number("SEARCH_API_DISK_INDEX_CACHE_BYTES", DEFAULT_DISK_INDEX_CACHE_BYTES)?,
             disk_store_cache_bytes: env_number("SEARCH_API_DISK_STORE_CACHE_BYTES", DEFAULT_DISK_STORE_CACHE_BYTES)?,
-            disk_cache_ttl_secs: env_number("SEARCH_API_DISK_CACHE_TTL_SECS", DEFAULT_DISK_CACHE_TTL_SECS)?,
-            store_cache_max_range_bytes: env_number(
-                "SEARCH_API_STORE_CACHE_MAX_RANGE_BYTES",
-                DEFAULT_STORE_CACHE_MAX_RANGE_BYTES,
-            )?,
-            disk_cache_sweep_secs: env_number("SEARCH_API_DISK_CACHE_SWEEP_SECS", DEFAULT_DISK_CACHE_SWEEP_SECS)?,
             disk_cache_disabled: env_bool("SEARCH_API_DISK_CACHE_DISABLED", false)?,
             prewarm_concurrency: env_number("SEARCH_API_PREWARM_CONCURRENCY", DEFAULT_PREWARM_CONCURRENCY)?,
-            fanout_concurrency: env_number("SEARCH_API_FANOUT_CONCURRENCY", DEFAULT_FANOUT_CONCURRENCY)?,
-            id_column: env_string("SEARCH_API_ID_COLUMN", DEFAULT_ID_COLUMN),
             statsd_addr: env_string("SEARCH_API_STATSD_ADDR", &default_statsd_addr()),
             telemetry_disabled: env_bool("SEARCH_API_TELEMETRY_DISABLED", false)?,
             recall_sample_rate: env_unit_fraction("SEARCH_API_RECALL_SAMPLE_RATE", DEFAULT_RECALL_SAMPLE_RATE)?,
             io_concurrency: env_number("SEARCH_API_IO_CONCURRENCY", DEFAULT_IO_CONCURRENCY)?,
-            io_block_size_bytes: env_number("SEARCH_API_IO_BLOCK_SIZE_BYTES", DEFAULT_IO_BLOCK_SIZE_BYTES)?,
-            object_store_timeout_secs: env_number(
-                "SEARCH_API_OBJECT_STORE_TIMEOUT_SECS",
-                DEFAULT_OBJECT_STORE_TIMEOUT_SECS,
-            )?,
             serve_by_tag: env_bool("SEARCH_API_SERVE_BY_TAG", DEFAULT_SERVE_BY_TAG)?,
             serve_tag: env_string("SEARCH_API_SERVE_TAG", DEFAULT_SERVE_TAG),
             serve_tag_ttl_secs: env_number("SEARCH_API_SERVE_TAG_TTL_SECS", DEFAULT_SERVE_TAG_TTL_SECS)?,
@@ -326,7 +293,7 @@ mod tests {
     }
 
     /// Env var names cleared so defaults apply in tests.
-    const OPTIONAL_VARS: [&str; 24] = [
+    const OPTIONAL_VARS: [&str; 17] = [
         "SEARCH_API_SERVE_BY_TAG",
         "SEARCH_API_SERVE_TAG",
         "SEARCH_API_SERVE_TAG_TTL_SECS",
@@ -337,19 +304,12 @@ mod tests {
         "SEARCH_API_CACHE_DIR",
         "SEARCH_API_DISK_INDEX_CACHE_BYTES",
         "SEARCH_API_DISK_STORE_CACHE_BYTES",
-        "SEARCH_API_DISK_CACHE_TTL_SECS",
-        "SEARCH_API_STORE_CACHE_MAX_RANGE_BYTES",
-        "SEARCH_API_DISK_CACHE_SWEEP_SECS",
         "SEARCH_API_DISK_CACHE_DISABLED",
         "SEARCH_API_PREWARM_CONCURRENCY",
-        "SEARCH_API_FANOUT_CONCURRENCY",
-        "SEARCH_API_ID_COLUMN",
         "SEARCH_API_STATSD_ADDR",
         "SEARCH_API_TELEMETRY_DISABLED",
         "SEARCH_API_RECALL_SAMPLE_RATE",
         "SEARCH_API_IO_CONCURRENCY",
-        "SEARCH_API_IO_BLOCK_SIZE_BYTES",
-        "SEARCH_API_OBJECT_STORE_TIMEOUT_SECS",
         "DD_AGENT_HOST",
     ];
 
@@ -364,19 +324,12 @@ mod tests {
             assert_eq!(config.cache_dir, PathBuf::from(DEFAULT_CACHE_DIR));
             assert_eq!(config.disk_index_cache_bytes, DEFAULT_DISK_INDEX_CACHE_BYTES);
             assert_eq!(config.disk_store_cache_bytes, DEFAULT_DISK_STORE_CACHE_BYTES);
-            assert_eq!(config.disk_cache_ttl_secs, DEFAULT_DISK_CACHE_TTL_SECS);
-            assert_eq!(config.store_cache_max_range_bytes, DEFAULT_STORE_CACHE_MAX_RANGE_BYTES);
-            assert_eq!(config.disk_cache_sweep_secs, DEFAULT_DISK_CACHE_SWEEP_SECS);
             assert!(!config.disk_cache_disabled);
             assert_eq!(config.prewarm_concurrency, DEFAULT_PREWARM_CONCURRENCY);
-            assert_eq!(config.fanout_concurrency, DEFAULT_FANOUT_CONCURRENCY);
-            assert_eq!(config.id_column, DEFAULT_ID_COLUMN);
             assert_eq!(config.statsd_addr, DEFAULT_STATSD_ADDR);
             assert!(!config.telemetry_disabled);
             assert_eq!(config.recall_sample_rate, DEFAULT_RECALL_SAMPLE_RATE);
             assert_eq!(config.io_concurrency, DEFAULT_IO_CONCURRENCY);
-            assert_eq!(config.io_block_size_bytes, DEFAULT_IO_BLOCK_SIZE_BYTES);
-            assert_eq!(config.object_store_timeout_secs, DEFAULT_OBJECT_STORE_TIMEOUT_SECS);
             assert_eq!(config.serve_by_tag, DEFAULT_SERVE_BY_TAG);
             assert_eq!(config.serve_tag, DEFAULT_SERVE_TAG);
             assert_eq!(config.serve_tag_ttl_secs, DEFAULT_SERVE_TAG_TTL_SECS);
@@ -531,14 +484,6 @@ mod tests {
                 config.io_concurrency, DEFAULT_IO_CONCURRENCY,
                 "io_concurrency must default to {DEFAULT_IO_CONCURRENCY}"
             );
-            assert_eq!(
-                config.io_block_size_bytes, DEFAULT_IO_BLOCK_SIZE_BYTES,
-                "io_block_size_bytes must default to {DEFAULT_IO_BLOCK_SIZE_BYTES}"
-            );
-            assert_eq!(
-                config.object_store_timeout_secs, DEFAULT_OBJECT_STORE_TIMEOUT_SECS,
-                "object_store_timeout_secs must default to {DEFAULT_OBJECT_STORE_TIMEOUT_SECS}",
-            );
         });
     }
 
@@ -548,29 +493,20 @@ mod tests {
             &[
                 ("LANCE_ETL_BASE_URI", Some("/data/lance")),
                 ("SEARCH_API_IO_CONCURRENCY", Some("128")),
-                ("SEARCH_API_IO_BLOCK_SIZE_BYTES", Some("131072")),
-                ("SEARCH_API_OBJECT_STORE_TIMEOUT_SECS", Some("60")),
             ],
             || {
                 let config = Config::from_env().unwrap();
                 assert_eq!(config.io_concurrency, 128);
-                assert_eq!(config.io_block_size_bytes, 131_072);
-                assert_eq!(config.object_store_timeout_secs, 60);
             },
         );
     }
 
     #[test]
     fn io_tuning_invalid_values_are_rejected() {
-        for (var, bad) in [
-            ("SEARCH_API_IO_CONCURRENCY", "many"),
-            ("SEARCH_API_IO_BLOCK_SIZE_BYTES", "big"),
-            ("SEARCH_API_OBJECT_STORE_TIMEOUT_SECS", "forever"),
-        ] {
-            with_env(&[("LANCE_ETL_BASE_URI", Some("/data/lance")), (var, Some(bad))], || {
-                let err = Config::from_env().unwrap_err();
-                assert!(err.contains(var), "expected error to name {var}, got: {err}");
-            });
-        }
+        let (var, bad) = ("SEARCH_API_IO_CONCURRENCY", "many");
+        with_env(&[("LANCE_ETL_BASE_URI", Some("/data/lance")), (var, Some(bad))], || {
+            let err = Config::from_env().unwrap_err();
+            assert!(err.contains(var), "expected error to name {var}, got: {err}");
+        });
     }
 }

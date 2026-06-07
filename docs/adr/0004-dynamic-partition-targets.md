@@ -19,8 +19,12 @@ The legacy per-column rename flags were removed (breaking change, no compat shim
 ## Consequences
 
 `dataset_uri` builds arbitrary-depth paths with per-component validation against the path allowlist. Dataset
-discovery for index and compact is depth-agnostic (recursive `*.lance` glob, excluding sidecars). Duplicate
-semantics are explicit and allowed: a key whose partition value changes between runs leaves a stale copy in the
-previously-routed dataset, and a delete only reaches the currently-routed dataset, so readers and the serving
-layer dedup. The serving layer addresses this via [0006](0006-date-range-fanout-dedup.md) (dedup-keep-best
-across date partitions). Airflow exposes the knobs as Variables defaulting to the legacy trio.
+discovery for index and compact is depth-agnostic (recursive `*.lance` glob, excluding sidecars). Airflow
+exposes the `partition_cols` knob as `lance_etl_partition_by`, defaulting to the legacy trio.
+
+**Amendment ([0014](0014-drop-by-date-partitioning.md)):** The by-date partition target and the associated
+`partition_derivations` / `--partition-derive` / strftime-to-Spark translation were removed. Each key now lives
+in exactly one dataset, so the per-dataset `merge_insert` keyed on `key_col` is the sole dedup mechanism. The
+`lance_etl_partition_derive` Airflow Variable and the `--partition-derive` CLI flag no longer exist. Generic
+`partition_cols` path routing (for example the default `org_id/tenant_id/namespace` trio or any other stable
+identity columns) is retained.

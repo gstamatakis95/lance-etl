@@ -21,6 +21,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 
 from datadog.dogstatsd import DogStatsd
@@ -36,6 +37,34 @@ except ImportError:
     capture_trace_events = None
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+DEFAULT_CONFLICT_RETRIES: int = 10
+"""Conflict-retry budget for the ETL ``merge_insert`` / ``delete`` commit loop.
+
+Mirrors Lance's own ``merge_insert`` ``conflict_retries`` so the strictly-additive Python wrapper never thins the
+inner budget. Shared by :class:`lance_etl.etl.ETLConfig` rather than duplicated as a literal.
+"""
+
+DEFAULT_RETRY_TIMEOUT: timedelta = timedelta(seconds=120)
+"""Total time budget for ETL conflict retries.
+
+Raised above the 30-second Lance default to give headroom on hot multi-tenant datasets.
+"""
+
+DEFAULT_COMMIT_RETRIES: int = 20
+"""Conflict-retry budget for index and compaction commits.
+
+This is the single home for the budget that was duplicated across :class:`lance_etl.indexing.IndexJobConfig` and
+:class:`lance_etl.compaction.CompactionConfig`. It sizes the only retry layer the binding-less segment-index and
+distributed-compaction commits have.
+"""
+
+DEFAULT_LARGE_COMMIT_RETRIES: int = 2
+"""Retry budget around the tier-B ``Compaction.commit`` call.
+
+Kept small because the commit pins its conflict scan to the plan version, so a semantic conflict re-fails
+deterministically and only the raw manifest-write race benefits from a retry.
+"""
 
 EXECUTION_DISTRIBUTION_KEYS: tuple[str, ...] = (
     "output_rows",
