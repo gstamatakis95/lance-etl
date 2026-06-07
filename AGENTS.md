@@ -12,11 +12,12 @@ lance-etl/
   src/lance_etl/          Python package (production sources)
     etl.py                IcebergToLanceETL: read, collapse, repartition, merge_insert
     indexing.py           LanceIndexer + per-type handlers (VectorIndex, BTree, Bitmap, Fts)
-    compaction.py         LanceCompactor: Compaction.plan / Compaction.commit
+    compaction.py         LanceCompactor: two-tier (small/large), blue-green tag, migrate
+    recall.py             RecallAuditJob: replay Datadog spans, score recall@k/nDCG@k/MRR
     telemetry.py          Telemetry, TelemetryConfig, LanceRuntimeConfig, commit_with_retries
     cloud_storage.py      resolve_filesystem + discover_datasets for pyarrow filesystem I/O
     arrow_types.py        resolve_arrow_type / resolve_type_map (CLI type specs)
-    cli.py                Entry point: etl / compact / index subcommands
+    cli.py                Entry point: etl / compact / index / recall / tag / migrate-manifests
   bench/                  Benchmark package (python -m bench)
     cli.py                Subcommand dispatch: download / prepare / ingest / index / compact
                           / search / report / all
@@ -40,16 +41,17 @@ lance-etl/
       backend.rs          SearchBackend trait
       prewarm.rs          PrewarmSpec, PrewarmReport, Prewarmer trait
       clusters.rs         ClusterSpec, ClusterReport, ClusterReader trait
-      fusion.rs           FusionSpec, RrfFusion
+      fusion.rs           FusionSpec (Rrf and Weighted variants) and fusion logic
+      rerank.rs           Reranker seam, IdentityReranker (no-op default)
       merge.rs            Dedup-by-id fan-out merge
       error.rs            SearchError
-    src/cache/            Persistent two-tier caching layer
+    src/cache/            Persistent two-tier caching layer (index + metadata, no raw data)
       layout.rs           Versioned stamp dir, key hashing, atomic writes, TTL/budget sweep
       disk_cache.rs       Hybrid disk + Moka CacheBackend for the Lance index cache
       store_cache.rs      Read-through byte cache for immutable metadata of wrapped stores
       janitor.rs          Periodic TTL + budget sweep over both cache tiers
     src/lance/            Lance backend implementations
-      backend.rs          LanceSearchBackend — date-range fan-out, dedup, RRF
+      backend.rs          LanceSearchBackend — date-range fan-out, dedup, post-fusion rerank
       provider.rs         DatasetProvider trait, CachingDatasetProvider (shared session + LRU)
       filter.rs           filter_to_expr: domain Filter -> DataFusion Expr
       text.rs             Domain text query tree -> Lance FTS parameters
@@ -63,13 +65,18 @@ lance-etl/
     src/telemetry/        Datadog observability
       traces.rs           OTLP span export, JSON stdout logs with trace correlation
       metrics.rs          Typed DogStatsD facade (Metrics struct + tag enums)
+      recall.rs           Deterministic sampled-query capture into recall.* span attributes
     src/config.rs         Config from env vars
     src/lib.rs            Crate root
     src/main.rs           Binary entry point
     Cargo.toml            Workspace root for the crate
   airflow/
-    lance_etl_dag.py      Configurable-schedule Airflow DAG (etl -> index -> compact)
+    lance_etl_dag.py      Configurable-schedule Airflow DAG (etl >> compact >> index)
   tests/                  pytest suite (conftest.py + test_*.py)
+  docs/
+    adr/                  13 Architecture Decision Records (0001-0013)
+    FINDINGS.md           Narrative companion to the ADRs
+  market-research/        Detailed evaluation notes, plans, and evidence underlying the ADRs
   claude/                 Original reference artifacts — IMMUTABLE, never edit
   pyproject.toml          Build, dependencies, ruff config
 ```
@@ -88,7 +95,9 @@ done.
 
 Do not define names that begin with `_` or `__` anywhere in `src/`, `tests/`, or `airflow/`.
 Third-party internals accessed through a leading underscore (e.g. `dataset._ds`) must go through a
-single, documented helper function. Never scatter bare `_attr` accesses across the codebase.
+single, documented helper function. Never scatter bare `_attr` accesses across the codebase. Note:
+the `__version__` dunder was removed from `src/lance_etl/__init__.py` precisely because it violated
+this rule.
 
 ### 2. No inline comments — use docstrings only
 
@@ -170,7 +179,15 @@ dataset schema and the allowlist `[A-Za-z_][A-Za-z0-9_]*`. Literals become typed
 expressions via `filter_to_expr`. Do not accept, construct, or pass raw SQL strings anywhere in
 the gRPC or domain layers.
 
-### 8. The `claude/` directory is immutable
+### 8. No stable row IDs — they are rejected, not deferred
+
+Move-stable row IDs (`enable_stable_row_ids`) were evaluated and rejected because
+`merge_insert + delete + concurrent compaction` trips the `RowIdIndex` overlapping-chunk invariant,
+risking silent data corruption on release builds. Do not add `enable_stable_row_ids=True` to any
+dataset creation or compaction path. See `docs/adr/0010-stable-row-ids-rejected.md` for the full
+decision. Revisiting requires a fresh ADR.
+
+### 9. The `claude/` directory is immutable
 
 The files in `claude/` are the original reference artifacts that informed the current
 implementation. Never edit, delete, or add files there. They are checked into git as-is.
@@ -230,8 +247,6 @@ Key facts to internalize:
 - `CommitConflictError` is not reliably importable from `lance` directly. Use the fallback chain
   in `telemetry.py`. Conflicts surface as `OSError` or `RuntimeError` from lance internals.
 - `defer_index_remap=True` on the small-dataset tier builds a `__lance_frag_reuse` system index.
-  On the current lance build this leaves indexed vector queries failing with a missing fragment-id
-  error until the remap runs. The production default is `False` (opt-in via `--defer-index-remap`).
   The large-dataset tier ignores `defer_index_remap` entirely because the Python `Compaction.commit`
   binding hard-codes default options and always remaps inline.
 - The FTS path requires a Lance field id (not a pyarrow schema index) for `Index(fields=[...])`.
@@ -239,6 +254,9 @@ Key facts to internalize:
 - Iceberg 1.10 rejects `start-timestamp` / `end-timestamp` outside changelog scans. Use
   `snapshot_id_bounds` in `etl.py` to resolve wall-clock windows to `start-snapshot-id` /
   `end-snapshot-id` from the `{table}.snapshots` metadata table before reading.
+- V2 manifest paths default on (`enable_v2_manifest_paths=True` at dataset creation). New datasets
+  use V2. Existing datasets migrate via `migrate_manifest_paths_v2`. V2 makes every dataset open
+  a single object-store request regardless of version-history depth.
 
 ---
 
@@ -250,6 +268,8 @@ Key facts to internalize:
   `env:`, `service:`, and optional constant tags.
 - Lance trace events are bridged to Datadog automatically on the first `Telemetry.create` call per
   process via `attach_lance_event_bridge`.
+- The Rust service emits `search_api.*` metrics via the typed `Metrics` facade. All metric emitters
+  are infallible: an unreachable Datadog Agent never panics and never fails a request.
 
 ---
 
