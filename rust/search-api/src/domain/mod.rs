@@ -7,9 +7,10 @@
 //! - [`target`]: dataset addressing (org/tenant/namespace plus the optional day range).
 //! - [`query`]: vector, full-text, and hybrid request/result types.
 //! - [`filter`]: the typed predicate AST replacing raw SQL strings.
-//! - [`fusion`]: hybrid leg fusion strategies (RRF).
+//! - [`fusion`]: hybrid leg fusion strategies (RRF and weighted score fusion).
 //! - [`merge`]: dedup-by-id merging of date-range fan-out legs.
 //! - [`backend`]: the [`SearchBackend`] trait every engine implements.
+//! - [`rerank`]: post-fusion reranking types and the [`Reranker`] trait.
 //! - [`prewarm`]: cache prewarming types and the [`Prewarmer`] trait.
 //! - [`clusters`]: IVF centroid introspection types and the [`ClusterReader`] trait.
 //! - [`error`]: the single domain error type shared below the transport.
@@ -22,6 +23,7 @@ pub mod fusion;
 pub mod merge;
 pub mod prewarm;
 pub mod query;
+pub mod rerank;
 pub mod target;
 
 pub use backend::SearchBackend;
@@ -32,7 +34,8 @@ pub use fusion::FusionSpec;
 pub use merge::{MergeOutcome, ScoreOrder, merge_hits};
 pub use prewarm::{PrewarmReport, PrewarmSpec, PrewarmedIndex, Prewarmer};
 pub use query::{
-    DistanceKind, FilterMode, FusedHit, Fuzziness, Hit, HybridQuery, MatchSpec, PhraseSpec, TextOperator, TextQuery,
-    TextQueryNode, VectorQuery, VectorSearchOutcome,
+    DistanceKind, FilterMode, FusedHit, Fuzziness, Hit, HybridQuery, HybridSearchOutcome, MatchSpec, PhraseSpec,
+    TextOperator, TextQuery, TextQueryNode, TextSearchOutcome, VectorQuery, VectorSearchOutcome,
 };
+pub use rerank::{IdentityReranker, RerankRequest, RerankSpec, Reranker};
 pub use target::{DatasetRef, DatasetTarget, DateRange, MAX_DATE_RANGE_DAYS};

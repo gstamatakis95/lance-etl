@@ -401,10 +401,13 @@ def score(recall: float | None, **overrides: Any) -> SampleScore:
         "sample_id": "s",
         "org_id": "acme",
         "k": 10,
+        "query_type": "vector",
         "nprobes_min": None,
         "nprobes_max": None,
         "refine_factor": None,
         "recall": recall,
+        "ndcg": recall,
+        "mrr": recall,
         "version_drift": False,
         "skip_reason": None if recall is not None else "null_result_ids",
     }
@@ -466,8 +469,8 @@ class TestAggregationAndReport:
         assert "parse skips: missing:recall.k=2" in rendered
         assert "score skips: null_result_ids=1" in rendered
 
-    def test_emit_metrics_only_for_rpc_buckets_without_org_tags(self, telemetry: Telemetry) -> None:
-        """Gauges are emitted per RPC bucket only, tagged with RPC parameters and never the org."""
+    def test_emit_metrics_for_rpc_and_query_type_buckets_without_org_tags(self, telemetry: Telemetry) -> None:
+        """Recall, nDCG, and MRR gauges are emitted per RPC and per query-type bucket, never tagged with the org."""
         emitted: list[tuple[str, float, list[str]]] = []
 
         def capture(name: str, value: float, tags: list[str] | None = None) -> None:
@@ -482,17 +485,22 @@ class TestAggregationAndReport:
 
         telemetry.gauge = capture
         rows: list[AggregateRow] = aggregate_scores(
-            [score(1.0, nprobes_min=8, nprobes_max=32, refine_factor=2), score(0.5, org_id="beta")]
+            [
+                score(1.0, nprobes_min=8, nprobes_max=32, refine_factor=2),
+                score(0.5, org_id="beta", query_type="text"),
+            ]
         )
         emit_recall_metrics(telemetry, rows)
-        assert len(emitted) == 2
-        assert all(name == "recall.measured" for name, value, tags in emitted)
+        names: set[str] = {name for name, value, tags in emitted}
+        assert names == {"recall.measured", "recall.ndcg", "recall.mrr"}
         all_tags: list[str] = [tag for name, value, tags in emitted for tag in tags]
         assert "nprobes_min:8" in all_tags
         assert "nprobes_max:32" in all_tags
         assert "refine_factor:2" in all_tags
         assert "nprobes_min:default" in all_tags
         assert "refine_factor:unset" in all_tags
+        assert "query_type:vector" in all_tags
+        assert "query_type:text" in all_tags
         assert not any(tag.startswith("org") for tag in all_tags)
 
 

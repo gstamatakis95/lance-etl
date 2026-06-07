@@ -62,7 +62,8 @@ async fn cold_process_serves_searches_from_disk_caches() {
     let hits = backend_a
         .text_search(&test_target(), TextQuery::simple("lemon", 3))
         .await
-        .unwrap();
+        .unwrap()
+        .hits;
     assert_eq!(hits.len(), 1);
     let hits = backend_a
         .vector_search(&test_target(), vector_query())
@@ -91,7 +92,8 @@ async fn cold_process_serves_searches_from_disk_caches() {
     let hits = backend_b
         .text_search(&test_target(), TextQuery::simple("lemon", 3))
         .await
-        .unwrap();
+        .unwrap()
+        .hits;
     assert_eq!(hits.len(), 1);
     let (indices_b, manifests_b, _) = counts_b.snapshot();
     assert_eq!(
@@ -155,7 +157,8 @@ async fn tiny_budget_sweep_keeps_cache_within_bounds_and_searches_correct() {
     let hits = backend
         .text_search(&test_target(), TextQuery::simple("lemon", 3))
         .await
-        .unwrap();
+        .unwrap()
+        .hits;
     assert_eq!(
         hits.len(),
         1,

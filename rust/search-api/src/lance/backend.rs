@@ -16,8 +16,8 @@ use serde_json::{Map, Value};
 use tracing::Instrument;
 
 use crate::domain::{
-    DatasetRef, DatasetTarget, DistanceKind, FilterMode, FusedHit, Hit, HybridQuery, ScoreOrder, SearchBackend,
-    SearchError, TextQuery, VectorQuery, VectorSearchOutcome, merge_hits,
+    DatasetRef, DatasetTarget, DistanceKind, FilterMode, Hit, HybridQuery, HybridSearchOutcome, ScoreOrder,
+    SearchBackend, SearchError, TextQuery, TextSearchOutcome, VectorQuery, VectorSearchOutcome, merge_hits,
 };
 use crate::lance::error::classify_lance_error;
 use crate::lance::filter::filter_to_expr;
@@ -221,10 +221,18 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
             fanout.dedup_dropped = tracing::field::Empty,
         )
     )]
-    async fn text_search(&self, target: &DatasetTarget, mut query: TextQuery) -> Result<Vec<Hit>, SearchError> {
+    async fn text_search(
+        &self,
+        target: &DatasetTarget,
+        mut query: TextQuery,
+    ) -> Result<TextSearchOutcome, SearchError> {
         let Some(range) = target.date_range else {
             let dataset = self.provider.dataset(target, None, DatasetRef::Serve).await?;
-            return run_text_query(&dataset, &query, &self.metrics, Rpc::TextSearch).await;
+            let hits = run_text_query(&dataset, &query, &self.metrics, Rpc::TextSearch).await?;
+            return Ok(TextSearchOutcome {
+                hits,
+                dataset_version: Some(dataset.version_id()),
+            });
         };
         validate_k(query.k)?;
         let strip_id = self.ensure_id_projected(&mut query.projection);
@@ -235,7 +243,10 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
                 run_text_query(&dataset, query, metrics, Rpc::TextSearch).await
             })
             .await?;
-        Ok(self.merge_fanout_legs(legs, ScoreOrder::HigherIsBetter, query.k, FanoutLeg::Text, strip_id))
+        Ok(TextSearchOutcome {
+            hits: self.merge_fanout_legs(legs, ScoreOrder::HigherIsBetter, query.k, FanoutLeg::Text, strip_id),
+            dataset_version: None,
+        })
     }
 
     #[tracing::instrument(
@@ -249,7 +260,11 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
             fanout.dedup_dropped = tracing::field::Empty,
         )
     )]
-    async fn hybrid_search(&self, target: &DatasetTarget, query: HybridQuery) -> Result<Vec<FusedHit>, SearchError> {
+    async fn hybrid_search(
+        &self,
+        target: &DatasetTarget,
+        query: HybridQuery,
+    ) -> Result<HybridSearchOutcome, SearchError> {
         validate_k(query.k)?;
         let mut vector_query = query.vector;
         if vector_query.k == 0 {
@@ -268,7 +283,10 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
             );
             let (vector_hits, text_hits) = (vector_hits?, text_hits?);
             let fuse_span = tracing::info_span!("fusion.fuse", search.k = query.k);
-            return Ok(fuse_span.in_scope(|| fusion.fuse(vec![vector_hits, text_hits], query.k)));
+            return Ok(HybridSearchOutcome {
+                hits: fuse_span.in_scope(|| fusion.fuse(vec![vector_hits, text_hits], query.k)),
+                dataset_version: Some(dataset.version_id()),
+            });
         };
         let strip_vector_id = self.ensure_id_projected(&mut vector_query.projection);
         let strip_text_id = self.ensure_id_projected(&mut text_query.projection);
@@ -306,12 +324,15 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
                 hit.row.remove(&self.id_column);
             }
         }
-        Ok(fused)
+        Ok(HybridSearchOutcome {
+            hits: fused,
+            dataset_version: None,
+        })
     }
 }
 
 /// Returns the name of the first fixed-size-list vector column in the dataset schema.
-pub fn default_vector_column(dataset: &Dataset) -> Result<String, SearchError> {
+fn default_vector_column(dataset: &Dataset) -> Result<String, SearchError> {
     dataset
         .schema()
         .fields
@@ -322,7 +343,7 @@ pub fn default_vector_column(dataset: &Dataset) -> Result<String, SearchError> {
 }
 
 /// Lists the scalar (non-vector) columns returned by default in search results.
-pub fn scalar_output_columns(dataset: &Dataset) -> Vec<String> {
+fn scalar_output_columns(dataset: &Dataset) -> Vec<String> {
     dataset
         .schema()
         .fields

@@ -7,7 +7,7 @@ use crate::domain::target::parse_date;
 use crate::domain::{
     ClusterReport, ClusterSpec, CompareOp, DatasetRef, DatasetTarget, DateRange, DistanceKind, Filter, FilterMode,
     FusedHit, FusionSpec, Fuzziness, Hit, HybridQuery, Literal, MatchSpec, PhraseSpec, PrewarmReport, PrewarmSpec,
-    SearchError, TextOperator, TextQuery, TextQueryNode, VectorQuery,
+    RerankSpec, SearchError, TextOperator, TextQuery, TextQueryNode, VectorQuery,
 };
 use crate::pb;
 
@@ -173,7 +173,34 @@ pub fn fusion_from_proto(fusion: Option<pb::Fusion>) -> Result<FusionSpec, Searc
             }
             Ok(FusionSpec::Rrf { rrf_k })
         }
+        Some(pb::fusion::Strategy::Weighted(weighted)) => {
+            let vector_weight = weighted
+                .vector_weight
+                .unwrap_or(crate::domain::fusion::DEFAULT_WEIGHTED_VECTOR_WEIGHT);
+            if !vector_weight.is_finite() || !(0.0..=1.0).contains(&vector_weight) {
+                return Err(SearchError::invalid_argument(
+                    "vector_weight must be a finite number in [0, 1]",
+                ));
+            }
+            Ok(FusionSpec::Weighted { vector_weight })
+        }
         None => Ok(FusionSpec::default()),
+    }
+}
+
+/// Converts a proto rerank config into the optional domain spec.
+///
+/// An absent message or an unset strategy means no reranking (the result order is returned
+/// unchanged), so existing clients that never set the field keep their behavior.
+pub fn rerank_from_proto(rerank: Option<pb::Rerank>) -> Result<Option<RerankSpec>, SearchError> {
+    let Some(rerank) = rerank else {
+        return Ok(None);
+    };
+    match rerank.strategy {
+        Some(pb::rerank::Strategy::Identity(identity)) => Ok(Some(RerankSpec::Identity {
+            top_n: identity.top_n.map(|n| n as usize),
+        })),
+        None => Ok(None),
     }
 }
 
@@ -345,6 +372,25 @@ pub fn text_hit_to_proto(hit: Hit) -> pb::TextSearchResult {
     pb::TextSearchResult {
         score: hit.score as f32,
         row: Some(json_map_to_struct(hit.row)),
+    }
+}
+
+/// Lifts a single-leg hit into a fused hit so the reranker seam can treat every result family
+/// uniformly. The leg score (distance or BM25) carries over unchanged.
+pub fn hit_to_fused(hit: Hit) -> FusedHit {
+    FusedHit {
+        row_id: hit.row_id,
+        score: hit.score,
+        row: hit.row,
+    }
+}
+
+/// Lowers a fused hit back into a single-leg hit after reranking, preserving the score.
+pub fn fused_to_hit(hit: FusedHit) -> Hit {
+    Hit {
+        row_id: hit.row_id,
+        score: hit.score,
+        row: hit.row,
     }
 }
 

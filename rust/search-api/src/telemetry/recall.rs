@@ -1,11 +1,12 @@
-//! Sampled-query recall capture: records a deterministic sample of vector searches as span
-//! attributes so an offline job can replay them and score recall.
+//! Sampled-query recall capture: records a deterministic sample of vector, text, and hybrid
+//! searches as span attributes so an offline job can replay them and score recall.
 //!
 //! # What is sampled
 //!
-//! Only `VectorSearch` requests without a `date_range` are eligible (fan-out replay is out of
-//! v1 scope). Requests carrying a typed filter are eligible and the capture records the filter,
-//! so the offline scorer can replay it. Text and hybrid requests are never sampled.
+//! `VectorSearch`, `TextSearch`, and `HybridSearch` requests without a `date_range` are eligible
+//! (fan-out replay is out of v1 scope). Requests carrying a typed filter are eligible and the
+//! vector capture records the filter, so the offline scorer can replay it. Each query type has its
+//! own deterministic sampler counter.
 //!
 //! # Sampler design
 //!
@@ -18,26 +19,43 @@
 //!
 //! A sampled request attaches one flat group of `recall.*` attributes to the current tracing
 //! span — the per-RPC server span opened by the OpenTelemetry tower layer, which the Datadog
-//! Spans API can retrieve. Every JSON-valued attribute is a single compact string:
+//! Spans API can retrieve. Every JSON-valued attribute is a single compact string. Rust writes
+//! these and the Python recall job reads them, so the two sides must agree on this schema:
 //!
+//! Shared (every query type):
 //! - `recall.sample` (bool) — always `true` on sampled spans, the retrieval filter key.
 //! - `recall.sample_id` (string) — UUIDv4 identifying this capture.
 //! - `recall.captured_at_unix_ms` (int) — capture wall-clock time in Unix milliseconds.
 //! - `recall.org_id` / `recall.tenant_id` / `recall.namespace` (string) — the dataset target.
 //! - `recall.dataset_version` (int) — the committed Lance dataset version that served the query.
-//! - `recall.k` (int) — requested neighbor count.
+//! - `recall.k` (int) — requested result count (the fused `k` for hybrid).
+//! - `recall.query_type` (string) — `vector`, `text`, or `hybrid`.
+//! - `recall.result_ids` (string) — JSON array of the served id-column values in rank order
+//!   (`null` for rows whose projection omitted the id column).
+//!
+//! Vector (and the vector knobs of a query that carries them):
 //! - `recall.nprobes_min` / `recall.nprobes_max` (int) — probed-partition bounds as recorded on
-//!   the request (`nprobes` sets both). Absent when the request left them to the index defaults.
+//!   the request (`nprobes` sets both). Absent when left to the index defaults.
 //! - `recall.refine_factor` (int) — re-rank factor. Absent when unset.
 //! - `recall.distance_type` (string) — `l2`, `cosine`, `dot`, or `hamming`. Absent when the
 //!   request kept the index metric.
-//! - `recall.query_vector` (string) — the full query vector as a compact JSON array of numbers,
-//!   e.g. `[1.0,0.0,0.5]`. Sized for vectors up to ~1536 dims (one attribute string).
+//! - `recall.query_vector` (string) — the full query vector as a compact JSON array of numbers.
+//!   Present for `vector` and `hybrid`.
 //! - `recall.filter` (string) — the typed filter AST as the stable JSON documented in
-//!   [`crate::domain::filter`]. Absent when the request had no filter.
-//! - `recall.result_ids` (string) — JSON array of the served id-column values in rank order
-//!   (`null` for rows whose projection omitted the id column).
+//!   [`crate::domain::filter`]. Present for `vector` only, and absent when unfiltered.
 //! - `recall.result_distances` (string) — JSON array of the served distances in rank order.
+//!   Present for `vector` only.
+//!
+//! Text and hybrid:
+//! - `recall.text_query` (string) — the [`crate::domain::query::TextQueryNode`] AST serialized as
+//!   the stable JSON documented in [`crate::domain::query`].
+//! - `recall.text_columns` (string) — JSON array of the text query columns.
+//! - `recall.result_scores` (string) — JSON array of the served relevance scores (BM25 for text,
+//!   fused score for hybrid) in rank order.
+//!
+//! Hybrid only:
+//! - `recall.fusion` (string) — the fusion strategy as JSON, e.g. `{"rrf":{"k":60.0}}` or
+//!   `{"weighted":{"vector_weight":0.7}}`.
 //!
 //! # Datadog retention
 //!
@@ -51,11 +69,33 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::domain::{DatasetTarget, DistanceKind, Hit, VectorQuery};
+use crate::domain::{DatasetTarget, DistanceKind, Hit, HybridQuery, TextQuery, VectorQuery};
 use crate::telemetry::Metrics;
 
 /// Observer invoked with every finished capture record. Used by tests to assert captures.
 pub type RecallHook = Arc<dyn Fn(&RecallRecord) + Send + Sync>;
+
+/// The query family a recall capture was taken from (`recall.query_type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecallQueryType {
+    /// Nearest-neighbor search.
+    Vector,
+    /// Full-text search.
+    Text,
+    /// Hybrid (fused vector + text) search.
+    Hybrid,
+}
+
+impl RecallQueryType {
+    /// The `recall.query_type` attribute value and metric tag for this query type.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vector => "vector",
+            Self::Text => "text",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
 
 /// Deterministic counter-based sampler: over `N` calls exactly `floor(N * rate)` return true.
 #[derive(Debug)]
@@ -89,6 +129,8 @@ impl RecallSampler {
 /// One finished capture: every field that lands on the span as a `recall.*` attribute.
 #[derive(Debug, Clone)]
 pub struct RecallRecord {
+    /// The query family this capture came from (`recall.query_type`).
+    pub query_type: RecallQueryType,
     /// UUIDv4 identifying this capture (`recall.sample_id`).
     pub sample_id: String,
     /// Capture time in Unix milliseconds (`recall.captured_at_unix_ms`).
@@ -101,7 +143,7 @@ pub struct RecallRecord {
     pub namespace: String,
     /// Committed dataset version that served the query (`recall.dataset_version`).
     pub dataset_version: Option<u64>,
-    /// Requested neighbor count (`recall.k`).
+    /// Requested result count (`recall.k`).
     pub k: usize,
     /// Minimum probed partitions as recorded on the request (`recall.nprobes_min`).
     pub nprobes_min: Option<usize>,
@@ -111,21 +153,33 @@ pub struct RecallRecord {
     pub refine_factor: Option<u32>,
     /// Distance metric override (`recall.distance_type`). `None` keeps the index metric.
     pub distance_type: Option<&'static str>,
-    /// The full query vector as a compact JSON number array (`recall.query_vector`).
-    pub query_vector_json: String,
-    /// The typed filter AST as stable JSON (`recall.filter`). `None` when unfiltered.
+    /// The full query vector as a compact JSON number array (`recall.query_vector`). `None` for
+    /// pure text searches.
+    pub query_vector_json: Option<String>,
+    /// The text query node AST as stable JSON (`recall.text_query`). `None` for pure vector.
+    pub text_query_json: Option<String>,
+    /// The text query columns as a JSON array (`recall.text_columns`). `None` for pure vector.
+    pub text_columns_json: Option<String>,
+    /// The fusion strategy as JSON (`recall.fusion`). `Some` for hybrid only.
+    pub fusion_json: Option<String>,
+    /// The typed filter AST as stable JSON (`recall.filter`). `Some` for filtered vector searches.
     pub filter_json: Option<String>,
     /// Served id-column values in rank order as a JSON array (`recall.result_ids`).
     pub result_ids_json: String,
-    /// Served distances in rank order as a JSON array (`recall.result_distances`).
-    pub result_distances_json: String,
+    /// Served distances in rank order as a JSON array (`recall.result_distances`). `Some` for
+    /// vector searches.
+    pub result_distances_json: Option<String>,
+    /// Served relevance scores in rank order as a JSON array (`recall.result_scores`). `Some` for
+    /// text and hybrid searches.
+    pub result_scores_json: Option<String>,
 }
 
 impl RecallRecord {
-    /// Attaches every field as a `recall.*` attribute on the current tracing span.
+    /// Attaches every present field as a `recall.*` attribute on the current tracing span.
     pub fn attach_to_current_span(&self) {
         let span = tracing::Span::current();
         span.set_attribute("recall.sample", true);
+        span.set_attribute("recall.query_type", self.query_type.as_str());
         span.set_attribute("recall.sample_id", self.sample_id.clone());
         span.set_attribute("recall.captured_at_unix_ms", self.captured_at_unix_ms);
         span.set_attribute("recall.org_id", self.org_id.clone());
@@ -147,18 +201,35 @@ impl RecallRecord {
         if let Some(distance) = self.distance_type {
             span.set_attribute("recall.distance_type", distance);
         }
-        span.set_attribute("recall.query_vector", self.query_vector_json.clone());
+        if let Some(vector) = &self.query_vector_json {
+            span.set_attribute("recall.query_vector", vector.clone());
+        }
+        if let Some(text_query) = &self.text_query_json {
+            span.set_attribute("recall.text_query", text_query.clone());
+        }
+        if let Some(text_columns) = &self.text_columns_json {
+            span.set_attribute("recall.text_columns", text_columns.clone());
+        }
+        if let Some(fusion) = &self.fusion_json {
+            span.set_attribute("recall.fusion", fusion.clone());
+        }
         if let Some(filter) = &self.filter_json {
             span.set_attribute("recall.filter", filter.clone());
         }
         span.set_attribute("recall.result_ids", self.result_ids_json.clone());
-        span.set_attribute("recall.result_distances", self.result_distances_json.clone());
+        if let Some(distances) = &self.result_distances_json {
+            span.set_attribute("recall.result_distances", distances.clone());
+        }
+        if let Some(scores) = &self.result_scores_json {
+            span.set_attribute("recall.result_scores", scores.clone());
+        }
     }
 }
 
 /// A sampled request awaiting its results: the query context cloned at decision time.
 #[derive(Debug)]
 pub struct PendingRecall {
+    query_type: RecallQueryType,
     org_id: String,
     tenant_id: String,
     namespace: String,
@@ -167,7 +238,10 @@ pub struct PendingRecall {
     nprobes_max: Option<usize>,
     refine_factor: Option<u32>,
     distance_type: Option<&'static str>,
-    query_vector_json: String,
+    query_vector_json: Option<String>,
+    text_query_json: Option<String>,
+    text_columns_json: Option<String>,
+    fusion_json: Option<String>,
     filter_json: Option<String>,
     filtered: bool,
 }
@@ -175,7 +249,9 @@ pub struct PendingRecall {
 /// The capture facade owned by the transport: sampling decision, record assembly, span
 /// attachment, and the `recall.samples` metric.
 pub struct RecallCapture {
-    sampler: RecallSampler,
+    vector_sampler: RecallSampler,
+    text_sampler: RecallSampler,
+    hybrid_sampler: RecallSampler,
     id_column: String,
     metrics: Arc<Metrics>,
     hook: Option<RecallHook>,
@@ -183,7 +259,11 @@ pub struct RecallCapture {
 
 impl std::fmt::Debug for RecallCapture {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RecallCapture").field("sampler", &self.sampler).finish()
+        f.debug_struct("RecallCapture")
+            .field("vector_sampler", &self.vector_sampler)
+            .field("text_sampler", &self.text_sampler)
+            .field("hybrid_sampler", &self.hybrid_sampler)
+            .finish()
     }
 }
 
@@ -191,7 +271,9 @@ impl RecallCapture {
     /// Creates a capture facade with the given sample rate and result id column.
     pub fn new(rate: f64, id_column: impl Into<String>, metrics: Arc<Metrics>) -> Self {
         Self {
-            sampler: RecallSampler::new(rate),
+            vector_sampler: RecallSampler::new(rate),
+            text_sampler: RecallSampler::new(rate),
+            hybrid_sampler: RecallSampler::new(rate),
             id_column: id_column.into(),
             metrics,
             hook: None,
@@ -214,14 +296,12 @@ impl RecallCapture {
     /// Requests whose target carries a date range are never eligible and never advance the
     /// sampler counter.
     pub fn begin(&self, target: &DatasetTarget, query: &VectorQuery) -> Option<PendingRecall> {
-        if target.date_range.is_some() || !self.sampler.should_sample() {
+        if target.date_range.is_some() || !self.vector_sampler.should_sample() {
             return None;
         }
-        let (nprobes_min, nprobes_max) = match query.nprobes {
-            Some(nprobes) => (Some(nprobes), Some(nprobes)),
-            None => (query.minimum_nprobes, query.maximum_nprobes),
-        };
+        let (nprobes_min, nprobes_max) = nprobes_bounds(query);
         Some(PendingRecall {
+            query_type: RecallQueryType::Vector,
             org_id: target.org_id.clone(),
             tenant_id: target.tenant_id.clone(),
             namespace: target.namespace.clone(),
@@ -230,7 +310,10 @@ impl RecallCapture {
             nprobes_max,
             refine_factor: query.refine_factor,
             distance_type: query.distance.map(distance_tag),
-            query_vector_json: serde_json::to_string(&query.vector).unwrap_or_else(|_| "[]".to_string()),
+            query_vector_json: Some(vector_to_json(&query.vector)),
+            text_query_json: None,
+            text_columns_json: None,
+            fusion_json: None,
             filter_json: query
                 .filter
                 .as_ref()
@@ -239,15 +322,77 @@ impl RecallCapture {
         })
     }
 
+    /// Decides whether this text search is sampled, snapshotting the query when it is.
+    ///
+    /// Date-range targets are never eligible and never advance the sampler counter.
+    pub fn begin_text(&self, target: &DatasetTarget, query: &TextQuery) -> Option<PendingRecall> {
+        if target.date_range.is_some() || !self.text_sampler.should_sample() {
+            return None;
+        }
+        Some(PendingRecall {
+            query_type: RecallQueryType::Text,
+            org_id: target.org_id.clone(),
+            tenant_id: target.tenant_id.clone(),
+            namespace: target.namespace.clone(),
+            k: query.k,
+            nprobes_min: None,
+            nprobes_max: None,
+            refine_factor: None,
+            distance_type: None,
+            query_vector_json: None,
+            text_query_json: serde_json::to_string(&query.node).ok(),
+            text_columns_json: serde_json::to_string(&query.columns).ok(),
+            fusion_json: None,
+            filter_json: None,
+            filtered: query.filter.is_some(),
+        })
+    }
+
+    /// Decides whether this hybrid search is sampled, snapshotting the query when it is.
+    ///
+    /// Date-range targets are never eligible and never advance the sampler counter. `k` is the
+    /// fused result count.
+    pub fn begin_hybrid(&self, target: &DatasetTarget, query: &HybridQuery) -> Option<PendingRecall> {
+        if target.date_range.is_some() || !self.hybrid_sampler.should_sample() {
+            return None;
+        }
+        Some(PendingRecall {
+            query_type: RecallQueryType::Hybrid,
+            org_id: target.org_id.clone(),
+            tenant_id: target.tenant_id.clone(),
+            namespace: target.namespace.clone(),
+            k: query.k,
+            nprobes_min: None,
+            nprobes_max: None,
+            refine_factor: None,
+            distance_type: None,
+            query_vector_json: Some(vector_to_json(&query.vector.vector)),
+            text_query_json: serde_json::to_string(&query.text.node).ok(),
+            text_columns_json: serde_json::to_string(&query.text.columns).ok(),
+            fusion_json: Some(query.fusion.to_recall_json().to_string()),
+            filter_json: None,
+            filtered: query.vector.filter.is_some() || query.text.filter.is_some(),
+        })
+    }
+
     /// Finishes one sampled request: assembles the record from the served hits, attaches it to
     /// the current span, emits the `recall.samples` counter, and notifies the test hook.
+    ///
+    /// Vector captures record the served scores as `recall.result_distances`; text and hybrid
+    /// captures record them as `recall.result_scores`.
     pub fn finish(&self, pending: PendingRecall, dataset_version: Option<u64>, hits: &[Hit]) {
         let ids: Vec<Value> = hits
             .iter()
             .map(|hit| hit.row.get(&self.id_column).cloned().unwrap_or(Value::Null))
             .collect();
-        let distances: Vec<f64> = hits.iter().map(|hit| hit.score).collect();
+        let scores: Vec<f64> = hits.iter().map(|hit| hit.score).collect();
+        let scores_json = serde_json::to_string(&scores).unwrap_or_else(|_| "[]".to_string());
+        let (result_distances_json, result_scores_json) = match pending.query_type {
+            RecallQueryType::Vector => (Some(scores_json), None),
+            RecallQueryType::Text | RecallQueryType::Hybrid => (None, Some(scores_json)),
+        };
         let record = RecallRecord {
+            query_type: pending.query_type,
             sample_id: uuid::Uuid::new_v4().to_string(),
             captured_at_unix_ms: unix_millis(),
             org_id: pending.org_id,
@@ -260,16 +405,34 @@ impl RecallCapture {
             refine_factor: pending.refine_factor,
             distance_type: pending.distance_type,
             query_vector_json: pending.query_vector_json,
+            text_query_json: pending.text_query_json,
+            text_columns_json: pending.text_columns_json,
+            fusion_json: pending.fusion_json,
             filter_json: pending.filter_json,
             result_ids_json: serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string()),
-            result_distances_json: serde_json::to_string(&distances).unwrap_or_else(|_| "[]".to_string()),
+            result_distances_json,
+            result_scores_json,
         };
         record.attach_to_current_span();
-        self.metrics.recall_sample(pending.filtered);
+        self.metrics
+            .recall_sample(pending.query_type.as_str(), pending.filtered);
         if let Some(hook) = &self.hook {
             hook(&record);
         }
     }
+}
+
+/// The probed-partition bounds recorded for a vector query (`nprobes` sets both).
+fn nprobes_bounds(query: &VectorQuery) -> (Option<usize>, Option<usize>) {
+    match query.nprobes {
+        Some(nprobes) => (Some(nprobes), Some(nprobes)),
+        None => (query.minimum_nprobes, query.maximum_nprobes),
+    }
+}
+
+/// Serializes a query vector as a compact JSON number array.
+fn vector_to_json(vector: &[f32]) -> String {
+    serde_json::to_string(vector).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// Tag value for a distance metric.
@@ -293,7 +456,7 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{CompareOp, DateRange, Filter, Literal};
+    use crate::domain::{CompareOp, DateRange, Filter, Literal, MatchSpec, TextQueryNode};
     use serde_json::Map;
     use std::sync::Mutex;
 
@@ -323,6 +486,12 @@ mod tests {
         assert_eq!(samples(0.001, 1000), 1);
     }
 
+    /// Builds a capture that records every finished record into `sink`.
+    fn capturing(sink: Arc<Mutex<Vec<RecallRecord>>>) -> RecallCapture {
+        RecallCapture::new(1.0, "vector_id", Arc::new(Metrics::disabled()))
+            .with_hook(Arc::new(move |record| sink.lock().unwrap().push(record.clone())))
+    }
+
     /// Builds a no-range target and a filtered query for capture fixtures.
     fn fixture() -> (DatasetTarget, VectorQuery) {
         let target = DatasetTarget::new("org1", "tenant1", "ns1");
@@ -345,9 +514,7 @@ mod tests {
     #[test]
     fn begin_skips_date_ranges_and_finish_builds_the_record() {
         let captured: Arc<Mutex<Vec<RecallRecord>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = captured.clone();
-        let capture = RecallCapture::new(1.0, "vector_id", Arc::new(Metrics::disabled()))
-            .with_hook(Arc::new(move |record| sink.lock().unwrap().push(record.clone())));
+        let capture = capturing(captured.clone());
         let (mut target, query) = fixture();
         target.date_range = Some(
             DateRange::new(
@@ -373,6 +540,7 @@ mod tests {
         let records = captured.lock().unwrap();
         assert_eq!(records.len(), 1);
         let record = &records[0];
+        assert_eq!(record.query_type, RecallQueryType::Vector);
         assert_eq!(record.org_id, "org1");
         assert_eq!(record.dataset_version, Some(42));
         assert_eq!(record.k, 2);
@@ -380,13 +548,14 @@ mod tests {
         assert_eq!(record.nprobes_max, Some(20));
         assert_eq!(record.refine_factor, Some(2));
         assert_eq!(record.distance_type, Some("cosine"));
-        assert_eq!(record.query_vector_json, "[1.0,0.5,0.0]");
+        assert_eq!(record.query_vector_json.as_deref(), Some("[1.0,0.5,0.0]"));
         assert_eq!(
             record.filter_json.as_deref(),
             Some(r#"{"compare":{"column":"id","op":"gt","value":{"int":1}}}"#)
         );
         assert_eq!(record.result_ids_json, "[7]");
-        assert_eq!(record.result_distances_json, "[0.25]");
+        assert_eq!(record.result_distances_json.as_deref(), Some("[0.25]"));
+        assert_eq!(record.result_scores_json, None);
         assert!(!record.sample_id.is_empty());
         assert!(record.captured_at_unix_ms > 0);
     }
@@ -394,9 +563,7 @@ mod tests {
     #[test]
     fn missing_id_column_values_become_json_nulls() {
         let captured: Arc<Mutex<Vec<RecallRecord>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = captured.clone();
-        let capture = RecallCapture::new(1.0, "vector_id", Arc::new(Metrics::disabled()))
-            .with_hook(Arc::new(move |record| sink.lock().unwrap().push(record.clone())));
+        let capture = capturing(captured.clone());
         let (target, mut query) = fixture();
         query.filter = None;
         query.nprobes = None;
@@ -416,9 +583,86 @@ mod tests {
     }
 
     #[test]
+    fn text_capture_records_query_type_text_query_and_scores() {
+        let captured: Arc<Mutex<Vec<RecallRecord>>> = Arc::new(Mutex::new(Vec::new()));
+        let capture = capturing(captured.clone());
+        let target = DatasetTarget::new("org1", "tenant1", "ns1");
+        let mut query = TextQuery::simple("lemon", 3);
+        query.columns = vec!["text".to_string()];
+        let pending = capture.begin_text(&target, &query).expect("rate 1.0 must sample");
+        let mut row = Map::new();
+        row.insert("vector_id".to_string(), Value::from(4));
+        let hits = vec![Hit {
+            row_id: 4,
+            score: 2.5,
+            row,
+        }];
+        capture.finish(pending, Some(7), &hits);
+        let records = captured.lock().unwrap();
+        let record = &records[0];
+        assert_eq!(record.query_type, RecallQueryType::Text);
+        assert_eq!(record.query_vector_json, None);
+        assert_eq!(
+            record.text_query_json.as_deref(),
+            Some(
+                r#"{"match":{"terms":"lemon","column":null,"boost":1.0,"operator":"or","fuzziness":"exact","max_expansions":null,"prefix_length":0}}"#
+            )
+        );
+        assert_eq!(record.text_columns_json.as_deref(), Some(r#"["text"]"#));
+        assert_eq!(record.result_ids_json, "[4]");
+        assert_eq!(record.result_scores_json.as_deref(), Some("[2.5]"));
+        assert_eq!(record.result_distances_json, None);
+        assert_eq!(record.fusion_json, None);
+    }
+
+    #[test]
+    fn hybrid_capture_records_vector_text_and_fusion() {
+        use crate::domain::FusionSpec;
+        let captured: Arc<Mutex<Vec<RecallRecord>>> = Arc::new(Mutex::new(Vec::new()));
+        let capture = capturing(captured.clone());
+        let target = DatasetTarget::new("org1", "tenant1", "ns1");
+        let query = HybridQuery {
+            vector: VectorQuery {
+                vector: vec![0.0, 1.0],
+                k: 2,
+                ..Default::default()
+            },
+            text: TextQuery {
+                node: TextQueryNode::Match(MatchSpec::new("pear")),
+                columns: vec!["text".to_string()],
+                k: 2,
+                ..TextQuery::simple("pear", 2)
+            },
+            k: 2,
+            fusion: FusionSpec::Weighted { vector_weight: 0.7 },
+        };
+        let pending = capture.begin_hybrid(&target, &query).expect("rate 1.0 must sample");
+        let mut row = Map::new();
+        row.insert("vector_id".to_string(), Value::from(2));
+        let hits = vec![Hit {
+            row_id: 2,
+            score: 0.42,
+            row,
+        }];
+        capture.finish(pending, Some(9), &hits);
+        let records = captured.lock().unwrap();
+        let record = &records[0];
+        assert_eq!(record.query_type, RecallQueryType::Hybrid);
+        assert_eq!(record.query_vector_json.as_deref(), Some("[0.0,1.0]"));
+        assert_eq!(record.text_columns_json.as_deref(), Some(r#"["text"]"#));
+        assert_eq!(
+            record.fusion_json.as_deref(),
+            Some(r#"{"weighted":{"vector_weight":0.7}}"#)
+        );
+        assert_eq!(record.result_scores_json.as_deref(), Some("[0.42]"));
+        assert_eq!(record.result_distances_json, None);
+    }
+
+    #[test]
     fn disabled_capture_never_begins() {
         let capture = RecallCapture::disabled();
         let (target, query) = fixture();
         assert!(capture.begin(&target, &query).is_none());
+        assert!(capture.begin_text(&target, &TextQuery::simple("x", 1)).is_none());
     }
 }

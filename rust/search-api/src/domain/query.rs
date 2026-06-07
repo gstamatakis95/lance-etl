@@ -1,5 +1,11 @@
 //! Domain request and result types for vector, full-text, and hybrid search.
+//!
+//! The full-text query tree ([`TextQueryNode`] and its leaf specs) carries a serde serialization
+//! that is part of the recall-capture contract: the `recall.text_query` span attribute holds
+//! exactly this JSON and the offline recall job parses it. Enums use external tagging with
+//! `snake_case` variant names, mirroring [`crate::domain::filter`].
 
+use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::domain::filter::Filter;
@@ -66,7 +72,8 @@ pub struct VectorQuery {
 }
 
 /// How match-query terms combine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TextOperator {
     /// At least one term must match.
     #[default]
@@ -76,7 +83,8 @@ pub enum TextOperator {
 }
 
 /// Fuzzy-matching behavior for a match query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Fuzziness {
     /// Exact term matching (edit distance 0).
     #[default]
@@ -88,7 +96,7 @@ pub enum Fuzziness {
 }
 
 /// Terms query against one column.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MatchSpec {
     /// Query terms, tokenized by the index tokenizer.
     pub terms: String,
@@ -122,7 +130,7 @@ impl MatchSpec {
 }
 
 /// Exact phrase query. The index must store positions.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PhraseSpec {
     /// Phrase terms in order.
     pub terms: String,
@@ -133,7 +141,8 @@ pub struct PhraseSpec {
 }
 
 /// Full-text query node tree.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TextQueryNode {
     /// Terms matching with OR/AND semantics and optional fuzziness.
     Match(MatchSpec),
@@ -208,6 +217,26 @@ impl TextQuery {
             offset: None,
         }
     }
+
+    /// Returns a representative query string for reranking context, when one can be extracted.
+    ///
+    /// Walks the node tree to the first leaf carrying terms (a match, phrase, multi-match, or the
+    /// positive side of a boost / the first should-or-must clause of a boolean). `None` when no
+    /// leaf carries terms.
+    pub fn rerank_text(&self) -> Option<String> {
+        node_terms(&self.node).map(str::to_string)
+    }
+}
+
+/// Extracts the leading terms of a query node for reranking context.
+fn node_terms(node: &TextQueryNode) -> Option<&str> {
+    match node {
+        TextQueryNode::Match(spec) => Some(spec.terms.as_str()),
+        TextQueryNode::Phrase(spec) => Some(spec.terms.as_str()),
+        TextQueryNode::MultiMatch { terms, .. } => Some(terms.as_str()),
+        TextQueryNode::Boost { positive, .. } => node_terms(positive),
+        TextQueryNode::Boolean { should, must, .. } => should.iter().chain(must).find_map(node_terms),
+    }
 }
 
 /// One hybrid query: a vector leg, a text leg, and a fusion strategy.
@@ -228,6 +257,26 @@ pub struct HybridQuery {
 pub struct VectorSearchOutcome {
     /// Hits ordered nearest-first.
     pub hits: Vec<Hit>,
+    /// The committed version of the Lance dataset that served the query. `None` for date-range
+    /// fan-out, where several per-day datasets (each with its own version) contribute.
+    pub dataset_version: Option<u64>,
+}
+
+/// The result of one full-text search: ranked hits plus dataset provenance for recall capture.
+#[derive(Debug, Clone, Default)]
+pub struct TextSearchOutcome {
+    /// Hits ordered best-first.
+    pub hits: Vec<Hit>,
+    /// The committed version of the Lance dataset that served the query. `None` for date-range
+    /// fan-out, where several per-day datasets (each with its own version) contribute.
+    pub dataset_version: Option<u64>,
+}
+
+/// The result of one hybrid search: fused hits plus dataset provenance for recall capture.
+#[derive(Debug, Clone, Default)]
+pub struct HybridSearchOutcome {
+    /// Fused hits ordered best-first.
+    pub hits: Vec<FusedHit>,
     /// The committed version of the Lance dataset that served the query. `None` for date-range
     /// fan-out, where several per-day datasets (each with its own version) contribute.
     pub dataset_version: Option<u64>,

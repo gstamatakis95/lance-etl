@@ -427,11 +427,28 @@ impl Metrics {
             .send();
     }
 
-    /// One vector search captured for recall scoring, tagged by whether it carried a filter.
-    pub fn recall_sample(&self, filtered: bool) {
+    /// One search captured for recall scoring, tagged by query type and whether it carried a
+    /// filter. `query_type` is one of `vector`, `text`, or `hybrid` (low cardinality).
+    pub fn recall_sample(&self, query_type: &'static str, filtered: bool) {
         self.client
             .count_with_tags("recall.samples", 1)
+            .with_tag("query_type", query_type)
             .with_tag("filtered", if filtered { "true" } else { "false" })
+            .send();
+    }
+
+    /// One post-fusion reranking pass: candidate count and duration tagged by `rpc`.
+    ///
+    /// `candidates` is the number of hits fed to the reranker before any truncation. Emitted only
+    /// when a request carries a rerank spec, so the default identity path stays metric-free.
+    pub fn rerank(&self, rpc: Rpc, candidates: u64, duration: Duration) {
+        self.client
+            .distribution_with_tags("rerank.duration_ms", millis(duration))
+            .with_tag("rpc", rpc.as_tag())
+            .send();
+        self.client
+            .distribution_with_tags("rerank.candidates", candidates)
+            .with_tag("rpc", rpc.as_tag())
             .send();
     }
 
@@ -586,21 +603,49 @@ mod tests {
     #[test]
     fn recall_sample_metric_renders_expected_tags() {
         let (metrics, drain) = spy_metrics();
-        metrics.recall_sample(true);
-        metrics.recall_sample(false);
+        metrics.recall_sample("vector", true);
+        metrics.recall_sample("text", false);
+        metrics.recall_sample("hybrid", false);
         let lines = drain();
         assert!(
             lines
                 .iter()
-                .any(|line| line.starts_with("search_api.recall.samples:1|c") && line.contains("filtered:true")),
-            "missing filtered sample count: {lines:?}"
+                .any(|line| line.starts_with("search_api.recall.samples:1|c")
+                    && line.contains("query_type:vector")
+                    && line.contains("filtered:true")),
+            "missing filtered vector sample count: {lines:?}"
         );
         assert!(
             lines
                 .iter()
-                .any(|line| line.starts_with("search_api.recall.samples:1|c") && line.contains("filtered:false")),
-            "missing unfiltered sample count: {lines:?}"
+                .any(|line| line.starts_with("search_api.recall.samples:1|c")
+                    && line.contains("query_type:text")
+                    && line.contains("filtered:false")),
+            "missing text sample count: {lines:?}"
         );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("search_api.recall.samples:1|c") && line.contains("query_type:hybrid")),
+            "missing hybrid sample count: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn rerank_metric_renders_candidates_and_duration_tagged_by_rpc() {
+        let (metrics, drain) = spy_metrics();
+        metrics.rerank(Rpc::HybridSearch, 7, Duration::from_millis(4));
+        let lines = drain();
+        let expect = [
+            ("search_api.rerank.duration_ms:4|d", "rpc:hybrid_search"),
+            ("search_api.rerank.candidates:7|d", "rpc:hybrid_search"),
+        ];
+        for (head, tag) in expect {
+            assert!(
+                lines.iter().any(|line| line.starts_with(head) && line.contains(tag)),
+                "missing {head} with {tag} in {lines:?}"
+            );
+        }
     }
 
     #[test]

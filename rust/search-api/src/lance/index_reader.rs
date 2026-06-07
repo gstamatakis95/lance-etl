@@ -26,7 +26,7 @@ use crate::lance::provider::DatasetProvider;
 /// Returns `NotFound` when the index does not exist (or no vector index exists for the default),
 /// `InvalidArgument` when the name resolves to a non-vector index, the default is ambiguous, or
 /// the index carries no centroid data, and an engine-classified error for everything else.
-pub async fn ivf_centroids(dataset: &Dataset, index_name: Option<&str>) -> Result<ClusterReport, SearchError> {
+async fn ivf_centroids(dataset: &Dataset, index_name: Option<&str>) -> Result<ClusterReport, SearchError> {
     let name = match index_name {
         Some(name) => name.to_string(),
         None => default_vector_index(dataset).await?,

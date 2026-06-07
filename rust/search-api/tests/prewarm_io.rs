@@ -54,11 +54,11 @@ async fn searches_after_prewarm_do_no_index_or_manifest_io() {
     };
     let outcome = backend.vector_search(&target, vector.clone()).await.unwrap();
     assert_eq!(outcome.hits.len(), 2);
-    let hits = backend
+    let text = backend
         .text_search(&target, TextQuery::simple("pear", 3))
         .await
         .unwrap();
-    assert_eq!(hits.len(), 1);
+    assert_eq!(text.hits.len(), 1);
     let fused = backend
         .hybrid_search(
             &target,
@@ -71,7 +71,7 @@ async fn searches_after_prewarm_do_no_index_or_manifest_io() {
         )
         .await
         .unwrap();
-    assert_eq!(fused.len(), 2);
+    assert_eq!(fused.hits.len(), 2);
 
     let (indices_after, manifests_after, data_after) = counts.snapshot();
     assert_eq!(

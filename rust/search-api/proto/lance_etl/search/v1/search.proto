@@ -285,7 +285,7 @@ message VectorQuery {
   FilterMode filter_mode = 13;
   // Columns to return; defaults to all non-vector columns.
   repeated string projection = 14;
-  // Include the stable `_rowid` meta column in each returned row.
+  // Include the physical `_rowid` row-address column (changes across compaction; use only for the duration of the request).
   bool with_row_id = 15;
   // Number of leading hits to skip.
   optional uint64 offset = 16;
@@ -404,7 +404,7 @@ message TextQuery {
   FilterMode filter_mode = 7;
   // Columns to return; defaults to all non-vector columns.
   repeated string projection = 8;
-  // Include the stable `_rowid` meta column in each returned row.
+  // Include the physical `_rowid` row-address column (changes across compaction; use only for the duration of the request).
   bool with_row_id = 9;
   // Number of leading hits to skip.
   optional uint64 offset = 10;
@@ -416,6 +416,8 @@ message Fusion {
   oneof strategy {
     // Reciprocal-rank fusion.
     RrfFusion rrf = 1;
+    // Weighted score fusion of min-max normalized legs.
+    WeightedFusion weighted = 2;
   }
 }
 
@@ -425,12 +427,38 @@ message RrfFusion {
   optional double rrf_k = 1;
 }
 
+// Weighted score fusion: each leg's scores are min-max normalized into [0, 1] (the vector leg is
+// inverted so the nearest neighbor maps to 1.0, the text leg's top BM25 hit maps to 1.0), then the
+// fused score is vector_weight * vector_norm + (1 - vector_weight) * text_norm.
+message WeightedFusion {
+  // Vector-leg weight in [0, 1]; the text leg takes the complement (default 0.7).
+  optional double vector_weight = 1;
+}
+
+// Post-fusion reranking strategy applied to the top candidates of a vector, text, or hybrid result.
+message Rerank {
+  // Exactly one strategy; when the message is absent the result order is returned unchanged.
+  oneof strategy {
+    // Identity reranking: keep the post-fusion order, optionally truncating to top_n.
+    IdentityRerank identity = 1;
+  }
+}
+
+// Identity reranking: preserves the incoming candidate order. The seam where a cross-encoder or
+// LLM reranker slots in later without changing the request shape.
+message IdentityRerank {
+  // Number of leading candidates to keep; absent keeps all.
+  optional uint64 top_n = 1;
+}
+
 // Request for SearchService.VectorSearch.
 message VectorSearchRequest {
   // Dataset(s) to search.
   DatasetTarget target = 1;
   // Nearest-neighbor query parameters.
   VectorQuery query = 2;
+  // Optional post-search reranking of the top candidates. Absent returns the order unchanged.
+  Rerank rerank = 3;
 }
 
 // Response for SearchService.VectorSearch.
@@ -453,6 +481,8 @@ message TextSearchRequest {
   DatasetTarget target = 1;
   // Full-text query parameters.
   TextQuery query = 2;
+  // Optional post-search reranking of the top candidates. Absent returns the order unchanged.
+  Rerank rerank = 3;
 }
 
 // Response for SearchService.TextSearch.
@@ -481,6 +511,8 @@ message HybridSearchRequest {
   uint32 k = 4;
   // Fusion strategy; defaults to reciprocal-rank fusion with rrf_k = 60.
   Fusion fusion = 5;
+  // Optional post-fusion reranking of the top candidates. Absent returns the fused order unchanged.
+  Rerank rerank = 6;
 }
 
 // Response for SearchService.HybridSearch.

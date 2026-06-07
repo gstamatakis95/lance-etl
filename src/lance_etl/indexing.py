@@ -344,6 +344,30 @@ def split_evenly(values: list[int], shards: int) -> list[list[int]]:
     return [group for group in groups if group]
 
 
+def all_fragment_ids(dataset: lance.LanceDataset) -> list[int]:
+    """Return every fragment id of a dataset in fragment order.
+
+    Args:
+        dataset: The dataset to inspect.
+
+    Returns:
+        The fragment ids in the order ``get_fragments`` reports them.
+    """
+    return [fragment.fragment_id for fragment in dataset.get_fragments()]
+
+
+def live_fragment_ids(dataset: lance.LanceDataset) -> set[int]:
+    """Return the set of fragment ids currently live in a dataset.
+
+    Args:
+        dataset: The dataset to inspect.
+
+    Returns:
+        The live fragment ids as a set.
+    """
+    return set(all_fragment_ids(dataset))
+
+
 def serialize_segment(segment: Index) -> str:
     """Serialize uncommitted segment metadata to a JSON document.
 
@@ -397,6 +421,37 @@ def deserialize_segment(document: str) -> Index:
     )
 
 
+def commit_index_with_retries(
+    action: Callable[[], Any],
+    config: IndexJobConfig,
+    telemetry: Telemetry,
+    tags: list[str],
+) -> Any:
+    """Run an index commit action, retrying commit conflicts with the configured budget.
+
+    Centralizes the retry budget, backoff, and the shared ``index.commit_conflict`` conflict metric used by every
+    index commit path so each call site states only its action and its metric tags.
+
+    Args:
+        action: The commit to attempt, returning any result. It must re-read the dataset so each retry rebases.
+        config: Indexing configuration supplying the retry budget and backoff.
+        telemetry: Telemetry facade for the current process.
+        tags: Metric tags applied to the conflict counter.
+
+    Returns:
+        Whatever ``action`` returns on its first non-conflicting attempt.
+
+    Raises:
+        OSError | RuntimeError: If commits keep conflicting past the retry budget.
+    """
+    return commit_with_retries(
+        action,
+        config.commit_retries,
+        config.commit_backoff_seconds,
+        lambda: telemetry.incr("index.commit_conflict", tags=tags),
+    )
+
+
 def optimize_existing_index(
     uri: str,
     index_name: str,
@@ -431,12 +486,7 @@ def optimize_existing_index(
         dataset.optimize.optimize_indices(**kwargs)
         telemetry.incr("index.optimized", tags=tags)
 
-    commit_with_retries(
-        action,
-        config.commit_retries,
-        config.commit_backoff_seconds,
-        lambda: telemetry.incr("index.commit_conflict", tags=tags),
-    )
+    commit_index_with_retries(action, config, telemetry, tags)
 
 
 def index_delta_count(dataset: lance.LanceDataset, index_name: str) -> int:
@@ -553,7 +603,7 @@ def commit_segments(
     def action() -> int:
         """Drop stale segments, merge if needed, and commit at the latest version."""
         dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-        live: set[int] = {fragment.fragment_id for fragment in dataset.get_fragments()}
+        live: set[int] = live_fragment_ids(dataset)
         fresh: list[Index] = [segment for segment in segments if set(segment.fragment_ids) <= live]
         stale: int = len(segments) - len(fresh)
         if stale:
@@ -575,12 +625,7 @@ def commit_segments(
         telemetry.incr("index.committed", tags=tags)
         return len(fresh)
 
-    return commit_with_retries(
-        action,
-        config.commit_retries,
-        config.commit_backoff_seconds,
-        lambda: telemetry.incr("index.commit_conflict", tags=tags),
-    )
+    return commit_index_with_retries(action, config, telemetry, tags)
 
 
 def index_holds_dead_fragments(dataset: lance.LanceDataset, index_name: str) -> bool:
@@ -598,7 +643,7 @@ def index_holds_dead_fragments(dataset: lance.LanceDataset, index_name: str) -> 
     Returns:
         ``True`` when any segment of the index references a fragment that is not live.
     """
-    live: set[int] = {fragment.fragment_id for fragment in dataset.get_fragments()}
+    live: set[int] = live_fragment_ids(dataset)
     for description in dataset.describe_indices():
         if description.name == index_name:
             for segment in description.segments:
@@ -632,12 +677,7 @@ def drop_stale_index(uri: str, index_name: str, config: IndexJobConfig, telemetr
             dataset.drop_index(index_name)
             telemetry.incr("index.dropped_stale", tags=tags)
 
-    commit_with_retries(
-        action,
-        config.commit_retries,
-        config.commit_backoff_seconds,
-        lambda: telemetry.incr("index.commit_conflict", tags=tags),
-    )
+    commit_index_with_retries(action, config, telemetry, tags)
 
 
 def build_and_commit_segments(
@@ -933,7 +973,7 @@ class IndexHandler:
         Returns:
             Every fragment when rebuilding, otherwise only uncovered fragments.
         """
-        all_ids: list[int] = [fragment.fragment_id for fragment in dataset.get_fragments()]
+        all_ids: list[int] = all_fragment_ids(dataset)
         if self.config.rebuild:
             return all_ids
         covered: set[int] = self.covered_fragments(dataset)
@@ -1253,7 +1293,7 @@ class VectorIndexHandler(IndexHandler):
         covered: Any = manifest.get("covered_fragment_ids")
         if covered is None:
             return False
-        live: set[int] = {fragment.fragment_id for fragment in dataset.get_fragments()}
+        live: set[int] = live_fragment_ids(dataset)
         return not set(covered) <= live
 
     def record_coverage(self, uri: str, dataset: lance.LanceDataset) -> None:
@@ -1270,7 +1310,7 @@ class VectorIndexHandler(IndexHandler):
         manifest: dict[str, Any] | None = self.load_manifest(uri)
         if manifest is None:
             return
-        live: set[int] = {fragment.fragment_id for fragment in dataset.get_fragments()}
+        live: set[int] = live_fragment_ids(dataset)
         manifest["covered_fragment_ids"] = sorted(self.covered_fragments(dataset) & live)
         filesystem, manifest_path = sidecar_locations(uri, self.column, self.config.storage_options)[:2]
         write_object(filesystem, manifest_path, json.dumps(manifest).encode("utf-8"))
@@ -1295,7 +1335,7 @@ class VectorIndexHandler(IndexHandler):
             manifest: dict[str, Any] | None = self.load_manifest(dataset.uri)
             if manifest is not None and "rabitq_model" in manifest:
                 if self.growth_requires_retrain(manifest, dataset.count_rows()):
-                    return [fragment.fragment_id for fragment in dataset.get_fragments()]
+                    return all_fragment_ids(dataset)
                 if self.remap_requires_rebuild(manifest, dataset):
                     logger.info(
                         "rebuilding %s on %s: a compaction rewrote covered fragments and the inline remap "
@@ -1303,7 +1343,7 @@ class VectorIndexHandler(IndexHandler):
                         self.index_name,
                         dataset.uri,
                     )
-                    return [fragment.fragment_id for fragment in dataset.get_fragments()]
+                    return all_fragment_ids(dataset)
         return super().target_fragments(dataset)
 
     def validate_manifest(self, manifest: dict[str, Any], dimension: int) -> None:
@@ -1610,7 +1650,7 @@ class FtsIndexHandler(IndexHandler):
         def action() -> None:
             """Publish the merged inverted index at the latest version."""
             current: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
-            live: set[int] = {fragment.fragment_id for fragment in current.get_fragments()}
+            live: set[int] = live_fragment_ids(current)
             missing: set[int] = fragments - live
             if missing:
                 raise ValueError(
@@ -1629,12 +1669,7 @@ class FtsIndexHandler(IndexHandler):
             lance.LanceDataset.commit(uri, operation, read_version=current.version, storage_options=storage_options)
             telemetry.incr("index.committed", tags=tags)
 
-        commit_with_retries(
-            action,
-            config.commit_retries,
-            config.commit_backoff_seconds,
-            lambda: telemetry.incr("index.commit_conflict", tags=tags),
-        )
+        commit_index_with_retries(action, config, telemetry, tags)
 
     def build(self, spark: SparkSession, uri: str, telemetry: Telemetry) -> dict[str, Any]:
         """Maintain the inverted index incrementally, or rebuild it across executors.
@@ -1660,7 +1695,7 @@ class FtsIndexHandler(IndexHandler):
             drop_stale_index(uri, self.index_name, config, telemetry)
             dataset = lance.dataset(uri, storage_options=config.storage_options)
 
-        fragment_ids: list[int] = [fragment.fragment_id for fragment in dataset.get_fragments()]
+        fragment_ids: list[int] = all_fragment_ids(dataset)
         if not fragment_ids:
             return {"column": self.column, "index": self.index_name, "segments": 0, "fragments": 0}
 

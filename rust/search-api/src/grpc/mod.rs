@@ -4,8 +4,10 @@
 //! delegates to the backend, and converts domain results and errors back to protobuf. Per-RPC
 //! observability lives here: the tower layer in `main` opens the server span, and the handlers
 //! annotate it with the dataset target and the gRPC status, emit one request/latency metric per
-//! call, and log failures with the target context. Sampled VectorSearch requests additionally
-//! get `recall.*` capture attributes on the server span (see [`crate::telemetry::recall`]).
+//! call, and log failures with the target context. Sampled vector, text, and hybrid requests
+//! additionally get `recall.*` capture attributes on the server span (see
+//! [`crate::telemetry::recall`]), and a request carrying a rerank spec is reranked after the
+//! backend returns (see [`crate::domain::rerank`]).
 //!
 //! Submodules:
 //! - [`convert`]: pure conversions between protobuf messages and domain types.
@@ -18,11 +20,14 @@ use std::time::Instant;
 use tonic::{Code, Request, Response, Status};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::domain::{ClusterReader, DatasetTarget, Prewarmer, SearchBackend, SearchError};
+use crate::domain::{
+    ClusterReader, DatasetTarget, FusedHit, IdentityReranker, Prewarmer, RerankRequest, RerankSpec, Reranker,
+    SearchBackend, SearchError,
+};
 use crate::grpc::convert::{
-    cluster_report_to_proto, cluster_spec_from_proto, dataset_target_from_proto, fused_hit_to_proto,
-    hybrid_query_from_proto, prewarm_ref_from_proto, prewarm_report_to_proto, prewarm_spec_from_proto,
-    text_hit_to_proto, text_query_from_proto, vector_hit_to_proto, vector_query_from_proto,
+    cluster_report_to_proto, cluster_spec_from_proto, dataset_target_from_proto, fused_hit_to_proto, fused_to_hit,
+    hit_to_fused, hybrid_query_from_proto, prewarm_ref_from_proto, prewarm_report_to_proto, prewarm_spec_from_proto,
+    rerank_from_proto, text_hit_to_proto, text_query_from_proto, vector_hit_to_proto, vector_query_from_proto,
 };
 use crate::pb::search_service_server::SearchService;
 use crate::pb::{
@@ -36,23 +41,55 @@ pub struct SearchGrpc<B> {
     backend: Arc<B>,
     metrics: Arc<Metrics>,
     recall: RecallCapture,
+    reranker: Arc<dyn Reranker>,
 }
 
 impl<B> SearchGrpc<B> {
     /// Creates the adapter emitting per-RPC metrics through the given facade, with recall
-    /// capture disabled.
+    /// capture disabled and the no-op identity reranker installed.
     pub fn with_metrics(backend: Arc<B>, metrics: Arc<Metrics>) -> Self {
         Self {
             backend,
             metrics,
             recall: RecallCapture::disabled(),
+            reranker: Arc::new(IdentityReranker),
         }
     }
 
-    /// Enables sampled-query recall capture for VectorSearch requests.
+    /// Enables sampled-query recall capture for vector, text, and hybrid requests.
     pub fn with_recall(mut self, recall: RecallCapture) -> Self {
         self.recall = recall;
         self
+    }
+
+    /// Installs a post-fusion reranker. The default is the no-op [`IdentityReranker`], so behavior
+    /// is unchanged unless a request also carries a rerank spec.
+    pub fn with_reranker(mut self, reranker: Arc<dyn Reranker>) -> Self {
+        self.reranker = reranker;
+        self
+    }
+
+    /// Applies the reranker to `hits` when `spec` is set, timing it and recording the candidate
+    /// count. A `None` spec returns the candidates untouched without invoking the reranker or
+    /// emitting metrics, so the default path stays free of overhead.
+    async fn maybe_rerank(
+        &self,
+        rpc: Rpc,
+        spec: Option<RerankSpec>,
+        query_text: Option<String>,
+        k: usize,
+        hits: Vec<FusedHit>,
+    ) -> Result<Vec<FusedHit>, Status> {
+        let Some(spec) = spec else {
+            return Ok(hits);
+        };
+        let started = Instant::now();
+        let candidates = hits.len() as u64;
+        let request = RerankRequest { spec, query_text, k };
+        let reranked = self.reranker.rerank(&request, hits).await.map_err(status_from_error)?;
+        self.metrics.rerank(rpc, candidates, started.elapsed());
+        tracing::Span::current().set_attribute("rerank.candidates", candidates as i64);
+        Ok(reranked)
     }
 
     /// Shared per-RPC scaffold: converts and annotates the target, runs the handler body, and
@@ -178,18 +215,30 @@ impl<B: SearchBackend + Prewarmer + ClusterReader> SearchService for SearchGrpc<
         let request = request.into_inner();
         self.handle(Rpc::VectorSearch, request.target, async |target| {
             let query = vector_query_from_proto(request.query).map_err(status_from_error)?;
+            let rerank = rerank_from_proto(request.rerank).map_err(status_from_error)?;
             tracing::Span::current().set_attribute("search.k", query.k as i64);
+            let k = query.k;
             let pending = self.recall.begin(target, &query);
             let outcome = self
                 .backend
                 .vector_search(target, query)
                 .await
                 .map_err(status_from_error)?;
+            let reranked = self
+                .maybe_rerank(
+                    Rpc::VectorSearch,
+                    rerank,
+                    None,
+                    k,
+                    outcome.hits.into_iter().map(hit_to_fused).collect(),
+                )
+                .await?;
+            let hits: Vec<_> = reranked.into_iter().map(fused_to_hit).collect();
             if let Some(pending) = pending {
-                self.recall.finish(pending, outcome.dataset_version, &outcome.hits);
+                self.recall.finish(pending, outcome.dataset_version, &hits);
             }
             Ok(VectorSearchResponse {
-                results: outcome.hits.into_iter().map(vector_hit_to_proto).collect(),
+                results: hits.into_iter().map(vector_hit_to_proto).collect(),
             })
         })
         .await
@@ -200,12 +249,30 @@ impl<B: SearchBackend + Prewarmer + ClusterReader> SearchService for SearchGrpc<
         let request = request.into_inner();
         self.handle(Rpc::TextSearch, request.target, async |target| {
             let query = text_query_from_proto(request.query).map_err(status_from_error)?;
+            let rerank = rerank_from_proto(request.rerank).map_err(status_from_error)?;
             tracing::Span::current().set_attribute("search.k", query.k as i64);
-            let hits = self
+            let k = query.k;
+            let query_text = query.rerank_text();
+            let pending = self.recall.begin_text(target, &query);
+            let outcome = self
                 .backend
                 .text_search(target, query)
                 .await
                 .map_err(status_from_error)?;
+            let dataset_version = outcome.dataset_version;
+            let reranked = self
+                .maybe_rerank(
+                    Rpc::TextSearch,
+                    rerank,
+                    query_text,
+                    k,
+                    outcome.hits.into_iter().map(hit_to_fused).collect(),
+                )
+                .await?;
+            let hits: Vec<_> = reranked.into_iter().map(fused_to_hit).collect();
+            if let Some(pending) = pending {
+                self.recall.finish(pending, dataset_version, &hits);
+            }
             Ok(TextSearchResponse {
                 results: hits.into_iter().map(text_hit_to_proto).collect(),
             })
@@ -220,15 +287,28 @@ impl<B: SearchBackend + Prewarmer + ClusterReader> SearchService for SearchGrpc<
     ) -> Result<Response<HybridSearchResponse>, Status> {
         let mut request = request.into_inner();
         let target = request.target.take();
+        let rerank = request.rerank.take();
         tracing::Span::current().set_attribute("search.hybrid", true);
         self.handle(Rpc::HybridSearch, target, async |target| {
             let query = hybrid_query_from_proto(request).map_err(status_from_error)?;
+            let rerank = rerank_from_proto(rerank).map_err(status_from_error)?;
             tracing::Span::current().set_attribute("search.k", query.k as i64);
-            let hits = self
+            let k = query.k;
+            let query_text = query.text.rerank_text();
+            let pending = self.recall.begin_hybrid(target, &query);
+            let outcome = self
                 .backend
                 .hybrid_search(target, query)
                 .await
                 .map_err(status_from_error)?;
+            let dataset_version = outcome.dataset_version;
+            let hits = self
+                .maybe_rerank(Rpc::HybridSearch, rerank, query_text, k, outcome.hits)
+                .await?;
+            if let Some(pending) = pending {
+                let recall_hits: Vec<_> = hits.iter().cloned().map(fused_to_hit).collect();
+                self.recall.finish(pending, dataset_version, &recall_hits);
+            }
             Ok(HybridSearchResponse {
                 results: hits.into_iter().map(fused_hit_to_proto).collect(),
             })
