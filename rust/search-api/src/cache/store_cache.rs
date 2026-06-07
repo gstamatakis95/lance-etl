@@ -4,7 +4,7 @@
 //! disk and passes every other operation, including all raw data reads under `data/`, straight
 //! through to the wrapped store.
 
-use std::path::{Path as FsPath, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -23,14 +23,13 @@ use object_store::{
 };
 use serde_json::Value;
 
-use crate::cache::layout::{SweepStats, atomic_write, dir_stats, gauge_sub, hash_hex, sweep_tier, touch_file};
+use crate::cache::layout::{
+    META_FILE, SweepStats, atomic_write, dir_stats, gauge_sub, hash_hex, sweep_tier, touch_file,
+};
 use crate::telemetry::{CacheName, EvictionReason, Metrics, Tier};
 
 /// File name for cached full-object bytes.
 const FULL_OBJECT_FILE: &str = "full.bin";
-
-/// File name for the cached `ObjectMeta` sidecar of one object.
-const META_FILE: &str = "meta.json";
 
 /// Directory holding version manifests.
 const VERSIONS_DIR: &str = "_versions";
@@ -138,11 +137,6 @@ impl MetadataByteCache {
                 metrics,
             }),
         })
-    }
-
-    /// Returns the cache root directory (the `store/` tier under the stamp dir).
-    pub fn root(&self) -> &FsPath {
-        &self.state.root
     }
 
     /// Sweeps the byte cache tier with the shared TTL/budget policy.
@@ -336,7 +330,7 @@ impl CachedStore {
             if tokio::fs::metadata(&meta_path).await.is_err() {
                 let _ = atomic_write(&meta_path, meta_to_json(&meta).as_bytes()).await;
             }
-            if atomic_write(&entry_path, &bytes).await.is_ok() {
+            if tokio::fs::metadata(&entry_path).await.is_err() && atomic_write(&entry_path, &bytes).await.is_ok() {
                 self.state.record_insert(bytes.len() as u64);
                 self.state
                     .metrics

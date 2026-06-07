@@ -115,11 +115,16 @@ impl CachingDatasetProvider {
         if let Some(store_cache) = &store_cache {
             wrappers.push(store_cache.clone());
         }
+        let block_size = Some(config.io_block_size_bytes);
         let store_params = if wrappers.is_empty() {
-            None
+            Some(ObjectStoreParams {
+                block_size,
+                ..Default::default()
+            })
         } else {
             let wrapper: Arc<dyn WrappingObjectStore> = Arc::new(ChainedWrappingObjectStore::new(wrappers));
             Some(ObjectStoreParams {
+                block_size,
                 object_store_wrapper: Some(wrapper),
                 ..Default::default()
             })

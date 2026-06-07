@@ -20,7 +20,7 @@ from pyspark.sql import SparkSession
 
 from lance_etl.arrow_types import resolve_type_map
 from lance_etl.cloud_storage import discover_datasets
-from lance_etl.compaction import CompactionConfig, LanceCompactor
+from lance_etl.compaction import CompactionConfig, LanceCompactor, migrate_manifest_paths
 from lance_etl.etl import DEFAULT_PARTITION_COLS, ETLConfig, IcebergToLanceETL, PartitionDerivation
 from lance_etl.indexing import IndexJobConfig, LanceIndexer
 from lance_etl.recall import DatadogSpanSource, RecallAuditJob, RecallJobConfig
@@ -228,6 +228,8 @@ def run_etl(args: argparse.Namespace, spark: SparkSession) -> None:
         window_start=args.window_start,
         window_end=args.window_end,
         window_column=args.window_column,
+        ingested_at_col=args.ingested_at_col,
+        enable_v2_manifest_paths=args.enable_v2_manifest_paths,
     )
     IcebergToLanceETL(config).run(spark, args.table, parse_epoch_ms(args.start), parse_epoch_ms(args.end))
 
@@ -327,6 +329,25 @@ def run_recall(args: argparse.Namespace, spark: SparkSession) -> None:
     )
     source: DatadogSpanSource = DatadogSpanSource(site=args.dd_site)
     RecallAuditJob(config).run(spark, source, parse_epoch_ms(args.from_ts), parse_epoch_ms(args.to_ts))
+
+
+def run_migrate_manifests(args: argparse.Namespace, spark: SparkSession) -> None:
+    """Run the manifest-path migration subcommand.
+
+    Migrates every selected dataset's manifest paths to the V2 naming scheme so subsequent opens cost one object-store
+    request instead of a version-count-proportional LIST. The migration is not transactional, so run it only with the
+    targeted datasets quiesced (no concurrent ingestion, compaction, or indexing).
+
+    Args:
+        args: Parsed command-line arguments.
+        spark: Active Spark session.
+    """
+    migrate_manifest_paths(
+        spark,
+        load_dataset_uris(args),
+        build_telemetry_config(args),
+        parse_storage_options(args),
+    )
 
 
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -504,6 +525,31 @@ def build_parser() -> argparse.ArgumentParser:
             "present in the source table.  Default: updated_at."
         ),
     )
+    etl.add_argument(
+        "--ingested-at-col",
+        default="_ingested_at",
+        help=(
+            "Name of the ingestion-timestamp payload column stamped on every row. Refreshed on updates so it reflects "
+            "the most recent ingestion. Never a routing or key column. Default: _ingested_at."
+        ),
+    )
+    etl.add_argument(
+        "--enable-v2-manifest-paths",
+        dest="enable_v2_manifest_paths",
+        action="store_true",
+        default=True,
+        help=(
+            "Create datasets with V2 manifest paths so each open is one object-store request instead of a "
+            "version-count-proportional LIST. ON by default; honored only at dataset bootstrap. Migrate existing "
+            "datasets with the migrate-manifests subcommand."
+        ),
+    )
+    etl.add_argument(
+        "--no-v2-manifest-paths",
+        dest="enable_v2_manifest_paths",
+        action="store_false",
+        help="Create datasets with the legacy V1 manifest paths (readable by Lance prior to 0.17.0).",
+    )
 
     compact: argparse.ArgumentParser = subparsers.add_parser("compact", help="Distributed compaction of Lance datasets")
     add_common_arguments(compact)
@@ -639,6 +685,16 @@ def build_parser() -> argparse.ArgumentParser:
     recall.add_argument("--id-column", default="vector_id", help="Unique id column matched against served result ids")
     recall.add_argument("--vector-column", default="vector", help="Fixed-size-list vector column to scan")
     recall.add_argument("--batch-size", type=int, default=8192, help="Scanner batch size for the brute-force scan")
+
+    migrate_manifests: argparse.ArgumentParser = subparsers.add_parser(
+        "migrate-manifests",
+        help=(
+            "Migrate existing datasets' manifest paths to the V2 naming scheme (one object-store request per open). "
+            "Not transactional: run only with the targeted datasets quiesced."
+        ),
+    )
+    add_common_arguments(migrate_manifests)
+    add_dataset_arguments(migrate_manifests)
     return parser
 
 
@@ -664,6 +720,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "compact": run_compact,
         "index": run_index,
         "recall": run_recall,
+        "migrate-manifests": run_migrate_manifests,
     }
     try:
         runners[args.command](args, spark)

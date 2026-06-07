@@ -169,7 +169,7 @@ class CompactionConfig:
         """Build the options dict for the distributed ``Compaction.plan`` path.
 
         ``defer_index_remap`` is excluded because the distributed commit uses default options and remaps indices inline
-        regardless of the plan-time setting. A non-default ``defer_index_remap=False`` therefore has no effect on this
+        regardless of the plan-time setting. An explicit ``defer_index_remap=True`` therefore has no effect on this
         tier, and a warning is logged so operators are not silently surprised. It still applies on the small-dataset
         tier, where ``Compaction.execute`` parses all options.
 
@@ -178,9 +178,9 @@ class CompactionConfig:
         """
         options: dict[str, Any] = self.execute_options()
         options.pop("defer_index_remap", None)
-        if not self.defer_index_remap:
+        if self.defer_index_remap:
             logger.warning(
-                "defer_index_remap=False is ignored on the large-dataset tier: the distributed Compaction.commit "
+                "defer_index_remap=True is ignored on the large-dataset tier: the distributed Compaction.commit "
                 "binding uses default options and remaps indices inline. The setting only affects the "
                 "small-dataset tier."
             )
@@ -238,6 +238,92 @@ def cleanup_dataset(uri: str, config: CompactionConfig, telemetry: Telemetry) ->
         stats = dataset.cleanup_old_versions(older_than=older_than, retain_versions=config.retain_versions)
     telemetry.distribution("dataset.bytes_removed", stats.bytes_removed)
     return int(stats.bytes_removed)
+
+
+def migrate_dataset_manifest_paths(
+    uri: str, storage_options: dict[str, Any] | None, telemetry: Telemetry
+) -> dict[str, Any]:
+    """Migrate one existing dataset's manifest paths to the V2 naming scheme in place.
+
+    Datasets bootstrapped by the ETL now default to V2 manifest paths
+    (:attr:`lance_etl.etl.ETLConfig.enable_v2_manifest_paths`), which makes every open one object-store request instead
+    of a version-count-proportional LIST. Datasets created before that default still carry V1 names. This helper calls
+    ``LanceDataset.migrate_manifest_paths_v2`` (``python/python/lance/dataset.py:4592-4604``, backed by
+    ``migrate_scheme_to_v2`` at ``rust/lance-table/src/io/commit.rs:175-197``), which renames every V1 manifest to the
+    V2 inverted-version name. The call is idempotent, so re-running it on an already-migrated or freshly-bootstrapped
+    dataset is a cheap no-op.
+
+    DANGER: this is not transactional. Lance documents that it must not run while other operations touch the dataset and
+    must run to completion before any resume (``dataset.py:4601-4602``). Schedule it in a maintenance window with
+    ingestion, compaction, and indexing paused for the targeted datasets.
+
+    Args:
+        uri: Dataset URI.
+        storage_options: Object-store options forwarded to pylance.
+        telemetry: Telemetry facade for the current process.
+
+    Returns:
+        A statistics dictionary ``{"uri", "migrated": True}`` for the dataset.
+    """
+    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
+    with telemetry.timed("dataset.migrate_manifest_ms", tags=[f"uri:{uri}"]):
+        dataset.migrate_manifest_paths_v2()
+    telemetry.incr("dataset.manifest_migrated")
+    return {"uri": uri, "migrated": True}
+
+
+def migrate_manifest_paths(
+    spark: SparkSession,
+    dataset_uris: Iterable[str],
+    telemetry_config: TelemetryConfig,
+    storage_options: dict[str, Any] | None,
+    partitions: int = 512,
+) -> list[dict[str, Any]]:
+    """Migrate a fleet of datasets to V2 manifest paths, one task per executor partition.
+
+    Each dataset is independent, so the migration fans out across executors exactly like the compaction small tier. The
+    per-dataset call is idempotent, so a retried task converges instead of corrupting state. This is a maintenance
+    operation: run it only with the targeted datasets quiesced (see :func:`migrate_dataset_manifest_paths`).
+
+    Args:
+        spark: Active Spark session.
+        dataset_uris: Datasets whose manifest paths should be migrated to V2.
+        telemetry_config: Telemetry configuration created per executor process.
+        storage_options: Object-store options forwarded to pylance.
+        partitions: Maximum Spark partitions for the migration job.
+
+    Returns:
+        One statistics dictionary per dataset.
+    """
+    driver_telemetry: Telemetry = Telemetry.create(telemetry_config)
+    with driver_telemetry.span("lance.manifest_migration.run") as run_span:
+        uris: list[str] = list(dataset_uris)
+        run_span.set_tag("dataset_count", len(uris))
+        if not uris:
+            return []
+
+        def migrate_partition(partition: Iterable[str]) -> Iterator[dict[str, Any]]:
+            """Migrate one partition of dataset URIs on an executor.
+
+            Args:
+                partition: Dataset URIs assigned to this executor task.
+
+            Yields:
+                One outcome dictionary per dataset.
+            """
+            executor_telemetry: Telemetry = Telemetry.create(telemetry_config)
+            for uri in partition:
+                yield migrate_dataset_manifest_paths(uri, storage_options, executor_telemetry)
+
+        with driver_telemetry.timed("run.migrate_manifest_ms"):
+            results: list[dict[str, Any]] = (
+                spark.sparkContext.parallelize(uris, min(len(uris), partitions))
+                .mapPartitions(migrate_partition)
+                .collect()
+            )
+        driver_telemetry.gauge("run.manifests_migrated", len(results))
+        logger.info("manifest migration: %d datasets migrated to V2 paths", len(results))
+        return results
 
 
 def compact_small_dataset(uri: str, config: CompactionConfig, telemetry: Telemetry) -> dict[str, Any]:

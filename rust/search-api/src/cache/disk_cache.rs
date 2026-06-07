@@ -73,11 +73,6 @@ impl DiskIndexCacheBackend {
         })
     }
 
-    /// Returns the cache root directory (the `index/` tier under the stamp dir).
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
     /// Approximate bytes currently persisted on disk by this tier (excludes the memory tier).
     pub fn disk_size_bytes(&self) -> u64 {
         self.disk_bytes.load(Ordering::Relaxed)

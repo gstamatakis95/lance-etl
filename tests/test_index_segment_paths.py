@@ -70,11 +70,13 @@ def index_config() -> IndexJobConfig:
     )
 
 
-def test_handler_build_segment_is_picklable() -> None:
-    """The bound ``build_segment`` captured by the Spark closure pickles cleanly.
+def test_handler_segment_builder_is_picklable() -> None:
+    """The ``segment_builder`` callable captured by the Spark closure pickles cleanly and stays small.
 
-    ``IndexHandler.build`` ships the bound method (and through it the handler instance) to executors inside the closure,
-    so each segment-building handler must round-trip through pickle.
+    ``IndexHandler.build`` ships ``segment_builder()`` to executors inside the closure. It is a
+    :func:`functools.partial` over a module-level function bound to primitive values only, so it must round-trip
+    through pickle without dragging the handler instance (and its ``config`` with ``storage_options`` and
+    ``telemetry``) onto every task.
     """
     config: IndexJobConfig = index_config()
     handlers: list[IndexHandler] = [
@@ -83,8 +85,11 @@ def test_handler_build_segment_is_picklable() -> None:
         BitmapIndexHandler(config, "category", "category_idx"),
     ]
     for handler in handlers:
-        restored: object = pickle.loads(pickle.dumps(handler.build_segment))
+        builder: object = handler.segment_builder()
+        payload: bytes = pickle.dumps(builder)
+        restored: object = pickle.loads(payload)
         assert callable(restored)
+        assert len(payload) < len(pickle.dumps(handler))
 
 
 def fragment_ids_of(uri: str) -> list[int]:

@@ -172,7 +172,7 @@ async fn serve_with_metrics(tmp: &TempDir, metrics: Arc<Metrics>) -> Channel {
 
 /// Like [`serve_with_metrics`] but optionally enabling sampled-query recall capture.
 async fn serve_full(tmp: &TempDir, metrics: Arc<Metrics>, recall: Option<RecallCapture>) -> Channel {
-    drop(telemetry::init_tracing(true));
+    drop(telemetry::init_tracing(true, metrics.clone()));
     let config = Config {
         base_uri: tmp.path().display().to_string(),
         dataset_cache_capacity: 16,
@@ -192,6 +192,9 @@ async fn serve_full(tmp: &TempDir, metrics: Arc<Metrics>, recall: Option<RecallC
         statsd_addr: "127.0.0.1:8125".to_string(),
         telemetry_disabled: true,
         recall_sample_rate: 0.0,
+        io_concurrency: search_api::config::DEFAULT_IO_CONCURRENCY,
+        io_block_size_bytes: search_api::config::DEFAULT_IO_BLOCK_SIZE_BYTES,
+        object_store_timeout_secs: search_api::config::DEFAULT_OBJECT_STORE_TIMEOUT_SECS,
     };
     let provider = CachingDatasetProvider::with_telemetry(&config, metrics.clone());
     let backend = Arc::new(
@@ -1137,6 +1140,24 @@ async fn instrumented_server_emits_rpc_metrics_and_passes_requests_through() {
             .iter()
             .any(|line| line.starts_with("search_api.cache.handles.entries:")),
         "missing handle cache gauge: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("search_api.query.iops:") && line.contains("rpc:vector_search")),
+        "missing per-query iops distribution from the lance execution-stats callback: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("search_api.query.bytes_read:") && line.contains("rpc:vector_search")),
+        "missing per-query bytes_read distribution: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("search_api.query.parts_loaded:") && line.contains("rpc:vector_search")),
+        "missing per-query parts_loaded distribution: {lines:?}"
     );
     assert!(
         !lines.iter().any(|line| line.contains("org_id")),

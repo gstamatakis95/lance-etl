@@ -35,4 +35,4 @@ pub use query::{
     DistanceKind, FilterMode, FusedHit, Fuzziness, Hit, HybridQuery, MatchSpec, PhraseSpec, TextOperator, TextQuery,
     TextQueryNode, VectorQuery, VectorSearchOutcome,
 };
-pub use target::{DatasetTarget, DateRange, MAX_DATE_RANGE_DAYS};
+pub use target::{DatasetRef, DatasetTarget, DateRange, MAX_DATE_RANGE_DAYS};

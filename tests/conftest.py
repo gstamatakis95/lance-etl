@@ -27,7 +27,7 @@ def telemetry_config() -> TelemetryConfig:
     """Return a telemetry configuration pointing at a local statsd sink.
 
     Returns:
-        A default telemetry configuration; DogStatsD sends are fire-and-forget
+        A default telemetry configuration. DogStatsD sends are fire-and-forget
         UDP so no agent needs to listen.
     """
     return TelemetryConfig(service="lance-etl-tests", env="test")

@@ -174,7 +174,7 @@ class TestDerivedPaths:
         assert config.prepared_key() == "n100-t2-s3-c64"
 
     def test_prepared_key_prefixes_non_default_dataset(self) -> None:
-        """Non-default datasets get a name-prefixed prepared key; sift1m keeps its historical key."""
+        """Non-default datasets get a name-prefixed prepared key. sift1m keeps its historical key."""
         config: BenchConfig = config_for(["prepare", "--dataset", "gist1m", "--limit", "100"])
         assert config.prepared_key() == "gist1m-n100-t1-s42-c64"
 

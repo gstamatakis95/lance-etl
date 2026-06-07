@@ -238,6 +238,41 @@ impl Metrics {
         }
     }
 
+    /// Per-query object-store execution stats from one Lance scan, tagged by `rpc`.
+    ///
+    /// Values come from Lance's execution-stats callback (`ExecutionSummaryCounts`): `iops` is the
+    /// number of I/O operations after coalescing, `bytes_read` the bytes pulled from storage, and
+    /// `parts_loaded` the number of index partitions loaded. Emitted as distributions so the
+    /// per-query spread is preserved. No `org`/`tenant` tags: cardinality lives in traces.
+    pub fn query_execution_stats(&self, rpc: Rpc, iops: u64, bytes_read: u64, parts_loaded: u64) {
+        self.client
+            .distribution_with_tags("query.iops", iops)
+            .with_tag("rpc", rpc.as_tag())
+            .send();
+        self.client
+            .distribution_with_tags("query.bytes_read", bytes_read)
+            .with_tag("rpc", rpc.as_tag())
+            .send();
+        self.client
+            .distribution_with_tags("query.parts_loaded", parts_loaded)
+            .with_tag("rpc", rpc.as_tag())
+            .send();
+    }
+
+    /// One Lance object-store throttle event from the AIMD rate limiter.
+    ///
+    /// `errored` counts a throttle error against `throttle.errors`. `new_rate`, when present,
+    /// records the limiter's freshly reduced fill rate (requests per second) as the
+    /// `throttle.new_rate` gauge. Both are untagged: throttle pressure is a per-process signal.
+    pub fn throttle_event(&self, errored: bool, new_rate: Option<f64>) {
+        if errored {
+            self.client.count_with_tags("throttle.errors", 1).send();
+        }
+        if let Some(rate) = new_rate {
+            self.client.gauge_with_tags("throttle.new_rate", rate).send();
+        }
+    }
+
     /// Latency of one dataset resolution. `cold` marks resolutions that actually opened the
     /// dataset instead of hitting the handle cache.
     pub fn dataset_open(&self, cold: bool, duration: Duration) {
@@ -567,6 +602,54 @@ mod tests {
             1,
             "zero-count dedup drops must not be emitted: {lines:?}"
         );
+    }
+
+    #[test]
+    fn query_execution_stats_render_three_distributions_tagged_by_rpc() {
+        let (metrics, drain) = spy_metrics();
+        metrics.query_execution_stats(Rpc::VectorSearch, 7, 4096, 3);
+        let lines = drain();
+        let expect = [
+            ("search_api.query.iops:7|d", "rpc:vector_search"),
+            ("search_api.query.bytes_read:4096|d", "rpc:vector_search"),
+            ("search_api.query.parts_loaded:3|d", "rpc:vector_search"),
+        ];
+        for (head, tag) in expect {
+            assert!(
+                lines.iter().any(|line| line.starts_with(head) && line.contains(tag)),
+                "missing {head} with {tag} in {lines:?}"
+            );
+        }
+        assert!(
+            !lines.iter().any(|line| line.contains("org")),
+            "execution stats must never carry org/tenant tags: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn throttle_event_emits_error_counter_and_rate_gauge() {
+        let (metrics, drain) = spy_metrics();
+        metrics.throttle_event(true, Some(12.5));
+        let lines = drain();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("search_api.throttle.errors:1|c")),
+            "missing throttle error counter: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("search_api.throttle.new_rate:12.5|g")),
+            "missing throttle rate gauge: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn throttle_event_without_error_or_rate_emits_nothing() {
+        let (metrics, drain) = spy_metrics();
+        metrics.throttle_event(false, None);
+        assert!(drain().is_empty(), "no throttle signal must produce no metrics");
     }
 
     #[test]

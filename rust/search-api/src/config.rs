@@ -48,6 +48,38 @@ pub const DEFAULT_STATSD_ADDR: &str = "127.0.0.1:8125";
 /// Default recall sample rate (0.0 disables sampled-query recall capture).
 pub const DEFAULT_RECALL_SAMPLE_RATE: f64 = 0.0;
 
+/// Default IO concurrency (number of parallel in-flight object-store requests per dataset).
+///
+/// This feeds `LANCE_IO_THREADS`, which is read at every `ObjectStore::io_parallelism()` call.
+/// Lance's cloud default is 64; 256 saturates typical 10 Gbit S3 links without hitting the
+/// AIMD ~5 000 req/s/process ceiling because the parallelism drives concurrent range-reads,
+/// not independent request opens.
+pub const DEFAULT_IO_CONCURRENCY: usize = 256;
+
+/// Default minimum object-store request size in bytes (IO buffer / block size) — 256 KiB.
+///
+/// Passed as `ObjectStoreParams::block_size` when opening every dataset.  Larger values
+/// reduce round-trip count for sequential scans at the cost of over-fetching for small
+/// random reads.  256 KiB is a practical balance for S3 given typical index page sizes.
+pub const DEFAULT_IO_BLOCK_SIZE_BYTES: usize = 256 * 1024;
+
+/// Default serve tag resolved to a concrete version when serve-by-tag is enabled.
+pub const DEFAULT_SERVE_TAG: &str = "prod";
+
+/// Default TTL in seconds for trusting a resolved serve-tag version before re-reading the tag.
+///
+/// Bounds how long a tag flip can go unobserved by a replica. 10 s keeps the steady-state cost at
+/// zero extra manifest reads per request while flips propagate within roughly the TTL.
+pub const DEFAULT_SERVE_TAG_TTL_SECS: u64 = 10;
+
+/// Default object-store retry-window timeout in seconds — 120 s.
+///
+/// This feeds `OBJECT_STORE_CLIENT_RETRY_TIMEOUT`, which is picked up by the S3/GCS/Azure
+/// client builders.  It is the total wall-clock budget across all retries for one cloud
+/// request, not a per-attempt connect timeout.  120 s is generous enough to survive S3
+/// throttle back-offs without exceeding a reasonable P99 SLO.
+pub const DEFAULT_OBJECT_STORE_TIMEOUT_SECS: u64 = 120;
+
 /// Runtime configuration for the search API.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -97,6 +129,28 @@ pub struct Config {
     /// `recall.*` span attributes for offline recall scoring. Must lie in `[0, 1]`. Default 0.0
     /// (disabled). Env: `SEARCH_API_RECALL_SAMPLE_RATE`.
     pub recall_sample_rate: f64,
+    /// Number of parallel in-flight object-store requests per dataset (default 256).
+    ///
+    /// Written to the process-global `LANCE_IO_THREADS` env var at startup, which Lance reads at
+    /// every `ObjectStore::io_parallelism()` call.  Higher values increase S3 throughput up to the
+    /// AIMD ~5 000 req/s/process ceiling; beyond that the AIMD throttle layer absorbs excess.
+    /// Env: `SEARCH_API_IO_CONCURRENCY`.
+    pub io_concurrency: usize,
+    /// Minimum object-store request size in bytes (block size) passed to every dataset open
+    /// (default 256 KiB).
+    ///
+    /// Wired as `ObjectStoreParams::block_size` in the provider on each cache miss.  Larger
+    /// values cut round-trip count for sequential scans; 256 KiB fits typical Lance index page
+    /// sizes without wasteful over-fetching.  Env: `SEARCH_API_IO_BLOCK_SIZE_BYTES`.
+    pub io_block_size_bytes: usize,
+    /// Object-store retry-window timeout in seconds (default 120).
+    ///
+    /// Written to the process-global `OBJECT_STORE_CLIENT_RETRY_TIMEOUT` env var at startup,
+    /// which is picked up by the S3/GCS/Azure client builders inside Lance.  This is the total
+    /// wall-clock budget across all retries for one cloud request.  120 s comfortably outlasts
+    /// S3 throttle back-offs without breaching a typical search-service SLO.
+    /// Env: `SEARCH_API_OBJECT_STORE_TIMEOUT_SECS`.
+    pub object_store_timeout_secs: u64,
 }
 
 impl Config {
@@ -110,8 +164,10 @@ impl Config {
     /// `SEARCH_API_STORE_CACHE_MAX_RANGE_BYTES`, `SEARCH_API_DISK_CACHE_SWEEP_SECS`,
     /// `SEARCH_API_DISK_CACHE_DISABLED`, `SEARCH_API_PREWARM_CONCURRENCY`,
     /// `SEARCH_API_FANOUT_CONCURRENCY`, `SEARCH_API_ID_COLUMN`, `SEARCH_API_STATSD_ADDR`
-    /// (default honors `DD_AGENT_HOST`), `SEARCH_API_TELEMETRY_DISABLED`, and
-    /// `SEARCH_API_RECALL_SAMPLE_RATE` (must lie in `[0, 1]`).
+    /// (default honors `DD_AGENT_HOST`), `SEARCH_API_TELEMETRY_DISABLED`,
+    /// `SEARCH_API_RECALL_SAMPLE_RATE` (must lie in `[0, 1]`),
+    /// `SEARCH_API_IO_CONCURRENCY` (default 256), `SEARCH_API_IO_BLOCK_SIZE_BYTES`
+    /// (default 256 KiB), and `SEARCH_API_OBJECT_STORE_TIMEOUT_SECS` (default 120).
     pub fn from_env() -> Result<Self, String> {
         let base_uri = std::env::var("LANCE_ETL_BASE_URI")
             .map_err(|_| "LANCE_ETL_BASE_URI must be set".to_string())?
@@ -142,6 +198,12 @@ impl Config {
             statsd_addr: env_string("SEARCH_API_STATSD_ADDR", &default_statsd_addr()),
             telemetry_disabled: env_bool("SEARCH_API_TELEMETRY_DISABLED", false)?,
             recall_sample_rate: env_unit_fraction("SEARCH_API_RECALL_SAMPLE_RATE", DEFAULT_RECALL_SAMPLE_RATE)?,
+            io_concurrency: env_number("SEARCH_API_IO_CONCURRENCY", DEFAULT_IO_CONCURRENCY)?,
+            io_block_size_bytes: env_number("SEARCH_API_IO_BLOCK_SIZE_BYTES", DEFAULT_IO_BLOCK_SIZE_BYTES)?,
+            object_store_timeout_secs: env_number(
+                "SEARCH_API_OBJECT_STORE_TIMEOUT_SECS",
+                DEFAULT_OBJECT_STORE_TIMEOUT_SECS,
+            )?,
         })
     }
 }
@@ -223,7 +285,7 @@ mod tests {
     }
 
     /// Env var names cleared so defaults apply in tests.
-    const OPTIONAL_VARS: [&str; 18] = [
+    const OPTIONAL_VARS: [&str; 21] = [
         "SEARCH_API_DATASET_CACHE_CAPACITY",
         "SEARCH_API_INDEX_CACHE_BYTES",
         "SEARCH_API_METADATA_CACHE_BYTES",
@@ -241,6 +303,9 @@ mod tests {
         "SEARCH_API_STATSD_ADDR",
         "SEARCH_API_TELEMETRY_DISABLED",
         "SEARCH_API_RECALL_SAMPLE_RATE",
+        "SEARCH_API_IO_CONCURRENCY",
+        "SEARCH_API_IO_BLOCK_SIZE_BYTES",
+        "SEARCH_API_OBJECT_STORE_TIMEOUT_SECS",
         "DD_AGENT_HOST",
     ];
 
@@ -264,6 +329,9 @@ mod tests {
             assert_eq!(config.statsd_addr, DEFAULT_STATSD_ADDR);
             assert!(!config.telemetry_disabled);
             assert_eq!(config.recall_sample_rate, DEFAULT_RECALL_SAMPLE_RATE);
+            assert_eq!(config.io_concurrency, DEFAULT_IO_CONCURRENCY);
+            assert_eq!(config.io_block_size_bytes, DEFAULT_IO_BLOCK_SIZE_BYTES);
+            assert_eq!(config.object_store_timeout_secs, DEFAULT_OBJECT_STORE_TIMEOUT_SECS);
         });
     }
 
@@ -372,5 +440,58 @@ mod tests {
                 assert!(err.contains("SEARCH_API_DISK_INDEX_CACHE_BYTES"));
             },
         );
+    }
+
+    #[test]
+    fn io_tuning_defaults_are_production_leaning() {
+        let mut vars: Vec<(&str, Option<&str>)> = vec![("LANCE_ETL_BASE_URI", Some("/data/lance"))];
+        vars.extend(OPTIONAL_VARS.iter().map(|name| (*name, None)));
+        with_env(&vars, || {
+            let config = Config::from_env().unwrap();
+            assert_eq!(
+                config.io_concurrency, DEFAULT_IO_CONCURRENCY,
+                "io_concurrency must default to {DEFAULT_IO_CONCURRENCY}"
+            );
+            assert_eq!(
+                config.io_block_size_bytes, DEFAULT_IO_BLOCK_SIZE_BYTES,
+                "io_block_size_bytes must default to {DEFAULT_IO_BLOCK_SIZE_BYTES}"
+            );
+            assert_eq!(
+                config.object_store_timeout_secs, DEFAULT_OBJECT_STORE_TIMEOUT_SECS,
+                "object_store_timeout_secs must default to {DEFAULT_OBJECT_STORE_TIMEOUT_SECS}",
+            );
+        });
+    }
+
+    #[test]
+    fn io_tuning_env_overrides_apply() {
+        with_env(
+            &[
+                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
+                ("SEARCH_API_IO_CONCURRENCY", Some("128")),
+                ("SEARCH_API_IO_BLOCK_SIZE_BYTES", Some("131072")),
+                ("SEARCH_API_OBJECT_STORE_TIMEOUT_SECS", Some("60")),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.io_concurrency, 128);
+                assert_eq!(config.io_block_size_bytes, 131_072);
+                assert_eq!(config.object_store_timeout_secs, 60);
+            },
+        );
+    }
+
+    #[test]
+    fn io_tuning_invalid_values_are_rejected() {
+        for (var, bad) in [
+            ("SEARCH_API_IO_CONCURRENCY", "many"),
+            ("SEARCH_API_IO_BLOCK_SIZE_BYTES", "big"),
+            ("SEARCH_API_OBJECT_STORE_TIMEOUT_SECS", "forever"),
+        ] {
+            with_env(&[("LANCE_ETL_BASE_URI", Some("/data/lance")), (var, Some(bad))], || {
+                let err = Config::from_env().unwrap_err();
+                assert!(err.contains(var), "expected error to name {var}, got: {err}");
+            });
+        }
     }
 }

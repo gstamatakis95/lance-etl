@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -51,9 +52,10 @@ import pyarrow as pa
 import pyarrow.compute as pc
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import TimestampType
 from pyspark.sql.window import Window, WindowSpec
 
-from lance_etl.telemetry import Telemetry, TelemetryConfig
+from lance_etl.telemetry import Telemetry, TelemetryConfig, commit_with_retries
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -204,6 +206,24 @@ class ETLConfig:
         window_start: ISO-8601 lower bound (inclusive) for the source timestamp window filter. Absent means open.
         window_end: ISO-8601 upper bound (exclusive) for the source timestamp window filter. Absent means open.
         window_column: Column used for the timestamp window pushdown filter. Defaults to ``updated_at``.
+        ingested_at_col: Name of the ingestion-timestamp column stamped on every row during the run. The column is a
+            payload column, never a routing or key column: it is excluded from the collapse keys, from
+            ``partition_cols`` routing, and from partition validation. ``when_matched_update_all`` refreshes it on
+            updates so the value reflects the most recent ingestion. The leading underscore is a data-column string
+            value (filterable through the gRPC allowlist), not a Python identifier, so it does not violate the
+            no-leading-underscore code rule. Defaults to ``_ingested_at``.
+        enable_v2_manifest_paths: Create every dataset with the V2 manifest naming scheme. V1 names a manifest
+            ``_versions/{version}.manifest`` so locating the latest version costs a directory LIST that grows with the
+            version count, while V2 names it ``_versions/{u64::MAX - version}.manifest`` zero-padded to 20 digits
+            (``rust/lance-table/src/io/commit.rs:104-109``) so the latest version sorts first and is found with one
+            head/list, turning every dataset open into a single object-store request regardless of history depth. This
+            is honored only at dataset bootstrap and ignored on ``append`` once a dataset
+            exists; existing datasets migrate one-shot via :func:`lance_etl.compaction.migrate_dataset_manifest_paths`.
+            Defaults to ``True``: the only documented caveat is that a V2 dataset is unreadable by Lance prior to 0.17.0
+            (``python/python/lance/dataset.py:7095-7100``), which the pinned build is well past, and there is no
+            concurrency or correctness caveat on creation, unlike stable row ids.
+        retry_backoff_seconds: Base backoff in seconds for the Python-side commit-conflict retry loop that observes the
+            merge conflict count. Tests set this to ``0.0`` to avoid sleeping.
     """
 
     base_uri: str
@@ -227,6 +247,9 @@ class ETLConfig:
     window_start: str | None = None
     window_end: str | None = None
     window_column: str = "updated_at"
+    ingested_at_col: str = "_ingested_at"
+    enable_v2_manifest_paths: bool = True
+    retry_backoff_seconds: float = 0.5
 
     def routing_cols(self) -> list[str]:
         """Return the routing columns in dataset-path order.
@@ -352,16 +375,71 @@ def build_delete_predicate(key_col: str, keys: pa.Array) -> str:
     return f"{key_col} IN ({joined})"
 
 
+def conflict_bucket(conflicts: int) -> str:
+    """Bucket an observed commit-conflict count into a low-cardinality metric tag value.
+
+    Args:
+        conflicts: The number of retryable commit conflicts observed during one merge.
+
+    Returns:
+        ``"0"`` for no conflict, ``"1"`` for a single conflict, ``"2+"`` for two or more.
+    """
+    if conflicts <= 0:
+        return "0"
+    if conflicts == 1:
+        return "1"
+    return "2+"
+
+
+def ensure_ingested_at_column(dataset: lance.LanceDataset, source_schema: pa.Schema, column: str) -> None:
+    """Evolve a pre-existing dataset that predates the ingestion-timestamp column so the merge can populate it.
+
+    Lance ``merge_insert`` rejects a source schema carrying a column the target lacks: ``check_compatible_schema``
+    accepts only a full match or a subset of the target schema, so a source column absent from the target fails both
+    and raises. A dataset created before ``ingested_at_col`` existed would therefore break the merge. Adding the column
+    as an all-null nullable field via ``add_columns`` (a metadata-only commit) lets the subsequent merge upsert
+    populate it. The call is a no-op once the column is present, so steady-state runs incur nothing.
+
+    Args:
+        dataset: The opened target dataset to evolve in place.
+        source_schema: The schema of the upsert source table, supplying the column's Arrow type.
+        column: The ingestion-timestamp column name to ensure on the target.
+    """
+    if column in dataset.schema.names:
+        return
+    field_index: int = source_schema.get_field_index(column)
+    if field_index < 0:
+        return
+    source_field: pa.Field = source_schema.field(field_index)
+    dataset.add_columns(pa.schema([pa.field(source_field.name, source_field.type)]))
+
+
 def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], group: pa.Table) -> tuple[int, int]:
     """Apply one dataset's terminal rows with merge upsert and physical delete.
 
     Bootstrap strategy: when the dataset does not exist yet, an empty table is written with ``lance.write_dataset(...,
     mode='append')``, which creates the dataset if absent and is race-free for concurrent first writers on the same
-    routing key. The rows themselves always flow through ``merge_insert`` so a re-upsert of an existing key updates it
-    in place instead of duplicating it.
+    routing key. ``enable_v2_manifest_paths`` is passed on this bootstrap write because V2 manifest paths are a
+    creation-time naming choice, so bootstrapping with the flag makes every later open of the dataset a single
+    object-store request instead of a version-count-proportional LIST. The rows themselves always flow through
+    ``merge_insert`` so a
+    re-upsert of an existing key updates it in place instead of duplicating it.
 
     The merge ``execute()`` return dict provides authoritative row counts (``num_inserted_rows``, ``num_updated_rows``,
     ``num_deleted_rows``). We report those rather than recomputing from the source table.
+
+    Schema evolution: a dataset created before ``ingested_at_col`` existed lacks that column, and ``merge_insert``
+    rejects a source carrying a column the target lacks. :func:`ensure_ingested_at_column` adds it as a metadata-only
+    nullable column before the merge so pre-existing datasets do not fail.
+
+    Conflict visibility: Lance does not surface its internal ``num_attempts`` through the pylance merge stats dict, so
+    the retry count is captured by wrapping the merge in :func:`commit_with_retries`, whose ``on_conflict`` callback
+    counts each retryable commit conflict observed in Python. The builder keeps its own ``conflict_retries`` so Lance's
+    internal handling of write contention (``Error::TooMuchWriteContention``, which is intentionally not a retryable
+    marker for the Python loop) is unchanged; the Python wrapper is a strictly-additive outer layer for commit-conflict
+    markers and never reduces the existing retry budget. The ``dataset.merge_ms`` timing is tagged with a ``conflicts:``
+    bucket (``"0"`` / ``"1"`` / ``"2+"``), and a ``dataset.merge_conflict_retries`` counter is emitted when any
+    conflict was observed.
 
     Args:
         config: ETL configuration.
@@ -382,32 +460,61 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
     deleted: int = 0
 
     if upserts.num_rows:
-        with telemetry.timed("dataset.merge_ms"):
+        conflicts: list[int] = []
+
+        def run_merge() -> dict[str, Any]:
+            """Open or bootstrap the dataset, evolve its schema, and execute the merge upsert once.
+
+            Returns:
+                The merge statistics dictionary with the authoritative row counts.
+            """
             try:
-                dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+                dataset_local: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
             except (FileNotFoundError, ValueError):
-                dataset = lance.write_dataset(
-                    upserts.schema.empty_table(), uri, mode="append", storage_options=config.storage_options
+                dataset_local = lance.write_dataset(
+                    upserts.schema.empty_table(),
+                    uri,
+                    mode="append",
+                    storage_options=config.storage_options,
+                    enable_v2_manifest_paths=config.enable_v2_manifest_paths,
                 )
-            try:
-                builder = dataset.merge_insert(on=[config.key_col])
-                if config.guard_updates_by_ts:
-                    builder = builder.when_matched_update_all(
-                        condition=f"source.{config.ts_col} > target.{config.ts_col}"
-                    )
-                else:
-                    builder = builder.when_matched_update_all()
-                stats: dict[str, Any] = (
-                    builder.when_not_matched_insert_all()
-                    .conflict_retries(config.conflict_retries)
-                    .retry_timeout(config.retry_timeout)
-                    .execute(upserts)
-                )
-                upserted = stats.get("num_inserted_rows", 0) + stats.get("num_updated_rows", 0)
-                telemetry.incr("dataset.merged")
-            except Exception:
-                telemetry.incr("dataset.merge_error")
-                raise
+            else:
+                ensure_ingested_at_column(dataset_local, upserts.schema, config.ingested_at_col)
+            builder = dataset_local.merge_insert(on=[config.key_col])
+            if config.guard_updates_by_ts:
+                builder = builder.when_matched_update_all(condition=f"source.{config.ts_col} > target.{config.ts_col}")
+            else:
+                builder = builder.when_matched_update_all()
+            return (
+                builder.when_not_matched_insert_all()
+                .conflict_retries(config.conflict_retries)
+                .retry_timeout(config.retry_timeout)
+                .execute(upserts)
+            )
+
+        def count_conflict() -> None:
+            """Record one observed retryable commit conflict for the merge bucket tag."""
+            conflicts.append(1)
+
+        started: float = time.perf_counter()
+        try:
+            stats: dict[str, Any] = commit_with_retries(
+                run_merge,
+                retries=config.conflict_retries,
+                backoff_seconds=config.retry_backoff_seconds,
+                on_conflict=count_conflict,
+            )
+            upserted = stats.get("num_inserted_rows", 0) + stats.get("num_updated_rows", 0)
+            telemetry.incr("dataset.merged")
+        except Exception:
+            telemetry.incr("dataset.merge_error")
+            raise
+        finally:
+            bucket: str = conflict_bucket(len(conflicts))
+            merge_ms: float = (time.perf_counter() - started) * 1000.0
+            telemetry.distribution("dataset.merge_ms", merge_ms, tags=[f"conflicts:{bucket}"])
+            if conflicts:
+                telemetry.incr("dataset.merge_conflict_retries", value=len(conflicts), tags=[f"conflicts:{bucket}"])
 
     if deletes.num_rows:
         try:
@@ -609,6 +716,24 @@ class IcebergToLanceETL:
             )
         return result
 
+    def stamp_ingested_at(self, source: DataFrame) -> DataFrame:
+        """Stamp every row with the ingestion timestamp before collapse and routing.
+
+        Uses ``F.current_timestamp()`` cast to ``TimestampType``. Spark fixes ``current_timestamp`` to a single value
+        per query, which matches the relaxed accuracy requirement: one ingestion instant per run, identical across all
+        routed rows, is acceptable. The column is added before the collapse and the routing repartition so it lands in
+        every routed dataset and flows through ``merge_insert``. ``when_matched_update_all`` later refreshes it on
+        updates so the value reflects the most recent ingestion. The column is a payload column only: it is never a
+        collapse key, a routing column, or a partition-validation target.
+
+        Args:
+            source: The increment with derived partition columns materialized.
+
+        Returns:
+            The DataFrame with the ingestion-timestamp column added.
+        """
+        return source.withColumn(self.config.ingested_at_col, F.current_timestamp().cast(TimestampType()))
+
     def flatten_maps(self, source: DataFrame) -> DataFrame:
         """Flatten the vector and metadata maps into struct-free parallel arrays.
 
@@ -667,7 +792,7 @@ class IcebergToLanceETL:
         driver_telemetry: Telemetry = Telemetry.create(config.telemetry)
         with driver_telemetry.span("lance.etl.run") as run_span:
             self.validate_schema(source)
-            prepared: DataFrame = self.derive_partition_columns(source)
+            prepared: DataFrame = self.stamp_ingested_at(self.derive_partition_columns(source))
             collapsed: DataFrame = self.collapse(self.flatten_maps(prepared))
             routing: list[str] = config.routing_cols()
             routed: DataFrame = collapsed.repartition(config.num_partitions, *[F.col(c) for c in routing])

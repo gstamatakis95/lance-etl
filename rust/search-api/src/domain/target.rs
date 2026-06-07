@@ -7,6 +7,27 @@ use crate::domain::error::SearchError;
 /// Upper bound on the number of days one date range may span.
 pub const MAX_DATE_RANGE_DAYS: usize = 366;
 
+/// Selects which committed version of a dataset to open.
+///
+/// `Serve` follows the provider's configured serve policy: the configured serve tag when
+/// serve-by-tag is enabled, otherwise the latest committed version. The other variants pin an
+/// explicit version, opt out of the serve tag (`Latest`), or name a tag to resolve. Pinning to a
+/// concrete version id (directly or via tag resolution) is what lets blue and green versions of
+/// one dataset coexist in the handle cache and lets prewarm warm the exact version that will be
+/// served.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DatasetRef {
+    /// Follow the configured serve policy (serve tag when enabled, else latest). Used by serving.
+    #[default]
+    Serve,
+    /// The latest committed version, ignoring any serve tag.
+    Latest,
+    /// A specific committed version id.
+    Version(u64),
+    /// A tag resolved to its committed version id at open time.
+    Tag(String),
+}
+
 /// An inclusive calendar-day range over date-partitioned datasets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DateRange {

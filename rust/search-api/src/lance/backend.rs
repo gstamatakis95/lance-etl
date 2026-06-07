@@ -9,7 +9,7 @@ use arrow_schema::DataType;
 use chrono::NaiveDate;
 use futures::StreamExt;
 use lance::Dataset;
-use lance::dataset::scanner::Scanner;
+use lance::dataset::scanner::{ExecutionStatsCallback, ExecutionSummaryCounts, Scanner};
 use lance_core::ROW_ID;
 use lance_linalg::distance::DistanceType;
 use serde_json::{Map, Value};
@@ -24,7 +24,7 @@ use crate::lance::filter::filter_to_expr;
 use crate::lance::provider::DatasetProvider;
 use crate::lance::rows::batch_to_json_rows;
 use crate::lance::text::text_query_to_fts;
-use crate::telemetry::FanoutLeg;
+use crate::telemetry::{FanoutLeg, Metrics, Rpc};
 
 /// Column key under which Lance reports vector distances.
 const DISTANCE_KEY: &str = "_distance";
@@ -189,7 +189,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
     ) -> Result<VectorSearchOutcome, SearchError> {
         let Some(range) = target.date_range else {
             let dataset = self.provider.dataset(target, None).await?;
-            let hits = run_vector_query(&dataset, &query).await?;
+            let hits = run_vector_query(&dataset, &query, &self.metrics, Rpc::VectorSearch).await?;
             return Ok(VectorSearchOutcome {
                 hits,
                 dataset_version: Some(dataset.version_id()),
@@ -198,9 +198,10 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
         validate_k(query.k)?;
         let strip_id = self.ensure_id_projected(&mut query.projection);
         let query = &query;
+        let metrics = &self.metrics;
         let legs = self
             .fan_out(target, range.days(), FanoutLeg::Vector, |dataset| async move {
-                run_vector_query(&dataset, query).await
+                run_vector_query(&dataset, query, metrics, Rpc::VectorSearch).await
             })
             .await?;
         Ok(VectorSearchOutcome {
@@ -223,14 +224,15 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
     async fn text_search(&self, target: &DatasetTarget, mut query: TextQuery) -> Result<Vec<Hit>, SearchError> {
         let Some(range) = target.date_range else {
             let dataset = self.provider.dataset(target, None).await?;
-            return run_text_query(&dataset, &query).await;
+            return run_text_query(&dataset, &query, &self.metrics, Rpc::TextSearch).await;
         };
         validate_k(query.k)?;
         let strip_id = self.ensure_id_projected(&mut query.projection);
         let query = &query;
+        let metrics = &self.metrics;
         let legs = self
             .fan_out(target, range.days(), FanoutLeg::Text, |dataset| async move {
-                run_text_query(&dataset, query).await
+                run_text_query(&dataset, query, metrics, Rpc::TextSearch).await
             })
             .await?;
         Ok(self.merge_fanout_legs(legs, ScoreOrder::HigherIsBetter, query.k, FanoutLeg::Text, strip_id))
@@ -261,8 +263,8 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
         let Some(range) = target.date_range else {
             let dataset = self.provider.dataset(target, None).await?;
             let (vector_hits, text_hits) = tokio::join!(
-                run_vector_query(&dataset, &vector_query),
-                run_text_query(&dataset, &text_query),
+                run_vector_query(&dataset, &vector_query, &self.metrics, Rpc::HybridSearch),
+                run_text_query(&dataset, &text_query, &self.metrics, Rpc::HybridSearch),
             );
             let (vector_hits, text_hits) = (vector_hits?, text_hits?);
             let fuse_span = tracing::info_span!("fusion.fuse", search.k = query.k);
@@ -272,11 +274,12 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
         let strip_text_id = self.ensure_id_projected(&mut text_query.projection);
         let strip_id = strip_vector_id || strip_text_id;
         let (vector_query, text_query) = (&vector_query, &text_query);
+        let metrics = &self.metrics;
         let legs: Vec<(Vec<Hit>, Vec<Hit>)> = self
             .fan_out(target, range.days(), FanoutLeg::Hybrid, |dataset| async move {
                 let (vector_hits, text_hits) = tokio::join!(
-                    run_vector_query(&dataset, vector_query),
-                    run_text_query(&dataset, text_query),
+                    run_vector_query(&dataset, vector_query, metrics, Rpc::HybridSearch),
+                    run_text_query(&dataset, text_query, metrics, Rpc::HybridSearch),
                 );
                 Ok((vector_hits?, text_hits?))
             })
@@ -371,9 +374,31 @@ fn apply_common_options(
     Ok(())
 }
 
+/// Builds a Lance scan-stats callback that reports per-query object-store stats as `query.*`
+/// distributions tagged by `rpc`.
+///
+/// Lance invokes the callback once, after the scan's plan finishes, with the aggregated
+/// [`ExecutionSummaryCounts`]. The callback only emits metrics through the infallible facade, so it
+/// never panics and never blocks the scan.
+fn execution_stats_callback(metrics: Arc<Metrics>, rpc: Rpc) -> ExecutionStatsCallback {
+    Arc::new(move |counts: &ExecutionSummaryCounts| {
+        metrics.query_execution_stats(
+            rpc,
+            counts.iops as u64,
+            counts.bytes_read as u64,
+            counts.parts_loaded as u64,
+        );
+    })
+}
+
 /// Runs one nearest-neighbor query against an open dataset.
 #[tracing::instrument(name = "lance.vector_query", skip_all, fields(search.k = query.k))]
-async fn run_vector_query(dataset: &Dataset, query: &VectorQuery) -> Result<Vec<Hit>, SearchError> {
+async fn run_vector_query(
+    dataset: &Dataset,
+    query: &VectorQuery,
+    metrics: &Arc<Metrics>,
+    rpc: Rpc,
+) -> Result<Vec<Hit>, SearchError> {
     validate_k(query.k)?;
     if query.vector.is_empty() {
         return Err(SearchError::invalid_argument("vector must be non-empty"));
@@ -385,6 +410,7 @@ async fn run_vector_query(dataset: &Dataset, query: &VectorQuery) -> Result<Vec<
     let key = Float32Array::from(query.vector.clone());
     let fetch = query.k + query.offset.unwrap_or(0);
     let mut scanner = dataset.scan();
+    scanner.scan_stats_callback(execution_stats_callback(metrics.clone(), rpc));
     scanner
         .nearest(&column_name, &key, fetch)
         .map_err(|err| classify_lance_error(&err))?;
@@ -431,11 +457,17 @@ async fn run_vector_query(dataset: &Dataset, query: &VectorQuery) -> Result<Vec<
 
 /// Runs one full-text query against an open dataset.
 #[tracing::instrument(name = "lance.text_query", skip_all, fields(search.k = query.k))]
-async fn run_text_query(dataset: &Dataset, query: &TextQuery) -> Result<Vec<Hit>, SearchError> {
+async fn run_text_query(
+    dataset: &Dataset,
+    query: &TextQuery,
+    metrics: &Arc<Metrics>,
+    rpc: Rpc,
+) -> Result<Vec<Hit>, SearchError> {
     validate_k(query.k)?;
     let fetch = query.k + query.offset.unwrap_or(0);
     let fts = text_query_to_fts(query, fetch)?;
     let mut scanner = dataset.scan();
+    scanner.scan_stats_callback(execution_stats_callback(metrics.clone(), rpc));
     scanner
         .full_text_search(fts)
         .map_err(|err| classify_lance_error(&err))?;

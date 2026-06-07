@@ -275,7 +275,7 @@ class TestCliPartitionFlags:
         ]
 
     def test_parse_partition_cols(self) -> None:
-        """Comma-separated columns parse into a trimmed list; absent stays None."""
+        """Comma-separated columns parse into a trimmed list. Absent stays None."""
         assert parse_partition_cols("org_id, tenant_id ,namespace") == ["org_id", "tenant_id", "namespace"]
         assert parse_partition_cols(None) is None
 

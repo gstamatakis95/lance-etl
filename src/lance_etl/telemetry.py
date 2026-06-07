@@ -43,6 +43,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 EXECUTION_DISTRIBUTION_KEYS: tuple[str, ...] = (
     "output_rows",
     "iops",
+    "requests",
     "bytes_read",
     "indices_loaded",
     "parts_loaded",
@@ -175,6 +176,23 @@ def commit_with_retries(
     retry sleeps a uniformly random duration in ``[0, backoff_seconds * 2**attempt)`` (capped at 64 units), so
     concurrent committers on one dataset randomize apart instead of colliding on every slot. Conflicts are detected
     with :func:`is_commit_conflict_error`, which matches retryable markers only and lets hard conflicts propagate.
+
+    Layering against Lance's own inner retry loop. Lance's ``merge_insert`` and ``delete`` already wrap the
+    execute-then-commit cycle in ``execute_with_retry`` (``rust/lance/src/dataset/write/retry.rs:75-130``), whose
+    ``RetryConfig`` defaults to ``max_retries=10`` and ``retry_timeout=30s``
+    (``retry.rs:23-30``; ``merge_insert.rs:464-465`` and ``delete.rs:134-135``). That inner loop retries only
+    ``Error::RetryableCommitConflict``, calling ``checkout_latest`` before each attempt, and on exhaustion converts the
+    failure to ``Error::TooMuchWriteContention`` ("Too many concurrent writers", ``retry.rs:99-103,126-129``) rather
+    than re-surfacing the conflict. ``TooMuchWriteContention`` is deliberately excluded from
+    :data:`COMMIT_CONFLICT_MARKERS`, so this wrapper does NOT re-retry an exhausted inner loop and the two layers never
+    stack on the same conflict. What this wrapper adds is strictly complementary: it catches the non-retryable
+    ``Error::CommitConflict`` variant (``rust/lance-core/src/error.rs:96-97``) that the inner loop returns straight
+    through (``retry.rs:122``), and it covers operations that have no inner retry loop at all (the distributed
+    ``Compaction.commit`` / segment-index commits), re-reading the dataset in ``action`` so each attempt rebases. It
+    also supplies the conflict count Lance never surfaces through the pylance stats dict. The ETL budget (10) mirrors
+    the merge-insert ``conflict_retries``; the compaction budget (20) sizes the only retry layer that path has. Both are
+    correct as-is: shrinking them would thin the only coverage for ``CommitConflict`` and the binding-less compaction
+    commits, and growing them would not help because the inner loop already owns ``RetryableCommitConflict`` exhaustion.
 
     Args:
         action: The commit to attempt, returning any result.

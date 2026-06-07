@@ -3,3 +3,6 @@
 /.claude/
 lance-etl.iml
 /rust/search-api/target/
+
+__pycache__/
+*.pyc

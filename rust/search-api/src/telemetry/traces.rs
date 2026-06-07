@@ -2,6 +2,7 @@
 //! correlation.
 
 use std::fmt;
+use std::sync::Arc;
 
 use opentelemetry::trace::{TraceContextExt, TracerProvider};
 use opentelemetry::{KeyValue, global};
@@ -15,12 +16,26 @@ use tracing::{Event, Subscriber};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::fmt::format::{JsonFields, Writer};
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormattedFields};
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 
+use super::metrics::Metrics;
+
 /// Service name reported when neither `OTEL_SERVICE_NAME` nor `DD_SERVICE` is set.
 pub const DEFAULT_SERVICE_NAME: &str = "search-api";
+
+/// Tracing target of Lance's AIMD object-store rate limiter.
+///
+/// Verified against the Lance checkout at
+/// `rust/lance-io/src/object_store/throttle.rs:402-471` (constant
+/// `lance_core::utils::tracing::TRACE_OBJECT_STORE_THROTTLE`). Kept as a local literal so the
+/// telemetry layer stays free of Lance type dependencies.
+const THROTTLE_TARGET: &str = "lance::object_store::throttle";
+
+/// `EnvFilter` directive forcing the throttle target through at `info` severity (the AIMD
+/// rate-reduction event is emitted at `warn`, which `info` admits) regardless of `RUST_LOG`.
+const THROTTLE_TARGET_DIRECTIVE: &str = "lance::object_store::throttle=info";
 
 /// Resolves the service name from `OTEL_SERVICE_NAME`, then `DD_SERVICE`, then the default.
 fn service_name() -> String {
@@ -55,7 +70,10 @@ impl Drop for TelemetryGuard {
 /// `OTEL_TRACES_SAMPLER_ARG`. The function never panics and never fails: exporter setup errors
 /// degrade to log-only mode, and calling it when a subscriber is already installed (tests) is a
 /// no-op.
-pub fn init_tracing(telemetry_disabled: bool) -> TelemetryGuard {
+///
+/// `metrics` backs the [`ThrottleMetricsLayer`] so Lance object-store throttle events become
+/// DogStatsD metrics. Pass [`Metrics::disabled`](super::Metrics::disabled) to suppress them.
+pub fn init_tracing(telemetry_disabled: bool, metrics: Arc<Metrics>) -> TelemetryGuard {
     let tracer_provider = if telemetry_disabled {
         None
     } else {
@@ -70,12 +88,14 @@ pub fn init_tracing(telemetry_disabled: bool) -> TelemetryGuard {
                 .with(env_filter())
                 .with(otel_layer)
                 .with(json_fmt_layer())
+                .with(ThrottleMetricsLayer::new(metrics))
                 .try_init();
         }
         None => {
             let _ = tracing_subscriber::registry()
                 .with(env_filter())
                 .with(json_fmt_layer())
+                .with(ThrottleMetricsLayer::new(metrics))
                 .try_init();
         }
     }
@@ -83,8 +103,16 @@ pub fn init_tracing(telemetry_disabled: bool) -> TelemetryGuard {
 }
 
 /// `RUST_LOG`-driven filter, defaulting to `info` when the variable is unset or invalid.
+///
+/// The throttle target is always admitted at `info` (see [`THROTTLE_TARGET_DIRECTIVE`]) so the
+/// [`ThrottleMetricsLayer`] still sees rate-limit events when `RUST_LOG` narrows the crate's logs.
 fn env_filter() -> tracing_subscriber::EnvFilter {
-    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    match THROTTLE_TARGET_DIRECTIVE.parse() {
+        Ok(directive) => filter.add_directive(directive),
+        Err(_) => filter,
+    }
 }
 
 /// JSON stdout log layer with Datadog trace correlation, generic over the subscriber stack.
@@ -228,16 +256,122 @@ impl Visit for JsonEventVisitor<'_> {
     }
 }
 
+/// Tracing layer that promotes Lance object-store throttle events into DogStatsD metrics.
+///
+/// It matches events whose target is [`THROTTLE_TARGET`] (Lance's AIMD rate limiter) and forwards
+/// a throttle-error count and the limiter's freshly reduced fill rate through the [`Metrics`]
+/// facade. The layer only reads event fields and emits metrics, so it never panics, never blocks
+/// the traced task, and adds nothing for non-throttle events.
+pub struct ThrottleMetricsLayer {
+    metrics: Arc<Metrics>,
+}
+
+impl ThrottleMetricsLayer {
+    /// Builds a throttle metrics layer emitting through the given facade.
+    pub fn new(metrics: Arc<Metrics>) -> Self {
+        Self { metrics }
+    }
+}
+
+impl<S> Layer<S> for ThrottleMetricsLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        if event.metadata().target() != THROTTLE_TARGET {
+            return;
+        }
+        let mut visitor = ThrottleVisitor::default();
+        event.record(&mut visitor);
+        self.metrics.throttle_event(visitor.errored, visitor.new_rate);
+    }
+}
+
+/// Extracts the throttle fields used for metrics: whether an `error` was present and the `new_rate`
+/// the AIMD controller settled on. Lance emits `new_rate` as a formatted string and `error` via a
+/// `Display` wrapper, so both string and debug records are handled.
+#[derive(Default)]
+struct ThrottleVisitor {
+    errored: bool,
+    new_rate: Option<f64>,
+}
+
+impl Visit for ThrottleVisitor {
+    fn record_f64(&mut self, field: &Field, value: f64) {
+        if field.name() == "new_rate" {
+            self.new_rate = Some(value);
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        match field.name() {
+            "new_rate" => self.new_rate = value.trim().parse().ok(),
+            "error" => self.errored = true,
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        match field.name() {
+            "error" => self.errored = true,
+            "new_rate" if self.new_rate.is_none() => {
+                self.new_rate = format!("{value:?}").trim_matches('"').trim().parse().ok();
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cadence::SpyMetricSink;
+    use tracing_subscriber::layer::SubscriberExt;
 
     #[test]
     fn init_tracing_disabled_is_idempotent_and_panic_free() {
-        let first = init_tracing(true);
-        let second = init_tracing(true);
+        let first = init_tracing(true, Arc::new(Metrics::disabled()));
+        let second = init_tracing(true, Arc::new(Metrics::disabled()));
         tracing::info!(org_id = "org-test", "telemetry smoke event");
         drop(second);
         drop(first);
+    }
+
+    #[test]
+    fn throttle_layer_emits_error_counter_and_rate_gauge_on_matching_events() {
+        let (receiver, sink) = SpyMetricSink::new();
+        let metrics = Arc::new(Metrics::from_sink(sink));
+        let subscriber = tracing_subscriber::registry().with(ThrottleMetricsLayer::new(metrics));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                target: THROTTLE_TARGET,
+                previous_rate = "20.0",
+                new_rate = "12.5",
+                error = "503 Slow Down",
+                "AIMD throttle"
+            );
+            tracing::info!(target: "search_api::other", new_rate = "99.0", "unrelated event");
+        });
+        let mut lines = Vec::new();
+        while let Ok(packet) = receiver.try_recv() {
+            lines.push(String::from_utf8(packet).unwrap());
+        }
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("search_api.throttle.errors:1|c")),
+            "missing throttle error counter: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("search_api.throttle.new_rate:12.5|g")),
+            "missing throttle rate gauge: {lines:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("throttle")).count(),
+            2,
+            "only the matching throttle event must produce metrics: {lines:?}"
+        );
     }
 }

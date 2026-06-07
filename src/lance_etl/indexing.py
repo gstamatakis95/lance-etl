@@ -43,6 +43,7 @@ Requires pylance and the Datadog Agent on the executors. Artifact IO uses pyarro
 from __future__ import annotations
 
 import base64
+import functools
 import json
 import logging
 import math
@@ -478,6 +479,38 @@ def merge_index_deltas(uri: str, index_name: str, config: IndexJobConfig, teleme
     return True
 
 
+STALE_FRAGMENT_MARKERS: tuple[str, ...] = ("would orphan fragments", "no longer exist")
+"""Display-string markers of a segment commit invalidated by a concurrent compaction.
+
+``"would orphan fragments"`` matches the ``Error::InvalidInput`` that ``commit_existing_index_segments`` raises (lance
+``rust/lance/src/index.rs:1233``) when incoming segments overlap a wider existing segment but do not cover all of its
+fragments, which happens after a compaction rewrites one covered fragment and remaps the surviving wider segment over
+it. ``"no longer exist"`` matches the inverted-index publish guard in
+:meth:`FtsIndexHandler.commit_index`. Both surface to Python as ``ValueError`` (lance ``python/src/error.rs:83`` maps
+``InvalidInput`` to ``PyValueError``), so neither is caught by :func:`commit_with_retries`, which retries only
+``OSError`` / ``RuntimeError`` commit conflicts. Both mean the planned fragment set went stale and the build must be
+re-resolved against the latest version.
+"""
+
+
+def is_stale_fragment_error(exc: BaseException) -> bool:
+    """Report whether an exception marks a segment commit invalidated by a concurrent compaction.
+
+    Shared by the vector, scalar, and inverted-index paths so the stale-fragment guard is detected in one place
+    rather than reimplemented per index type.
+
+    Args:
+        exc: The exception to inspect.
+
+    Returns:
+        ``True`` when the exception means the planned fragment set is stale and the build must be redone.
+    """
+    if not isinstance(exc, ValueError):
+        return False
+    message: str = str(exc)
+    return any(marker in message for marker in STALE_FRAGMENT_MARKERS)
+
+
 def commit_segments(
     uri: str,
     segment_documents: list[str],
@@ -486,14 +519,15 @@ def commit_segments(
     merge: bool,
     config: IndexJobConfig,
     telemetry: Telemetry,
-) -> None:
+) -> int:
     """Commit built segments, retrying conflicts to coexist with writers.
 
     Each attempt validates the segments against the latest fragment set first. A concurrent compaction can rewrite
     fragments between the segment build and this commit, and a blind retry at the new head version would then publish
     segments pointing at fragments that no longer exist, silently corrupting search results. Stale segments are
-    dropped with a metric instead, leaving their fragments uncovered for the next incremental run to rebuild. When
-    every segment is stale the commit is skipped entirely.
+    dropped with a metric instead. When every segment is stale the commit is skipped and ``0`` is returned. When a
+    surviving segment overlaps a wider existing segment that a compaction remapped over a rewritten fragment, lance
+    raises the ``"would orphan fragments"`` ``ValueError``, which propagates so the caller can re-resolve and rebuild.
 
     Args:
         uri: Dataset URI.
@@ -504,13 +538,19 @@ def commit_segments(
         config: Indexing configuration.
         telemetry: Driver telemetry facade.
 
+    Returns:
+        The number of fresh (non-stale) segments that were committed. ``0`` when every segment was stale and the
+        commit was skipped.
+
     Raises:
+        ValueError: If publishing the fresh segments would orphan fragments held by a wider existing segment, so the
+            caller must re-resolve the fragment set and rebuild.
         OSError | RuntimeError: If commits keep conflicting past the retry budget.
     """
     segments: list[Index] = [deserialize_segment(document) for document in segment_documents]
     tags: list[str] = [f"index:{index_name}"]
 
-    def action() -> None:
+    def action() -> int:
         """Drop stale segments, merge if needed, and commit at the latest version."""
         dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
         live: set[int] = {fragment.fragment_id for fragment in dataset.get_fragments()}
@@ -526,13 +566,71 @@ def commit_segments(
             )
         if not fresh:
             logger.warning("every segment for %s on %s is stale; skipping commit, next run re-covers", index_name, uri)
-            return
+            return 0
         if merge and len(fresh) > 1:
             merged = dataset.merge_existing_index_segments(fresh)
             dataset.commit_existing_index_segments(index_name, column, [merged])
         else:
             dataset.commit_existing_index_segments(index_name, column, fresh)
         telemetry.incr("index.committed", tags=tags)
+        return len(fresh)
+
+    return commit_with_retries(
+        action,
+        config.commit_retries,
+        config.commit_backoff_seconds,
+        lambda: telemetry.incr("index.commit_conflict", tags=tags),
+    )
+
+
+def index_holds_dead_fragments(dataset: lance.LanceDataset, index_name: str) -> bool:
+    """Report whether a committed index segment references fragments that no longer exist.
+
+    A compaction's inline index remap can leave a committed segment pointing at fragments it rewrote away. The orphan
+    guard in ``commit_existing_index_segments`` then refuses to publish any new segment that would orphan those dead
+    fragments, and no rebuild can ever cover a fragment that does not exist, so the index can only be repaired by
+    dropping and rebuilding it from the intact rows.
+
+    Args:
+        dataset: A dataset handle at the latest version.
+        index_name: The index name to inspect.
+
+    Returns:
+        ``True`` when any segment of the index references a fragment that is not live.
+    """
+    live: set[int] = {fragment.fragment_id for fragment in dataset.get_fragments()}
+    for description in dataset.describe_indices():
+        if description.name == index_name:
+            for segment in description.segments:
+                if not set(segment.fragment_ids) <= live:
+                    return True
+    return False
+
+
+def drop_stale_index(uri: str, index_name: str, config: IndexJobConfig, telemetry: Telemetry) -> None:
+    """Drop a corrupt index whose committed segments reference rewritten-away fragments, retrying conflicts.
+
+    Used by :func:`build_and_commit_segments` when a compaction remap orphaned dead fragments inside an existing
+    segment. Dropping clears the unrepairable segment so the next build re-covers every live fragment from the intact
+    rows. Runs in the calling process.
+
+    Args:
+        uri: Dataset URI.
+        index_name: The index to drop.
+        config: Indexing configuration.
+        telemetry: Telemetry facade for the current process.
+
+    Raises:
+        OSError | RuntimeError: If commits keep conflicting past the retry budget.
+    """
+    tags: list[str] = [f"index:{index_name}"]
+
+    def action() -> None:
+        """Drop the index at the latest version when it still exists."""
+        dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+        if index_name in {description.name for description in dataset.describe_indices()}:
+            dataset.drop_index(index_name)
+            telemetry.incr("index.dropped_stale", tags=tags)
 
     commit_with_retries(
         action,
@@ -540,6 +638,95 @@ def commit_segments(
         config.commit_backoff_seconds,
         lambda: telemetry.incr("index.commit_conflict", tags=tags),
     )
+
+
+def build_and_commit_segments(
+    uri: str,
+    handler: IndexHandler,
+    config: IndexJobConfig,
+    telemetry: Telemetry,
+    build_documents: Callable[[list[list[int]], int, object | None], list[str]],
+) -> dict[str, int]:
+    """Build per-shard segments and commit them, rebuilding when a concurrent compaction makes the plan stale.
+
+    The segment build plans over a fragment set resolved at one version. A concurrent compaction can rewrite some of
+    those fragments and remap an existing wider index segment over them between the build and the commit, so
+    publishing the freshly built segments would either orphan fragments the existing segment still holds
+    (:func:`commit_segments` re-raises the ``"would orphan fragments"`` ``ValueError``) or cover fragments that no
+    longer exist (:func:`commit_segments` drops them). Both mean the fragment set is stale. This mirrors the
+    compactor's re-plan-on-conflict loop: it re-reads the dataset at the latest version, re-resolves the target
+    fragments (dropping fragments that no longer exist), rebuilds the affected segments, and re-commits, bounded by
+    ``config.commit_retries``. When the orphan is caused by an existing segment still pointing at fragments a
+    compaction rewrote away (:func:`index_holds_dead_fragments`), no rebuild can cover the dead fragments, so the
+    corrupt index is dropped (:func:`drop_stale_index`) and rebuilt clean from the intact rows. Every live target
+    therefore ends up covered rather than silently skipped. If the budget is exhausted while a writer keeps rewriting,
+    the remaining fragments are left for the next maintenance pass, which re-covers them once the contention clears.
+
+    Args:
+        uri: Dataset URI.
+        handler: The per-type index handler resolving targets and recording coverage.
+        config: Indexing configuration.
+        telemetry: Telemetry facade for the current process.
+        build_documents: Builds one serialized segment per shard for the given fragment groups, pinned to the given
+            dataset version, using the broadcast artifacts. Supplied by the distributed and in-process callers so the
+            rebuild loop is shared.
+
+    Returns:
+        A mapping with the total ``segments`` committed and the ``fragments`` targeted on the first attempt.
+    """
+    tags: list[str] = [f"index:{handler.index_name}"]
+    total_segments: int = 0
+    first_targets: int = 0
+    for attempt in range(config.commit_retries + 1):
+        dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+        targets: list[int] = handler.target_fragments(dataset)
+        if attempt == 0:
+            first_targets = len(targets)
+        if not targets:
+            return {"segments": total_segments, "fragments": first_targets}
+        artifacts: object | None = handler.prepare(dataset, uri, telemetry)
+        version: int = dataset.version
+        groups: list[list[int]] = split_evenly(targets, config.num_shards)
+        documents: list[str] = build_documents(groups, version, artifacts)
+        try:
+            committed: int = commit_segments(
+                uri, documents, handler.column, handler.index_name, handler.merges(), config, telemetry
+            )
+        except ValueError as exc:
+            if not is_stale_fragment_error(exc):
+                raise
+            telemetry.incr("index.stale_fragment_replan", tags=tags)
+            refreshed: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+            if index_holds_dead_fragments(refreshed, handler.index_name):
+                logger.warning(
+                    "dropping corrupt index %s on %s: a compaction remap left a segment pointing at "
+                    "rewritten-away fragments; rebuilding from intact rows (%s)",
+                    handler.index_name,
+                    uri,
+                    exc,
+                )
+                drop_stale_index(uri, handler.index_name, config, telemetry)
+            else:
+                logger.warning(
+                    "rebuilding %s on %s: a concurrent compaction orphaned the planned fragment set (%s)",
+                    handler.index_name,
+                    uri,
+                    exc,
+                )
+            continue
+        if committed:
+            total_segments += committed
+            handler.record_coverage(uri, lance.dataset(uri, storage_options=config.storage_options))
+        if committed == len(documents):
+            return {"segments": total_segments, "fragments": first_targets}
+        telemetry.incr("index.stale_fragment_replan", tags=tags)
+    logger.warning(
+        "index %s on %s still has uncovered fragments after %d rebuild attempts; next pass re-covers",
+        handler.index_name,
+        uri,
+        config.commit_retries,
+    )
+    return {"segments": total_segments, "fragments": first_targets}
 
 
 def lance_field_id(dataset: lance.LanceDataset, column: str) -> int:
@@ -563,6 +750,92 @@ def lance_field_id(dataset: lance.LanceDataset, column: str) -> int:
     if lance_field is None:
         raise ValueError(f"column {column!r} not found in Lance schema")
     return lance_field.id()
+
+
+def build_scalar_segment(
+    dataset: lance.LanceDataset,
+    fragment_ids: list[int],
+    artifacts: object | None,
+    column: str,
+    index_name: str,
+    index_type: str,
+) -> Index:
+    """Build one artifact-free scalar segment (BTREE or BITMAP) over a shard of fragments.
+
+    This is a module-level function so the Spark closure can capture it through a small
+    :func:`functools.partial` of primitive values rather than a bound method, which would pickle the entire handler
+    instance onto every task. ``index_uuid`` must not be passed for these segment builds. Lance mints segment ids
+    itself. ``replace=True`` bypasses the same-name existence guard on the uncommitted path so incremental segments can
+    extend an existing index. It removes nothing, since delta removal happens only on the committed path.
+
+    Args:
+        dataset: A dataset handle pinned to the build version.
+        fragment_ids: The fragment ids for this shard.
+        artifacts: Unused by scalar builds. Present so the callable signature matches the vector builder.
+        column: The column to index.
+        index_name: The name of the index.
+        index_type: The scalar index type (``BTREE`` or ``BITMAP``).
+
+    Returns:
+        The uncommitted segment metadata.
+    """
+    del artifacts
+    return dataset.create_index_uncommitted(
+        column=column,
+        index_type=index_type,
+        name=index_name,
+        replace=True,
+        fragment_ids=fragment_ids,
+    )
+
+
+def build_vector_segment(
+    dataset: lance.LanceDataset,
+    fragment_ids: list[int],
+    artifacts: object | None,
+    column: str,
+    index_name: str,
+    metric: str,
+) -> Index:
+    """Build one IVF_RQ segment over a shard of fragments.
+
+    Module-level for the same closure-pickling reason as :func:`build_scalar_segment`. ``replace=True`` is required for
+    incremental coverage: the uncommitted build path applies the same-name existence guard, and without it a segment
+    build for an index that already exists raises. The flag only bypasses that guard. Removal of prior deltas happens
+    solely on the committed ``execute`` path, never here, so existing coverage is preserved and :func:`commit_segments`
+    publishes the new segments as a delta.
+
+    Args:
+        dataset: A dataset handle pinned to the build version.
+        fragment_ids: The fragment ids for this shard.
+        artifacts: The centroids bytes, the shared RaBitQ model string, num_bits, and the IVF partition count.
+        column: The column to index.
+        index_name: The name of the index.
+        metric: The distance metric for the vector index.
+
+    Returns:
+        The uncommitted segment metadata.
+
+    Raises:
+        ValueError: If ``artifacts`` is ``None``. Vector segment builds require the artifact tuple produced by
+            :meth:`VectorIndexHandler.prepare`.
+    """
+    if artifacts is None:
+        raise ValueError("build_vector_segment requires artifacts from prepare; got None")
+    centroids_bytes, rabitq_model, num_bits, num_partitions = artifacts
+    centroids: pa.Array = centroids_from_ipc(centroids_bytes)
+    return dataset.create_index_uncommitted(
+        column=column,
+        index_type="IVF_RQ",
+        name=index_name,
+        metric=metric,
+        replace=True,
+        num_partitions=num_partitions,
+        num_bits=num_bits,
+        ivf_centroids=centroids,
+        rabitq_model=rabitq_model,
+        fragment_ids=fragment_ids,
+    )
 
 
 class IndexHandler:
@@ -698,11 +971,9 @@ class IndexHandler:
     def build_segment(self, dataset: lance.LanceDataset, fragment_ids: list[int], artifacts: object | None) -> Index:
         """Build one uncommitted scalar segment over a shard of fragments.
 
-        This base implementation covers the artifact-free scalar types (BTREE and BITMAP). ``index_uuid`` must not be
-        passed for these segment builds. Lance mints segment ids itself. ``replace=True`` bypasses the same-name
-        existence guard on the uncommitted path so incremental segments can extend an existing index. It removes
-        nothing, since delta removal happens only on the committed path. Handlers that need broadcast artifacts
-        override this method.
+        This base implementation covers the artifact-free scalar types (BTREE and BITMAP). It delegates to the
+        module-level :func:`build_scalar_segment` so the same logic backs both direct calls and the closure-friendly
+        builder returned by :meth:`segment_builder`. Handlers that need broadcast artifacts override this method.
 
         Args:
             dataset: A dataset handle pinned to the build version.
@@ -712,13 +983,31 @@ class IndexHandler:
         Returns:
             The uncommitted segment metadata.
         """
-        del artifacts
-        return dataset.create_index_uncommitted(
+        return build_scalar_segment(
+            dataset,
+            fragment_ids,
+            artifacts,
             column=self.column,
+            index_name=self.index_name,
             index_type=self.index_type(),
-            name=self.index_name,
-            replace=True,
-            fragment_ids=fragment_ids,
+        )
+
+    def segment_builder(self) -> Callable[[lance.LanceDataset, list[int], object | None], Index]:
+        """Return a picklable per-shard segment builder that does not capture the handler instance.
+
+        The Spark closure in :meth:`build` ships this callable to executors. Returning a
+        :func:`functools.partial` over the module-level :func:`build_scalar_segment` with only primitive values keeps
+        the serialized task small. Capturing the bound ``self.build_segment`` instead would pickle the whole handler,
+        including its ``config`` with ``storage_options`` and ``telemetry``, onto every task.
+
+        Returns:
+            A callable taking the shard dataset, fragment ids, and broadcast artifacts.
+        """
+        return functools.partial(
+            build_scalar_segment,
+            column=self.column,
+            index_name=self.index_name,
+            index_type=self.index_type(),
         )
 
     def merge_deltas(self, spark: SparkSession, uri: str, telemetry: Telemetry) -> bool:
@@ -776,59 +1065,56 @@ class IndexHandler:
             telemetry.incr("index.skipped", tags=[f"index:{self.index_name}"])
             return {"column": self.column, "index": self.index_name, "segments": 0, "fragments": 0, "skipped": reason}
         self.validate(dataset)
-        targets: list[int] = self.target_fragments(dataset)
-        if not targets:
-            return {
-                "column": self.column,
-                "index": self.index_name,
-                "segments": 0,
-                "fragments": 0,
-                "deltas_merged": self.merge_deltas(spark, uri, telemetry),
-            }
 
-        artifacts: object | None = self.prepare(dataset, uri, telemetry)
-        version: int = dataset.version
-        groups: list[list[int]] = split_evenly(targets, config.num_shards)
         spark_context = spark.sparkContext
-        broadcast_artifacts = spark_context.broadcast(artifacts) if artifacts is not None else None
-        build_segment: Callable[[lance.LanceDataset, list[int], object | None], Index] = self.build_segment
+        build_segment: Callable[[lance.LanceDataset, list[int], object | None], Index] = self.segment_builder()
         storage_options: dict[str, Any] | None = config.storage_options
         index_type: str = self.index_type()
 
-        def build_partition(group_iterator: Iterator[list[int]]) -> Iterator[str]:
-            """Build one segment per shard on an executor.
+        def build_documents(groups: list[list[int]], version: int, artifacts: object | None) -> list[str]:
+            """Build one serialized segment per shard across executors at the pinned version.
 
             Args:
-                group_iterator: Fragment-id shards assigned to this task.
+                groups: Fragment-id shards to build.
+                version: Dataset version to pin every shard build to.
+                artifacts: Broadcast artifacts for the segment builder, if any.
 
-            Yields:
-                The serialized segment for each shard.
+            Returns:
+                The serialized segments collected from the executors.
             """
-            telemetry_local: Telemetry = Telemetry.create(config.telemetry)
-            local_artifacts: object | None = broadcast_artifacts.value if broadcast_artifacts is not None else None
-            tags: list[str] = [f"index_type:{index_type}"]
-            with telemetry_local.span("lance.indexing.build_segment"):
-                for group in group_iterator:
-                    shard_dataset: lance.LanceDataset = lance.dataset(
-                        uri, version=version, storage_options=storage_options
-                    )
-                    with telemetry_local.timed("segment.build_ms", tags=tags):
-                        segment = build_segment(shard_dataset, list(group), local_artifacts)
-                    telemetry_local.incr("segment.built", tags=tags)
-                    yield serialize_segment(segment)
+            broadcast_artifacts = spark_context.broadcast(artifacts) if artifacts is not None else None
+
+            def build_partition(group_iterator: Iterator[list[int]]) -> Iterator[str]:
+                """Build one segment per shard on an executor.
+
+                Args:
+                    group_iterator: Fragment-id shards assigned to this task.
+
+                Yields:
+                    The serialized segment for each shard.
+                """
+                telemetry_local: Telemetry = Telemetry.create(config.telemetry)
+                local_artifacts: object | None = broadcast_artifacts.value if broadcast_artifacts is not None else None
+                tags: list[str] = [f"index_type:{index_type}"]
+                with telemetry_local.span("lance.indexing.build_segment"):
+                    for group in group_iterator:
+                        shard_dataset: lance.LanceDataset = lance.dataset(
+                            uri, version=version, storage_options=storage_options
+                        )
+                        with telemetry_local.timed("segment.build_ms", tags=tags):
+                            segment = build_segment(shard_dataset, list(group), local_artifacts)
+                        telemetry_local.incr("segment.built", tags=tags)
+                        yield serialize_segment(segment)
+
+            return spark_context.parallelize(groups, len(groups)).mapPartitions(build_partition).collect()
 
         with telemetry.timed("index.build_ms", tags=[f"index:{self.index_name}"]):
-            segment_documents: list[str] = (
-                spark_context.parallelize(groups, len(groups)).mapPartitions(build_partition).collect()
-            )
-        with telemetry.timed("index.commit_ms", tags=[f"index:{self.index_name}"]):
-            commit_segments(uri, segment_documents, self.column, self.index_name, self.merges(), config, telemetry)
-        self.record_coverage(uri, lance.dataset(uri, storage_options=config.storage_options))
+            stats: dict[str, int] = build_and_commit_segments(uri, self, config, telemetry, build_documents)
         result: dict[str, Any] = {
             "column": self.column,
             "index": self.index_name,
-            "segments": len(segment_documents),
-            "fragments": len(targets),
+            "segments": stats["segments"],
+            "fragments": stats["fragments"],
             "deltas_merged": self.merge_deltas(spark, uri, telemetry),
         }
         result.update(self.extra_stats())
@@ -1132,10 +1418,8 @@ class VectorIndexHandler(IndexHandler):
     def build_segment(self, dataset: lance.LanceDataset, fragment_ids: list[int], artifacts: object | None) -> Index:
         """Build one IVF_RQ segment over a shard of fragments.
 
-        ``replace=True`` is required for incremental coverage: the uncommitted build path applies the same-name
-        existence guard, and without it a segment build for an index that already exists raises. The flag only bypasses
-        that guard. Removal of prior deltas happens solely on the committed ``execute`` path, never here, so existing
-        coverage is preserved and :func:`commit_segments` publishes the new segments as a delta.
+        Delegates to the module-level :func:`build_vector_segment` so the same logic backs both direct calls and the
+        closure-friendly builder returned by :meth:`segment_builder`.
 
         Args:
             dataset: A dataset handle pinned to the build version.
@@ -1149,21 +1433,30 @@ class VectorIndexHandler(IndexHandler):
             ValueError: If ``artifacts`` is ``None``. Vector segment builds require the artifact tuple produced by
                 :meth:`prepare`.
         """
-        if artifacts is None:
-            raise ValueError("VectorIndexHandler.build_segment requires artifacts from prepare; got None")
-        centroids_bytes, rabitq_model, num_bits, num_partitions = artifacts
-        centroids: pa.Array = centroids_from_ipc(centroids_bytes)
-        return dataset.create_index_uncommitted(
+        return build_vector_segment(
+            dataset,
+            fragment_ids,
+            artifacts,
             column=self.column,
-            index_type="IVF_RQ",
-            name=self.index_name,
+            index_name=self.index_name,
             metric=self.config.metric,
-            replace=True,
-            num_partitions=num_partitions,
-            num_bits=num_bits,
-            ivf_centroids=centroids,
-            rabitq_model=rabitq_model,
-            fragment_ids=fragment_ids,
+        )
+
+    def segment_builder(self) -> Callable[[lance.LanceDataset, list[int], object | None], Index]:
+        """Return a picklable IVF_RQ segment builder that does not capture the handler instance.
+
+        Mirrors :meth:`IndexHandler.segment_builder` but binds the vector-specific :func:`build_vector_segment` with
+        the metric. The centroids and RaBitQ model are not bound here. They reach executors through the separate
+        artifact broadcast and arrive as the ``artifacts`` argument at call time.
+
+        Returns:
+            A callable taking the shard dataset, fragment ids, and broadcast artifacts.
+        """
+        return functools.partial(
+            build_vector_segment,
+            column=self.column,
+            index_name=self.index_name,
+            metric=self.config.metric,
         )
 
 

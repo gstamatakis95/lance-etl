@@ -246,6 +246,9 @@ pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) 
         statsd_addr: "127.0.0.1:8125".to_string(),
         telemetry_disabled: true,
         recall_sample_rate: 0.0,
+        io_concurrency: search_api::config::DEFAULT_IO_CONCURRENCY,
+        io_block_size_bytes: search_api::config::DEFAULT_IO_BLOCK_SIZE_BYTES,
+        object_store_timeout_secs: search_api::config::DEFAULT_OBJECT_STORE_TIMEOUT_SECS,
     }
 }
 

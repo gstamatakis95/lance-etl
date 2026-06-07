@@ -15,6 +15,13 @@ pub const LANCE_CACHE_STAMP: &str = "8.0.0-beta.6";
 /// Substring marking in-progress write files which readers must ignore and sweeps may delete.
 const TMP_MARKER: &str = ".tmp-";
 
+/// File name of the per-object `ObjectMeta` sidecar written by the store cache.
+///
+/// Sidecars are excluded from residency accounting and from the sweep's eviction set: they are
+/// never inserted through `record_insert`, so counting them in `dir_stats` would make the in-process
+/// gauges diverge from the on-disk reality. Lone sidecars are reclaimed by `prune_empty_dirs`.
+pub const META_FILE: &str = "meta.json";
+
 /// Returns the stamp directory name combining our schema version and the lance version.
 pub fn stamp_dir_name() -> String {
     format!("v{CACHE_SCHEMA_VERSION}-lance-{LANCE_CACHE_STAMP}")
@@ -70,13 +77,16 @@ pub async fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     tokio::fs::rename(&tmp, path).await
 }
 
-/// Decrements an atomic residency gauge without underflowing past zero.
+/// Decrements an atomic residency gauge, saturating at zero.
 ///
-/// The load-then-sub pair is not one transaction: under concurrent updates the gauge may drift
-/// low, which only makes the janitor briefly under-evict. The sweep reconciles any residual
-/// drift.
+/// Uses a single `fetch_update` so the read-and-subtract is one atomic transaction. A plain
+/// load-then-`fetch_sub` pair has a TOCTOU window: concurrent decrements can each clamp against the
+/// same stale snapshot and drive the gauge below zero, wrapping it near `u64::MAX`. The saturating
+/// update closes that window entirely.
 pub fn gauge_sub(gauge: &AtomicU64, amount: u64) {
-    gauge.fetch_sub(amount.min(gauge.load(Ordering::Relaxed)), Ordering::Relaxed);
+    let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(amount))
+    });
 }
 
 /// Best-effort mtime refresh so the sweep's LRU-by-mtime approximation tracks disk hits.
@@ -96,12 +106,19 @@ fn collect_files(root: &Path, files: &mut Vec<(PathBuf, u64, SystemTime)>) {
         let path = entry.path();
         if path.is_dir() {
             collect_files(&path, files);
-        } else if path
+            continue;
+        }
+        if path
             .file_name()
             .is_some_and(|name| name.to_string_lossy().contains(TMP_MARKER))
         {
             let _ = std::fs::remove_file(&path);
-        } else if let Ok(meta) = entry.metadata() {
+            continue;
+        }
+        if path.file_name().is_some_and(|name| name == META_FILE) {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
             let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             files.push((path, meta.len(), mtime));
         }
@@ -173,6 +190,10 @@ pub fn sweep_tier(
 }
 
 /// Removes empty directories below `root` (and `root` itself when `include_root` is set).
+///
+/// A directory whose only remaining files are `META_FILE` sidecars counts as empty: its data
+/// entries have all been evicted, so the orphaned sidecars are deleted along with the directory.
+/// This keeps sidecars from accumulating now that the sweep no longer evicts them directly.
 fn prune_empty_dirs(root: &Path, include_root: bool) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
@@ -183,13 +204,23 @@ fn prune_empty_dirs(root: &Path, include_root: bool) {
             prune_empty_dirs(&path, true);
         }
     }
-    if include_root
-        && std::fs::read_dir(root)
-            .map(|mut it| it.next().is_none())
-            .unwrap_or(false)
-    {
-        let _ = std::fs::remove_dir(root);
+    if include_root && dir_holds_only_sidecars(root) {
+        let _ = std::fs::remove_dir_all(root);
     }
+}
+
+/// Reports whether `root` contains nothing but `META_FILE` sidecars (and so holds no live entry).
+fn dir_holds_only_sidecars(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() || path.file_name().is_none_or(|name| name != META_FILE) {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
