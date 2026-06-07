@@ -16,7 +16,7 @@ def test_help_exits_zero() -> None:
 
 def test_subcommand_help_exits_zero() -> None:
     """Every subcommand's ``--help`` exits with status 0."""
-    for subcommand in ("etl", "compact", "index", "ttl", "migrate-namespace"):
+    for subcommand in ("etl", "maintenance", "index", "migrate-namespace"):
         with pytest.raises(SystemExit) as exc_info:
             main([subcommand, "--help"])
         assert exc_info.value.code == 0
@@ -53,44 +53,36 @@ def test_etl_has_no_ingested_at_flag() -> None:
     assert not hasattr(args, "ingested_at_col")
 
 
-REQUIRED_TTL_ARGV: list[str] = [
-    "ttl",
-    "--retention-days",
-    "30",
+REQUIRED_MAINTENANCE_ARGV: list[str] = [
+    "maintenance",
     "--base-uri",
     "/tmp/lance",
 ]
 
 
-def test_ttl_parses_required_args() -> None:
-    """``ttl`` subcommand parses ``--retention-days`` and ``--base-uri``."""
-    args = build_parser().parse_args(REQUIRED_TTL_ARGV)
-    assert args.command == "ttl"
-    assert args.retention_days == 30
+def test_maintenance_parses_required_args() -> None:
+    """``maintenance`` subcommand parses dataset selection."""
+    args = build_parser().parse_args(REQUIRED_MAINTENANCE_ARGV)
+    assert args.command == "maintenance"
     assert args.base_uri == "/tmp/lance"
 
 
-def test_ttl_defaults() -> None:
-    """``ttl`` subcommand defaults: timestamp_column=timestamp, no_compact=False."""
-    args = build_parser().parse_args(REQUIRED_TTL_ARGV)
-    assert args.timestamp_column == "timestamp"
-    assert args.no_compact is False
+def test_maintenance_ttl_defaults_off() -> None:
+    """``maintenance`` defaults: ttl_column=None (off), ts_column=timestamp."""
+    args = build_parser().parse_args(REQUIRED_MAINTENANCE_ARGV)
+    assert args.ttl_column is None
+    assert args.ts_column == "timestamp"
 
 
-def test_ttl_no_compact_flag() -> None:
-    """``--no-compact`` sets no_compact to True."""
-    args = build_parser().parse_args([*REQUIRED_TTL_ARGV, "--no-compact"])
-    assert args.no_compact is True
+def test_maintenance_ttl_column_flag() -> None:
+    """``--ttl-column`` turns on per-row TTL and ``--ts-column`` overrides the clock column."""
+    args = build_parser().parse_args([*REQUIRED_MAINTENANCE_ARGV, "--ttl-column", "ttl", "--ts-column", "event_time"])
+    assert args.ttl_column == "ttl"
+    assert args.ts_column == "event_time"
 
 
-def test_ttl_custom_timestamp_column() -> None:
-    """``--timestamp-column`` overrides the default column name."""
-    args = build_parser().parse_args([*REQUIRED_TTL_ARGV, "--timestamp-column", "event_time"])
-    assert args.timestamp_column == "event_time"
-
-
-def test_ttl_requires_retention_days() -> None:
-    """``ttl`` subcommand fails without ``--retention-days``."""
+def test_ttl_subcommand_removed() -> None:
+    """The standalone ``ttl`` subcommand no longer exists; TTL is folded into ``maintenance``."""
     with pytest.raises(SystemExit) as exc_info:
         build_parser().parse_args(["ttl", "--base-uri", "/tmp/lance"])
     assert exc_info.value.code != 0

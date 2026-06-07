@@ -1,6 +1,50 @@
 # 0018. TTL data-expiration by event age
 
-Status: Accepted
+Status: Accepted (amended)
+
+## Amendment (2026-06): per-row TTL folded into the maintenance job
+
+TTL is no longer a global retention window applied as `ts_col < now - retention`, and it is no longer a standalone
+`TTLJob`. Two things changed.
+
+**TTL is now per-row.** Each row carries its own lifetime in a dedicated TTL column holding an Arrow `Duration` value.
+Rows expire individually. The delete predicate combines the event timestamp column (`MaintenanceConfig.ts_column`,
+default `"timestamp"`, matching `ETLConfig.ts_col`) with the per-row TTL column:
+`{ts_column} + {ttl_column} < TIMESTAMP '{now}'`. A row is expired once its event timestamp plus its lifetime is before
+the current instant.
+
+**Predicate shape chosen: a `Duration` TTL column with native column arithmetic (shape a).** We evaluated two shapes
+against the pinned Lance build before deciding.
+
+1. A per-row TTL column plus `ts_col + ttl < now` column arithmetic in the delete predicate.
+2. An ETL-derived `expires_at = ts_col + ttl` timestamp column plus the plain `expires_at < now` predicate.
+
+Lance parses delete predicates through its DataFusion planner. We verified empirically that interval-literal arithmetic
+(`ts + ttl_secs * INTERVAL '1' SECOND`) is rejected by the Lance planner, but timestamp-plus-`Duration`-column
+arithmetic (`ts + ttl_duration < TIMESTAMP '...'`) is evaluated natively and deletes exactly the expired rows. Shape (a)
+with a `Duration` column is therefore both correct and the simplest overall: the TTL column is an ordinary source
+column that flows through the ETL unchanged (flatten and collapse leave it alone, and `merge_insert`'s
+`when_matched_update_all` and `when_not_matched_insert_all` refresh and insert it like any other payload column), so no
+derived column and no ETL derivation step are needed. Shape (b) would add a second column and an ingest-time derivation
+step for no correctness gain, so it was rejected. The integer-seconds-plus-`arrow_cast` form also works but reads worse
+than a typed `Duration` column, so the column is opinionated to `Duration`.
+
+**Default off.** TTL runs only when `MaintenanceConfig.ttl_column` names a column and that column exists in the dataset
+schema. With no TTL column configured the TTL step is a strict no-op. A dataset that is missing the TTL column is
+skipped for the TTL step (and still compacted) rather than failing the run. There is no `retention` knob and no
+`enabled` flag any more: naming the column is the opt-in.
+
+**Folded into maintenance.** The expiration is the first step of `MaintenanceJob` (`src/lance_etl/maintenance.py`),
+before compaction and version cleanup (see [ADR 0002](0002-two-tier-compaction-orchestration.md)). The delete runs as a
+single fan-out pass across executors (one `LanceDataset.delete` call per dataset, no fragment tiering, since the delete
+is one call regardless of dataset size), and the compaction that follows materialises the deletion vectors and reclaims
+the storage. The old standalone `ttl` CLI subcommand and the separate Airflow `ttl` task are removed. The cutoff is now
+simply `now(UTC)`, shared across the run, because per-row expiry is decided by each row's own timestamp plus lifetime
+rather than a global window.
+
+Predicate safety is unchanged in spirit: both the event timestamp and TTL column names are validated against the
+dataset schema and the identifier allowlist `[A-Za-z_][A-Za-z0-9_]*` before the predicate is built, and the cutoff is
+formatted internally as a typed `TIMESTAMP` literal. The original event-age design below is retained for history.
 
 ## Context
 

@@ -12,7 +12,7 @@ from pathlib import Path
 import lance
 import pyarrow as pa
 
-from lance_etl.compaction import CompactionConfig, compact_small_dataset
+from lance_etl.maintenance import MaintenanceConfig, compact_small_dataset
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 ROWS: int = 6000
@@ -43,7 +43,7 @@ def write_indexed_dataset(tmp_path: Path) -> str:
     return uri
 
 
-def fri_config(telemetry_config: TelemetryConfig) -> CompactionConfig:
+def fri_config(telemetry_config: TelemetryConfig) -> MaintenanceConfig:
     """Build the compaction configuration used by the FRI tests.
 
     Args:
@@ -52,7 +52,7 @@ def fri_config(telemetry_config: TelemetryConfig) -> CompactionConfig:
     Returns:
         A small-tier configuration with deferred index remap enabled.
     """
-    return CompactionConfig(
+    return MaintenanceConfig(
         telemetry=telemetry_config,
         target_rows_per_fragment=2000,
         defer_index_remap=True,
@@ -92,6 +92,6 @@ def test_defer_index_remap_scoped_to_execute_options(telemetry_config: Telemetry
     The distributed commit binding compacts with default options, so the flag is only honored where
     ``Compaction.execute`` parses the full option set.
     """
-    config: CompactionConfig = fri_config(telemetry_config)
+    config: MaintenanceConfig = fri_config(telemetry_config)
     assert config.execute_options()["defer_index_remap"] is True
     assert "defer_index_remap" not in config.plan_options()

@@ -1,6 +1,25 @@
 # 0002. Two-tier compaction orchestration for the 30k-org power law
 
-Status: Accepted
+Status: Accepted (amended)
+
+## Amendment (2026-06): folded into a maintenance job
+
+The two-tier compaction described below is unchanged in mechanics, but it is no longer a standalone job. It now lives
+in `src/lance_etl/maintenance.py` as one step of `MaintenanceJob` (renamed from `LanceCompactor`), configured by
+`MaintenanceConfig` (renamed from `CompactionConfig`). A maintenance run applies three ordered steps per dataset.
+First, per-row TTL expiration deletes expired rows when a TTL column is configured (see [ADR
+0018](0018-ttl-expiration.md)). Second, the two-tier compaction below runs. Third, version cleanup prunes old
+versions. The TTL delete runs before compaction so the compaction reclaims the storage the expired rows occupied, and
+version cleanup runs at the tail of each dataset's compaction (`compact_small_dataset` and `compact_one` both call
+`cleanup_dataset`). The blue-green serving-tag helpers (`update_serving_tag` and friends) and the manifest-path
+migration move into the same module unchanged.
+
+The CLI subcommand is renamed `compact` -> `maintenance` and the Airflow task is renamed `compact` -> `maintenance`
+(chain stays `etl >> maintenance >> index`). The run span is renamed `lance.compaction.run` -> `lance.maintenance.run`
+and the default FAIR scheduler pool is renamed `lance-compaction` -> `lance-maintenance`. The compaction metrics
+(`dataset.compacted`, `dataset.committed`, `run.fragments_removed`, and the stage timings) keep their names. TTL adds
+`dataset.ttl_rows_deleted`, `dataset.ttl_expired`, `dataset.ttl_commit_conflict`, `run.ttl_rows_deleted`, and
+`run.ttl_datasets_expired`.
 
 ## Context
 

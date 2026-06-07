@@ -12,13 +12,12 @@ lance-etl/
   src/lance_etl/          Python package (production sources)
     etl.py                IcebergToLanceETL: read, collapse, repartition, merge_insert
     indexing.py           LanceIndexer + per-type handlers (VectorIndex, BTree, Bitmap, Fts)
-    compaction.py         LanceCompactor: two-tier (small/large), blue-green tag, migrate
+    maintenance.py        MaintenanceJob + MaintenanceConfig: per-row TTL expiration, two-tier compaction, version cleanup
     recall.py             RecallAuditJob: replay Datadog spans, score recall@k/nDCG@k/MRR
     telemetry.py          Telemetry, TelemetryConfig, LanceRuntimeConfig, commit_with_retries
     cloud_storage.py      resolve_filesystem + discover_datasets for pyarrow filesystem I/O
     arrow_types.py        resolve_arrow_type / resolve_type_map (CLI type specs)
-    cli.py                Entry point: etl / compact / index / recall / tag / migrate-manifests / ttl / migrate-namespace
-    ttl.py                TTLJob + TTLConfig: event-timestamp-based row expiration (opt-in, default off)
+    cli.py                Entry point: etl / maintenance / index / recall / tag / migrate-manifests / migrate-namespace
     migrate_namespace.py  NamespaceMigrator + MigrateConfig: one-off namespace copy/optimize utility
   bench/                  Benchmark package (python -m bench)
     cli.py                Subcommand dispatch: download / prepare / ingest / index / compact
@@ -75,7 +74,7 @@ lance-etl/
     src/main.rs           Binary entry point
     Cargo.toml            Workspace root for the crate
   airflow/
-    lance_etl_dag.py      Configurable-schedule Airflow DAG (etl >> compact >> index [>> ttl when enabled])
+    lance_etl_dag.py      Configurable-schedule Airflow DAG (etl >> maintenance >> index)
   tests/                  pytest suite (conftest.py + test_*.py)
   docs/
     adr/                  19 Architecture Decision Records (0001-0019)

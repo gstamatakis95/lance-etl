@@ -8,9 +8,9 @@ with no Spark involved:
   The expected terminal state is tracked exactly in memory as ``{key_index: last_upsert_round}``.
 - A COMPACTOR thread sweeps every dataset, compacting whenever the fragment count exceeds a small threshold. The
   head dataset uses the tier-B plan/execute/commit triad with the production re-plan-on-conflict loop
-  (:meth:`lance_etl.compaction.LanceCompactor.commit_rewrites` plus re-plan, mirroring ``compact_one``), and the
-  tail datasets use :func:`lance_etl.compaction.compact_small_dataset`. Version cleanup runs only at the end,
-  through :func:`lance_etl.compaction.cleanup_dataset` with the default retention horizon, so concurrent readers
+  (:meth:`lance_etl.maintenance.MaintenanceJob.commit_rewrites` plus re-plan, mirroring ``compact_one``), and the
+  tail datasets use :func:`lance_etl.maintenance.compact_small_dataset`. Version cleanup runs only at the end,
+  through :func:`lance_etl.maintenance.cleanup_dataset` with the default retention horizon, so concurrent readers
   pinned to older versions are never broken mid-run.
 - An INDEXER thread loops incremental maintenance. The head dataset uses the real segment-API paths: vector IVF_RQ
   and BTREE increments through ``create_index_uncommitted`` plus :func:`lance_etl.indexing.commit_segments` (which
@@ -86,7 +86,6 @@ import pytest
 from lance.optimize import Compaction, CompactionTask
 
 from lance_etl import indexing
-from lance_etl.compaction import CompactionConfig, LanceCompactor, cleanup_dataset, compact_small_dataset
 from lance_etl.etl import ETLConfig, apply_merge, dataset_uri
 from lance_etl.indexing import (
     BTreeIndexHandler,
@@ -104,6 +103,7 @@ from lance_etl.indexing import (
     scalar_index_name,
     serialize_segment,
 )
+from lance_etl.maintenance import MaintenanceConfig, MaintenanceJob, cleanup_dataset, compact_small_dataset
 from lance_etl.telemetry import Telemetry, TelemetryConfig, is_commit_conflict_error
 
 pytestmark = pytest.mark.integration
@@ -313,11 +313,11 @@ def run_ingester(
         time.sleep(pause_seconds)
 
 
-def compact_head_with_replan(uri: str, compactor: LanceCompactor, telemetry: Telemetry) -> str:
+def compact_head_with_replan(uri: str, compactor: MaintenanceJob, telemetry: Telemetry) -> str:
     """Run one tier-B plan/execute/commit cycle with the production re-plan loop.
 
-    Mirrors :meth:`LanceCompactor.compact_one` without Spark: the rewrite tasks execute in process and the commit
-    goes through :meth:`LanceCompactor.commit_rewrites` with its deliberately small manifest-race budget. A
+    Mirrors :meth:`MaintenanceJob.compact_one` without Spark: the rewrite tasks execute in process and the commit
+    goes through :meth:`MaintenanceJob.commit_rewrites` with its deliberately small manifest-race budget. A
     semantic commit conflict triggers a re-plan at the latest version instead of a re-commit, up to the configured
     ``replan_budget``, after which the dataset is skipped for this sweep.
 
@@ -330,7 +330,7 @@ def compact_head_with_replan(uri: str, compactor: LanceCompactor, telemetry: Tel
         ``"noop"`` when nothing needed compacting, ``"committed"`` on success, or ``"skipped"`` when every
         re-plan cycle conflicted.
     """
-    config: CompactionConfig = compactor.config
+    config: MaintenanceConfig = compactor.config
     cycles: int = 0
     while cycles < config.replan_budget:
         cycles += 1
@@ -357,8 +357,8 @@ def compact_head_with_replan(uri: str, compactor: LanceCompactor, telemetry: Tel
 def run_compactor_loop(
     head_uri: str,
     tail_uris: list[str],
-    head_compactor: LanceCompactor,
-    tail_config: CompactionConfig,
+    head_compactor: MaintenanceJob,
+    tail_config: MaintenanceConfig,
     telemetry: Telemetry,
     stop: threading.Event,
 ) -> None:
@@ -643,8 +643,8 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
     ]
     tail_uris: list[str] = [dataset_uri(etl_config, *routing) for routing in tail_routings]
 
-    head_compactor: LanceCompactor = LanceCompactor(
-        CompactionConfig(
+    head_compactor: MaintenanceJob = MaintenanceJob(
+        MaintenanceConfig(
             telemetry=telemetry_config,
             target_rows_per_fragment=HEAD_TARGET_ROWS_PER_FRAGMENT,
             commit_backoff_seconds=0.05,
@@ -652,7 +652,7 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
             replan_budget=4,
         )
     )
-    tail_compaction_config: CompactionConfig = CompactionConfig(
+    tail_compaction_config: MaintenanceConfig = MaintenanceConfig(
         telemetry=telemetry_config,
         commit_retries=30,
         commit_backoff_seconds=0.05,
@@ -805,7 +805,7 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
     for uri in tail_uris:
         index_dataset_locally(uri, index_config)
 
-    cleanup_config: CompactionConfig = CompactionConfig(telemetry=telemetry_config)
+    cleanup_config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config)
     bytes_removed: int = 0
     for uri in [head_uri, *tail_uris]:
         bytes_removed += cleanup_dataset(uri, cleanup_config, telemetry)
@@ -915,7 +915,7 @@ def write_two_fragment_dataset(uri: str) -> None:
 
 def racing_compaction_commit(
     uri: str,
-    compaction_config: CompactionConfig,
+    compaction_config: MaintenanceConfig,
     telemetry: Telemetry,
     state: dict[str, bool],
 ) -> Callable[..., int]:
@@ -994,7 +994,7 @@ def test_vector_segment_commit_survives_compaction_orphan(tmp_path: Path, monkey
 
     lance.dataset(uri).delete("id >= 300 and id < 450")
     rebuild_config: IndexJobConfig = IndexJobConfig(rebuild=True, **shared)
-    compaction_config: CompactionConfig = CompactionConfig(
+    compaction_config: MaintenanceConfig = MaintenanceConfig(
         telemetry=telemetry_config,
         target_rows_per_fragment=250,
         commit_retries=10,
@@ -1055,7 +1055,7 @@ def test_scalar_segment_commit_survives_compaction_orphan(tmp_path: Path, monkey
         commit_retries=10,
         commit_backoff_seconds=0.0,
     )
-    compaction_config: CompactionConfig = CompactionConfig(
+    compaction_config: MaintenanceConfig = MaintenanceConfig(
         telemetry=telemetry_config,
         target_rows_per_fragment=250,
         commit_retries=10,

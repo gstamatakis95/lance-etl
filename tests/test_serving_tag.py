@@ -1,7 +1,7 @@
 """Tests for the blue-green serving-tag helper and the cleanup-exempts-tagged behavior.
 
-Covers :func:`lance_etl.compaction.update_serving_tag` creating and moving a serving tag through the Lance tags API,
-and :func:`lance_etl.compaction.cleanup_dataset` skipping tagged versions instead of raising, which is what keeps a
+Covers :func:`lance_etl.maintenance.update_serving_tag` creating and moving a serving tag through the Lance tags API,
+and :func:`lance_etl.maintenance.cleanup_dataset` skipping tagged versions instead of raising, which is what keeps a
 serving layer's pinned version readable across maintenance.
 """
 
@@ -13,7 +13,7 @@ import lance
 import pyarrow as pa
 import pytest
 
-from lance_etl.compaction import CompactionConfig, cleanup_dataset, update_serving_tag
+from lance_etl.maintenance import MaintenanceConfig, cleanup_dataset, update_serving_tag
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 
@@ -55,7 +55,7 @@ def test_cleanup_exempts_tagged_versions(tmp_path: Path, telemetry: Telemetry) -
     uri: str = str(tmp_path / "ds.lance")
     write_versions(uri, 3)
     update_serving_tag(uri, 1, None, telemetry)
-    config: CompactionConfig = CompactionConfig(telemetry=TelemetryConfig(), retain_versions=1)
+    config: MaintenanceConfig = MaintenanceConfig(telemetry=TelemetryConfig(), retain_versions=1)
 
     cleanup_dataset(uri, config, telemetry)
 

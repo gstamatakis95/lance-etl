@@ -227,10 +227,10 @@ class TestCLIWindowFlags:
         assert args.window_start == "2024-06-01T00:00:00Z"
         assert args.window_end == "2024-06-02T00:00:00Z"
 
-    def test_window_flags_not_present_on_compact(self) -> None:
-        """The compact subcommand does not expose window flags."""
+    def test_window_flags_not_present_on_maintenance(self) -> None:
+        """The maintenance subcommand does not expose window flags."""
         parser = build_parser()
-        args = parser.parse_args(["compact", "--datasets-file", "/tmp/ds.txt"])
+        args = parser.parse_args(["maintenance", "--datasets-file", "/tmp/ds.txt"])
         assert not hasattr(args, "window_start")
         assert not hasattr(args, "window_end")
         assert not hasattr(args, "window_column")

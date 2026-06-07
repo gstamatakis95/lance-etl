@@ -49,7 +49,7 @@ lance-etl turns raw source data into fast, searchable, per-customer datasets.
 - **Relevant results.** Vector, keyword, and hybrid search give applications modern, high-quality retrieval out of the box.
 - **Fast and cheap to serve.** Aggressive caching and prewarming keep query latency low and object-store costs down.
 - **Safe to operate.** Ingestion, maintenance, and serving run concurrently with proven zero data loss, and promotions between dataset versions are designed to be instant and reversible.
-- **Cost control built in.** Retention (TTL) can expire old data on a schedule, and storage is reclaimed automatically.
+- **Cost control built in.** Per-row TTL can expire data when each row's own lifetime elapses, and compaction reclaims the freed storage automatically.
 - **Decisions are documented.** Every load-bearing choice has a written ADR with the reasoning and the evidence, so the system stays understandable as it grows.
 
 ---
@@ -70,7 +70,7 @@ lance-etl turns raw source data into fast, searchable, per-customer datasets.
 | **Recall** | A quality measure. Of the truly best results, what fraction did the search actually return? Higher is better. |
 | **Org / tenant / namespace** | The three identifiers that address a dataset. Think organization, a sub-account inside it, and a logical grouping of data. |
 | **Blue-green serving** | Building a new version of a dataset off to the side ("green"), then flipping traffic to it in one atomic step, with an easy rollback to the old one ("blue"). |
-| **TTL (time to live)** | A retention rule that deletes records older than a configured age. |
+| **TTL (time to live)** | A per-row expiry mechanism. Each row carries its own lifetime in a dedicated Duration column. The maintenance job deletes rows where the row's event timestamp plus its lifetime is before the current instant. |
 | **Compaction** | Housekeeping that merges many small data files into fewer large ones so reads stay fast and storage stays tidy. |
 | **Index** | A precomputed structure that makes a certain kind of lookup fast (vector, range, category, or text). |
 
@@ -99,8 +99,8 @@ The data plane is about throughput over thousands of datasets. The serving plane
                              v
    ============== PYTHON DATA PLANE (Apache Spark) ==============
    |                                                             |
-   |   etl  -->  compact  -->  index   [ + ttl (optional) ]      |
-   |   (merge_insert)  (two-tier)  (segment API)                 |
+   |   etl  -->  maintenance  -->  index                         |
+   |   (merge_insert)  (TTL+compact+cleanup)  (segment API)      |
    |                                                             |
    |   maintenance: recall audit | migrate-manifests |          |
    |                migrate-namespace | tag (blue-green)         |
@@ -142,7 +142,7 @@ The data plane is about throughput over thousands of datasets. The serving plane
 
 *Audience: engineers*
 
-- The Spark jobs are orchestrated by an **Airflow DAG** (`etl >> compact >> index`, with an optional `ttl` task). Compaction runs before indexing on purpose so fresh fragments are merged before any index covers them, which avoids paying inline index-remap cost on the large tier.
+- The Spark jobs are orchestrated by an **Airflow DAG** (`etl >> maintenance >> index`). Maintenance runs before indexing on purpose so fresh fragments are merged before any index covers them, which avoids paying inline index-remap cost on the large tier.
 - The Rust crate enforces hard layering boundaries: `domain` (engine- and transport-agnostic types and traits), `lance` (the only place Lance types appear), `grpc` (the only place proto and tonic types appear), `cache`, and `telemetry`. `lib.rs` re-exports a clean surface.
 - Every request resolves to exactly **one** dataset at `base/<org>/<tenant>/<namespace>.lance`. There is no cross-dataset fan-out in the server (see ADR 0014).
 
@@ -158,14 +158,13 @@ The data plane is about throughput over thousands of datasets. The serving plane
 |---|---|
 | `etl.py` | `IcebergToLanceETL`: incremental Iceberg read, flatten maps, last-write-wins collapse, repartition by routing key, `merge_insert` upsert plus `when_matched_delete` into per-key Lance datasets. |
 | `indexing.py` | `LanceIndexer` plus per-type handlers (`VectorIndexHandler`, `BTreeIndexHandler`, `BitmapIndexHandler`, `FtsIndexHandler`). Builds indexes via the Lance segment API. |
-| `compaction.py` | `LanceCompactor`: two-tier (small and large) compaction, blue-green tag helpers, manifest migration. |
+| `maintenance.py` | `MaintenanceJob`: per-row TTL expiration (opt-in), two-tier (small and large) compaction, version cleanup — applied in that order per dataset. Also contains blue-green tag helpers and manifest migration. |
 | `recall.py` | `RecallAuditJob`: replays Datadog-sampled queries as exact brute-force scans, scores recall@k, nDCG@k, MRR. |
-| `ttl.py` | `TTLJob`: expires rows older than a retention window by event age, two-tier execution, optional post-delete compaction. |
 | `migrate_namespace.py` | `NamespaceMigrator`: copy-plus-optimize a whole namespace to a new name, source kept for rollback. |
 | `telemetry.py` | `Telemetry`, `TelemetryConfig`, `LanceRuntimeConfig`, `commit_with_retries`, the Lance event bridge, and the shared retry-budget constants. |
 | `cloud_storage.py` | `resolve_filesystem` plus `discover_datasets` for cloud-agnostic pyarrow filesystem I/O (S3, GCS, Azure). |
 | `arrow_types.py` | `resolve_arrow_type` / `resolve_type_map` for CLI type specs. |
-| `cli.py` | Entry point: `etl`, `compact`, `index`, `recall`, `tag`, `migrate-manifests`, `ttl`, `migrate-namespace`. |
+| `cli.py` | Entry point: `etl`, `maintenance`, `index`, `recall`, `tag`, `migrate-manifests`, `migrate-namespace`. |
 
 ### Benchmark package (`bench/`)
 
@@ -184,7 +183,7 @@ The `bench` package (`python -m bench`) drives the real pipeline and the live se
 
 ### Airflow (`airflow/lance_etl_dag.py`)
 
-A configurable-schedule DAG that runs `etl >> compact >> index`, with an optional `ttl` task gated by a Variable. Each stage maps to a `SparkSubmitOperator` that calls `python -m lance_etl.cli <subcommand>`.
+A configurable-schedule DAG that runs `etl >> maintenance >> index`. Each stage maps to a `SparkSubmitOperator` that calls `python -m lance_etl.cli <subcommand>`. The `maintenance` task runs per-row TTL expiration (when `lance_etl_ttl_column` is set), two-tier compaction, and version cleanup in a single Spark job.
 
 ### Frameworks used
 
@@ -315,13 +314,13 @@ Two services share one binary, one port, one router, one health endpoint, and on
 3. **Repartition and route.** Rows are shuffled by routing key so each row can only reach its own dataset. The dataset URI is a validated pure function of the routing columns.
 4. **merge_insert.** Each routing key's rows are applied to exactly one Lance dataset with a `merge_insert` upsert plus `when_matched_delete`. Replayed or retried windows converge rather than duplicate, so backfills are just catch-up replays of the same job.
 5. **Distributed index build via the segment API.** The driver trains IVF centroids and one shared RaBitQ model, broadcasts them, executors build one index segment per fragment shard, and the driver merges and commits. Scalar and FTS indexes follow their own segment flows (ADR 0001).
-6. **Two-tier compaction.** Small datasets are compacted whole-dataset-per-task in one batched job. Large datasets use the distributed plan/execute/commit fan-out driven concurrently (ADR 0002).
+6. **Maintenance: TTL, two-tier compaction, version cleanup.** When a per-row TTL column is configured, expired rows are deleted first so the compaction that follows reclaims their storage. Small datasets are then compacted whole-dataset-per-task in one batched job, including version cleanup. Large datasets use the distributed plan/execute/commit fan-out driven concurrently (ADR 0002). Version cleanup runs after each dataset's compaction.
 7. **Blue-green tag flip.** A `prod` tag is moved to the new version for an O(1) cutover. The safe sequence is build green, prewarm green by explicit version, then flip the tag (ADR 0013).
 8. **Serving.** The Rust service resolves the target to one dataset, applies the typed filter, runs the query, and returns ranked hits, served out of warm disk and memory caches.
 
 ### Maintenance flows
 
-- **TTL expiration.** Rows whose event timestamp is older than `now - retention` are deleted by writing a deletion vector, then optionally compacted to reclaim storage. Two-tier execution. Default off, opt-in per run. Retention is by event age only (ADR 0018).
+- **Per-row TTL expiration.** Each row carries its own lifetime in a dedicated Arrow `Duration` column. The maintenance job deletes rows where `ts_column + ttl_column < now`, which Lance evaluates natively as timestamp-plus-duration column arithmetic. TTL is off by default. It runs only when `MaintenanceConfig.ttl_column` names a column present in the dataset schema. There are no global retention or enabled knobs. The delete runs before compaction so the compaction reclaims the vacated storage. (ADR 0018)
 - **Namespace migrate.** Every dataset in a source namespace is copied to a new namespace name, then optimized (write, recompact, reindex) in production order. The source is kept for rollback. Two-tier scale (ADR 0019).
 - **Recall audit.** A fraction of vector, text, and hybrid queries are sampled onto Datadog spans, including the dataset version that served them. An offline Spark job replays each query as an exact brute-force scan against that pinned version and scores recall@k, nDCG@k, and MRR (ADR 0008).
 
@@ -339,9 +338,9 @@ Each decision below cites its ADR. Accepted unless noted.
 - BTREE and BITMAP go per-shard then straight to commit with no merge step (Lance main rejects `merge_index_metadata` for these). FTS uses a shared `index_uuid` and a create-index commit.
 - All heavy I/O runs in executors. The driver only plans, broadcasts, and commits.
 
-### Two-tier compaction and small/big scale (ADR 0002)
+### Maintenance as a single ordered job: TTL, two-tier compaction, version cleanup (ADR 0002)
 - The 30k-org power law means a sequential per-dataset loop would launch on the order of 120k blocking Spark jobs.
-- Tier A batches many small datasets into one job using non-distributed calls that honor every option. Tier B keeps the distributed fan-out for large datasets, driven concurrently with FAIR scheduler pools.
+- Maintenance runs three steps per dataset in order: per-row TTL expiration (opt-in), two-tier compaction, and version cleanup. Tier A batches many small datasets into one job using non-distributed calls that honor every option. Tier B keeps the distributed fan-out for large datasets, driven concurrently with FAIR scheduler pools.
 - A tier-B commit conflict triggers a re-plan and re-execute, never a blind re-commit, because the commit pins its conflict scan to the plan version.
 
 ### Incremental read via snapshot bounds (ADR 0003)
@@ -392,12 +391,13 @@ Each decision below cites its ADR. Accepted unless noted.
 - A second gRPC service accepts UPSERT and DELETE record writes over `Write` and `WriteStream`. It shares the single `lance_etl.v1` proto and the `DatasetTarget` message with the search service, and its response returns only `succeeded_ids` and `failed_ids`.
 - The destination sits behind the `RecordSink` trait. `StdoutSink` today, `KafkaSink` later, swappable in one line with no proto change. Intake never opens a dataset, so it carries no Lance dependency.
 
-### TTL by event age (ADR 0018)
-- Retention deletes rows by event age via a deletion vector, then optionally compacts. Two-tier execution, default off, with a `ValueError` guard against zero or negative retention.
-- The predicate column is validated against the schema and the identifier allowlist before construction. Receipt-based retention is explicitly not supported.
+### Per-row TTL folded into maintenance (ADR 0018)
+- Each row carries its own lifetime in a dedicated Arrow `Duration` column. The delete predicate is `ts_column + ttl_column < TIMESTAMP 'now'`, evaluated natively by Lance/DataFusion as timestamp-plus-duration column arithmetic.
+- TTL is off by default. It runs only when `MaintenanceConfig.ttl_column` names a column present in the dataset schema. There are no global retention or enabled knobs: passing the column name is the opt-in.
+- Both column names are validated against the dataset schema and the identifier allowlist before any predicate is constructed. Receipt-based retention is explicitly not supported.
 
 ### Namespace migrate (ADR 0019)
-- A whole namespace is copied to a new name, then optimized in production order (write, recompact, reindex), reusing `LanceCompactor` and `LanceIndexer`.
+- A whole namespace is copied to a new name, then optimized in production order (write, recompact, reindex), reusing `MaintenanceJob` and `LanceIndexer`.
 - The source is kept for a free blue-green rollback story. Reindex is skipped when no index columns are supplied because the columns cannot be guessed. Two-tier scale.
 
 ---
@@ -488,18 +488,18 @@ Both planes report to Datadog. Every emitter on the Rust side is infallible by c
 | Subcommand | Purpose |
 |---|---|
 | `etl` | Read a time window from an Iceberg table and upsert/delete into per-tenant Lance datasets. |
-| `compact` | Run distributed two-tier compaction and version cleanup over a set of datasets. |
+| `maintenance` | Per-dataset maintenance in order: per-row TTL expiration (when `--ttl-column` is set, deleting rows where `ts_column + ttl_column < now`), two-tier distributed compaction, and version cleanup. TTL is off by default. Pass `--ttl-column` to opt in. Pass `--ts-column` to name the event timestamp column (default `timestamp`). |
 | `index` | Build IVF_RQ vector, BTREE scalar, BITMAP, and full-text BM25 indexes over a set of datasets. |
 | `recall` | Replay Datadog-sampled queries as exact brute-force scans and report recall@k, nDCG@k, MRR. |
 | `tag` | Flip a serving tag (default `prod`) to a target dataset version for blue-green promotion. |
 | `migrate-manifests` | Migrate dataset manifest paths to the V2 naming scheme. |
-| `ttl` | Expire rows whose event timestamp is older than a retention window. Running it is the opt-in. |
 | `migrate-namespace` | Copy a whole namespace to a new namespace name. One-off operator tool, not scheduled. |
 
 ### The Airflow DAG
 
-- The pipeline is `etl >> compact >> index`, with an optional `ttl` task appended when `lance_etl_ttl_enabled=true`.
-- **Compaction runs before indexing on purpose.** It merges fresh uncovered fragments before any index covers them, so the large-tier inline index remap cost for fresh data disappears, and it serializes compaction and index commits per dataset within a run.
+- The pipeline is `etl >> maintenance >> index`.
+- The `maintenance` task runs TTL expiration (when `lance_etl_ttl_column` is set), two-tier compaction, and version cleanup in a single Spark job. Setting `lance_etl_ttl_column` to the name of a per-row Duration column enables TTL. Leaving it empty makes the task compaction plus cleanup only.
+- **Maintenance runs before indexing on purpose.** It merges fresh uncovered fragments before any index covers them, so the large-tier inline index remap cost for fresh data disappears, and it serializes compaction and index commits per dataset within a run.
 - `max_active_runs=1` extends that serialization across runs so overlapping runs cannot race same-name index maintenance commits.
 - The schedule is driven by the `lance_etl_schedule` Variable (default `@daily`). The window comes from the Airflow data interval, or from explicit `start` / `end` keys in the trigger config.
 - Backfills are native Airflow backfills. The idempotent `merge_insert` ensures a replayed slot converges rather than duplicates.
@@ -538,7 +538,7 @@ These are honest, verified against the ADRs.
 - **The intake sink is stdout-only today.** The IntakeService validates and routes record writes, but the only sink is `StdoutSink`, which prints them. The planned `KafkaSink` (for the ETL to consume) is a one-line swap behind the same trait, but it is not built yet (ADR 0017).
 - **Blue-green serving is still Proposed, not implemented.** The Python tag helper and the design are ready, but the Rust serving-side tag resolution and prewarm-before-flip safety are not done. A prior attempt was interrupted and backed out to keep the crate compiling (ADR 0013).
 - **Reindex during migrate needs explicit index columns.** A namespace copy carries no indexes, and the columns to rebuild cannot be guessed, so reindex is skipped with a warning unless index column flags are supplied (ADR 0019).
-- **No receipt-based (ingest-age) retention.** There is no ingest-time column by design, so retention is by event age only. Adding ingest-age retention would require a fresh ADR with an explicit ingest-time design, not a revival of the removed `_ingested_at` column (ADR 0016, ADR 0018).
+- **No receipt-based (ingest-age) TTL.** There is no ingest-time column by design, so TTL is driven by each row's own lifetime column relative to its event timestamp. Adding ingest-age TTL would require a fresh ADR with an explicit ingest-time design, not a revival of the removed `_ingested_at` column (ADR 0016, ADR 0018).
 - **Physically separate per-date datasets are no longer a built-in.** By-date partitioning and cross-date fan-out were removed. Time-bounded queries are now scalar range filters on the event timestamp. Routing each date to its own dataset is possible only as a deliberate orchestrator-layer choice, which reintroduces multi-dataset serving and is documented as a how-to, not a default (ADR 0014).
 - **Stable row IDs remain rejected.** They are unsafe under the production concurrent workload (silent corruption risk on release builds). They will not be re-added, even opt-in, unless the upstream `RowIdIndex` defect is fixed, and only then via a fresh ADR (ADR 0010).
 - **Large-tier index remap is paid inline.** The Python `Compaction.commit` binding hard-codes default options, so `defer_index_remap` cannot take effect on the large tier. Every covering index is remapped inline at commit. This is a binding gap, not a format limitation, and the DAG ordering (compact before index) keeps the cost low for fresh data (ADR 0002).

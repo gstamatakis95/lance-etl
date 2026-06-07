@@ -8,14 +8,15 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import lance
 import pyarrow as pa
 import pytest
 
-from lance_etl.compaction import CompactionConfig, compact_small_dataset
 from lance_etl.etl import ETLConfig, apply_merge, build_delete_predicate, dataset_uri
+from lance_etl.maintenance import MaintenanceConfig, compact_small_dataset
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 ROUTING_KEY: tuple[str, str, str] = ("org1", "tenant1", "ns1")
@@ -92,6 +93,43 @@ def test_apply_merge_reupsert_updates_in_place(etl_config: ETLConfig, telemetry:
     assert table["value"].to_pylist() == [2.0, 2.0, 1.0]
 
 
+def make_ttl_group(keys: list[str], op: str = "insert", lifetime_days: int = 30) -> pa.Table:
+    """Build one routing key's change rows carrying a per-row Duration TTL column.
+
+    Args:
+        keys: Vector ids for the rows.
+        op: Operation value for every row.
+        lifetime_days: The per-row lifetime stored in the ``ttl`` Duration column.
+
+    Returns:
+        A routed ETL group with an extra ``ttl`` duration column.
+    """
+
+    count: int = len(keys)
+    return pa.table(
+        {
+            "vector_id": pa.array(keys, pa.string()),
+            "org_id": pa.array([ROUTING_KEY[0]] * count),
+            "tenant_id": pa.array([ROUTING_KEY[1]] * count),
+            "namespace": pa.array([ROUTING_KEY[2]] * count),
+            "timestamp": pa.array([1] * count, pa.int64()),
+            "op": pa.array([op] * count),
+            "ttl": pa.array([timedelta(days=lifetime_days)] * count, pa.duration("us")),
+        }
+    )
+
+
+def test_apply_merge_passes_ttl_column_through(etl_config: ETLConfig, telemetry: Telemetry) -> None:
+    """A per-row Duration TTL column flows through merge_insert and is refreshed on re-upsert."""
+
+    apply_merge(etl_config, telemetry, ROUTING_KEY, make_ttl_group(["a", "b"], lifetime_days=30))
+    apply_merge(etl_config, telemetry, ROUTING_KEY, make_ttl_group(["a"], lifetime_days=90))
+    uri: str = dataset_uri(etl_config, *ROUTING_KEY)
+    table: pa.Table = lance.dataset(uri).to_table().sort_by("vector_id")
+    assert "ttl" in table.column_names
+    assert table["ttl"].to_pylist() == [timedelta(days=90), timedelta(days=30)]
+
+
 def test_apply_merge_delete_path(etl_config: ETLConfig, telemetry: Telemetry) -> None:
     """Delete operations physically remove rows and report merge-derived counts."""
     apply_merge(etl_config, telemetry, ROUTING_KEY, make_group(["a", "b", "c"]))
@@ -117,7 +155,7 @@ def test_concurrent_merges_and_compaction(
     keys_two: list[str] = [f"k{i:04d}" for i in range(200, 400)]
     apply_merge(etl_config, telemetry, ROUTING_KEY, make_group(keys_one[:1], value=0.0))
     uri: str = dataset_uri(etl_config, *ROUTING_KEY)
-    compaction_config: CompactionConfig = CompactionConfig(
+    compaction_config: MaintenanceConfig = MaintenanceConfig(
         telemetry=telemetry_config,
         commit_retries=30,
         commit_backoff_seconds=0.05,

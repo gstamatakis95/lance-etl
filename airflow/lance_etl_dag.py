@@ -1,20 +1,19 @@
 """Airflow DAG: configurable-schedule Iceberg → Lance ETL pipeline.
 
 Pipeline stages (in order):
-    1. ``etl``      — reads a bounded source window from the Iceberg source table and
-                      upserts/deletes into per-tenant Lance datasets.
-    2. ``compact``  — runs distributed compaction and version cleanup over the
-                      updated datasets.
-    3. ``index``    — builds or incrementally maintains IVF_RQ vector and
-                      btree/bitmap/FTS scalar indices over the same datasets.
-    4. ``ttl``      — optional maintenance task: expires rows whose event timestamp is
-                      older than the configured retention window. Gated by the Airflow
-                      Variable ``lance_etl_ttl_enabled`` (default ``false``). When
-                      disabled the task is absent from the DAG entirely, so it does not
-                      appear in the run graph and adds no overhead. Set
-                      ``lance_etl_ttl_enabled=true`` and ``lance_etl_ttl_retention_days``
-                      to activate. The ``migrate-namespace`` subcommand is a one-off
-                      operator tool run manually via the CLI and is not scheduled here.
+    1. ``etl``         — reads a bounded source window from the Iceberg source table and
+                         upserts/deletes into per-tenant Lance datasets.
+    2. ``maintenance`` — per-dataset maintenance over the updated datasets: per-row TTL
+                         expiration (only when a TTL column is configured via the Airflow
+                         Variable ``lance_etl_ttl_column``), two-tier distributed
+                         compaction, and version cleanup, in that order. TTL deletes
+                         expired rows before compaction so the compaction reclaims them.
+                         When ``lance_etl_ttl_column`` is unset the TTL step is a no-op
+                         and the task is compaction plus cleanup only.
+    3. ``index``       — builds or incrementally maintains IVF_RQ vector and
+                         btree/bitmap/FTS scalar indices over the same datasets.
+
+The ``migrate-namespace`` subcommand is a one-off operator tool run manually via the CLI and is not scheduled here.
 
 Compaction runs before indexing on purpose. The compaction planner cannot bin fragments with different
 index-coverage sets together, and the distributed commit binding always remaps covering indices inline, so
@@ -81,7 +80,7 @@ Airflow Variables (all optional — defaults are listed in ``dag_params`` below)
     lance_etl_iceberg_table          Fully-qualified Iceberg table name.
     lance_etl_lance_base_uri         Base URI under which per-tenant datasets live.
     lance_etl_datasets_file          Path to a file with one dataset URI per line
-                                     (required by the ``index`` and ``compact`` steps).
+                                     (required by the ``index`` and ``maintenance`` steps).
     lance_etl_index_flags            Shell-tokenized index column-selection flags appended verbatim to the
                                      ``index`` subcommand, e.g.
                                      ``--vector-column vector --metric cosine --scalar-column updated_at
@@ -100,11 +99,10 @@ Airflow Variables (all optional — defaults are listed in ``dag_params`` below)
     lance_etl_partition_by           Comma-separated partition columns forwarded as
                                      ``--partition-by``. Empty (the default) omits the flag so the
                                      ETL keeps the current org_id/tenant_id/namespace routing.
-    lance_etl_ttl_enabled            Set to ``true`` to activate the TTL expiration task. Default: ``false``
-                                     (task is absent from the DAG). When enabled, ``lance_etl_ttl_retention_days``
-                                     must also be set.
-    lance_etl_ttl_retention_days     Retention window in days forwarded as ``--retention-days``. Only used when
-                                     ``lance_etl_ttl_enabled`` is ``true``.
+    lance_etl_ttl_column             Per-row TTL column name forwarded to the ``maintenance`` step as
+                                     ``--ttl-column``. Empty (the default) turns TTL off so maintenance is
+                                     compaction plus cleanup only. When set, the column must hold each row's
+                                     lifetime as an Arrow Duration and rows are expired before compaction.
 """
 
 from __future__ import annotations
@@ -261,17 +259,18 @@ def build_etl_application_args(params: dict[str, str | int]) -> list[str]:
 
 
 def build_datasets_subcommand_args(subcommand: str, params: dict[str, str | int]) -> list[str]:
-    """Build the CLI argument list for a datasets-file subcommand (``index`` or ``compact``).
+    """Build the CLI argument list for a datasets-file subcommand (``index`` or ``maintenance``).
 
     Both subcommands share the same required flags: the datasets file, the Datadog service/env tags, and any
-    user-supplied tag pairs.  The leading subcommand token differs, and the ``index`` subcommand additionally needs
+    user-supplied tag pairs.  The leading subcommand token differs.  The ``index`` subcommand additionally needs
     column-selection flags: with no ``--vector-column`` / ``--scalar-column`` / ``--bitmap-column`` / ``--text-column``
     the indexer configures zero handlers and the Spark job is a silent no-op.  Those flags are read verbatim from the
     ``lance_etl_index_flags`` Airflow Variable (shell-tokenized) so operators control exactly which index types are
-    maintained without editing this file.
+    maintained without editing this file.  The ``maintenance`` subcommand additionally appends ``--ttl-column`` when the
+    ``lance_etl_ttl_column`` Variable is set, which turns on per-row TTL expiration before compaction.
 
     Args:
-        subcommand: The CLI subcommand token, either ``"index"`` or ``"compact"``.
+        subcommand: The CLI subcommand token, either ``"index"`` or ``"maintenance"``.
         params: DAG-run ``params`` dict.
 
     Returns:
@@ -291,6 +290,10 @@ def build_datasets_subcommand_args(subcommand: str, params: dict[str, str | int]
         index_flags: str = Variable.get("lance_etl_index_flags", default_var="").strip()
         if index_flags:
             args += shlex.split(index_flags)
+    if subcommand == "maintenance":
+        ttl_column: str = Variable.get("lance_etl_ttl_column", default_var="").strip()
+        if ttl_column:
+            args += ["--ttl-column", ttl_column]
     return args
 
 
@@ -337,35 +340,6 @@ def make_lance_operator(
     )
 
 
-def build_ttl_application_args(params: dict[str, str | int]) -> list[str]:
-    """Build the CLI argument list for the ``ttl`` subcommand.
-
-    Reads ``lance_etl_ttl_retention_days`` and the shared dataset/identity Variables. The datasets
-    file and base URI are taken from the same Variables as the other maintenance subcommands so the
-    TTL task operates over the same dataset fleet as ``compact`` and ``index``.
-
-    Args:
-        params: DAG-run ``params`` dict.
-
-    Returns:
-        Argument list starting with the ``ttl`` subcommand token.
-    """
-    retention_days: str = Variable.get("lance_etl_ttl_retention_days", default_var="90")
-    args = [
-        "ttl",
-        "--datasets-file",
-        resolve_variable("datasets_file", params),
-        "--retention-days",
-        retention_days,
-        "--dd-service",
-        resolve_variable("dd_service", params),
-        "--dd-env",
-        resolve_variable("dd_env", params),
-    ]
-    args += build_dd_tag_flags(params)
-    return args
-
-
 default_args: dict[str, Any] = {
     "owner": "data-engineering",
     "depends_on_past": False,
@@ -381,7 +355,7 @@ dag_schedule: str = Variable.get("lance_etl_schedule", default_var="@daily")
 
 with DAG(
     dag_id=DAG_ID,
-    description="Iceberg → Lance ETL: etl → compact → index (schedule driven by lance_etl_schedule Variable)",
+    description="Iceberg → Lance ETL: etl → maintenance → index (schedule driven by lance_etl_schedule Variable)",
     schedule=dag_schedule,
     start_date=datetime(2026, 6, 1, tzinfo=UTC),
     catchup=False,
@@ -394,16 +368,11 @@ with DAG(
     spark_conf: dict[str, str] = build_base_spark_conf(dag_params)
 
     etl_task = make_lance_operator("etl", spark_conn_id, build_etl_application_args(dag_params), spark_conf)
-    compact_task = make_lance_operator(
-        "compact", spark_conn_id, build_datasets_subcommand_args("compact", dag_params), spark_conf
+    maintenance_task = make_lance_operator(
+        "maintenance", spark_conn_id, build_datasets_subcommand_args("maintenance", dag_params), spark_conf
     )
     index_task = make_lance_operator(
         "index", spark_conn_id, build_datasets_subcommand_args("index", dag_params), spark_conf
     )
 
-    ttl_enabled: bool = Variable.get("lance_etl_ttl_enabled", default_var="false").strip().lower() == "true"
-    if ttl_enabled:
-        ttl_task = make_lance_operator("ttl", spark_conn_id, build_ttl_application_args(dag_params), spark_conf)
-        etl_task >> compact_task >> index_task >> ttl_task
-    else:
-        etl_task >> compact_task >> index_task
+    etl_task >> maintenance_task >> index_task

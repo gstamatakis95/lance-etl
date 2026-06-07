@@ -28,13 +28,14 @@ LanceIndexer.run()
        └─ create_scalar_index             executor: build per-fragment INVERTED segment
        └─ merge_index_metadata            driver: merge INVERTED metadata
        └─ LanceDataset.commit             driver: publish with LanceOperation.CreateIndex
-LanceCompactor.run()
-  └─ Tier A (small datasets)              executor: Compaction.execute per dataset
+MaintenanceJob.run()
+  └─ TTL delete (optional)               executor: delete rows where ts + ttl_col < now
+  └─ Tier A (small datasets)             executor: Compaction.execute per dataset + cleanup
   └─ Tier B (large datasets)
-       └─ Compaction.plan()               driver: build rewrite-task list
-       └─ parallelize(tasks).map(...)     executor: CompactionTask.execute
-       └─ Compaction.commit               driver: commit rewrites
-  └─ cleanup_old_versions                 driver: prune old versions (tagged versions exempt)
+       └─ Compaction.plan()              driver: build rewrite-task list
+       └─ parallelize(tasks).map(...)    executor: CompactionTask.execute
+       └─ Compaction.commit              driver: commit rewrites
+       └─ cleanup_old_versions           driver: prune old versions (tagged versions exempt)
 ```
 
 All heavy I/O and compute runs in executors. The driver plans, broadcasts shared artifacts
@@ -82,13 +83,12 @@ prewarm every replica against the green version explicitly (use the `version` or
 |---|---|---|
 | `etl.py` | `ETLConfig`, `IcebergToLanceETL` | Iceberg read, collapse, repartition, merge_insert |
 | `indexing.py` | `LanceIndexer`, `*IndexHandler` | Distributed index builds via the segment API |
-| `compaction.py` | `CompactionConfig`, `LanceCompactor` | Two-tier compaction (small/large), blue-green tag, migrate |
+| `maintenance.py` | `MaintenanceConfig`, `MaintenanceJob` | Per-row TTL expiration (opt-in), two-tier compaction (small/large), and version cleanup — run in that order per dataset |
 | `recall.py` | `RecallAuditJob`, `RecallJobConfig` | Offline recall@k / nDCG@k / MRR audit from Datadog spans |
 | `telemetry.py` | `Telemetry`, `TelemetryConfig` | ddtrace spans, DogStatsD, Lance event bridge |
 | `cloud_storage.py` | `resolve_filesystem`, `discover_datasets` | pyarrow filesystem + recursive dataset discovery |
 | `arrow_types.py` | `resolve_arrow_type`, `resolve_type_map` | Arrow type specs (`fixed_size_list<float32,768>`) |
-| `cli.py` | `main`, `build_parser` | Eight subcommands: `etl`, `compact`, `index`, `recall`, `tag`, `migrate-manifests`, `ttl`, `migrate-namespace` |
-| `ttl.py` | `TTLJob`, `TTLConfig` | Event-timestamp-based row expiration across a dataset fleet (opt-in, default off) |
+| `cli.py` | `main`, `build_parser` | Seven subcommands: `etl`, `maintenance`, `index`, `recall`, `tag`, `migrate-manifests`, `migrate-namespace` |
 | `migrate_namespace.py` | `NamespaceMigrator`, `MigrateConfig` | One-off operator utility to copy a whole namespace to a new namespace name |
 
 ### Rust (`rust/search-api/src/`)
@@ -124,14 +124,13 @@ prewarm every replica against the green version explicitly (use the `version` or
 
 ### Airflow (`airflow/lance_etl_dag.py`)
 
-DAG `lance_etl_pipeline` running `etl -> compact -> index` as `SparkSubmitOperator` tasks with
-`max_active_runs=1`. An optional `ttl` task follows `index` when the Airflow Variable
-`lance_etl_ttl_enabled` is set to `true`. Compaction runs before indexing so fresh uncovered
-fragments are merged into large fragments before the index covers them, avoiding inline remap cost on
-every index commit. Schedule is driven by the Airflow Variable `lance_etl_schedule` (default
-`@daily`). Data-interval windowing and `dag_run.conf` overrides are described in the module
-docstring. The `migrate-namespace` subcommand is a one-off operator tool run manually via the CLI
-and is not scheduled here.
+DAG `lance_etl_pipeline` running `etl -> maintenance -> index` as `SparkSubmitOperator` tasks with
+`max_active_runs=1`. Maintenance runs before indexing so fresh uncovered fragments are merged into
+large fragments before the index covers them, avoiding inline remap cost on every index commit.
+Schedule is driven by the Airflow Variable `lance_etl_schedule` (default `@daily`).
+Data-interval windowing and `dag_run.conf` overrides are described in the module docstring. The
+`migrate-namespace` subcommand is a one-off operator tool run manually via the CLI and is not
+scheduled here.
 
 ### Benchmark package (`bench/`)
 
@@ -155,6 +154,7 @@ can drive the entire `all` chain.
   and namespace migrate utility.
 - `docs/FINDINGS.md` — narrative companion to the ADRs: verified APIs, production patterns,
   scale design, coexistence results, and open items.
+- `docs/datadog-dashboard-guide.md` — guide to the Datadog dashboards shipped with the pipeline.
 - `market-research/` — detailed evaluation notes, plans, and evidence underlying the ADRs.
 
 ---
@@ -187,11 +187,11 @@ Datadog service) and what to build (partition routing, which index types, the di
 the FTS base tokenizer and language). Every tuning knob — the schema column names, shuffle
 partitions, retry budgets, compaction fragment sizing, IVF training parameters, fine-grained FTS
 tokenizer toggles, and two-tier thresholds — is set to an opinionated default in the configuration
-dataclasses (`ETLConfig`, `IndexJobConfig`, `CompactionConfig`, `TTLConfig`) and stays tunable in
+dataclasses (`ETLConfig`, `IndexJobConfig`, `MaintenanceConfig`) and stays tunable in
 code, not from the command line.
 
-The entry point is installed as `lance-etl`. Subcommands: `etl`, `compact`, `index`, `recall`,
-`tag`, `migrate-manifests`, `ttl`, `migrate-namespace`.
+The entry point is installed as `lance-etl`. Subcommands: `etl`, `maintenance`, `index`, `recall`,
+`tag`, `migrate-manifests`, `migrate-namespace`.
 
 #### `etl` — read a snapshot window from Iceberg and upsert/delete into Lance datasets
 
@@ -246,16 +246,27 @@ Full `etl` flag reference:
 | `--dd-version` | empty | Datadog version tag |
 | `--dd-tag` | none | Repeatable constant `key=value` Datadog tag |
 
-#### `compact` — distributed compaction
+#### `maintenance` — TTL expiration, distributed compaction, and version cleanup
 
 ```bash
-lance-etl compact \
+lance-etl maintenance \
   --base-uri s3://my-bucket/lance \
   --dd-service lance-pipeline --dd-env prod
 ```
 
+Runs three ordered steps per dataset: per-row TTL expiration (when `--ttl-column` is set), two-tier
+distributed compaction, and version cleanup. TTL deletes expired rows before compaction so the
+compaction reclaims that storage.
+
 Dataset selection: `--dataset-uri` (repeatable), `--datasets-file`, or `--base-uri` (discovers all
-`*.lance` paths recursively). All tuning knobs use opinionated defaults from `CompactionConfig`.
+`*.lance` paths recursively). All tuning knobs use opinionated defaults from `MaintenanceConfig`.
+
+TTL flags:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--ttl-column` | none (TTL off) | Per-row TTL column holding each row's lifetime as an Arrow `Duration`. When set, rows are deleted before compaction by the predicate `ts_column + ttl_column < now`. Absent means TTL is off. |
+| `--ts-column` | `timestamp` | Event timestamp column used as the TTL clock. Must match `ETLConfig.ts_col`. Only consulted when `--ttl-column` is set. |
 
 #### `index` — build or incrementally maintain indices
 
@@ -357,28 +368,6 @@ lance-etl migrate-manifests \
 Migrates each dataset's manifest paths to the V2 naming scheme, turning every subsequent dataset
 open into a single object-store request. Not transactional: run only with the targeted datasets
 quiesced (no concurrent ingestion, compaction, or indexing).
-
-#### `ttl` — expire rows by event age
-
-```bash
-lance-etl ttl \
-  --base-uri s3://my-bucket/lance \
-  --retention-days 90 \
-  --dd-service lance-pipeline --dd-env prod
-```
-
-Deletes rows whose event timestamp (the canonical `ETLConfig.ts_col` column, default `timestamp`)
-is older than `now - retention`. Running this subcommand is the opt-in: the job is constructed with
-`enabled=True`. A BTREE scalar index on the timestamp column makes the predicate efficient.
-
-| Flag | Default | Purpose |
-|---|---|---|
-| `--retention-days` | (required) | Retain rows within this many days of now |
-| `--timestamp-column` | `timestamp` | Event timestamp column name in each dataset |
-| `--no-compact` | off | Skip post-delete compaction (use when a separate compact step follows) |
-
-Dataset selection uses the same `--dataset-uri` / `--datasets-file` / `--base-uri` flags shared by
-`compact` and `index`.
 
 #### `migrate-namespace` — copy a whole namespace to a new name
 
@@ -507,7 +496,7 @@ where a cross-encoder or LLM reranker slots in without changing the request shap
 ### Airflow DAG deployment
 
 Deploy `airflow/lance_etl_dag.py` to your Airflow DAGs folder. Set the Airflow Connection
-`spark_default` to point at your Spark cluster. Pipeline order is `etl >> compact >> index` with
+`spark_default` to point at your Spark cluster. Pipeline order is `etl >> maintenance >> index` with
 `max_active_runs=1`.
 
 Configure via Airflow Variables:
@@ -517,7 +506,7 @@ Configure via Airflow Variables:
 | `lance_etl_schedule` | `@daily` | Airflow schedule expression |
 | `lance_etl_iceberg_table` | `prod.vectors.events` | Fully-qualified Iceberg table name |
 | `lance_etl_lance_base_uri` | `s3://my-bucket/lance` | Base URI for Lance datasets |
-| `lance_etl_datasets_file` | `/opt/lance/datasets.txt` | File listing dataset URIs for `index` and `compact` |
+| `lance_etl_datasets_file` | `/opt/lance/datasets.txt` | File listing dataset URIs for `index` and `maintenance` |
 | `lance_etl_index_flags` | empty | Shell-tokenized index column-selection flags for the `index` step |
 | `lance_etl_spark_conn_id` | `spark_default` | Airflow Spark connection id |
 | `lance_etl_executor_instances` | `8` | `spark.executor.instances` |
@@ -528,8 +517,7 @@ Configure via Airflow Variables:
 | `lance_etl_dd_env` | `prod` | Datadog env tag |
 | `lance_etl_dd_tags` | empty | Comma-separated `key:value` constant tags |
 | `lance_etl_partition_by` | empty | Comma-separated partition columns for `--partition-by` |
-| `lance_etl_ttl_enabled` | `false` | Set to `true` to add the optional TTL task after `index` |
-| `lance_etl_ttl_retention_days` | `90` | Retention window in days passed as `--retention-days` to the `ttl` step. Required when `lance_etl_ttl_enabled=true`. |
+| `lance_etl_ttl_column` | empty (TTL off) | Per-row TTL column name forwarded to the `maintenance` step as `--ttl-column`. When set, the column must hold each row's lifetime as an Arrow `Duration`. Rows are expired before compaction by `ts_column + ttl_column < now`. Absent means TTL is off. |
 
 `lance_etl_index_flags` is required when index maintenance is desired. Without it the `index` step
 configures zero handlers and is a silent no-op. Example value:

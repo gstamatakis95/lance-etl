@@ -1,0 +1,319 @@
+"""Tests for the maintenance job: per-row TTL expiration, compaction, and version cleanup.
+
+Covers the per-row TTL predicate (timestamp plus a Duration lifetime column), validation safety, the default-off
+no-op, an end-to-end run that deletes only expired rows and then compacts, and the delete-before-compact ordering of
+the run. The functional TTL tests use a tiny real Lance dataset with a ``Duration`` TTL column so the delete path
+exercises actual Lance timestamp-plus-duration arithmetic. Ordering is pinned with an in-process fake Spark so the
+fan-out callables run in the driver process and can be observed.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Iterator
+from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
+
+import lance
+import pyarrow as pa
+import pytest
+
+from lance_etl import maintenance
+from lance_etl.maintenance import (
+    MaintenanceConfig,
+    MaintenanceJob,
+    build_ttl_predicate,
+    compute_cutoff,
+    delete_expired_rows,
+    validate_column_name,
+)
+from lance_etl.telemetry import Telemetry, TelemetryConfig
+
+TS_COLUMN: str = "ts"
+TTL_COLUMN: str = "ttl"
+
+
+def make_ttl_table(rows: int, ts_base: datetime, step: timedelta, lifetime: timedelta) -> pa.Table:
+    """Build a table with id, an event timestamp column, and a per-row Duration TTL column.
+
+    Args:
+        rows: Number of rows.
+        ts_base: Timestamp of the first row.
+        step: Time between consecutive rows.
+        lifetime: The per-row TTL lifetime stored in the Duration column.
+
+    Returns:
+        A table with ``id`` (int64), ``ts`` (timestamp[us, UTC]), and ``ttl`` (duration[us]) columns.
+    """
+    ids: pa.Array = pa.array(range(rows), pa.int64())
+    timestamps: pa.Array = pa.array([ts_base + step * i for i in range(rows)], pa.timestamp("us", tz="UTC"))
+    lifetimes: pa.Array = pa.array([lifetime for _ in range(rows)], pa.duration("us"))
+    return pa.table({"id": ids, TS_COLUMN: timestamps, TTL_COLUMN: lifetimes})
+
+
+class FakeRdd:
+    """Minimal in-process stand-in for a Spark RDD."""
+
+    def __init__(self, items: Iterable[object]) -> None:
+        """Initialize the fake RDD.
+
+        Args:
+            items: The partitioned items.
+        """
+        self.items: list[object] = list(items)
+
+    def map(self, fn: Callable[[object], object]) -> FakeRdd:
+        """Apply a function to every item eagerly.
+
+        Args:
+            fn: The mapper.
+
+        Returns:
+            A new fake RDD with the mapped items.
+        """
+        return FakeRdd([fn(item) for item in self.items])
+
+    def mapPartitions(self, fn: Callable[[Iterator[object]], Iterator[object]]) -> FakeRdd:  # noqa: N802
+        """Apply a partition function to the single in-process partition.
+
+        Args:
+            fn: The partition mapper yielding outputs.
+
+        Returns:
+            A new fake RDD with the collected outputs.
+        """
+        return FakeRdd(list(fn(iter(self.items))))
+
+    def collect(self) -> list[object]:
+        """Return the items.
+
+        Returns:
+            The current items.
+        """
+        return list(self.items)
+
+
+class FakeSparkContext:
+    """Minimal stand-in for a SparkContext running everything in process."""
+
+    def parallelize(self, items: Iterable[object], slices: int) -> FakeRdd:
+        """Wrap items into a fake RDD.
+
+        Args:
+            items: The items to distribute.
+            slices: Ignored partition count.
+
+        Returns:
+            The fake RDD.
+        """
+        del slices
+        return FakeRdd(items)
+
+    def setLocalProperty(self, key: str, value: str | None) -> None:  # noqa: N802
+        """Accept and ignore scheduler-pool properties.
+
+        Args:
+            key: The property name.
+            value: The property value.
+        """
+        del key, value
+
+
+class FakeSpark:
+    """Minimal stand-in for a SparkSession driving fan-out in the driver process."""
+
+    def __init__(self) -> None:
+        """Initialize the fake session with its fake context."""
+        self.sparkContext: FakeSparkContext = FakeSparkContext()
+
+
+@pytest.fixture
+def ttl_dataset(tmp_path: Path) -> tuple[str, int, int]:
+    """Write a fragmented Lance dataset with expired and fresh rows by per-row TTL.
+
+    Six rows have an event timestamp 100 days ago with a 1-day lifetime (expired), and four rows have an event
+    timestamp 1 day ago with a 100-day lifetime (still alive). The dataset is split into several fragments so
+    compaction has work to do.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+
+    Returns:
+        ``(uri, expired_count, alive_count)``.
+    """
+    now: datetime = datetime.now(tz=UTC)
+    expired: pa.Table = make_ttl_table(6, now - timedelta(days=100), timedelta(hours=1), timedelta(days=1))
+    alive: pa.Table = make_ttl_table(4, now - timedelta(days=1), timedelta(hours=1), timedelta(days=100))
+    uri: str = str(tmp_path / "ttl.lance")
+    lance.write_dataset(pa.concat_tables([expired, alive]), uri, max_rows_per_file=2)
+    return uri, 6, 4
+
+
+class TestMaintenanceConfigDefaults:
+    """MaintenanceConfig carries the expected TTL defaults."""
+
+    def test_ttl_off_by_default(self, telemetry_config: TelemetryConfig) -> None:
+        """ttl_column defaults to None so TTL is off."""
+        config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config)
+        assert config.ttl_column is None
+        assert config.ttl_active() is False
+
+    def test_ttl_active_when_column_set(self, telemetry_config: TelemetryConfig) -> None:
+        """Naming a ttl_column turns TTL on."""
+        config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config, ttl_column="ttl")
+        assert config.ttl_active() is True
+
+    def test_ts_column_default(self, telemetry_config: TelemetryConfig) -> None:
+        """The default event timestamp column matches ETLConfig.ts_col."""
+        assert MaintenanceConfig(telemetry=telemetry_config).ts_column == "timestamp"
+
+
+class TestPredicateSafety:
+    """The per-row TTL delete predicate and its column validation are safe."""
+
+    def test_build_predicate_format(self) -> None:
+        """build_ttl_predicate renders timestamp-plus-duration arithmetic against a typed literal."""
+        cutoff: datetime = datetime(2025, 3, 15, 12, 30, 45, 123456, tzinfo=UTC)
+        predicate: str = build_ttl_predicate("ts", "ttl", cutoff)
+        assert predicate == "ts + ttl < TIMESTAMP '2025-03-15T12:30:45.123456'"
+
+    def test_build_predicate_converts_to_utc(self) -> None:
+        """build_ttl_predicate converts a non-UTC cutoff to UTC."""
+        eastern: datetime = datetime(2025, 3, 15, 8, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
+        predicate: str = build_ttl_predicate("event_time", "lifetime", eastern)
+        assert "2025-03-15T13:00:00.000000" in predicate
+
+    def test_validate_rejects_injection(self, tmp_path: Path) -> None:
+        """validate_column_name raises ValueError for names with special characters."""
+        uri: str = str(tmp_path / "safe.lance")
+        ds: lance.LanceDataset = lance.write_dataset(pa.table({"id": pa.array([1], pa.int64())}), uri)
+        with pytest.raises(ValueError, match="allowlist"):
+            validate_column_name("ts; DROP TABLE", ds.schema)
+
+    def test_validate_rejects_unknown(self, tmp_path: Path) -> None:
+        """validate_column_name raises KeyError when the column is absent from the schema."""
+        uri: str = str(tmp_path / "nots.lance")
+        ds: lance.LanceDataset = lance.write_dataset(pa.table({"id": pa.array([1], pa.int64())}), uri)
+        with pytest.raises(KeyError, match="not present"):
+            validate_column_name("ts", ds.schema)
+
+    def test_validate_accepts_valid(self, tmp_path: Path) -> None:
+        """A column passing the allowlist and present in the schema does not raise."""
+        uri: str = str(tmp_path / "valid.lance")
+        ds: lance.LanceDataset = lance.write_dataset(
+            pa.table({"id": pa.array([1], pa.int64()), "ts": pa.array([datetime.now(tz=UTC)], pa.timestamp("us"))}),
+            uri,
+        )
+        validate_column_name("ts", ds.schema)
+
+
+class TestPerRowTtlDelete:
+    """delete_expired_rows removes only rows whose lifetime has elapsed."""
+
+    def test_deletes_only_expired_rows(self, ttl_dataset: tuple[str, int, int], telemetry: Telemetry) -> None:
+        """Rows whose event timestamp plus per-row lifetime is before now are deleted; the rest survive."""
+        uri, expired_count, alive_count = ttl_dataset
+        config: MaintenanceConfig = MaintenanceConfig(
+            telemetry=TelemetryConfig(), ttl_column=TTL_COLUMN, ts_column=TS_COLUMN, commit_backoff_seconds=0.0
+        )
+        result: dict[str, object] = delete_expired_rows(uri, config, compute_cutoff(), telemetry)
+        assert result["rows_deleted"] == expired_count
+        assert result["skipped"] == ""
+        assert lance.dataset(uri).count_rows() == alive_count
+
+    def test_keeps_rows_with_long_lifetime(self, tmp_path: Path, telemetry: Telemetry) -> None:
+        """When every row's lifetime outlasts its age, nothing is deleted."""
+        now: datetime = datetime.now(tz=UTC)
+        table: pa.Table = make_ttl_table(8, now - timedelta(days=5), timedelta(hours=1), timedelta(days=365))
+        uri: str = str(tmp_path / "alive.lance")
+        lance.write_dataset(table, uri)
+        config: MaintenanceConfig = MaintenanceConfig(
+            telemetry=TelemetryConfig(), ttl_column=TTL_COLUMN, ts_column=TS_COLUMN, commit_backoff_seconds=0.0
+        )
+        result: dict[str, object] = delete_expired_rows(uri, config, compute_cutoff(), telemetry)
+        assert result["rows_deleted"] == 0
+        assert lance.dataset(uri).count_rows() == 8
+
+    def test_skips_dataset_without_ttl_column(self, tmp_path: Path, telemetry: Telemetry) -> None:
+        """A dataset lacking the TTL column is skipped rather than failing."""
+        uri: str = str(tmp_path / "no_ttl.lance")
+        lance.write_dataset(pa.table({"id": pa.array([1, 2], pa.int64())}), uri)
+        config: MaintenanceConfig = MaintenanceConfig(
+            telemetry=TelemetryConfig(), ttl_column=TTL_COLUMN, ts_column=TS_COLUMN, commit_backoff_seconds=0.0
+        )
+        result: dict[str, object] = delete_expired_rows(uri, config, compute_cutoff(), telemetry)
+        assert result["rows_deleted"] == 0
+        assert result["skipped"] != ""
+
+
+class TestTtlOffIsNoop:
+    """With no TTL column configured the TTL step never runs."""
+
+    def test_run_with_ttl_off_deletes_nothing(self, ttl_dataset: tuple[str, int, int]) -> None:
+        """A maintenance run without ttl_column compacts but deletes no rows."""
+        uri, _, _ = ttl_dataset
+        config: MaintenanceConfig = MaintenanceConfig(
+            telemetry=TelemetryConfig(), target_rows_per_fragment=1000, commit_backoff_seconds=0.0
+        )
+        MaintenanceJob(config).run(FakeSpark(), [uri])
+        assert lance.dataset(uri).count_rows() == 10
+
+    def test_run_with_ttl_off_never_calls_delete(
+        self, ttl_dataset: tuple[str, int, int], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The TTL pass is skipped entirely when ttl_column is None."""
+        uri, _, _ = ttl_dataset
+
+        def fail_delete(*args: object, **kwargs: object) -> dict[str, object]:
+            """Fail if the TTL delete is ever invoked with TTL off."""
+            del args, kwargs
+            raise AssertionError("delete_expired_rows must not run when ttl_column is None")
+
+        monkeypatch.setattr(maintenance, "delete_expired_rows", fail_delete)
+        config: MaintenanceConfig = MaintenanceConfig(
+            telemetry=TelemetryConfig(), target_rows_per_fragment=1000, commit_backoff_seconds=0.0
+        )
+        MaintenanceJob(config).run(FakeSpark(), [uri])
+
+
+class TestRunOrdering:
+    """A maintenance run expires every dataset before compacting any of them."""
+
+    def test_all_deletes_run_before_any_compaction(
+        self, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The TTL pass completes for the whole fleet before the compaction pass begins."""
+        order: list[str] = []
+
+        def record_delete(uri: str, config: MaintenanceConfig, cutoff: datetime, tel: Telemetry) -> dict[str, object]:
+            """Record a TTL delete in call order."""
+            del config, cutoff, tel
+            order.append(f"delete:{uri}")
+            return {"uri": uri, "rows_deleted": 1, "skipped": ""}
+
+        def record_compact(uri: str, config: MaintenanceConfig, tel: Telemetry) -> dict[str, object]:
+            """Record a compaction in call order and report the small tier."""
+            del config, tel
+            order.append(f"compact:{uri}")
+            return {"uri": uri, "tier": "small", "tasks": 1, "bytes_removed": 0, "fragments_removed": 0}
+
+        monkeypatch.setattr(maintenance, "delete_expired_rows", record_delete)
+        monkeypatch.setattr(maintenance, "classify_or_compact", record_compact)
+        config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config, ttl_column="ttl")
+        MaintenanceJob(config).run(FakeSpark(), ["a.lance", "b.lance"])
+        assert order == ["delete:a.lance", "delete:b.lance", "compact:a.lance", "compact:b.lance"]
+
+    def test_run_expires_then_compacts_real_dataset(self, ttl_dataset: tuple[str, int, int]) -> None:
+        """An end-to-end run deletes expired rows and compacts the survivors into one fragment."""
+        uri, _, alive_count = ttl_dataset
+        config: MaintenanceConfig = MaintenanceConfig(
+            telemetry=TelemetryConfig(),
+            ttl_column=TTL_COLUMN,
+            ts_column=TS_COLUMN,
+            target_rows_per_fragment=1000,
+            commit_backoff_seconds=0.0,
+        )
+        MaintenanceJob(config).run(FakeSpark(), [uri])
+        dataset: lance.LanceDataset = lance.dataset(uri)
+        assert dataset.count_rows() == alive_count
+        assert len(dataset.get_fragments()) == 1
+        assert dataset.get_fragments()[0].metadata.deletion_file is None

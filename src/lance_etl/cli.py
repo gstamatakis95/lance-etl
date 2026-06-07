@@ -7,18 +7,17 @@ FTS base tokenizer and language). Every tuning knob — the schema column names,
 budgets, commit backoff, compaction fragment sizing, IVF training parameters, the fine-grained FTS
 tokenizer toggles, and two-tier thresholds — is set to a sensible opinionated default in the configuration dataclasses
 (:class:`lance_etl.etl.ETLConfig`, :class:`lance_etl.indexing.IndexJobConfig`,
-:class:`lance_etl.compaction.CompactionConfig`). Those fields stay tunable in code, just not from the
+:class:`lance_etl.maintenance.MaintenanceConfig`). Those fields stay tunable in code, just not from the
 command line.
 
 Provides the following subcommands. ``etl`` reads a time range from an Iceberg table and routes the
 changes into per-tenant Lance datasets. Backfills are catch-up replays of this same job over historical
-windows. ``compact`` runs distributed compaction over a set of datasets. ``index`` builds IVF_RQ vector,
-btree scalar, bitmap, and full-text BM25 indices over a set of datasets. ``recall`` replays
+windows. ``maintenance`` runs per-dataset maintenance over a set of datasets: per-row TTL expiration (when a
+TTL column is named), two-tier distributed compaction, and version cleanup, in that order. ``index`` builds
+IVF_RQ vector, btree scalar, bitmap, and full-text BM25 indices over a set of datasets. ``recall`` replays
 Datadog-sampled vector queries as exact brute-force scans against the dataset versions that served them
 and reports recall@k. ``tag`` flips a serving tag (default ``prod``) to a target dataset version for
 blue-green promotion. ``migrate-manifests`` migrates dataset manifest paths to the V2 naming scheme.
-``ttl`` expires rows whose event timestamp is older than a configured retention window. Running this
-subcommand is the opt-in: it constructs :class:`lance_etl.ttl.TTLConfig` with ``enabled=True``.
 ``migrate-namespace`` copies a whole namespace to a new namespace name; it is a one-off operator tool
 and is not scheduled.
 
@@ -31,24 +30,23 @@ from __future__ import annotations
 import argparse
 import logging
 from collections.abc import Callable, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from pyspark.sql import SparkSession
 
 from lance_etl.arrow_types import resolve_type_map
 from lance_etl.cloud_storage import discover_datasets
-from lance_etl.compaction import (
-    CompactionConfig,
-    LanceCompactor,
+from lance_etl.etl import DEFAULT_PARTITION_COLS, ETLConfig, IcebergToLanceETL
+from lance_etl.indexing import IndexJobConfig, LanceIndexer
+from lance_etl.maintenance import (
+    MaintenanceConfig,
+    MaintenanceJob,
     migrate_manifest_paths,
     update_serving_tags,
 )
-from lance_etl.etl import DEFAULT_PARTITION_COLS, ETLConfig, IcebergToLanceETL
-from lance_etl.indexing import IndexJobConfig, LanceIndexer
 from lance_etl.migrate_namespace import MigrateConfig, NamespaceMigrator
 from lance_etl.recall import DatadogSpanSource, RecallAuditJob, RecallJobConfig
 from lance_etl.telemetry import TelemetryConfig, configure_logging
-from lance_etl.ttl import TTLConfig, TTLJob
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -199,22 +197,26 @@ def run_etl(args: argparse.Namespace, spark: SparkSession) -> None:
     IcebergToLanceETL(config).run(spark, args.table, parse_epoch_ms(args.start), parse_epoch_ms(args.end))
 
 
-def run_compact(args: argparse.Namespace, spark: SparkSession) -> None:
-    """Run the compaction subcommand.
+def run_maintenance(args: argparse.Namespace, spark: SparkSession) -> None:
+    """Run the maintenance subcommand: per-row TTL expiration, compaction, and version cleanup.
 
-    Compaction has no per-deployment data contract beyond which datasets to compact, so the subcommand exposes
-    only dataset selection and identity. Fragment sizing, deletion materialization, two-tier thresholds, retry
-    budgets, and version-cleanup retention take their opinionated :class:`CompactionConfig` defaults.
+    Maintenance has no per-deployment data contract beyond which datasets to process and the optional TTL columns.
+    When ``--ttl-column`` names a per-row TTL (``Duration``) column, expired rows are deleted before compaction by the
+    predicate ``ts_column + ttl_column < now``. Absent the flag, TTL is off and the job is compaction plus cleanup
+    only. Fragment sizing, deletion materialization, two-tier thresholds, retry budgets, and version-cleanup retention
+    take their opinionated :class:`MaintenanceConfig` defaults.
 
     Args:
         args: Parsed command-line arguments.
         spark: Active Spark session.
     """
-    config: CompactionConfig = CompactionConfig(
+    config: MaintenanceConfig = MaintenanceConfig(
         telemetry=build_telemetry_config(args),
         storage_options=parse_storage_options(args),
+        ttl_column=args.ttl_column,
+        ts_column=args.ts_column,
     )
-    LanceCompactor(config).run(spark, load_dataset_uris(args))
+    MaintenanceJob(config).run(spark, load_dataset_uris(args))
 
 
 def run_index(args: argparse.Namespace, spark: SparkSession) -> None:
@@ -307,40 +309,6 @@ def run_migrate_manifests(args: argparse.Namespace, spark: SparkSession) -> None
     )
 
 
-def run_ttl(args: argparse.Namespace, spark: SparkSession) -> None:
-    """Run the TTL expiration subcommand.
-
-    Expires rows whose event timestamp is older than ``now - retention``. Running this subcommand is
-    the opt-in: the job is constructed with ``enabled=True``. The dataset source is ``--base-uri``
-    (discover all ``.lance`` datasets under the prefix) or ``--dataset-uri`` / ``--datasets-file``
-    flags shared by the other subcommands.
-
-    The ``--retention-days`` flag is required. All other tuning knobs (commit-retry budget, two-tier
-    thresholds, post-delete compaction cleanup horizon) take their opinionated :class:`TTLConfig`
-    defaults. Use ``--no-compact`` to skip the post-delete compaction when a separate compaction job
-    follows in the same pipeline.
-
-    Args:
-        args: Parsed command-line arguments.
-        spark: Active Spark session.
-    """
-    config: TTLConfig = TTLConfig(
-        retention=timedelta(days=args.retention_days),
-        telemetry=build_telemetry_config(args),
-        enabled=True,
-        timestamp_column=args.timestamp_column,
-        storage_options=parse_storage_options(args),
-        compact_after_delete=not args.no_compact,
-    )
-    uris: list[str] = list(args.dataset_uri or [])
-    if args.datasets_file:
-        with open(args.datasets_file, encoding="utf-8") as handle:
-            uris.extend(line.strip() for line in handle if line.strip())
-    base_uri: str | None = args.base_uri
-    report = TTLJob(config).run(spark, dataset_uris=uris or None, base_uri=base_uri)
-    logger.info("ttl report: %s", report)
-
-
 def run_migrate_namespace(args: argparse.Namespace, spark: SparkSession) -> None:
     """Run the namespace-migration subcommand.
 
@@ -409,7 +377,7 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def add_dataset_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add dataset-selection options shared by compact, index, tag, and migrate-manifests.
+    """Add dataset-selection options shared by maintenance, index, tag, and migrate-manifests.
 
     Args:
         parser: The subcommand parser to extend.
@@ -449,8 +417,8 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the top-level argument parser.
 
     Returns:
-        The parser with the ``etl``, ``compact``, ``index``, ``recall``, ``tag``, ``migrate-manifests``,
-        ``ttl``, and ``migrate-namespace`` subcommands.
+        The parser with the ``etl``, ``maintenance``, ``index``, ``recall``, ``tag``, ``migrate-manifests``,
+        and ``migrate-namespace`` subcommands.
     """
     parser: argparse.ArgumentParser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--log-level", default="INFO")
@@ -490,9 +458,31 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    compact: argparse.ArgumentParser = subparsers.add_parser("compact", help="Distributed compaction of Lance datasets")
-    add_common_arguments(compact)
-    add_dataset_arguments(compact)
+    maintenance: argparse.ArgumentParser = subparsers.add_parser(
+        "maintenance",
+        help=(
+            "Per-dataset maintenance: per-row TTL expiration (when --ttl-column is set), two-tier distributed "
+            "compaction, and version cleanup, in that order."
+        ),
+    )
+    add_common_arguments(maintenance)
+    add_dataset_arguments(maintenance)
+    maintenance.add_argument(
+        "--ttl-column",
+        default=None,
+        help=(
+            "Per-row TTL column holding each row's lifetime as an Arrow Duration. When set, rows are expired before "
+            "compaction by the predicate ts-column + ttl-column < now. Absent (the default) turns TTL off."
+        ),
+    )
+    maintenance.add_argument(
+        "--ts-column",
+        default="timestamp",
+        help=(
+            "Event timestamp column used as the TTL clock. Must match ETLConfig.ts_col. Only used when --ttl-column "
+            "is set. Default: timestamp."
+        ),
+    )
 
     index: argparse.ArgumentParser = subparsers.add_parser(
         "index", help="Build IVF_RQ vector, btree scalar, bitmap, and full-text BM25 indices on Lance datasets"
@@ -554,35 +544,6 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_arguments(migrate_manifests)
     add_dataset_arguments(migrate_manifests)
 
-    ttl: argparse.ArgumentParser = subparsers.add_parser(
-        "ttl",
-        help=(
-            "Expire rows whose event timestamp is older than the configured retention window. Running this subcommand "
-            "is the opt-in (TTLConfig.enabled is set to True). Requires --retention-days."
-        ),
-    )
-    add_common_arguments(ttl)
-    add_dataset_arguments(ttl)
-    ttl.add_argument(
-        "--retention-days",
-        type=int,
-        required=True,
-        help="Retain rows whose event timestamp is within this many days of now. Rows older than this are deleted.",
-    )
-    ttl.add_argument(
-        "--timestamp-column",
-        default="timestamp",
-        help="Event timestamp column name in each dataset. Must match ETLConfig.ts_col. Default: timestamp.",
-    )
-    ttl.add_argument(
-        "--no-compact",
-        action="store_true",
-        help=(
-            "Skip the post-delete compaction. Use when a separate compaction job follows TTL in the same pipeline "
-            "so deletion vectors are materialised by that job instead."
-        ),
-    )
-
     migrate_namespace: argparse.ArgumentParser = subparsers.add_parser(
         "migrate-namespace",
         help=(
@@ -637,12 +598,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     spark: SparkSession = SparkSession.builder.appName(APP_NAME).getOrCreate()
     runners: dict[str, Callable[[argparse.Namespace, SparkSession], None]] = {
         "etl": run_etl,
-        "compact": run_compact,
+        "maintenance": run_maintenance,
         "index": run_index,
         "recall": run_recall,
         "tag": run_tag,
         "migrate-manifests": run_migrate_manifests,
-        "ttl": run_ttl,
         "migrate-namespace": run_migrate_namespace,
     }
     try:

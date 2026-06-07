@@ -8,12 +8,12 @@ address with the namespace component swapped to ``target_namespace``.
 
 The default behaviour is copy plus optimize, keep source. The source datasets are never deleted, so an operator can
 build the new namespace, verify it, and only then flip serving to it through the blue-green tag helpers in
-:mod:`lance_etl.compaction`. During the copy the targets are optimized in the same order as the production pipeline:
-write, then recompact, then reindex. Recompaction reuses :class:`lance_etl.compaction.LanceCompactor` and reindexing
+:mod:`lance_etl.maintenance`. During the copy the targets are optimized in the same order as the production pipeline:
+write, then recompact, then reindex. Recompaction reuses :class:`lance_etl.maintenance.MaintenanceJob` and reindexing
 reuses :class:`lance_etl.indexing.LanceIndexer`, so the segment-API index flows and the two-tier compaction
 orchestration are shared rather than reimplemented.
 
-Two-tier scale mirrors :mod:`lance_etl.compaction`. The set of source datasets is classified by fragment count in one
+Two-tier scale mirrors :mod:`lance_etl.maintenance`. The set of source datasets is classified by fragment count in one
 distributed job that also resolves each target URI and tests whether it already exists. Small datasets are copied whole
 inside one executor task each, batched into a single Spark job. Large datasets keep a distributed per-dataset copy: the
 driver shards the source fragment ids, executors read their shard and write new fragment files into the target, and the
@@ -41,9 +41,9 @@ from lance.fragment import FragmentMetadata, write_fragments
 from pyspark.sql import SparkSession
 
 from lance_etl.cloud_storage import discover_datasets
-from lance_etl.compaction import CompactionConfig, LanceCompactor, fan_out_per_dataset
 from lance_etl.etl import DEFAULT_PARTITION_COLS, PATH_COMPONENT_PATTERN
 from lance_etl.indexing import IndexJobConfig, LanceIndexer, split_evenly
+from lance_etl.maintenance import MaintenanceConfig, MaintenanceJob, fan_out_per_dataset
 from lance_etl.telemetry import DEFAULT_COMMIT_RETRIES, Telemetry, TelemetryConfig, commit_with_retries
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -67,7 +67,7 @@ class MigrateConfig:
         namespace_col: Which entry of ``partition_cols`` is the namespace component. Must be present in
             ``partition_cols``.
         storage_options: Object-store options forwarded to pylance and pyarrow.
-        recompact: Recompact every target after the copy by reusing :class:`lance_etl.compaction.LanceCompactor`.
+        recompact: Recompact every target after the copy by reusing :class:`lance_etl.maintenance.MaintenanceJob`.
         reindex: Rebuild indexes on every target after compaction by reusing :class:`lance_etl.indexing.LanceIndexer`.
             A copy carries no indexes, so this is the only way the migrated namespace becomes searchable. Has no effect
             unless ``index`` supplies an index specification.
@@ -100,7 +100,7 @@ class MigrateConfig:
     recompact: bool = True
     reindex: bool = True
     overwrite_target: bool = False
-    compaction: CompactionConfig | None = None
+    compaction: MaintenanceConfig | None = None
     index: IndexJobConfig | None = None
     large_dataset_fragment_threshold: int = 128
     batch_partitions: int = 512
@@ -120,7 +120,7 @@ class MigrateConfig:
         """
         return self.partition_cols.index(self.namespace_col)
 
-    def compaction_config(self) -> CompactionConfig:
+    def compaction_config(self) -> MaintenanceConfig:
         """Return the compaction configuration for the recompact step.
 
         Returns:
@@ -128,7 +128,7 @@ class MigrateConfig:
         """
         if self.compaction is not None:
             return self.compaction
-        return CompactionConfig(telemetry=self.telemetry, storage_options=self.storage_options)
+        return MaintenanceConfig(telemetry=self.telemetry, storage_options=self.storage_options)
 
 
 @dataclass
@@ -574,7 +574,7 @@ class NamespaceMigrator:
         indexed: int = 0
         if config.recompact:
             with telemetry.timed("run.recompact_ms"):
-                compacted = len(LanceCompactor(config.compaction_config()).run(spark, copied))
+                compacted = len(MaintenanceJob(config.compaction_config()).run(spark, copied))
         if config.reindex:
             if config.index is None:
                 logger.warning(

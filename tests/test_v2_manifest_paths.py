@@ -17,8 +17,8 @@ import pyarrow as pa
 import pytest
 
 from lance_etl.cli import build_parser
-from lance_etl.compaction import migrate_dataset_manifest_paths
 from lance_etl.etl import ETLConfig, apply_merge
+from lance_etl.maintenance import migrate_dataset_manifest_paths
 from lance_etl.telemetry import TelemetryConfig
 
 V2_VERSION_PART_LEN: int = 20

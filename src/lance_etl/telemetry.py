@@ -55,7 +55,7 @@ DEFAULT_COMMIT_RETRIES: int = 20
 """Conflict-retry budget for index and compaction commits.
 
 This is the single home for the budget that was duplicated across :class:`lance_etl.indexing.IndexJobConfig` and
-:class:`lance_etl.compaction.CompactionConfig`. It sizes the only retry layer the binding-less segment-index and
+:class:`lance_etl.maintenance.MaintenanceConfig`. It sizes the only retry layer the binding-less segment-index and
 distributed-compaction commits have.
 """
 

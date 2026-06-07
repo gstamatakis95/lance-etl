@@ -18,7 +18,6 @@ from conftest import make_vector_table, write_fragmented_dataset
 from lance.dataset import Index
 from lance.optimize import Compaction
 
-from lance_etl.compaction import CompactionConfig
 from lance_etl.indexing import (
     BTreeIndexHandler,
     FtsIndexHandler,
@@ -32,6 +31,7 @@ from lance_etl.indexing import (
     serialize_segment,
     split_evenly,
 )
+from lance_etl.maintenance import MaintenanceConfig
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 ROWS: int = 2048
@@ -289,7 +289,7 @@ def compact_fragments(uri: str, max_source_fragments: int | None, target_rows_pe
             oldest-first, so partial compaction needs a target small enough to split the plan into tasks within it.
         target_rows_per_fragment: Desired rows per compacted fragment, controlling task sizes.
     """
-    config: CompactionConfig = CompactionConfig(
+    config: MaintenanceConfig = MaintenanceConfig(
         telemetry=TelemetryConfig(),
         target_rows_per_fragment=target_rows_per_fragment,
         max_source_fragments=max_source_fragments,

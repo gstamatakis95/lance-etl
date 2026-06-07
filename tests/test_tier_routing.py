@@ -17,8 +17,8 @@ import pytest
 from conftest import make_vector_table, write_fragmented_dataset
 from pyspark.sql import SparkSession
 
-from lance_etl.compaction import CompactionConfig, classify_or_compact
 from lance_etl.indexing import IndexJobConfig, LanceIndexer
+from lance_etl.maintenance import MaintenanceConfig, classify_or_compact
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 
@@ -46,7 +46,7 @@ def test_tiny_dataset_takes_cheap_in_process_compaction(tmp_path: Path, telemetr
     """A dataset below the fragment threshold is compacted in process and reports the small tier."""
     uri: str = str(tmp_path / "tiny.lance")
     write_fragmented_dataset(uri, make_vector_table(rows=100, dim=8), max_rows_per_file=25)
-    config: CompactionConfig = CompactionConfig(telemetry=TelemetryConfig(), large_dataset_fragment_threshold=128)
+    config: MaintenanceConfig = MaintenanceConfig(telemetry=TelemetryConfig(), large_dataset_fragment_threshold=128)
 
     result: dict[str, object] = classify_or_compact(uri, config, telemetry)
 
@@ -59,7 +59,7 @@ def test_huge_dataset_defers_to_fan_out_without_compacting(tmp_path: Path, telem
     """A dataset above the fragment threshold is only classified, leaving the rewrite to the distributed tier."""
     uri: str = str(tmp_path / "huge.lance")
     write_fragmented_dataset(uri, make_vector_table(rows=100, dim=8), max_rows_per_file=25)
-    config: CompactionConfig = CompactionConfig(telemetry=TelemetryConfig(), large_dataset_fragment_threshold=2)
+    config: MaintenanceConfig = MaintenanceConfig(telemetry=TelemetryConfig(), large_dataset_fragment_threshold=2)
 
     result: dict[str, object] = classify_or_compact(uri, config, telemetry)
 

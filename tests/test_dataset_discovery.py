@@ -80,8 +80,8 @@ def test_discovery_on_missing_base_returns_nothing(tmp_path: Path) -> None:
 
 
 def test_cli_base_uri_discovers_datasets(mixed_depth_base: Path) -> None:
-    """The compact subcommand's --base-uri flag feeds discovery through load_dataset_uris."""
-    args = build_parser().parse_args(["compact", "--base-uri", str(mixed_depth_base)])
+    """The maintenance subcommand's --base-uri flag feeds discovery through load_dataset_uris."""
+    args = build_parser().parse_args(["maintenance", "--base-uri", str(mixed_depth_base)])
     uris: list[str] = load_dataset_uris(args)
     assert len(uris) == 3
     assert all(uri.endswith(".lance") for uri in uris)

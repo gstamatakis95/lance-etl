@@ -310,7 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
         "prepare": "Write the Iceberg source table, synthetic text, and ground truth",
         "ingest": "Run the real Iceberg-to-Lance ETL into per-tenant datasets",
         "index": "Build IVF_RQ, BTREE, BITMAP, and INVERTED indices with LanceIndexer",
-        "compact": "Compact the datasets with LanceCompactor and record fragment counts",
+        "compact": "Compact the datasets with MaintenanceJob and record fragment counts",
         "search": "Run recall, FTS, hybrid, and ghz load modes against the gRPC server",
         "report": "Aggregate run artifacts into summary.md, results.csv, and pareto.png",
         "all": "Run the full chain: download, prepare, ingest, index, compact, search, report",

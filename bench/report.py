@@ -178,7 +178,7 @@ def summary_sections(config: BenchConfig, phases: dict[str, dict[str, Any] | Non
         )
     compact: dict[str, Any] | None = phases.get("compact")
     if compact:
-        sections.append("## Compaction (LanceCompactor)")
+        sections.append("## Compaction (MaintenanceJob)")
         rows: list[list[Any]] = [
             [uri.rsplit("/", 3)[-3], compact["fragments_before"][uri], compact["fragments_after"][uri]]
             for uri in compact["fragments_before"]
