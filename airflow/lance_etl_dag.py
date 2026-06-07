@@ -74,6 +74,11 @@ Airflow Variables (all optional — defaults are listed in ``dag_params`` below)
     lance_etl_lance_base_uri         Base URI under which per-tenant datasets live.
     lance_etl_datasets_file          Path to a file with one dataset URI per line
                                      (required by the ``index`` and ``compact`` steps).
+    lance_etl_index_flags            Shell-tokenized index column-selection flags appended verbatim to the
+                                     ``index`` subcommand, e.g.
+                                     ``--vector-column vector --metric cosine --scalar-column updated_at
+                                     --bitmap-column category --text-column text``. Empty (the default) means the
+                                     indexer configures no handlers and the ``index`` step is a no-op.
     lance_etl_spark_conf_overrides   JSON object of extra Spark conf key/value pairs,
                                      e.g. {"spark.executor.instances": "16"}.
     lance_etl_spark_conn_id          Airflow Spark connection id (default: spark_default).
@@ -100,7 +105,9 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from airflow.models import Variable
 from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
@@ -133,7 +140,7 @@ dag_params: dict[str, str | int] = {
 }
 
 
-def resolve_variable(key: str, params: dict, param_key: str | None = None) -> str:
+def resolve_variable(key: str, params: dict[str, str | int], param_key: str | None = None) -> str:
     """Return the Airflow Variable value if set, else fall back to the DAG-run param.
 
     The Variable is looked up under the name ``lance_etl_<key>``.  This lets operators override defaults without editing
@@ -151,7 +158,7 @@ def resolve_variable(key: str, params: dict, param_key: str | None = None) -> st
     return Variable.get(f"lance_etl_{key}", default_var=str(params[param_key if param_key is not None else key]))
 
 
-def build_base_spark_conf(params: dict) -> dict[str, str]:
+def build_base_spark_conf(params: dict[str, str | int]) -> dict[str, str]:
     """Build the Spark configuration dict from params and Variable overrides.
 
     Executor instance count and memory are taken from Variables / params first, then any ``spark_conf_overrides`` JSON
@@ -177,7 +184,7 @@ def build_base_spark_conf(params: dict) -> dict[str, str]:
     return conf
 
 
-def build_dd_tag_flags(params: dict) -> list[str]:
+def build_dd_tag_flags(params: dict[str, str | int]) -> list[str]:
     """Return a flat list of ``--dd-tag key:value`` CLI tokens.
 
     Tags are read from the ``lance_etl_dd_tags`` Variable (comma-separated ``key:value`` pairs) or the ``dd_tags`` DAG
@@ -200,7 +207,7 @@ def build_dd_tag_flags(params: dict) -> list[str]:
     return tokens
 
 
-def build_etl_application_args(params: dict) -> list[str]:
+def build_etl_application_args(params: dict[str, str | int]) -> list[str]:
     """Build the CLI argument list for the ``etl`` subcommand.
 
     The window bounds are resolved with the following precedence (highest first):
@@ -256,11 +263,15 @@ def build_etl_application_args(params: dict) -> list[str]:
     return args
 
 
-def build_datasets_subcommand_args(subcommand: str, params: dict) -> list[str]:
+def build_datasets_subcommand_args(subcommand: str, params: dict[str, str | int]) -> list[str]:
     """Build the CLI argument list for a datasets-file subcommand (``index`` or ``compact``).
 
     Both subcommands share the same required flags: the datasets file, the Datadog service/env tags, and any
-    user-supplied tag pairs.  The only difference between them is the leading subcommand token.
+    user-supplied tag pairs.  The leading subcommand token differs, and the ``index`` subcommand additionally needs
+    column-selection flags: with no ``--vector-column`` / ``--scalar-column`` / ``--bitmap-column`` / ``--text-column``
+    the indexer configures zero handlers and the Spark job is a silent no-op.  Those flags are read verbatim from the
+    ``lance_etl_index_flags`` Airflow Variable (shell-tokenized) so operators control exactly which index types are
+    maintained without editing this file.
 
     Args:
         subcommand: The CLI subcommand token, either ``"index"`` or ``"compact"``.
@@ -279,6 +290,10 @@ def build_datasets_subcommand_args(subcommand: str, params: dict) -> list[str]:
         resolve_variable("dd_env", params),
     ]
     args += build_dd_tag_flags(params)
+    if subcommand == "index":
+        index_flags: str = Variable.get("lance_etl_index_flags", default_var="").strip()
+        if index_flags:
+            args += shlex.split(index_flags)
     return args
 
 
@@ -325,7 +340,7 @@ def make_lance_operator(
     )
 
 
-default_args: dict = {
+default_args: dict[str, Any] = {
     "owner": "data-engineering",
     "depends_on_past": False,
     "retries": 2,

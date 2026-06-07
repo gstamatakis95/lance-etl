@@ -65,7 +65,8 @@ pub struct VectorQuery {
     pub filter_mode: FilterMode,
     /// Columns to return. Empty selects all non-vector columns.
     pub projection: Vec<String>,
-    /// Include the stable row id in each returned row.
+    /// Include the physical `_rowid` row-address column in each returned row. It changes across compaction and is
+    /// valid only for the duration of the request.
     pub with_row_id: bool,
     /// Number of leading hits to skip.
     pub offset: Option<usize>,
@@ -196,7 +197,8 @@ pub struct TextQuery {
     pub filter_mode: FilterMode,
     /// Columns to return. Empty selects all non-vector columns.
     pub projection: Vec<String>,
-    /// Include the stable row id in each returned row.
+    /// Include the physical `_rowid` row-address column in each returned row. It changes across compaction and is
+    /// valid only for the duration of the request.
     pub with_row_id: bool,
     /// Number of leading hits to skip.
     pub offset: Option<usize>,
@@ -285,7 +287,8 @@ pub struct HybridSearchOutcome {
 /// One ranked hit from a single search leg.
 #[derive(Debug, Clone)]
 pub struct Hit {
-    /// Stable row id of the hit.
+    /// Physical Lance row address (`_rowid`). Valid only for the duration of this request — changes across
+    /// compaction and across dataset opens. Used internally for within-dataset cross-leg fusion dedup only.
     pub row_id: u64,
     /// Leg-specific score: distance for vector legs, BM25 score for text legs.
     pub score: f64,
@@ -296,7 +299,8 @@ pub struct Hit {
 /// One fused hit produced by a [`crate::domain::fusion::Fusion`] strategy.
 #[derive(Debug, Clone)]
 pub struct FusedHit {
-    /// Stable row id of the hit.
+    /// Physical Lance row address (`_rowid`). Valid only for the duration of this request — changes across
+    /// compaction and across dataset opens. Used internally for within-dataset cross-leg fusion dedup only.
     pub row_id: u64,
     /// Fused score (larger is better).
     pub score: f64,

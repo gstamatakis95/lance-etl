@@ -187,6 +187,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
         target: &DatasetTarget,
         mut query: VectorQuery,
     ) -> Result<VectorSearchOutcome, SearchError> {
+        validate_k(query.k)?;
         let Some(range) = target.date_range else {
             let dataset = self.provider.dataset(target, None, DatasetRef::Serve).await?;
             let hits = run_vector_query(&dataset, &query, &self.metrics, Rpc::VectorSearch).await?;
@@ -195,7 +196,6 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
                 dataset_version: Some(dataset.version_id()),
             });
         };
-        validate_k(query.k)?;
         let strip_id = self.ensure_id_projected(&mut query.projection);
         let query = &query;
         let metrics = &self.metrics;
@@ -226,6 +226,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
         target: &DatasetTarget,
         mut query: TextQuery,
     ) -> Result<TextSearchOutcome, SearchError> {
+        validate_k(query.k)?;
         let Some(range) = target.date_range else {
             let dataset = self.provider.dataset(target, None, DatasetRef::Serve).await?;
             let hits = run_text_query(&dataset, &query, &self.metrics, Rpc::TextSearch).await?;
@@ -234,7 +235,6 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
                 dataset_version: Some(dataset.version_id()),
             });
         };
-        validate_k(query.k)?;
         let strip_id = self.ensure_id_projected(&mut query.projection);
         let query = &query;
         let metrics = &self.metrics;
@@ -366,7 +366,11 @@ fn validate_k(k: usize) -> Result<(), SearchError> {
     Ok(())
 }
 
-/// Applies projection, row-id, typed filter, and limit/offset to a scanner.
+/// Applies projection, typed filter, and limit/offset to a scanner.
+///
+/// The physical `_rowid` column is not requested here: each query path enables it conditionally via
+/// [`Scanner::with_row_id`] before calling this helper, so pure single-leg searches that neither
+/// return the row id nor feed cross-leg fusion dedup skip the extra object-store read.
 fn apply_common_options(
     scanner: &mut Scanner,
     dataset: &Dataset,
@@ -383,7 +387,6 @@ fn apply_common_options(
     } else {
         scanner.project(projection).map_err(|err| classify_lance_error(&err))?;
     }
-    scanner.with_row_id();
     if let Some(filter) = filter {
         let expr = filter_to_expr(filter, &schema_columns(dataset))?;
         scanner.filter_expr(expr);
@@ -460,6 +463,10 @@ async fn run_vector_query(
     if query.bypass_vector_index {
         scanner.use_index(false);
     }
+    let needs_row_id = query.with_row_id || rpc == Rpc::HybridSearch;
+    if needs_row_id {
+        scanner.with_row_id();
+    }
     apply_common_options(
         &mut scanner,
         dataset,
@@ -473,7 +480,12 @@ async fn run_vector_query(
         .try_into_batch()
         .await
         .map_err(|err| classify_lance_error(&err))?;
-    rows_to_hits(batch_to_json_rows(&batch)?, DISTANCE_KEY, query.with_row_id)
+    rows_to_hits(
+        batch_to_json_rows(&batch)?,
+        DISTANCE_KEY,
+        query.with_row_id,
+        needs_row_id,
+    )
 }
 
 /// Runs one full-text query against an open dataset.
@@ -492,6 +504,10 @@ async fn run_text_query(
     scanner
         .full_text_search(fts)
         .map_err(|err| classify_lance_error(&err))?;
+    let needs_row_id = query.with_row_id || rpc == Rpc::HybridSearch;
+    if needs_row_id {
+        scanner.with_row_id();
+    }
     apply_common_options(
         &mut scanner,
         dataset,
@@ -505,23 +521,36 @@ async fn run_text_query(
         .try_into_batch()
         .await
         .map_err(|err| classify_lance_error(&err))?;
-    rows_to_hits(batch_to_json_rows(&batch)?, SCORE_KEY, query.with_row_id)
+    rows_to_hits(batch_to_json_rows(&batch)?, SCORE_KEY, query.with_row_id, needs_row_id)
 }
 
-/// Converts JSON result rows into hits, extracting the score column and the stable row id.
+/// Converts JSON result rows into hits, extracting the score column and the physical row id.
 ///
 /// The score column is always removed from the row (it travels in a dedicated response field).
-/// The row id is kept in the row only when `keep_row_id` is set.
-fn rows_to_hits(rows: Vec<Map<String, Value>>, score_key: &str, keep_row_id: bool) -> Result<Vec<Hit>, SearchError> {
+/// When `has_row_id` is set the physical `_rowid` column is read from the row; it is kept in the row
+/// only when `keep_row_id` is also set, otherwise it is stripped after capture. When `has_row_id` is
+/// false the scanner did not fetch the column and the hit carries a placeholder row id of 0, which is
+/// never consulted because such hits never feed fusion dedup.
+fn rows_to_hits(
+    rows: Vec<Map<String, Value>>,
+    score_key: &str,
+    keep_row_id: bool,
+    has_row_id: bool,
+) -> Result<Vec<Hit>, SearchError> {
     rows.into_iter()
         .map(|mut row| {
-            let row_id = row
-                .get(ROW_ID)
-                .and_then(Value::as_u64)
-                .ok_or_else(|| SearchError::internal("search result row is missing its row id"))?;
-            if !keep_row_id {
-                row.remove(ROW_ID);
-            }
+            let row_id = if has_row_id {
+                let captured = row
+                    .get(ROW_ID)
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| SearchError::internal("search result row is missing its row id"))?;
+                if !keep_row_id {
+                    row.remove(ROW_ID);
+                }
+                captured
+            } else {
+                0
+            };
             let score = row.remove(score_key).and_then(|value| value.as_f64()).unwrap_or(0.0);
             Ok(Hit { row_id, score, row })
         })

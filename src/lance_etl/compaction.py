@@ -57,10 +57,10 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 COMPACTION_MODES: tuple[str, ...] = ("reencode", "try_binary_copy")
 """Accepted compaction modes. ``force_binary_copy`` is rejected because it errors instead of falling back when a
-fragment is incompatible with binary copy, failing whole rewrite tasks on deletion-bearing fragments."""
+fragment is incompatible with binary copy. It would fail whole rewrite tasks on deletion-bearing fragments."""
 
 MIN_CLEANUP_HORIZON_SECONDS: int = 6 * 3600
-"""Floor for ``cleanup_older_than_seconds``. Version cleanup is not a transaction: an aggressive horizon can delete the
+"""Floor for ``cleanup_older_than_seconds``. Version cleanup is not a transaction. An aggressive horizon can delete the
 transaction files an in-flight committer needs to rebase from its read version, breaking the longest-running tier-B
 plan-to-commit cycle on a head dataset. Several hours comfortably exceeds any single job."""
 

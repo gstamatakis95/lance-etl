@@ -227,13 +227,15 @@ def write_iceberg_table(
                 )
 
     started: float = time.perf_counter()
-    spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {config.catalog}.db")
-    specs = spark.createDataFrame(slices, "start long, count long").repartition(len(slices))
-    rows = specs.mapInArrow(generate, schema=SPARK_ROW_DDL)
-    rows = rows.withColumn("updated_at", F.timestamp_micros(F.col("updated_at_us"))).drop("updated_at_us")
-    rows.writeTo(config.table()).using("iceberg").createOrReplace()
-    elapsed: float = time.perf_counter() - started
-    spark.stop()
+    try:
+        spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {config.catalog}.db")
+        specs = spark.createDataFrame(slices, "start long, count long").repartition(len(slices))
+        rows = specs.mapInArrow(generate, schema=SPARK_ROW_DDL)
+        rows = rows.withColumn("updated_at", F.timestamp_micros(F.col("updated_at_us"))).drop("updated_at_us")
+        rows.writeTo(config.table()).using("iceberg").createOrReplace()
+        elapsed: float = time.perf_counter() - started
+    finally:
+        spark.stop()
     return elapsed
 
 

@@ -234,17 +234,22 @@ impl CachingDatasetProvider {
     /// re-read once (it is never cached by the byte cache, so the read is always live) and the
     /// `serve.tag_resolved` counter is emitted, tagged with whether the resolved version changed
     /// from the last time this tag was resolved. This bounds tag-flip propagation to the TTL.
+    ///
+    /// Concurrent callers for the same key coalesce onto a single read through the Moka future
+    /// cache's `try_get_with`, which runs the loader at most once per key per TTL window. This caps
+    /// a fleet-wide simultaneous-expiry burst at one live manifest read per process per tag.
     async fn resolve_tag_version(&self, uri: &str, tag: &str) -> Result<u64, SearchError> {
         let key = (uri.to_string(), tag.to_string());
-        if let Some(version) = self.tag_versions.get(&key).await {
-            return Ok(version);
-        }
-        let version = self.read_tag_version(uri, tag).await?;
-        let changed = self.last_tag_version.get(&key).await != Some(version);
-        self.metrics.serve_tag_resolved(changed);
-        self.tag_versions.insert(key.clone(), version).await;
-        self.last_tag_version.insert(key, version).await;
-        Ok(version)
+        self.tag_versions
+            .try_get_with(key.clone(), async {
+                let version = self.read_tag_version(uri, tag).await?;
+                let changed = self.last_tag_version.get(&key).await != Some(version);
+                self.metrics.serve_tag_resolved(changed);
+                self.last_tag_version.insert(key.clone(), version).await;
+                Ok::<u64, SearchError>(version)
+            })
+            .await
+            .map_err(|err| (*err).clone())
     }
 
     /// Reads which committed version a tag currently points at by opening at the tag and reporting

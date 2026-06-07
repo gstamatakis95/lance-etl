@@ -1648,7 +1648,7 @@ def score_hybrid_sample(
         )
     except FusionReplayError:
         return skipped_score(sample, "fusion_replay", version_drift)
-    candidate_count: int = len(set(vector_ids) | set(text_ids))
+    candidate_count: int = max(vector_count, text_count)
     recall, ndcg, mrr = ranking_quality(fused_ids, list(sample.result_ids or ()), sample.k, candidate_count)
     return scored_sample(sample, recall, ndcg, mrr, version_drift)
 
