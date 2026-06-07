@@ -46,8 +46,11 @@ orphaning fragments compaction removed) that is now guarded.
 
 The gRPC service is layered domain / lance / grpc / cache / telemetry with a typed filter AST and no raw SQL,
 see [ADR 0005](adr/0005-rust-grpc-layering-typed-filter.md). It supports vector, FTS, hybrid, Clusters, and
-Prewarm, with date-range fan-out and dedup-keep-best ([ADR 0006](adr/0006-date-range-fanout-dedup.md)). A
-disk-backed index and metadata cache excludes raw data ([ADR 0007](adr/0007-disk-cache-and-prewarm.md)).
+Prewarm. Each request resolves to exactly one dataset. Time-bounded queries are expressed as scalar filters on a
+timestamp column (pushed down via the typed `Filter` AST) rather than as a cross-dataset fan-out. The earlier
+date-range fan-out and dedup design ([ADR 0006](adr/0006-date-range-fanout-dedup.md)) was superseded by
+[ADR 0014](adr/0014-drop-by-date-partitioning.md). A disk-backed index and metadata cache excludes raw data
+([ADR 0007](adr/0007-disk-cache-and-prewarm.md)).
 Observability taps real Lance trace surfaces and samples queries for offline exact-recall auditing pinned to the
 dataset version that served each query ([ADR 0008](adr/0008-observability-and-recall-audit.md)).
 

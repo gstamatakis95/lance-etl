@@ -390,9 +390,14 @@ Listed roughly in order of confidence (highest first).
 
 ## 5. Keep list (genuinely per-deployment or genuinely variable)
 
+> NOTE: This document reflects the analysis at its drafting date. The accepted decisions live in
+> `docs/adr/0014-drop-by-date-partitioning.md` and `docs/adr/0015-cli-and-config-knob-reduction.md`.
+> Where this document conflicts with those ADRs, the ADRs govern. In particular `--partition-derive`
+> and `partition_derivations` were removed by ADR-0014 and must not be re-added.
+
 These knobs must stay because they reflect real deployment-time variation.
 
-**ETL:** `--table`, `--start`, `--end`, `--base-uri`, `--partition-by`, `--partition-derive`,
+**ETL:** `--table`, `--start`, `--end`, `--base-uri`, `--partition-by`,
 `--column-type`, `--iceberg-option`, `--window-start`, `--window-end`, `--storage-option`,
 `--dd-env`, `--dd-tag`.
 
@@ -403,7 +408,7 @@ These knobs must stay because they reflect real deployment-time variation.
 
 **Tag:** `--tag`, `--tag-version`.
 
-**Config fields:** `ETLConfig.partition_cols`, `partition_derivations`, `guard_updates_by_ts`,
+**Config fields:** `ETLConfig.partition_cols`, `guard_updates_by_ts`,
 `window_start/end`, `storage_options`, `column_types`, `iceberg_read_options`,
 `num_partitions` (Spark routing shards), `retry_backoff_seconds`. `IndexJobConfig.vector_column`,
 `metric`, `distance_type`, `vector_min_rows`, `scalar/bitmap/text_columns`, `fts_with_position`,

@@ -157,12 +157,13 @@ class CompactionConfig:
             "max_bytes_per_file": self.max_bytes_per_file,
             "materialize_deletions": True,
             "materialize_deletions_threshold": self.materialize_deletions_threshold,
-            "defer_index_remap": self.defer_index_remap,
             "max_source_fragments": self.max_source_fragments,
             "num_threads": self.num_threads,
             "batch_size": self.batch_size,
             "compaction_mode": COMPACTION_MODE,
         }
+        if self.defer_index_remap:
+            candidates["defer_index_remap"] = True
         return {name: value for name, value in candidates.items() if value is not None}
 
     def plan_options(self) -> dict[str, Any]:

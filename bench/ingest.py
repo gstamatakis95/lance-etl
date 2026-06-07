@@ -74,7 +74,6 @@ def etl_config(config: BenchConfig, dimension: int, window: tuple[str, str]) -> 
         num_partitions=config.etl_partitions,
         window_start=window[0],
         window_end=window[1],
-        window_column="updated_at",
     )
 
 
