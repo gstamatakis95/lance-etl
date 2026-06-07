@@ -260,6 +260,14 @@ class RecallJobConfig:
         vector_column: Name of the fixed-size-list vector column scanned for brute-force distances.
         max_samples: Cap on the number of span records fetched from the source.
         batch_size: Scanner batch size for the brute-force scan.
+        large_group_fragment_threshold: Fragment count above which a ``(uri, version)`` group is scored with the
+            per-fragment fan-out instead of one whole-dataset task. Groups at or below it are batched into the packed
+            small tier. The default mirrors the indexing small-tier threshold so a dataset that indexing treats as
+            large also brute-forces with the same fan-out here.
+        small_tier_slices: Spark partition count for the classification probe job and the packed small-tier scoring
+            job. Fewer slices than groups packs many small groups per task, amortizing task scheduling and cold opens.
+        large_tier_slices: Spark partition cap for the per-fragment fan-out job. One task scores one fragment up to
+            this cap, beyond which fragments share tasks while the driver still reduces them exactly.
     """
 
     base_uri: str
@@ -269,6 +277,9 @@ class RecallJobConfig:
     vector_column: str = "vector"
     max_samples: int = 10_000
     batch_size: int = 8192
+    large_group_fragment_threshold: int = 32
+    small_tier_slices: int = 256
+    large_tier_slices: int = 512
 
 
 class SpanSource(Protocol):
@@ -1023,6 +1034,53 @@ def fixed_size_list_to_numpy(column: pa.Array) -> np.ndarray:
     return values.reshape(len(column), column.type.list_size)
 
 
+def merge_top_k(
+    best_ids: list[Any], best_dists: np.ndarray, add_ids: list[Any], add_dists: np.ndarray, k: int
+) -> tuple[list[Any], np.ndarray]:
+    """Stable-merge a new partial top-k into a running top-k.
+
+    Concatenates the running best ids and distances with the incoming partial, keeps the ``k`` smallest distances by a
+    stable argsort, and carries the aligned ids. The stable sort keeps the running-best (earlier) entries ahead of the
+    incoming ones on ties, so the merge order reflects scan order: this is the single primitive shared by the
+    per-batch streaming merge and the per-fragment reduce, which is what makes the fanned-out reduce bit-identical to
+    the single-stream scan.
+
+    Args:
+        best_ids: The running best ids in ascending-distance order.
+        best_dists: The running best distances aligned with ``best_ids``.
+        add_ids: The incoming partial's ids.
+        add_dists: The incoming partial's distances aligned with ``add_ids``.
+        k: The number of results to keep.
+
+    Returns:
+        ``(merged_ids, merged_dists)`` truncated to the ``k`` smallest distances in ascending-distance order.
+    """
+    merged_dists: np.ndarray = np.concatenate([best_dists, np.asarray(add_dists, dtype=np.float64)])
+    merged_ids: list[Any] = best_ids + list(add_ids)
+    order: np.ndarray = np.argsort(merged_dists, kind="stable")[:k]
+    return [merged_ids[index] for index in order], merged_dists[order]
+
+
+def reduce_partial_top_k(partials: list[tuple[list[Any], list[float]]], k: int) -> tuple[list[Any], list[float]]:
+    """Reduce per-fragment partial top-k results into one exact top-k.
+
+    Folds the partials with :func:`merge_top_k` in the order given, which the caller must supply in ascending fragment
+    scan order so the result matches the single-stream scan exactly, ties included.
+
+    Args:
+        partials: One ``(ids, distances)`` partial top-k per fragment, in ascending fragment scan order.
+        k: The number of results to keep.
+
+    Returns:
+        ``(true_top_k_ids, true_top_k_distances)`` in ascending-distance order.
+    """
+    best_ids: list[Any] = []
+    best_dists: np.ndarray = np.empty(0, dtype=np.float64)
+    for ids, dists in partials:
+        best_ids, best_dists = merge_top_k(best_ids, best_dists, ids, np.asarray(dists, dtype=np.float64), k)
+    return best_ids, best_dists.tolist()
+
+
 def brute_force_top_k_scored(
     dataset: lance.LanceDataset,
     query: np.ndarray,
@@ -1032,11 +1090,14 @@ def brute_force_top_k_scored(
     vector_column: str,
     filter_sql: str | None,
     batch_size: int,
+    fragments: list[lance.LanceFragment] | None = None,
 ) -> tuple[list[Any], list[float], int]:
     """Compute the exact top-k ids and their distances for a query by scanning the dataset.
 
     Streams ``(id, vector)`` batches, computes exact distances per batch in numpy, and merges each batch's partial
-    top-k into a running top-k so memory stays bounded by ``batch_size + k``.
+    top-k into a running top-k so memory stays bounded by ``batch_size + k``. When ``fragments`` is given the scan is
+    restricted to those fragments, which is how the large tier computes one fragment's partial top-k; the per-fragment
+    partials are then reduced with :func:`reduce_partial_top_k`.
 
     Args:
         dataset: The opened (possibly version-pinned) dataset.
@@ -1047,6 +1108,7 @@ def brute_force_top_k_scored(
         vector_column: Name of the fixed-size-list vector column.
         filter_sql: The internally generated filter string, or None for an unfiltered scan.
         batch_size: Scanner batch size.
+        fragments: The fragments to restrict the scan to, or None to scan the whole dataset.
 
     Returns:
         ``(true_top_k_ids, true_top_k_distances, candidate_count)`` where the ids are in ascending-distance order, the
@@ -1057,7 +1119,7 @@ def brute_force_top_k_scored(
         ValueError: If a batch's vector dimension does not match the query dimension.
     """
     scanner: lance.LanceScanner = dataset.scanner(
-        columns=[id_column, vector_column], filter=filter_sql, batch_size=batch_size
+        columns=[id_column, vector_column], filter=filter_sql, batch_size=batch_size, fragments=fragments
     )
     best_ids: list[Any] = []
     best_dists: np.ndarray = np.empty(0, dtype=np.float64)
@@ -1079,11 +1141,7 @@ def brute_force_top_k_scored(
             )
         distances: np.ndarray = compute_distances(candidates, query, distance_type)
         candidate_count += table.num_rows
-        merged_dists: np.ndarray = np.concatenate([best_dists, distances])
-        merged_ids: list[Any] = best_ids + table.column(id_column).to_pylist()
-        order: np.ndarray = np.argsort(merged_dists, kind="stable")[:k]
-        best_dists = merged_dists[order]
-        best_ids = [merged_ids[index] for index in order]
+        best_ids, best_dists = merge_top_k(best_ids, best_dists, table.column(id_column).to_pylist(), distances, k)
     return best_ids, best_dists.tolist(), candidate_count
 
 
@@ -1488,6 +1546,70 @@ def scored_sample(sample: RecallSample, recall: float, ndcg: float, mrr: float, 
     )
 
 
+def grade_against_reference(
+    sample: RecallSample, true_ids: list[Any], candidate_count: int, version_drift: bool
+) -> SampleScore:
+    """Grade one served ranking against an exact single-leg reference top-k.
+
+    Shared by the vector and text scorers and by the large-tier reduce, so every path grades identically once it holds
+    the exact ground-truth ids and candidate count.
+
+    Args:
+        sample: The sample to grade.
+        true_ids: The exact ground-truth ids in best-first order.
+        candidate_count: The number of eligible candidates the reference was drawn from.
+        version_drift: Whether the dataset was opened at a drifted version.
+
+    Returns:
+        The sample's score, skipped with ``empty_candidate_set`` when no candidate was eligible.
+    """
+    if candidate_count == 0:
+        return skipped_score(sample, "empty_candidate_set", version_drift)
+    recall, ndcg, mrr = ranking_quality(true_ids, list(sample.result_ids or ()), sample.k, candidate_count)
+    return scored_sample(sample, recall, ndcg, mrr, version_drift)
+
+
+def grade_hybrid_reference(
+    sample: RecallSample,
+    vector_ids: list[Any],
+    vector_scores: list[float],
+    vector_count: int,
+    text_ids: list[Any],
+    text_scores: list[float],
+    text_count: int,
+    version_drift: bool,
+) -> SampleScore:
+    """Grade one served hybrid ranking against the exact vector and BM25 references fused with the recorded strategy.
+
+    Shared by the whole-dataset hybrid scorer and the large-tier path, where the vector leg arrives from the
+    per-fragment reduce and the BM25 leg from the whole-dataset scan.
+
+    Args:
+        sample: The hybrid sample to grade.
+        vector_ids: The exact vector leg ids in best-first order.
+        vector_scores: The exact vector leg distances aligned with ``vector_ids``.
+        vector_count: The vector leg candidate count.
+        text_ids: The exact BM25 leg ids in best-first order.
+        text_scores: The exact BM25 leg scores aligned with ``text_ids``.
+        text_count: The BM25 leg candidate count.
+        version_drift: Whether the dataset was opened at a drifted version.
+
+    Returns:
+        The sample's score, skipped when both legs are empty or the fusion replay fails.
+    """
+    if vector_count == 0 and text_count == 0:
+        return skipped_score(sample, "empty_candidate_set", version_drift)
+    try:
+        fused_ids: list[Any] = fuse_legs(
+            sample.fusion or {}, vector_ids, vector_scores, text_ids, text_scores, sample.k
+        )
+    except FusionReplayError:
+        return skipped_score(sample, "fusion_replay", version_drift)
+    candidate_count: int = len(fused_ids)
+    recall, ndcg, mrr = ranking_quality(fused_ids, list(sample.result_ids or ()), sample.k, candidate_count)
+    return scored_sample(sample, recall, ndcg, mrr, version_drift)
+
+
 def resolve_filter_sql(sample: RecallSample, schema_columns: frozenset[str]) -> tuple[str | None, str | None]:
     """Translate the sample's filter AST into a scanner filter string.
 
@@ -1544,10 +1666,7 @@ def score_vector_sample(
         )
     except (ValueError, OSError, RuntimeError):
         return skipped_score(sample, "scan_error", version_drift)
-    if candidate_count == 0:
-        return skipped_score(sample, "empty_candidate_set", version_drift)
-    recall, ndcg, mrr = ranking_quality(true_ids, list(sample.result_ids or ()), sample.k, candidate_count)
-    return scored_sample(sample, recall, ndcg, mrr, version_drift)
+    return grade_against_reference(sample, true_ids, candidate_count, version_drift)
 
 
 def score_text_sample(
@@ -1584,10 +1703,7 @@ def score_text_sample(
     except (ValueError, OSError, RuntimeError):
         return skipped_score(sample, "scan_error", version_drift)
     del true_scores
-    if candidate_count == 0:
-        return skipped_score(sample, "empty_candidate_set", version_drift)
-    recall, ndcg, mrr = ranking_quality(true_ids, list(sample.result_ids or ()), sample.k, candidate_count)
-    return scored_sample(sample, recall, ndcg, mrr, version_drift)
+    return grade_against_reference(sample, true_ids, candidate_count, version_drift)
 
 
 def score_hybrid_sample(
@@ -1640,17 +1756,9 @@ def score_hybrid_sample(
         )
     except (ValueError, OSError, RuntimeError):
         return skipped_score(sample, "scan_error", version_drift)
-    if vector_count == 0 and text_count == 0:
-        return skipped_score(sample, "empty_candidate_set", version_drift)
-    try:
-        fused_ids: list[Any] = fuse_legs(
-            sample.fusion or {}, vector_ids, vector_scores, text_ids, text_scores, sample.k
-        )
-    except FusionReplayError:
-        return skipped_score(sample, "fusion_replay", version_drift)
-    candidate_count: int = max(vector_count, text_count)
-    recall, ndcg, mrr = ranking_quality(fused_ids, list(sample.result_ids or ()), sample.k, candidate_count)
-    return scored_sample(sample, recall, ndcg, mrr, version_drift)
+    return grade_hybrid_reference(
+        sample, vector_ids, vector_scores, vector_count, text_ids, text_scores, text_count, version_drift
+    )
 
 
 def score_sample(
@@ -1719,6 +1827,225 @@ def score_version_group(
         return [
             score_sample(dataset, sample, schema_columns, default_distance, config, version_drift) for sample in samples
         ]
+
+
+def vector_leg_samples(samples: list[RecallSample]) -> list[RecallSample]:
+    """Select the samples of a group that need an exact vector leg.
+
+    Vector and hybrid samples carry a query vector and are fanned out per fragment. Samples with a null served-id
+    capture are excluded because they skip before any scan.
+
+    Args:
+        samples: The group's samples.
+
+    Returns:
+        The vector-bearing samples that are scorable.
+    """
+    return [s for s in samples if s.query_type in ("vector", "hybrid") and s.result_ids is not None]
+
+
+def text_leg_samples(samples: list[RecallSample]) -> list[RecallSample]:
+    """Select the samples of a group that need an exact BM25 leg.
+
+    Text and hybrid samples are scored against the whole-dataset BM25 reference because the BM25 inverse document
+    frequency and average document length are corpus-global statistics that cannot be sharded per fragment without
+    changing the scores, so the reference stays whole-dataset even in the large tier.
+
+    Args:
+        samples: The group's samples.
+
+    Returns:
+        The text-bearing samples that are scorable.
+    """
+    return [s for s in samples if s.query_type in ("text", "hybrid") and s.result_ids is not None]
+
+
+def fragment_vector_partials(
+    uri: str, version: int, fragment_index: int, samples: list[RecallSample], config: RecallJobConfig
+) -> dict[str, dict[str, Any]]:
+    """Compute one fragment's partial vector top-k for each vector-bearing sample of a large group.
+
+    Runs on an executor. Opens the dataset at the recorded version, restricts the brute-force scan to the single
+    fragment at ``fragment_index`` in the dataset's fragment order, and returns a per-sample partial top-k that the
+    driver reduces across fragments. Per-sample skip decisions that are deterministic across fragments (filter
+    translation, scan errors such as a vector-dimension mismatch) are returned as skip markers.
+
+    Args:
+        uri: The dataset URI shared by the group.
+        version: The recorded dataset version shared by the group.
+        fragment_index: The position of the fragment in the dataset's fragment order.
+        samples: The vector-bearing samples to score against this fragment.
+        config: The job configuration.
+
+    Returns:
+        A mapping from sample id to either ``{"status": "partial", "ids", "dists", "count"}`` or
+        ``{"status": "skip", "reason"}``.
+    """
+    dataset, _ = resolve_dataset(uri, version, config.storage_options)
+    if dataset is None:
+        return {sample.sample_id: {"status": "skip", "reason": "dataset_missing"} for sample in samples}
+    schema_columns: frozenset[str] = frozenset(dataset.schema.names)
+    default_distance: str = index_default_distance_type(dataset, config.vector_column)
+    fragment: lance.LanceFragment = dataset.get_fragments()[fragment_index]
+    partials: dict[str, dict[str, Any]] = {}
+    for sample in samples:
+        filter_sql, filter_skip = resolve_filter_sql(sample, schema_columns)
+        if filter_skip is not None:
+            partials[sample.sample_id] = {"status": "skip", "reason": filter_skip}
+            continue
+        distance_type: str = sample.distance_type or default_distance
+        query: np.ndarray = np.asarray(sample.query_vector, dtype=np.float64)
+        try:
+            ids, dists, count = brute_force_top_k_scored(
+                dataset,
+                query,
+                sample.k,
+                distance_type,
+                config.id_column,
+                config.vector_column,
+                filter_sql,
+                config.batch_size,
+                fragments=[fragment],
+            )
+        except (ValueError, OSError, RuntimeError):
+            partials[sample.sample_id] = {"status": "skip", "reason": "scan_error"}
+            continue
+        partials[sample.sample_id] = {"status": "partial", "ids": ids, "dists": dists, "count": count}
+    return partials
+
+
+def reduce_vector_legs(sample: RecallSample, fragment_partials: list[tuple[int, dict[str, Any]]]) -> dict[str, Any]:
+    """Reduce one sample's per-fragment vector partials into one exact leg, or propagate a skip.
+
+    The partials are reduced in ascending fragment-index order with :func:`reduce_partial_top_k`, the same stable merge
+    the single-stream scan uses across batches, so the reduced top-k equals the whole-dataset brute force exactly. A
+    deterministic per-fragment skip marker (every fragment agrees) becomes the leg's skip, independent of the order in
+    which the fan-out tasks returned. An empty partial set is itself a skip with the ``missing_partials`` reason.
+
+    Args:
+        sample: The sample whose vector leg is reduced.
+        fragment_partials: The ``(fragment_index, payload)`` partials gathered from the fan-out tasks.
+
+    Returns:
+        Either ``{"status": "leg", "ids", "dists", "count"}`` or ``{"status": "skip", "reason"}``.
+    """
+    if not fragment_partials:
+        return {"status": "skip", "reason": "missing_partials"}
+    skip_reasons: set[str] = {payload["reason"] for _, payload in fragment_partials if payload["status"] == "skip"}
+    if skip_reasons:
+        return {"status": "skip", "reason": next(iter(skip_reasons))}
+    ordered: list[tuple[int, dict[str, Any]]] = sorted(fragment_partials, key=lambda item: item[0])
+    partials: list[tuple[list[Any], list[float]]] = [(payload["ids"], payload["dists"]) for _, payload in ordered]
+    ids, dists = reduce_partial_top_k(partials, sample.k)
+    count: int = sum(int(payload["count"]) for _, payload in ordered)
+    return {"status": "leg", "ids": ids, "dists": dists, "count": count}
+
+
+def whole_dataset_text_legs(
+    uri: str, version: int, samples: list[RecallSample], config: RecallJobConfig
+) -> dict[str, dict[str, Any]]:
+    """Compute the whole-dataset exact BM25 leg for each text-bearing sample of a large group.
+
+    Runs on an executor. The BM25 reference stays whole-dataset because its corpus-global statistics cannot be sharded
+    per fragment without changing the scores. Skip decisions mirror the whole-dataset scorers.
+
+    Args:
+        uri: The dataset URI shared by the group.
+        version: The recorded dataset version shared by the group.
+        samples: The text-bearing samples to score.
+        config: The job configuration.
+
+    Returns:
+        A mapping from sample id to either ``{"status": "leg", "ids", "scores", "count"}`` or
+        ``{"status": "skip", "reason"}``.
+    """
+    dataset, _ = resolve_dataset(uri, version, config.storage_options)
+    if dataset is None:
+        return {sample.sample_id: {"status": "skip", "reason": "dataset_missing"} for sample in samples}
+    schema_columns: frozenset[str] = frozenset(dataset.schema.names)
+    legs: dict[str, dict[str, Any]] = {}
+    for sample in samples:
+        filter_sql, filter_skip = resolve_filter_sql(sample, schema_columns)
+        if filter_skip is not None:
+            legs[sample.sample_id] = {"status": "skip", "reason": filter_skip}
+            continue
+        try:
+            field_queries: list[tuple[str, list[str], str, float]] = text_query_field_queries(
+                sample.text_query, sample.text_columns, schema_columns
+            )
+        except TextQueryTranslationError:
+            legs[sample.sample_id] = {"status": "skip", "reason": "text_query_translation"}
+            continue
+        try:
+            ids, scores, count = bm25_top_k(
+                dataset, field_queries, sample.k, config.id_column, filter_sql, config.batch_size
+            )
+        except (ValueError, OSError, RuntimeError):
+            legs[sample.sample_id] = {"status": "skip", "reason": "scan_error"}
+            continue
+        legs[sample.sample_id] = {"status": "leg", "ids": ids, "scores": scores, "count": count}
+    return legs
+
+
+def combine_large_group_scores(
+    samples: list[RecallSample],
+    version_drift: bool,
+    vector_legs: dict[str, dict[str, Any]],
+    text_legs: dict[str, dict[str, Any]],
+) -> list[SampleScore]:
+    """Grade a large group's samples from their reduced vector legs and whole-dataset BM25 legs.
+
+    Vector samples grade against the reduced vector leg, text samples against the BM25 leg, and hybrid samples fuse the
+    two legs with the recorded strategy. Skip reasons carried on a leg propagate to the sample, and the skip-reason
+    vocabulary is identical to the whole-dataset path.
+
+    Args:
+        samples: The group's samples in capture order.
+        version_drift: Whether the dataset was opened at a drifted version, carried from the classification probe.
+        vector_legs: The reduced vector legs keyed by sample id, for vector and hybrid samples.
+        text_legs: The whole-dataset BM25 legs keyed by sample id, for text and hybrid samples.
+
+    Returns:
+        One score per sample.
+    """
+    scores: list[SampleScore] = []
+    for sample in samples:
+        if sample.result_ids is None:
+            scores.append(skipped_score(sample, "null_result_ids", version_drift))
+            continue
+        if sample.query_type == "vector":
+            leg: dict[str, Any] = vector_legs[sample.sample_id]
+            if leg["status"] == "skip":
+                scores.append(skipped_score(sample, leg["reason"], version_drift))
+            else:
+                scores.append(grade_against_reference(sample, leg["ids"], leg["count"], version_drift))
+        elif sample.query_type == "text":
+            leg = text_legs[sample.sample_id]
+            if leg["status"] == "skip":
+                scores.append(skipped_score(sample, leg["reason"], version_drift))
+            else:
+                scores.append(grade_against_reference(sample, leg["ids"], leg["count"], version_drift))
+        else:
+            vector_leg: dict[str, Any] = vector_legs[sample.sample_id]
+            text_leg: dict[str, Any] = text_legs[sample.sample_id]
+            if vector_leg["status"] == "skip":
+                scores.append(skipped_score(sample, vector_leg["reason"], version_drift))
+            elif text_leg["status"] == "skip":
+                scores.append(skipped_score(sample, text_leg["reason"], version_drift))
+            else:
+                scores.append(
+                    grade_hybrid_reference(
+                        sample,
+                        vector_leg["ids"],
+                        vector_leg["dists"],
+                        vector_leg["count"],
+                        text_leg["ids"],
+                        text_leg["scores"],
+                        text_leg["count"],
+                        version_drift,
+                    )
+                )
+    return scores
 
 
 def optional_label(value: int | None, fallback: str) -> str:
@@ -1955,12 +2282,195 @@ class RecallAuditJob:
         """
         self.config: RecallJobConfig = config
 
-    def run(self, spark: SparkSession, source: SpanSource, from_ms: int, to_ms: int) -> RecallReport:
-        """Fetch, parse, score, aggregate, and report one window of recall samples.
+    def classify_groups(
+        self, spark: SparkSession, items: list[tuple[str, int, list[RecallSample]]]
+    ) -> tuple[list[tuple[str, int, list[RecallSample]]], list[tuple[str, int, list[RecallSample], bool, int]]]:
+        """Split ``(uri, version)`` groups into the packed small tier and the per-fragment large tier.
 
-        The driver fetches and parses the spans and groups samples by ``(dataset_uri, dataset_version)``. Executors do
-        the heavy work: each Spark task opens one group's dataset at the recorded version and brute-force scores its
-        samples. The driver aggregates, logs the table, and emits the per-RPC-bucket gauges.
+        One distributed probe job opens each group's dataset at the recorded version, reads its fragment count, and
+        records whether it is scorable and whether the version drifted, so the driver never opens a dataset itself.
+        Groups whose dataset is missing, lacks the id or vector column, or has at most
+        ``large_group_fragment_threshold`` fragments go to the small tier, where the missing-dataset and missing-column
+        cases are handled identically by :func:`score_version_group`. Larger scorable groups go to the large tier with
+        their fragment count and drift flag carried forward.
+
+        Args:
+            spark: Active Spark session.
+            items: The ``(uri, version, samples)`` groups to classify.
+
+        Returns:
+            ``(small, large)`` where small items are ``(uri, version, samples)`` and large items are
+            ``(uri, version, samples, version_drift, fragments)``.
+        """
+        config: RecallJobConfig = self.config
+        storage_options: dict[str, Any] | None = config.storage_options
+        threshold: int = config.large_group_fragment_threshold
+        id_column: str = config.id_column
+        vector_column: str = config.vector_column
+        keys: list[tuple[str, int]] = [(uri, version) for uri, version, _ in items]
+
+        def probe(key: tuple[str, int]) -> tuple[int, bool, bool]:
+            """Probe one group's dataset size, scorability, and version drift on an executor.
+
+            Args:
+                key: The ``(uri, version)`` group key.
+
+            Returns:
+                ``(fragments, scorable, version_drift)`` where ``fragments`` is -1 when the dataset cannot be opened.
+            """
+            uri, version = key
+            dataset, drift = resolve_dataset(uri, version, storage_options)
+            if dataset is None:
+                return -1, False, False
+            columns: frozenset[str] = frozenset(dataset.schema.names)
+            scorable: bool = id_column in columns and vector_column in columns
+            return len(dataset.get_fragments()), scorable, drift
+
+        slices: int = max(1, min(config.small_tier_slices, len(keys)))
+        probes: list[tuple[int, bool, bool]] = spark.sparkContext.parallelize(keys, slices).map(probe).collect()
+        small: list[tuple[str, int, list[RecallSample]]] = []
+        large: list[tuple[str, int, list[RecallSample], bool, int]] = []
+        for (uri, version, samples), (fragments, scorable, drift) in zip(items, probes, strict=True):
+            if scorable and fragments > threshold:
+                large.append((uri, version, samples, drift, fragments))
+            else:
+                small.append((uri, version, samples))
+        return small, large
+
+    def run_small_tier(
+        self, spark: SparkSession, items: list[tuple[str, int, list[RecallSample]]], telemetry: Telemetry
+    ) -> list[SampleScore]:
+        """Score many small groups in one batched Spark job, packing several groups per task.
+
+        Fewer slices than groups means one task scores many small datasets end-to-end with the unchanged
+        :func:`score_version_group`, amortizing task scheduling and cold opens across the power-law tail.
+
+        Args:
+            spark: Active Spark session.
+            items: The small-tier ``(uri, version, samples)`` groups.
+            telemetry: Driver telemetry facade.
+
+        Returns:
+            One score per sample across the small groups.
+        """
+        config: RecallJobConfig = self.config
+
+        def score_group(item: tuple[str, int, list[RecallSample]]) -> list[SampleScore]:
+            """Score one version group on an executor.
+
+            Args:
+                item: The ``(uri, version, samples)`` group.
+
+            Returns:
+                One score per sample in the group.
+            """
+            return score_version_group(item[0], item[1], item[2], config)
+
+        slices: int = max(1, min(config.small_tier_slices, len(items)))
+        with telemetry.timed("recall.small_tier_ms"):
+            collected: list[list[SampleScore]] = (
+                spark.sparkContext.parallelize(items, slices).map(score_group).collect()
+            )
+        telemetry.gauge("recall.small_groups", len(items))
+        return [score for group in collected for score in group]
+
+    def run_large_tier(
+        self, spark: SparkSession, items: list[tuple[str, int, list[RecallSample], bool, int]], telemetry: Telemetry
+    ) -> list[SampleScore]:
+        """Score large groups by fanning the vector brute force out per fragment and reducing exactly on the driver.
+
+        One Spark job computes a partial vector top-k per ``(group, fragment)`` for every vector and hybrid sample, and
+        the driver reduces the partials per sample with the same stable merge the single-stream scan uses, so the
+        reduced top-k is bit-identical to the whole-dataset brute force. A second Spark job computes the whole-dataset
+        BM25 leg for text and hybrid samples, whose corpus-global statistics cannot be sharded. The driver then grades
+        vector samples from the reduced leg, text samples from the BM25 leg, and hybrid samples from the fusion of both.
+
+        Args:
+            spark: Active Spark session.
+            items: The large-tier ``(uri, version, samples, version_drift, fragments)`` groups.
+            telemetry: Driver telemetry facade.
+
+        Returns:
+            One score per sample across the large groups.
+        """
+        config: RecallJobConfig = self.config
+        telemetry.gauge("recall.large_groups", len(items))
+        vector_work: list[tuple[int, str, int, int, list[RecallSample]]] = []
+        text_work: list[tuple[int, str, int, list[RecallSample]]] = []
+        for index, (uri, version, samples, drift, fragments) in enumerate(items):
+            del drift
+            vector_samples: list[RecallSample] = vector_leg_samples(samples)
+            if vector_samples:
+                vector_work.extend(
+                    (index, uri, version, fragment_index, vector_samples) for fragment_index in range(fragments)
+                )
+            text_samples: list[RecallSample] = text_leg_samples(samples)
+            if text_samples:
+                text_work.append((index, uri, version, text_samples))
+
+        def vector_task(
+            work: tuple[int, str, int, int, list[RecallSample]],
+        ) -> tuple[int, int, dict[str, dict[str, Any]]]:
+            """Compute one fragment's partial vector top-k for a large group on an executor.
+
+            Args:
+                work: The ``(group_index, uri, version, fragment_index, samples)`` unit.
+
+            Returns:
+                ``(group_index, fragment_index, partials)`` for the driver reduce.
+            """
+            return work[0], work[3], fragment_vector_partials(work[1], work[2], work[3], work[4], config)
+
+        def text_task(work: tuple[int, str, int, list[RecallSample]]) -> tuple[int, dict[str, dict[str, Any]]]:
+            """Compute the whole-dataset BM25 legs for a large group on an executor.
+
+            Args:
+                work: The ``(group_index, uri, version, samples)`` unit.
+
+            Returns:
+                ``(group_index, legs)`` for the driver grade.
+            """
+            return work[0], whole_dataset_text_legs(work[1], work[2], work[3], config)
+
+        with telemetry.timed("recall.large_tier_ms"):
+            vector_results: list[tuple[int, int, dict[str, dict[str, Any]]]] = []
+            if vector_work:
+                vector_slices: int = max(1, min(config.large_tier_slices, len(vector_work)))
+                vector_results = spark.sparkContext.parallelize(vector_work, vector_slices).map(vector_task).collect()
+            text_results: list[tuple[int, dict[str, dict[str, Any]]]] = []
+            if text_work:
+                text_slices: int = max(1, min(config.large_tier_slices, len(text_work)))
+                text_results = spark.sparkContext.parallelize(text_work, text_slices).map(text_task).collect()
+
+        partials_by_group: dict[int, dict[str, list[tuple[int, dict[str, Any]]]]] = {}
+        for group_index, fragment_index, partials in vector_results:
+            per_sample: dict[str, list[tuple[int, dict[str, Any]]]] = partials_by_group.setdefault(group_index, {})
+            for sample_id, payload in partials.items():
+                per_sample.setdefault(sample_id, []).append((fragment_index, payload))
+        text_by_group: dict[int, dict[str, dict[str, Any]]] = {index: legs for index, legs in text_results}
+
+        telemetry.gauge("recall.large_group_fragments", len(vector_work))
+        scores: list[SampleScore] = []
+        for index, item in enumerate(items):
+            samples: list[RecallSample] = item[2]
+            drift: bool = item[3]
+            vector_legs: dict[str, dict[str, Any]] = {}
+            for sample in vector_leg_samples(samples):
+                fragment_partials: list[tuple[int, dict[str, Any]]] = partials_by_group.get(index, {}).get(
+                    sample.sample_id, []
+                )
+                vector_legs[sample.sample_id] = reduce_vector_legs(sample, fragment_partials)
+            text_legs: dict[str, dict[str, Any]] = text_by_group.get(index, {})
+            scores.extend(combine_large_group_scores(samples, drift, vector_legs, text_legs))
+        return scores
+
+    def run(self, spark: SparkSession, source: SpanSource, from_ms: int, to_ms: int) -> RecallReport:
+        """Fetch, parse, score, aggregate, and report one window of recall samples with two-tier scoring.
+
+        The driver fetches and parses the spans and groups samples by ``(dataset_uri, dataset_version)``. A probe job
+        classifies the groups by fragment count: the tail of tiny groups is packed into the small tier where one task
+        scores many datasets, and big groups go to the large tier where the vector brute force fans out per fragment
+        and reduces exactly on the driver. The driver aggregates, logs the table, and emits the per-bucket gauges.
 
         Args:
             spark: Active Spark session.
@@ -1983,25 +2493,16 @@ class RecallAuditJob:
             items: list[tuple[str, int, list[RecallSample]]] = [
                 (uri, version, group) for (uri, version), group in groups.items()
             ]
-
-            def score_group(item: tuple[str, int, list[RecallSample]]) -> list[SampleScore]:
-                """Score one version group on an executor.
-
-                Args:
-                    item: The ``(uri, version, samples)`` group.
-
-                Returns:
-                    One score per sample in the group.
-                """
-                return score_version_group(item[0], item[1], item[2], config)
-
             scores: list[SampleScore] = []
             if items:
+                small, large = self.classify_groups(spark, items)
+                run_span.set_tag("small_groups", len(small))
+                run_span.set_tag("large_groups", len(large))
                 with telemetry.timed("recall.score_ms"):
-                    collected: list[list[SampleScore]] = (
-                        spark.sparkContext.parallelize(items, len(items)).map(score_group).collect()
-                    )
-                scores = [score for group in collected for score in group]
+                    if small:
+                        scores.extend(self.run_small_tier(spark, small, telemetry))
+                    if large:
+                        scores.extend(self.run_large_tier(spark, large, telemetry))
             report: RecallReport = RecallReport(rows=aggregate_scores(scores), scores=scores, parse_skips=parse_skips)
             logger.info("recall audit results:\n%s", format_report(report))
             emit_recall_metrics(telemetry, report.rows)

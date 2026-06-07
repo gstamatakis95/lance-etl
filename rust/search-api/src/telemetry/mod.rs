@@ -33,12 +33,13 @@
 //!
 //! Caches and handles ([`metrics::Metrics::cache_lookup`], `cache_insert_bytes`,
 //! `cache_disk_gauges`, `cache_evictions`, `cache_serialize_error`, `dataset_open`,
-//! `dataset_handles`):
+//! `dataset_handles`, `dataset_handles_weighted`):
 //! - `cache.lookup` (count, tagged `cache`/`tier`/`outcome`), `cache.insert_bytes` (count),
 //!   `cache.disk.bytes` + `cache.disk.entries` (gauges, tagged `cache`), `cache.evictions`
 //!   (count, tagged `cache`/`reason`), `cache.serialize_errors` (count, tagged `cache`).
 //! - `dataset.open.duration_ms` (distribution, tagged `cold`), `cache.handles.entries` (gauge:
-//!   open-handle LRU size).
+//!   open-handle LRU entry count), `cache.handles.weighted_size` (gauge: open-handle LRU total
+//!   weighted size against the configured weighted capacity).
 //!
 //! Date-range fan-out ([`metrics::Metrics::fanout_legs`], `fanout_leg_duration`,
 //! `fanout_dedup_dropped`):

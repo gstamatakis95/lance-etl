@@ -9,8 +9,23 @@ pub const DEFAULT_INDEX_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 /// Default metadata cache budget in bytes (256 MiB).
 pub const DEFAULT_METADATA_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
-/// Default capacity of the open-dataset-handle LRU.
-pub const DEFAULT_DATASET_CACHE_CAPACITY: u64 = 1024;
+/// Default weighted capacity of the open-dataset-handle LRU.
+///
+/// The handle cache is weighted by a cheap per-handle proxy (open fragment count, clamped to
+/// [`crate::lance::provider::MAX_HANDLE_WEIGHT`]) rather than a flat entry count, so a tiny tenant
+/// handle costs one unit while a whale handle costs at most `MAX_HANDLE_WEIGHT` units. This budget
+/// is therefore "total resident handle weight", not a handle count.
+///
+/// Sized for a 30 000-tenant fleet whose load is a power-law tail of cheap tiny handles. A tiny
+/// handle holds only the manifest fragment list, the schema, and the shared session `Arc` — on the
+/// order of a few KiB resident. At one weight unit each, 16 384 units keeps over half the fleet's
+/// tiny handles resident (covering a realistic active working set many times over) for well under
+/// ~200 MiB of handle memory, which sits comfortably beside the 1 GiB index and 256 MiB metadata
+/// budgets. Because whale handles are weight-clamped, a burst of whale opens can consume at most
+/// `16384 / MAX_HANDLE_WEIGHT` units of the budget, so they can never evict the entire tiny tail.
+/// Raising the old flat 1024-handle cap to 16 384 weighted units directly removes the cold-open
+/// churn the tail paid against the previous count cap. Env: `SEARCH_API_DATASET_CACHE_CAPACITY`.
+pub const DEFAULT_DATASET_CACHE_CAPACITY: u64 = 16384;
 
 /// Default TCP port for the gRPC server.
 pub const DEFAULT_PORT: u16 = 8080;
@@ -93,7 +108,9 @@ pub struct Config {
     /// `{base}/{org_id}/{tenant_id}/{namespace}.lance` and date-partitioned ones to
     /// `{base}/{org_id}/{tenant_id}/{namespace}/{event_date}.lance`.
     pub base_uri: String,
-    /// Maximum number of open `Dataset` handles kept in the LRU map.
+    /// Weighted capacity of the open-`Dataset` handle LRU (total resident handle weight, not a
+    /// flat count). Handles are weighed by clamped open fragment count, so many cheap tiny handles
+    /// coexist while a few heavy whale handles are bounded. Env: `SEARCH_API_DATASET_CACHE_CAPACITY`.
     pub dataset_cache_capacity: u64,
     /// Byte budget for the in-memory tier of the shared session index cache.
     pub index_cache_bytes: usize,
@@ -343,6 +360,7 @@ mod tests {
         with_env(&vars, || {
             let config = Config::from_env().unwrap();
             assert_eq!(config.base_uri, "/data/lance", "trailing slash must be stripped");
+            assert_eq!(config.dataset_cache_capacity, DEFAULT_DATASET_CACHE_CAPACITY);
             assert_eq!(config.cache_dir, PathBuf::from(DEFAULT_CACHE_DIR));
             assert_eq!(config.disk_index_cache_bytes, DEFAULT_DISK_INDEX_CACHE_BYTES);
             assert_eq!(config.disk_store_cache_bytes, DEFAULT_DISK_STORE_CACHE_BYTES);
@@ -432,6 +450,19 @@ mod tests {
                 assert!(config.disk_cache_disabled);
                 assert_eq!(config.prewarm_concurrency, 9);
                 assert_eq!(config.recall_sample_rate, 0.25);
+            },
+        );
+    }
+
+    #[test]
+    fn dataset_cache_capacity_env_override_applies() {
+        with_env(
+            &[
+                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
+                ("SEARCH_API_DATASET_CACHE_CAPACITY", Some("4096")),
+            ],
+            || {
+                assert_eq!(Config::from_env().unwrap().dataset_cache_capacity, 4096);
             },
         );
     }

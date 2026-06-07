@@ -283,9 +283,20 @@ impl Metrics {
             .send();
     }
 
-    /// Current size of the open-dataset-handle LRU.
+    /// Current entry count of the open-dataset-handle LRU.
     pub fn dataset_handles(&self, entries: u64) {
         self.client.gauge_with_tags("cache.handles.entries", entries).send();
+    }
+
+    /// Current total weighted size of the open-dataset-handle LRU.
+    ///
+    /// The handle cache is bounded by total weight (clamped open fragment count per handle) rather
+    /// than a flat count, so this gauge tracks budget utilization against the configured weighted
+    /// capacity. Low cardinality: no org/tenant tags.
+    pub fn dataset_handles_weighted(&self, weighted_size: u64) {
+        self.client
+            .gauge_with_tags("cache.handles.weighted_size", weighted_size)
+            .send();
     }
 
     /// One serving cold open, tagged by whether the opened version had already been prewarmed on
@@ -568,6 +579,7 @@ mod tests {
         metrics.cache_serialize_error(CacheName::Index);
         metrics.dataset_open(true, Duration::from_millis(40));
         metrics.dataset_handles(7);
+        metrics.dataset_handles_weighted(42);
         metrics.prewarm_index(PrewarmIndexKind::Fts, Duration::from_millis(8));
         metrics.prewarm_indexes_warmed(2);
         metrics.prewarm_warmed_bytes(1024);
@@ -582,6 +594,7 @@ mod tests {
             ("search_api.cache.serialize_errors:1|c", vec!["cache:index"]),
             ("search_api.dataset.open.duration_ms:40|d", vec!["cold:true"]),
             ("search_api.cache.handles.entries:7|g", vec![]),
+            ("search_api.cache.handles.weighted_size:42|g", vec![]),
             ("search_api.prewarm.index.duration_ms:8|d", vec!["kind:fts"]),
             ("search_api.prewarm.indexes_warmed:2|c", vec![]),
             ("search_api.prewarm.warmed_bytes:1024|d", vec![]),

@@ -20,12 +20,30 @@ use crate::domain::{DatasetRef, DatasetTarget, SearchError};
 use crate::lance::error::classify_lance_error;
 use crate::telemetry::{CacheName, Metrics, Tier};
 
+/// Upper bound on the weight a single open-dataset handle contributes to the handle-cache budget.
+///
+/// The handle cache is weighted by open fragment count (a cheap O(1) manifest read). Clamping that
+/// proxy to this ceiling keeps a few whale handles from each consuming hundreds of budget units
+/// while still guaranteeing every whale is admittable: as long as the configured weighted capacity
+/// stays well above this value (the default is 16 384, this is 64), a whale handle is never
+/// rejected for exceeding the cap. A whale therefore costs at most this many tiny-handle slots.
+pub const MAX_HANDLE_WEIGHT: u32 = 64;
+
+/// Weighs one open-dataset handle for the handle cache by its clamped open fragment count.
+///
+/// `count_fragments` reads only the in-memory manifest length, so this is O(1). The result is
+/// clamped to `[1, MAX_HANDLE_WEIGHT]`: a tiny single-fragment handle weighs one unit, and a heavy
+/// whale handle weighs at most [`MAX_HANDLE_WEIGHT`], bounding its share of the budget.
+pub fn handle_weight(dataset: &Dataset) -> u32 {
+    (dataset.count_fragments() as u64).clamp(1, MAX_HANDLE_WEIGHT as u64) as u32
+}
+
 /// Resolves a dataset target (plus an optional day partition and a version selector) to an open
 /// Lance dataset handle.
 ///
 /// This is the seam for swapping dataset resolution strategies (URI layouts, catalogs,
 /// per-tenant registries, alternative blue-green schemes) without touching the search backend.
-/// Implementations own version/tag resolution and the open-handle cache; the backend only states
+/// Implementations own version/tag resolution and the open-handle cache. The backend only states
 /// *which* version it wants via [`DatasetRef`].
 pub trait DatasetProvider: Send + Sync + 'static {
     /// Returns an open dataset handle for one target at the selected version.
@@ -76,7 +94,9 @@ pub fn build_session(config: &Config, disk_backend: Option<Arc<DiskIndexCacheBac
 }
 
 /// Default provider: base-URI layout, one shared Lance session with optional disk-backed caches,
-/// and an LRU of open handles keyed by `(uri, resolved version)`.
+/// and an LRU of open handles keyed by `(uri, resolved version)` and bounded by total handle
+/// weight ([`handle_weight`]) rather than a flat entry count, so the cheap tiny-tenant tail stays
+/// resident while a few heavy whale handles are capped.
 ///
 /// Blue-green serving: when `serve_by_tag` is on, [`DatasetRef::Serve`] resolves `serve_tag` to a
 /// concrete version through `tag_versions` (a short-TTL cache, so a tag flip propagates within the
@@ -87,6 +107,7 @@ pub fn build_session(config: &Config, disk_backend: Option<Arc<DiskIndexCacheBac
 pub struct CachingDatasetProvider {
     base_uri: String,
     session: Arc<Session>,
+    /// Open-handle LRU keyed by `(uri, resolved version)` and bounded by total [`handle_weight`].
     datasets: Cache<(String, Option<u64>), Arc<Dataset>>,
     tag_versions: Cache<(String, String), u64>,
     last_tag_version: Cache<(String, String), u64>,
@@ -155,7 +176,10 @@ impl CachingDatasetProvider {
         Self {
             base_uri: config.base_uri.clone(),
             session: build_session(config, disk_index_cache.clone()),
-            datasets: Cache::new(config.dataset_cache_capacity),
+            datasets: Cache::builder()
+                .max_capacity(config.dataset_cache_capacity)
+                .weigher(|_key: &(String, Option<u64>), dataset: &Arc<Dataset>| handle_weight(dataset))
+                .build(),
             tag_versions: Cache::builder()
                 .max_capacity(config.dataset_cache_capacity)
                 .time_to_live(Duration::from_secs(config.serve_tag_ttl_secs))
@@ -169,6 +193,18 @@ impl CachingDatasetProvider {
             store_cache,
             metrics,
         }
+    }
+
+    /// Forces any pending handle-cache maintenance to run, then reports the cache's
+    /// `(entry_count, weighted_size)`.
+    ///
+    /// Moka applies admissions and evictions lazily on background maintenance, so the live
+    /// `entry_count`/`weighted_size` are only eventually consistent. Tests and introspection that
+    /// need the settled figures call this to drain pending tasks first. The weighted size is the
+    /// sum of every resident handle's [`handle_weight`] and never exceeds the configured capacity.
+    pub async fn handle_cache_stats(&self) -> (u64, u64) {
+        self.datasets.run_pending_tasks().await;
+        (self.datasets.entry_count(), self.datasets.weighted_size())
     }
 
     /// Builds the janitor over both disk tiers. `None` when disk caching is disabled.
@@ -354,6 +390,7 @@ impl DatasetProvider for CachingDatasetProvider {
         self.metrics.cache_lookup(CacheName::Handles, Tier::Memory, !cold);
         self.metrics.dataset_open(cold, started.elapsed());
         self.metrics.dataset_handles(self.datasets.entry_count());
+        self.metrics.dataset_handles_weighted(self.datasets.weighted_size());
         if cold && let Ok(dataset) = &result {
             let opened_version = dataset.version_id();
             tracing::Span::current().record("dataset.version", opened_version);
