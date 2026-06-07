@@ -7,6 +7,14 @@ Pipeline stages (in order):
                       updated datasets.
     3. ``index``    — builds or incrementally maintains IVF_RQ vector and
                       btree/bitmap/FTS scalar indices over the same datasets.
+    4. ``ttl``      — optional maintenance task: expires rows whose event timestamp is
+                      older than the configured retention window. Gated by the Airflow
+                      Variable ``lance_etl_ttl_enabled`` (default ``false``). When
+                      disabled the task is absent from the DAG entirely, so it does not
+                      appear in the run graph and adds no overhead. Set
+                      ``lance_etl_ttl_enabled=true`` and ``lance_etl_ttl_retention_days``
+                      to activate. The ``migrate-namespace`` subcommand is a one-off
+                      operator tool run manually via the CLI and is not scheduled here.
 
 Compaction runs before indexing on purpose. The compaction planner cannot bin fragments with different
 index-coverage sets together, and the distributed commit binding always remaps covering indices inline, so
@@ -92,6 +100,11 @@ Airflow Variables (all optional — defaults are listed in ``dag_params`` below)
     lance_etl_partition_by           Comma-separated partition columns forwarded as
                                      ``--partition-by``. Empty (the default) omits the flag so the
                                      ETL keeps the current org_id/tenant_id/namespace routing.
+    lance_etl_ttl_enabled            Set to ``true`` to activate the TTL expiration task. Default: ``false``
+                                     (task is absent from the DAG). When enabled, ``lance_etl_ttl_retention_days``
+                                     must also be set.
+    lance_etl_ttl_retention_days     Retention window in days forwarded as ``--retention-days``. Only used when
+                                     ``lance_etl_ttl_enabled`` is ``true``.
 """
 
 from __future__ import annotations
@@ -324,6 +337,35 @@ def make_lance_operator(
     )
 
 
+def build_ttl_application_args(params: dict[str, str | int]) -> list[str]:
+    """Build the CLI argument list for the ``ttl`` subcommand.
+
+    Reads ``lance_etl_ttl_retention_days`` and the shared dataset/identity Variables. The datasets
+    file and base URI are taken from the same Variables as the other maintenance subcommands so the
+    TTL task operates over the same dataset fleet as ``compact`` and ``index``.
+
+    Args:
+        params: DAG-run ``params`` dict.
+
+    Returns:
+        Argument list starting with the ``ttl`` subcommand token.
+    """
+    retention_days: str = Variable.get("lance_etl_ttl_retention_days", default_var="90")
+    args = [
+        "ttl",
+        "--datasets-file",
+        resolve_variable("datasets_file", params),
+        "--retention-days",
+        retention_days,
+        "--dd-service",
+        resolve_variable("dd_service", params),
+        "--dd-env",
+        resolve_variable("dd_env", params),
+    ]
+    args += build_dd_tag_flags(params)
+    return args
+
+
 default_args: dict[str, Any] = {
     "owner": "data-engineering",
     "depends_on_past": False,
@@ -359,4 +401,9 @@ with DAG(
         "index", spark_conn_id, build_datasets_subcommand_args("index", dag_params), spark_conf
     )
 
-    etl_task >> compact_task >> index_task
+    ttl_enabled: bool = Variable.get("lance_etl_ttl_enabled", default_var="false").strip().lower() == "true"
+    if ttl_enabled:
+        ttl_task = make_lance_operator("ttl", spark_conn_id, build_ttl_application_args(dag_params), spark_conf)
+        etl_task >> compact_task >> index_task >> ttl_task
+    else:
+        etl_task >> compact_task >> index_task

@@ -26,3 +26,5 @@ The companion narrative, with the live-verified numbers and the stale-branch cor
 | [0015](0015-cli-and-config-knob-reduction.md) | CLI and config knob reduction: opinionated defaults | Accepted |
 | [0016](0016-event-time-canonical-clock.md) | Event-time canonical clock: remove `_ingested_at`, use source event timestamp | Accepted |
 | [0017](0017-rust-intake-service.md) | Rust intake service with a pluggable record sink | Accepted |
+| [0018](0018-ttl-expiration.md) | TTL data-expiration by event age | Accepted |
+| [0019](0019-namespace-migrate-utility.md) | Namespace copy/migrate utility | Accepted |

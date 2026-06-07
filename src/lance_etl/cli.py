@@ -17,6 +17,10 @@ btree scalar, bitmap, and full-text BM25 indices over a set of datasets. ``recal
 Datadog-sampled vector queries as exact brute-force scans against the dataset versions that served them
 and reports recall@k. ``tag`` flips a serving tag (default ``prod``) to a target dataset version for
 blue-green promotion. ``migrate-manifests`` migrates dataset manifest paths to the V2 naming scheme.
+``ttl`` expires rows whose event timestamp is older than a configured retention window. Running this
+subcommand is the opt-in: it constructs :class:`lance_etl.ttl.TTLConfig` with ``enabled=True``.
+``migrate-namespace`` copies a whole namespace to a new namespace name; it is a one-off operator tool
+and is not scheduled.
 
 Each subcommand builds a Spark session, runs the job, and exits non-zero on failure so an orchestrator
 can retry.
@@ -27,7 +31,7 @@ from __future__ import annotations
 import argparse
 import logging
 from collections.abc import Callable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from pyspark.sql import SparkSession
 
@@ -41,8 +45,10 @@ from lance_etl.compaction import (
 )
 from lance_etl.etl import DEFAULT_PARTITION_COLS, ETLConfig, IcebergToLanceETL
 from lance_etl.indexing import IndexJobConfig, LanceIndexer
+from lance_etl.migrate_namespace import MigrateConfig, NamespaceMigrator
 from lance_etl.recall import DatadogSpanSource, RecallAuditJob, RecallJobConfig
 from lance_etl.telemetry import TelemetryConfig, configure_logging
+from lance_etl.ttl import TTLConfig, TTLJob
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -301,6 +307,90 @@ def run_migrate_manifests(args: argparse.Namespace, spark: SparkSession) -> None
     )
 
 
+def run_ttl(args: argparse.Namespace, spark: SparkSession) -> None:
+    """Run the TTL expiration subcommand.
+
+    Expires rows whose event timestamp is older than ``now - retention``. Running this subcommand is
+    the opt-in: the job is constructed with ``enabled=True``. The dataset source is ``--base-uri``
+    (discover all ``.lance`` datasets under the prefix) or ``--dataset-uri`` / ``--datasets-file``
+    flags shared by the other subcommands.
+
+    The ``--retention-days`` flag is required. All other tuning knobs (commit-retry budget, two-tier
+    thresholds, post-delete compaction cleanup horizon) take their opinionated :class:`TTLConfig`
+    defaults. Use ``--no-compact`` to skip the post-delete compaction when a separate compaction job
+    follows in the same pipeline.
+
+    Args:
+        args: Parsed command-line arguments.
+        spark: Active Spark session.
+    """
+    config: TTLConfig = TTLConfig(
+        retention=timedelta(days=args.retention_days),
+        telemetry=build_telemetry_config(args),
+        enabled=True,
+        timestamp_column=args.timestamp_column,
+        storage_options=parse_storage_options(args),
+        compact_after_delete=not args.no_compact,
+    )
+    uris: list[str] = list(args.dataset_uri or [])
+    if args.datasets_file:
+        with open(args.datasets_file, encoding="utf-8") as handle:
+            uris.extend(line.strip() for line in handle if line.strip())
+    base_uri: str | None = args.base_uri
+    report = TTLJob(config).run(spark, dataset_uris=uris or None, base_uri=base_uri)
+    logger.info("ttl report: %s", report)
+
+
+def run_migrate_namespace(args: argparse.Namespace, spark: SparkSession) -> None:
+    """Run the namespace-migration subcommand.
+
+    Copies every dataset whose namespace component equals ``--source-namespace`` to the same address
+    with the namespace component replaced by ``--target-namespace``. The source datasets are never
+    deleted, so an operator can verify the new namespace and flip serving through the blue-green tag
+    helpers before removing the source.
+
+    Recompaction and reindexing run in the same pipeline order as production (compact, then index).
+    Pass ``--no-recompact`` or ``--no-reindex`` to skip the respective step. If no index column flags
+    are provided, ``index`` is left as ``None`` and reindexing is skipped with a warning from the
+    migrator. Pass ``--overwrite-target`` to allow clobbering existing target datasets.
+
+    Args:
+        args: Parsed command-line arguments.
+        spark: Active Spark session.
+    """
+    index_config: IndexJobConfig | None = None
+    has_index_columns: bool = bool(args.vector_column or args.scalar_column or args.bitmap_column or args.text_column)
+    if has_index_columns:
+        index_config = IndexJobConfig(
+            telemetry=build_telemetry_config(args),
+            storage_options=parse_storage_options(args),
+            vector_column=args.vector_column,
+            metric=args.metric,
+            scalar_columns=list(args.scalar_column or []),
+            bitmap_columns=list(args.bitmap_column or []),
+            text_columns=list(args.text_column or []),
+            fts_with_position=args.fts_with_position,
+            fts_base_tokenizer=args.fts_base_tokenizer,
+            fts_language=args.fts_language,
+            rebuild=False,
+        )
+    partition_cols: list[str] | None = parse_partition_cols(args.partition_by)
+    config: MigrateConfig = MigrateConfig(
+        source_namespace=args.source_namespace,
+        target_namespace=args.target_namespace,
+        base_uri=args.base_uri,
+        telemetry=build_telemetry_config(args),
+        storage_options=parse_storage_options(args),
+        partition_cols=partition_cols or list(DEFAULT_PARTITION_COLS),
+        recompact=not args.no_recompact,
+        reindex=not args.no_reindex,
+        overwrite_target=args.overwrite_target,
+        index=index_config,
+    )
+    report = NamespaceMigrator(config).run(spark)
+    logger.info("migrate-namespace report: %s", report)
+
+
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     """Add the identity and storage options shared by all subcommands.
 
@@ -336,12 +426,31 @@ def add_dataset_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_index_column_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add index column-selection flags shared by the ``index`` and ``migrate-namespace`` subcommands.
+
+    These flags select which columns receive which index type. When no flags are given the indexer
+    builds no handlers and the step is a no-op (or skipped with a warning in the migrator).
+
+    Args:
+        parser: The subcommand parser to extend.
+    """
+    parser.add_argument("--vector-column", default=None, help="Vector column to index with IVF_RQ")
+    parser.add_argument("--metric", default="L2", help="Vector distance metric: L2, cosine, or dot")
+    parser.add_argument("--scalar-column", action="append", help="Scalar column for a btree index")
+    parser.add_argument("--bitmap-column", action="append", help="Column for a bitmap index")
+    parser.add_argument("--text-column", action="append", help="Text column for a full-text BM25 index")
+    parser.add_argument("--fts-with-position", action="store_true", help="Store token positions for phrase queries")
+    parser.add_argument("--fts-base-tokenizer", default=None, help="FTS base tokenizer name")
+    parser.add_argument("--fts-language", default=None, help="FTS stemming and stop-word language")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level argument parser.
 
     Returns:
-        The parser with the ``etl``, ``compact``, ``index``, ``recall``, ``tag``, and ``migrate-manifests``
-        subcommands.
+        The parser with the ``etl``, ``compact``, ``index``, ``recall``, ``tag``, ``migrate-manifests``,
+        ``ttl``, and ``migrate-namespace`` subcommands.
     """
     parser: argparse.ArgumentParser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--log-level", default="INFO")
@@ -390,14 +499,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_common_arguments(index)
     add_dataset_arguments(index)
-    index.add_argument("--vector-column", default=None, help="Vector column to index with IVF_RQ")
-    index.add_argument("--metric", default="L2", help="Vector distance metric: L2, cosine, or dot")
-    index.add_argument("--scalar-column", action="append", help="Scalar column for a btree index")
-    index.add_argument("--bitmap-column", action="append", help="Column for a bitmap index")
-    index.add_argument("--text-column", action="append", help="Text column for a full-text BM25 index")
-    index.add_argument("--fts-with-position", action="store_true", help="Store token positions for phrase queries")
-    index.add_argument("--fts-base-tokenizer", default=None, help="FTS base tokenizer name")
-    index.add_argument("--fts-language", default=None, help="FTS stemming and stop-word language")
+    add_index_column_arguments(index)
     index.add_argument(
         "--rebuild",
         action="store_true",
@@ -451,6 +553,72 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_common_arguments(migrate_manifests)
     add_dataset_arguments(migrate_manifests)
+
+    ttl: argparse.ArgumentParser = subparsers.add_parser(
+        "ttl",
+        help=(
+            "Expire rows whose event timestamp is older than the configured retention window. Running this subcommand "
+            "is the opt-in (TTLConfig.enabled is set to True). Requires --retention-days."
+        ),
+    )
+    add_common_arguments(ttl)
+    add_dataset_arguments(ttl)
+    ttl.add_argument(
+        "--retention-days",
+        type=int,
+        required=True,
+        help="Retain rows whose event timestamp is within this many days of now. Rows older than this are deleted.",
+    )
+    ttl.add_argument(
+        "--timestamp-column",
+        default="timestamp",
+        help="Event timestamp column name in each dataset. Must match ETLConfig.ts_col. Default: timestamp.",
+    )
+    ttl.add_argument(
+        "--no-compact",
+        action="store_true",
+        help=(
+            "Skip the post-delete compaction. Use when a separate compaction job follows TTL in the same pipeline "
+            "so deletion vectors are materialised by that job instead."
+        ),
+    )
+
+    migrate_namespace: argparse.ArgumentParser = subparsers.add_parser(
+        "migrate-namespace",
+        help=(
+            "Copy a whole namespace to a new namespace name. Source datasets are never deleted. "
+            "One-off operator tool — not a scheduled task."
+        ),
+    )
+    add_common_arguments(migrate_namespace)
+    migrate_namespace.add_argument("--source-namespace", required=True, help="Namespace component value to copy from.")
+    migrate_namespace.add_argument("--target-namespace", required=True, help="Namespace component value to copy to.")
+    migrate_namespace.add_argument("--base-uri", required=True, help="Root URI under which per-tenant datasets live.")
+    migrate_namespace.add_argument(
+        "--partition-by",
+        default=None,
+        help=(
+            "Comma-separated columns whose values build each dataset path in order. "
+            "Default: org_id,tenant_id,namespace."
+        ),
+    )
+    migrate_namespace.add_argument(
+        "--no-recompact",
+        action="store_true",
+        help="Skip compaction of target datasets after copying.",
+    )
+    migrate_namespace.add_argument(
+        "--no-reindex",
+        action="store_true",
+        help="Skip index rebuild on target datasets after copying.",
+    )
+    migrate_namespace.add_argument(
+        "--overwrite-target",
+        action="store_true",
+        help="Allow overwriting target datasets that already exist. Default: fail if any target exists.",
+    )
+    add_index_column_arguments(migrate_namespace)
+
     return parser
 
 
@@ -474,6 +642,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "recall": run_recall,
         "tag": run_tag,
         "migrate-manifests": run_migrate_manifests,
+        "ttl": run_ttl,
+        "migrate-namespace": run_migrate_namespace,
     }
     try:
         runners[args.command](args, spark)
