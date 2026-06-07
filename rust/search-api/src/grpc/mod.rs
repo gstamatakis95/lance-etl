@@ -10,9 +10,15 @@
 //! backend returns (see [`crate::domain::rerank`]).
 //!
 //! Submodules:
-//! - [`convert`]: pure conversions between protobuf messages and domain types.
+//! - [`convert`]: pure conversions between search protobuf messages and domain types.
+//! - [`intake`]: the [`intake::IntakeGrpc`] transport over the [`crate::domain::RecordSink`] seam.
+//! - [`intake_convert`]: pure conversions between intake protobuf messages and domain types.
 
 pub mod convert;
+pub mod intake;
+pub mod intake_convert;
+
+pub use intake::IntakeGrpc;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -121,7 +127,7 @@ pub fn status_from_error(err: SearchError) -> Status {
 }
 
 /// Low-cardinality metric tag for a gRPC status code.
-fn code_tag(code: Code) -> &'static str {
+pub(crate) fn code_tag(code: Code) -> &'static str {
     match code {
         Code::Ok => "ok",
         Code::Cancelled => "cancelled",

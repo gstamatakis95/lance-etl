@@ -1,0 +1,109 @@
+syntax = "proto3";
+
+package lance_etl.intake.v1;
+
+// Record intake into per-tenant Lance datasets: batched create/update/delete mutations.
+//
+// The service validates and routes mutations to a pluggable sink. The current sink prints the
+// mutations; a future sink writes them to Kafka for the ETL to consume. The wire contract does not
+// change when the sink does.
+service IntakeService {
+  // Applies one batch of mutations addressed to a single dataset in one call.
+  rpc Mutate(MutateRequest) returns (MutateResponse);
+  // Applies a high-throughput stream of mutation batches, returning one aggregated report when the
+  // client half-closes the stream. Each request in the stream carries its own target, so a single
+  // stream may feed several datasets.
+  rpc MutateStream(stream MutateRequest) returns (MutateResponse);
+}
+
+// Addresses the dataset a batch of mutations belongs to.
+//
+// The target resolves to the single dataset at
+// {base}/{org_id}/{tenant_id}/{namespace}.lance, the same addressing the search API uses.
+message DatasetTarget {
+  // Organization id. Must match [A-Za-z0-9_-]+.
+  string org_id = 1;
+  // Tenant id. Must match [A-Za-z0-9_-]+.
+  string tenant_id = 2;
+  // Namespace. Must match [A-Za-z0-9_-]+.
+  string namespace = 3;
+}
+
+// The kind of mutation to apply to a record.
+enum MutationOp {
+  // Invalid; mutations using it are rejected.
+  MUTATION_OP_UNSPECIFIED = 0;
+  // Create the record if absent, otherwise replace it. Carries the full record.
+  MUTATION_OP_UPSERT = 1;
+  // Delete the record by id. Only the record id is read.
+  MUTATION_OP_DELETE = 2;
+}
+
+// A fixed-length float array: one named vector column's values for a record.
+//
+// The length is the vector dimension. It must be non-empty on an upsert. Dimension consistency
+// across records is enforced downstream by the dataset schema, not by this service.
+message FloatVector {
+  // Vector components. Must be non-empty when the enclosing vector entry is present.
+  repeated float values = 1;
+}
+
+// One record to create, update, or (by id) delete.
+//
+// The record mirrors the ETL and search data model: a string id, an event-time clock, a metadata
+// map, zero or more named fixed-dimension vectors, and zero or more named text fields. The
+// addressing (org, tenant, namespace) lives on the request-level DatasetTarget and is never
+// duplicated onto each record.
+message Record {
+  // Client-assigned vector id. Transported verbatim and never interpreted as an expression.
+  string id = 1;
+  // Source event timestamp in epoch milliseconds. This is the canonical clock for the ETL; there
+  // is no separate ingestion timestamp.
+  int64 event_timestamp_ms = 2;
+  // Record metadata. Lands as an Arrow Map<Utf8, Utf8> column downstream. Keys and values are
+  // transported verbatim and never interpreted as expressions. May be empty.
+  map<string, string> metadata = 3;
+  // Named vector columns, each a fixed-length float array. Optional: an upsert may carry zero
+  // vectors. When present, every named vector must be non-empty. Each key is the vector column
+  // name in the dataset. Ignored for a delete.
+  map<string, FloatVector> vectors = 4;
+  // Named text fields. Optional: an upsert may carry zero text fields. Each key is a text column
+  // name, mirroring the search side's full-text convention: an intake text field under key "body"
+  // lands in the "body" column, which a TextSearch then queries by naming that same column. Values
+  // are transported verbatim and never interpreted as expressions. Ignored for a delete.
+  map<string, string> texts = 5;
+}
+
+// One mutation: an operation paired with the record it acts on.
+message Mutation {
+  // Operation to apply.
+  MutationOp op = 1;
+  // The record. For an upsert this is the full record. For a delete only `id` is read.
+  Record record = 2;
+}
+
+// Request for IntakeService.Mutate and one element of the IntakeService.MutateStream stream.
+message MutateRequest {
+  // Dataset the mutations in this request belong to.
+  DatasetTarget target = 1;
+  // Mutations to apply, batched in one call.
+  repeated Mutation mutations = 2;
+}
+
+// Response for IntakeService.Mutate and IntakeService.MutateStream.
+message MutateResponse {
+  // Number of mutations accepted by the sink.
+  uint64 accepted = 1;
+  // Number of mutations rejected by validation or the sink.
+  uint64 rejected = 2;
+  // Per-item errors for the rejected mutations.
+  repeated ItemError errors = 3;
+}
+
+// One rejected mutation.
+message ItemError {
+  // Record id the error refers to. Empty when the id itself was missing.
+  string id = 1;
+  // Client-safe reason the mutation was rejected.
+  string message = 2;
+}

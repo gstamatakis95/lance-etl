@@ -4,7 +4,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use search_api::config::Config;
-use search_api::grpc::SearchGrpc;
+use search_api::domain::StdoutSink;
+use search_api::grpc::{IntakeGrpc, SearchGrpc};
+use search_api::intake_pb::intake_service_server::IntakeServiceServer;
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
 use search_api::pb::search_service_server::SearchServiceServer;
 use search_api::telemetry::{self, Metrics, RecallCapture};
@@ -43,7 +45,9 @@ fn apply_lance_io_env(config: &Config) {
 
 /// Reads configuration from the environment, initializes Datadog telemetry (OTLP traces, JSON
 /// logs, DogStatsD metrics), wires provider -> backend -> transport, spawns the disk-cache
-/// janitor, and serves the gRPC API together with the standard gRPC health service.
+/// janitor, and serves the search and intake gRPC APIs together with the standard gRPC health
+/// service. The intake service uses the placeholder [`StdoutSink`]; a future Kafka sink drops in
+/// at this construction site without any other change.
 ///
 /// IO tuning: three process-global Lance knobs are stamped into the environment before any
 /// dataset opens, so that Lance reads them consistently across every thread.
@@ -97,16 +101,21 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         search_api::config::DEFAULT_ID_COLUMN,
         metrics.clone(),
     );
-    let service = SearchGrpc::with_metrics(backend, metrics).with_recall(recall);
+    let service = SearchGrpc::with_metrics(backend, metrics.clone()).with_recall(recall);
+    let intake = IntakeGrpc::with_metrics(Arc::new(StdoutSink), metrics);
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
         .set_serving::<SearchServiceServer<SearchGrpc<Backend>>>()
+        .await;
+    health_reporter
+        .set_serving::<IntakeServiceServer<IntakeGrpc<StdoutSink>>>()
         .await;
     tracing::info!(address = %addr, "search-api listening");
     Server::builder()
         .layer(OtelGrpcLayer::default().filter(reject_healthcheck))
         .add_service(health_service)
         .add_service(SearchServiceServer::new(service))
+        .add_service(IntakeServiceServer::new(intake))
         .serve(addr)
         .await?;
     drop(telemetry_guard);

@@ -9,6 +9,7 @@
 //! - [`filter`]: the typed predicate AST replacing raw SQL strings.
 //! - [`fusion`]: hybrid leg fusion strategies (RRF and weighted score fusion).
 //! - [`backend`]: the [`SearchBackend`] trait every engine implements.
+//! - [`intake`]: record-mutation types and the [`RecordSink`] write seam.
 //! - [`rerank`]: post-fusion reranking types and the [`Reranker`] trait.
 //! - [`prewarm`]: cache prewarming types and the [`Prewarmer`] trait.
 //! - [`clusters`]: IVF centroid introspection types and the [`ClusterReader`] trait.
@@ -19,6 +20,7 @@ pub mod clusters;
 pub mod error;
 pub mod filter;
 pub mod fusion;
+pub mod intake;
 pub mod prewarm;
 pub mod query;
 pub mod rerank;
@@ -29,6 +31,9 @@ pub use clusters::{ClusterReader, ClusterReport, ClusterSpec};
 pub use error::SearchError;
 pub use filter::{CompareOp, Filter, Literal};
 pub use fusion::FusionSpec;
+pub use intake::{
+    IntakeBatch, IntakeError, IntakeItemError, IntakeReport, Mutation, MutationOp, Record, RecordSink, StdoutSink,
+};
 pub use prewarm::{PrewarmReport, PrewarmSpec, PrewarmedIndex, Prewarmer};
 pub use query::{
     DistanceKind, FilterMode, FusedHit, Fuzziness, Hit, HybridQuery, HybridSearchOutcome, MatchSpec, PhraseSpec,

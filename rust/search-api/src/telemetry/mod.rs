@@ -67,6 +67,6 @@ pub mod metrics;
 pub mod recall;
 pub mod traces;
 
-pub use metrics::{CacheName, EvictionReason, Metrics, PrewarmIndexKind, PrewarmStatus, Rpc, Tier};
+pub use metrics::{CacheName, EvictionReason, IntakeRpc, Metrics, PrewarmIndexKind, PrewarmStatus, Rpc, Tier};
 pub use recall::{RecallCapture, RecallHook, RecallQueryType, RecallRecord};
 pub use traces::{TelemetryGuard, init_tracing};

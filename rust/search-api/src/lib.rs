@@ -55,3 +55,8 @@ pub mod telemetry;
 pub mod pb {
     tonic::include_proto!("lance_etl.search.v1");
 }
+
+/// Generated protobuf and gRPC types for `lance_etl.intake.v1`.
+pub mod intake_pb {
+    tonic::include_proto!("lance_etl.intake.v1");
+}
