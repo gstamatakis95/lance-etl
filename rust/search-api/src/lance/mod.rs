@@ -24,5 +24,5 @@ pub mod provider;
 pub mod rows;
 pub mod text;
 
-pub use backend::LanceSearchBackend;
+pub use backend::{LanceSearchBackend, ScanIoStats, ScanStatsHook};
 pub use provider::{CachingDatasetProvider, DatasetProvider};

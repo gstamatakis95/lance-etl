@@ -6,7 +6,7 @@ use serde_json::{Map, Value};
 use crate::domain::{
     ClusterReport, ClusterSpec, CompareOp, DatasetRef, DatasetTarget, DistanceKind, Filter, FilterMode, FusedHit,
     FusionSpec, Fuzziness, Hit, HybridQuery, Literal, MatchSpec, PhraseSpec, PrewarmReport, PrewarmSpec, RerankSpec,
-    SearchError, TextOperator, TextQuery, TextQueryNode, VectorQuery,
+    SearchError, TextOperator, TextQuery, TextQueryNode, TimeRange, VectorQuery,
 };
 use crate::pb;
 
@@ -91,8 +91,22 @@ pub fn prewarm_report_to_proto(report: PrewarmReport) -> pb::PrewarmResponse {
     }
 }
 
-/// Converts an optional proto vector query into the domain query.
-pub fn vector_query_from_proto(query: Option<pb::VectorQuery>) -> Result<VectorQuery, SearchError> {
+/// Converts an optional proto time range into the domain window.
+///
+/// An absent message means no window (search all event times). A present message with both bounds
+/// unset is carried through as an unbounded window, which the backend treats as a no-op.
+pub fn time_range_from_proto(range: Option<pb::TimeRange>) -> Option<TimeRange> {
+    range.map(|range| TimeRange {
+        start_ms: range.start_ms,
+        end_ms: range.end_ms,
+    })
+}
+
+/// Converts an optional proto vector query into the domain query, attaching the request time range.
+pub fn vector_query_from_proto(
+    query: Option<pb::VectorQuery>,
+    time_range: Option<TimeRange>,
+) -> Result<VectorQuery, SearchError> {
     let query = query.ok_or_else(|| SearchError::invalid_argument("query is required"))?;
     Ok(VectorQuery {
         vector: query.vector,
@@ -108,14 +122,18 @@ pub fn vector_query_from_proto(query: Option<pb::VectorQuery>) -> Result<VectorQ
         bypass_vector_index: query.bypass_vector_index,
         filter: query.filter.map(filter_from_proto).transpose()?,
         filter_mode: filter_mode_from_proto(query.filter_mode)?,
+        time_range,
         projection: query.projection,
         with_row_id: query.with_row_id,
         offset: query.offset.map(|n| n as usize),
     })
 }
 
-/// Converts an optional proto text query into the domain query.
-pub fn text_query_from_proto(query: Option<pb::TextQuery>) -> Result<TextQuery, SearchError> {
+/// Converts an optional proto text query into the domain query, attaching the request time range.
+pub fn text_query_from_proto(
+    query: Option<pb::TextQuery>,
+    time_range: Option<TimeRange>,
+) -> Result<TextQuery, SearchError> {
     let query = query.ok_or_else(|| SearchError::invalid_argument("query is required"))?;
     let node = match query.input {
         Some(pb::text_query::Input::Simple(terms)) => {
@@ -134,6 +152,7 @@ pub fn text_query_from_proto(query: Option<pb::TextQuery>) -> Result<TextQuery, 
         wand_factor: query.wand_factor,
         filter: query.filter.map(filter_from_proto).transpose()?,
         filter_mode: filter_mode_from_proto(query.filter_mode)?,
+        time_range,
         projection: query.projection,
         with_row_id: query.with_row_id,
         offset: query.offset.map(|n| n as usize),
@@ -141,10 +160,14 @@ pub fn text_query_from_proto(query: Option<pb::TextQuery>) -> Result<TextQuery, 
 }
 
 /// Converts a proto hybrid request into the domain query.
+///
+/// The request-level time range is applied to both legs, so the vector and text legs filter the
+/// same event-time window.
 pub fn hybrid_query_from_proto(request: pb::HybridSearchRequest) -> Result<HybridQuery, SearchError> {
+    let time_range = time_range_from_proto(request.time_range);
     Ok(HybridQuery {
-        vector: vector_query_from_proto(request.vector)?,
-        text: text_query_from_proto(request.text)?,
+        vector: vector_query_from_proto(request.vector, time_range)?,
+        text: text_query_from_proto(request.text, time_range)?,
         k: request.k as usize,
         fusion: fusion_from_proto(request.fusion)?,
     })

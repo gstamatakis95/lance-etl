@@ -250,6 +250,7 @@ pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) 
         serve_by_tag: search_api::config::DEFAULT_SERVE_BY_TAG,
         serve_tag: search_api::config::DEFAULT_SERVE_TAG.to_string(),
         serve_tag_ttl_secs: search_api::config::DEFAULT_SERVE_TAG_TTL_SECS,
+        event_timestamp_column: search_api::config::DEFAULT_EVENT_TIMESTAMP_COLUMN.to_string(),
     }
 }
 

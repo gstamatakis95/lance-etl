@@ -24,6 +24,25 @@ pub enum DistanceKind {
     Hamming,
 }
 
+/// An event-time window in epoch milliseconds, always applied to the event-timestamp column.
+///
+/// The window is start-inclusive and end-exclusive. Either bound may be `None` to leave that side
+/// unbounded. A backend translates it into a typed range predicate on its event-timestamp column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TimeRange {
+    /// Inclusive lower bound in epoch milliseconds. `None` leaves the window open on the low side.
+    pub start_ms: Option<i64>,
+    /// Exclusive upper bound in epoch milliseconds. `None` leaves the window open on the high side.
+    pub end_ms: Option<i64>,
+}
+
+impl TimeRange {
+    /// Returns true when at least one bound is set, so the window restricts the scan.
+    pub fn is_bounded(&self) -> bool {
+        self.start_ms.is_some() || self.end_ms.is_some()
+    }
+}
+
 /// Whether a filter runs before or after the index search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FilterMode {
@@ -63,6 +82,9 @@ pub struct VectorQuery {
     pub filter: Option<Filter>,
     /// Whether the filter runs before or after the index search.
     pub filter_mode: FilterMode,
+    /// Optional event-time window applied to the backend's event-timestamp column, ANDed with
+    /// `filter`. `None` searches all event times.
+    pub time_range: Option<TimeRange>,
     /// Columns to return. Empty selects all non-vector columns.
     pub projection: Vec<String>,
     /// Include the physical `_rowid` row-address column in each returned row. It changes across compaction and is
@@ -195,6 +217,9 @@ pub struct TextQuery {
     pub filter: Option<Filter>,
     /// Whether the filter runs before or after the index search.
     pub filter_mode: FilterMode,
+    /// Optional event-time window applied to the backend's event-timestamp column, ANDed with
+    /// `filter`. `None` searches all event times.
+    pub time_range: Option<TimeRange>,
     /// Columns to return. Empty selects all non-vector columns.
     pub projection: Vec<String>,
     /// Include the physical `_rowid` row-address column in each returned row. It changes across compaction and is
@@ -214,6 +239,7 @@ impl TextQuery {
             wand_factor: None,
             filter: None,
             filter_mode: FilterMode::default(),
+            time_range: None,
             projection: Vec::new(),
             with_row_id: false,
             offset: None,

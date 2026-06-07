@@ -5,10 +5,20 @@
 
 use std::collections::HashSet;
 
-use lance::deps::datafusion::common::Column;
+use arrow_schema::{DataType, TimeUnit};
+use lance::deps::datafusion::common::{Column, ScalarValue};
 use lance::deps::datafusion::logical_expr::{Expr, lit, not};
 
-use crate::domain::{CompareOp, Filter, Literal, SearchError};
+use crate::domain::{CompareOp, Filter, Literal, SearchError, TimeRange};
+
+/// Milliseconds per second, used to scale an epoch-millis bound to a second-resolution column.
+const MILLIS_PER_SECOND: i64 = 1_000;
+
+/// Microseconds per millisecond, used to scale an epoch-millis bound to a micro-resolution column.
+const MICROS_PER_MILLI: i64 = 1_000;
+
+/// Nanoseconds per millisecond, used to scale an epoch-millis bound to a nano-resolution column.
+const NANOS_PER_MILLI: i64 = 1_000_000;
 
 /// Maximum nesting depth accepted for a filter AST.
 const MAX_FILTER_DEPTH: usize = 32;
@@ -19,6 +29,54 @@ const MAX_FILTER_DEPTH: usize = 32;
 /// outside it (or outside the `[A-Za-z_][A-Za-z0-9_]*` identifier shape) is rejected.
 pub fn filter_to_expr(filter: &Filter, allowed_columns: &HashSet<String>) -> Result<Expr, SearchError> {
     translate(filter, allowed_columns, 0)
+}
+
+/// Translates an event-time window into a typed range predicate on `column` of type `data_type`.
+///
+/// The predicate is `column >= start` and/or `column < end` (start inclusive, end exclusive),
+/// depending on which bounds are present. Each epoch-millisecond bound becomes a typed literal of
+/// the column's own type (a [`ScalarValue`] timestamp scaled to the column unit and carrying the
+/// column timezone, or a plain integer literal for integer columns), so no client text is ever
+/// parsed as SQL and DataFusion needs no cross-type coercion. Returns `Ok(None)` when the window
+/// has no bounds. The caller ANDs the result with any caller-provided filter.
+pub fn time_range_to_expr(range: &TimeRange, column: &str, data_type: &DataType) -> Result<Option<Expr>, SearchError> {
+    let mut bounds: Vec<Expr> = Vec::new();
+    if let Some(start) = range.start_ms {
+        let column_expr = Expr::Column(Column::from_name(column));
+        bounds.push(column_expr.gt_eq(time_literal(start, data_type)?));
+    }
+    if let Some(end) = range.end_ms {
+        let column_expr = Expr::Column(Column::from_name(column));
+        bounds.push(column_expr.lt(time_literal(end, data_type)?));
+    }
+    Ok(bounds.into_iter().reduce(Expr::and))
+}
+
+/// Builds a typed literal for an epoch-millisecond bound matching the event-timestamp column type.
+///
+/// A timestamp column yields a [`ScalarValue`] timestamp scaled to the column's [`TimeUnit`] and
+/// carrying the column's timezone, so the comparison is exact with no coercion. An integer column
+/// (epoch milliseconds stored as an integer) yields a plain integer literal. Any other column type
+/// is rejected as an invalid argument.
+fn time_literal(epoch_ms: i64, data_type: &DataType) -> Result<Expr, SearchError> {
+    match data_type {
+        DataType::Timestamp(unit, tz) => {
+            let scalar = match unit {
+                TimeUnit::Second => ScalarValue::TimestampSecond(Some(epoch_ms / MILLIS_PER_SECOND), tz.clone()),
+                TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(Some(epoch_ms), tz.clone()),
+                TimeUnit::Microsecond => {
+                    ScalarValue::TimestampMicrosecond(Some(epoch_ms * MICROS_PER_MILLI), tz.clone())
+                }
+                TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(Some(epoch_ms * NANOS_PER_MILLI), tz.clone()),
+            };
+            Ok(lit(scalar))
+        }
+        DataType::Int64 => Ok(lit(epoch_ms)),
+        DataType::Int32 => Ok(lit(epoch_ms as i32)),
+        other => Err(SearchError::invalid_argument(format!(
+            "event-timestamp column has unsupported type for a time range: {other:?}"
+        ))),
+    }
 }
 
 /// Recursive worker for [`filter_to_expr`] tracking nesting depth.
@@ -244,6 +302,98 @@ mod tests {
                 negated: false,
             },
             &columns(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SearchError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn time_range_builds_inclusive_start_exclusive_end_on_a_timestamp_column() {
+        let data_type = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        let range = TimeRange {
+            start_ms: Some(1_000),
+            end_ms: Some(2_000),
+        };
+        let expr = time_range_to_expr(&range, "event_timestamp", &data_type)
+            .unwrap()
+            .expect("a bounded window must produce an expression");
+        let tz: Option<std::sync::Arc<str>> = Some("UTC".into());
+        let expected = col("event_timestamp")
+            .gt_eq(lit(ScalarValue::TimestampMicrosecond(Some(1_000_000), tz.clone())))
+            .and(col("event_timestamp").lt(lit(ScalarValue::TimestampMicrosecond(Some(2_000_000), tz))));
+        assert_eq!(expr, expected);
+    }
+
+    #[test]
+    fn time_range_single_bounds_and_units_scale_correctly() {
+        let millis = DataType::Timestamp(TimeUnit::Millisecond, None);
+        let start_only = time_range_to_expr(
+            &TimeRange {
+                start_ms: Some(5),
+                end_ms: None,
+            },
+            "event_timestamp",
+            &millis,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            start_only,
+            col("event_timestamp").gt_eq(lit(ScalarValue::TimestampMillisecond(Some(5), None)))
+        );
+
+        let nanos = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let end_only = time_range_to_expr(
+            &TimeRange {
+                start_ms: None,
+                end_ms: Some(3),
+            },
+            "event_timestamp",
+            &nanos,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            end_only,
+            col("event_timestamp").lt(lit(ScalarValue::TimestampNanosecond(Some(3_000_000), None)))
+        );
+    }
+
+    #[test]
+    fn time_range_on_an_integer_column_uses_an_integer_literal() {
+        let expr = time_range_to_expr(
+            &TimeRange {
+                start_ms: Some(42),
+                end_ms: None,
+            },
+            "event_timestamp",
+            &DataType::Int64,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(expr, col("event_timestamp").gt_eq(lit(42_i64)));
+    }
+
+    #[test]
+    fn time_range_without_bounds_produces_no_expression() {
+        let none = time_range_to_expr(
+            &TimeRange::default(),
+            "event_timestamp",
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+        )
+        .unwrap();
+        assert!(none.is_none(), "an unbounded window must not produce a predicate");
+    }
+
+    #[test]
+    fn time_range_on_an_unsupported_column_type_is_rejected() {
+        let err = time_range_to_expr(
+            &TimeRange {
+                start_ms: Some(1),
+                end_ms: None,
+            },
+            "event_timestamp",
+            &DataType::Utf8,
         )
         .unwrap_err();
         assert!(matches!(err, SearchError::InvalidArgument(_)));

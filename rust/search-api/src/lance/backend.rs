@@ -7,16 +7,18 @@ use arrow_array::Float32Array;
 use arrow_schema::DataType;
 use lance::Dataset;
 use lance::dataset::scanner::{ExecutionStatsCallback, ExecutionSummaryCounts, Scanner};
+use lance::deps::datafusion::logical_expr::Expr;
 use lance_core::ROW_ID;
 use lance_linalg::distance::DistanceType;
 use serde_json::{Map, Value};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::domain::{
     DatasetRef, DatasetTarget, DistanceKind, FilterMode, Hit, HybridQuery, HybridSearchOutcome, SearchBackend,
-    SearchError, TextQuery, TextSearchOutcome, VectorQuery, VectorSearchOutcome,
+    SearchError, TextQuery, TextSearchOutcome, TimeRange, VectorQuery, VectorSearchOutcome,
 };
 use crate::lance::error::classify_lance_error;
-use crate::lance::filter::filter_to_expr;
+use crate::lance::filter::{filter_to_expr, time_range_to_expr};
 use crate::lance::provider::DatasetProvider;
 use crate::lance::rows::batch_to_json_rows;
 use crate::lance::text::text_query_to_fts;
@@ -28,21 +30,72 @@ const DISTANCE_KEY: &str = "_distance";
 /// Column key under which Lance reports BM25 scores.
 const SCORE_KEY: &str = "_score";
 
+/// Object-store IO statistics captured from one Lance scan and attached to the per-query-leg span
+/// as `s3.*` attributes, so a slow query can be drilled into by its object-store request volume.
+///
+/// Values are sourced from Lance's execution-stats callback ([`ExecutionSummaryCounts`]). Lance
+/// exposes aggregate counts only: a precise GET/HEAD/LIST breakdown is not available outside the
+/// `test-util` build, so this records the object-store request count and the IO totals that are.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanIoStats {
+    /// Object-store requests made to the storage layer (`s3.requests`).
+    pub requests: u64,
+    /// I/O operations after coalescing (`s3.iops`).
+    pub iops: u64,
+    /// Bytes pulled from storage (`s3.bytes_read`).
+    pub bytes_read: u64,
+    /// Index partitions loaded from storage (`s3.parts_loaded`).
+    pub parts_loaded: u64,
+    /// Top-level indices loaded from storage (`s3.indices_loaded`).
+    pub indices_loaded: u64,
+}
+
+impl ScanIoStats {
+    /// Builds the stats from one Lance execution-summary count snapshot.
+    fn from_counts(counts: &ExecutionSummaryCounts) -> Self {
+        Self {
+            requests: counts.requests as u64,
+            iops: counts.iops as u64,
+            bytes_read: counts.bytes_read as u64,
+            parts_loaded: counts.parts_loaded as u64,
+            indices_loaded: counts.indices_loaded as u64,
+        }
+    }
+
+    /// Attaches every count to `span` as an `s3.*` attribute. Low cardinality: counts only, never
+    /// org/tenant ids.
+    fn attach_to_span(&self, span: &tracing::Span) {
+        span.set_attribute("s3.requests", self.requests as i64);
+        span.set_attribute("s3.iops", self.iops as i64);
+        span.set_attribute("s3.bytes_read", self.bytes_read as i64);
+        span.set_attribute("s3.parts_loaded", self.parts_loaded as i64);
+        span.set_attribute("s3.indices_loaded", self.indices_loaded as i64);
+    }
+}
+
+/// Observer invoked with the [`ScanIoStats`] captured from each scan. Test seam for asserting the
+/// object-store stat-capture path runs without inspecting exported spans.
+pub type ScanStatsHook = Arc<dyn Fn(&ScanIoStats) + Send + Sync>;
+
 /// Search backend executing queries with Lance scanners over datasets from a [`DatasetProvider`].
 pub struct LanceSearchBackend<P: DatasetProvider> {
     pub(crate) provider: P,
     pub(crate) prewarm_concurrency: usize,
     pub(crate) metrics: Arc<crate::telemetry::Metrics>,
+    pub(crate) event_timestamp_column: String,
+    pub(crate) scan_stats_hook: Option<ScanStatsHook>,
 }
 
 impl<P: DatasetProvider> LanceSearchBackend<P> {
-    /// Creates a backend over the given dataset provider with the default prewarm concurrency and
-    /// telemetry disabled.
+    /// Creates a backend over the given dataset provider with the default prewarm concurrency, the
+    /// default event-timestamp column, and telemetry disabled.
     pub fn new(provider: P) -> Self {
         Self {
             provider,
             prewarm_concurrency: crate::config::DEFAULT_PREWARM_CONCURRENCY,
             metrics: Arc::new(crate::telemetry::Metrics::disabled()),
+            event_timestamp_column: crate::config::DEFAULT_EVENT_TIMESTAMP_COLUMN.to_string(),
+            scan_stats_hook: None,
         }
     }
 
@@ -57,6 +110,41 @@ impl<P: DatasetProvider> LanceSearchBackend<P> {
         self.metrics = metrics;
         self
     }
+
+    /// Sets the column a request time range is applied to.
+    pub fn with_event_timestamp_column(mut self, column: impl Into<String>) -> Self {
+        self.event_timestamp_column = column.into();
+        self
+    }
+
+    /// Installs an observer invoked with the IO stats captured from each scan. Test seam.
+    pub fn with_scan_stats_hook(mut self, hook: ScanStatsHook) -> Self {
+        self.scan_stats_hook = Some(hook);
+        self
+    }
+
+    /// Bundles the per-query execution context (metrics facade, RPC tag, event-timestamp column,
+    /// and scan-stats hook) borrowed for one search leg.
+    fn context(&self, rpc: Rpc) -> QueryContext<'_> {
+        QueryContext {
+            metrics: &self.metrics,
+            rpc,
+            event_timestamp_column: &self.event_timestamp_column,
+            scan_stats_hook: self.scan_stats_hook.as_ref(),
+        }
+    }
+}
+
+/// Borrowed per-query execution context shared by a search leg.
+struct QueryContext<'a> {
+    /// Metrics facade for per-query execution stats.
+    metrics: &'a Arc<Metrics>,
+    /// RPC tag for metrics and the scan-stats span.
+    rpc: Rpc,
+    /// Column a request time range is applied to.
+    event_timestamp_column: &'a str,
+    /// Optional observer of the captured scan IO stats (test seam).
+    scan_stats_hook: Option<&'a ScanStatsHook>,
 }
 
 impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
@@ -72,7 +160,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
     ) -> Result<VectorSearchOutcome, SearchError> {
         validate_k(query.k)?;
         let dataset = self.provider.dataset(target, DatasetRef::Serve).await?;
-        let hits = run_vector_query(&dataset, &query, &self.metrics, Rpc::VectorSearch).await?;
+        let hits = run_vector_query(&dataset, &query, &self.context(Rpc::VectorSearch)).await?;
         Ok(VectorSearchOutcome {
             hits,
             dataset_version: Some(dataset.version_id()),
@@ -87,7 +175,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
     async fn text_search(&self, target: &DatasetTarget, query: TextQuery) -> Result<TextSearchOutcome, SearchError> {
         validate_k(query.k)?;
         let dataset = self.provider.dataset(target, DatasetRef::Serve).await?;
-        let hits = run_text_query(&dataset, &query, &self.metrics, Rpc::TextSearch).await?;
+        let hits = run_text_query(&dataset, &query, &self.context(Rpc::TextSearch)).await?;
         Ok(TextSearchOutcome {
             hits,
             dataset_version: Some(dataset.version_id()),
@@ -115,9 +203,10 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
         }
         let fusion = query.fusion;
         let dataset = self.provider.dataset(target, DatasetRef::Serve).await?;
+        let context = self.context(Rpc::HybridSearch);
         let (vector_hits, text_hits) = tokio::join!(
-            run_vector_query(&dataset, &vector_query, &self.metrics, Rpc::HybridSearch),
-            run_text_query(&dataset, &text_query, &self.metrics, Rpc::HybridSearch),
+            run_vector_query(&dataset, &vector_query, &context),
+            run_text_query(&dataset, &text_query, &context),
         );
         let (vector_hits, text_hits) = (vector_hits?, text_hits?);
         let fuse_span = tracing::info_span!("fusion.fuse", search.k = query.k);
@@ -163,7 +252,12 @@ fn validate_k(k: usize) -> Result<(), SearchError> {
     Ok(())
 }
 
-/// Applies projection, typed filter, and limit/offset to a scanner.
+/// Applies projection, typed filter, optional event-time range, and limit/offset to a scanner.
+///
+/// The caller-provided filter and the event-time range predicate are ANDed into a single filter
+/// expression through the typed [`filter_to_expr`] / [`time_range_to_expr`] path, so no raw SQL is
+/// ever constructed. When only a time range is present it still drives the scan filter, naturally
+/// pruned by a BTREE or zone-map on the event-timestamp column.
 ///
 /// The physical `_rowid` column is not requested here: each query path enables it conditionally via
 /// [`Scanner::with_row_id`] before calling this helper, so pure single-leg searches that neither
@@ -172,8 +266,7 @@ fn apply_common_options(
     scanner: &mut Scanner,
     dataset: &Dataset,
     projection: &[String],
-    filter: Option<&crate::domain::Filter>,
-    filter_mode: FilterMode,
+    predicate: ScanPredicate<'_>,
     k: usize,
     offset: Option<usize>,
 ) -> Result<(), SearchError> {
@@ -184,10 +277,9 @@ fn apply_common_options(
     } else {
         scanner.project(projection).map_err(|err| classify_lance_error(&err))?;
     }
-    if let Some(filter) = filter {
-        let expr = filter_to_expr(filter, &schema_columns(dataset))?;
+    if let Some(expr) = predicate.combined_expr(dataset)? {
         scanner.filter_expr(expr);
-        scanner.prefilter(filter_mode == FilterMode::Prefilter);
+        scanner.prefilter(predicate.filter_mode == FilterMode::Prefilter);
     }
     scanner
         .limit(Some(k as i64), offset.map(|skip| skip as i64))
@@ -195,20 +287,76 @@ fn apply_common_options(
     Ok(())
 }
 
-/// Builds a Lance scan-stats callback that reports per-query object-store stats as `query.*`
-/// distributions tagged by `rpc`.
+/// The scan predicate inputs: the caller's typed filter, its prefilter/postfilter mode, the
+/// optional event-time window, and the column the window applies to.
+struct ScanPredicate<'a> {
+    /// Caller-provided typed predicate, if any.
+    filter: Option<&'a crate::domain::Filter>,
+    /// Whether the predicate runs before or after the index search.
+    filter_mode: FilterMode,
+    /// Optional event-time window, ANDed with `filter`.
+    time_range: Option<&'a TimeRange>,
+    /// Column the event-time window is applied to.
+    event_timestamp_column: &'a str,
+}
+
+impl ScanPredicate<'_> {
+    /// Combines the caller filter and the event-time range into one DataFusion expression, ANDing
+    /// them when both are present. Returns `None` when neither restricts the scan.
+    fn combined_expr(&self, dataset: &Dataset) -> Result<Option<Expr>, SearchError> {
+        let filter_expr = match self.filter {
+            Some(filter) => Some(filter_to_expr(filter, &schema_columns(dataset))?),
+            None => None,
+        };
+        let range_expr = match self.time_range {
+            Some(range) if range.is_bounded() => {
+                let data_type = event_timestamp_data_type(dataset, self.event_timestamp_column)?;
+                time_range_to_expr(range, self.event_timestamp_column, &data_type)?
+            }
+            _ => None,
+        };
+        Ok(match (filter_expr, range_expr) {
+            (Some(filter), Some(range)) => Some(filter.and(range)),
+            (Some(filter), None) => Some(filter),
+            (None, range) => range,
+        })
+    }
+}
+
+/// Resolves the Arrow data type of the event-timestamp column, rejecting an absent column.
+fn event_timestamp_data_type(dataset: &Dataset, column: &str) -> Result<DataType, SearchError> {
+    dataset
+        .schema()
+        .fields
+        .iter()
+        .find(|field| field.name == column)
+        .map(|field| field.data_type())
+        .ok_or_else(|| {
+            SearchError::invalid_argument(format!("event-timestamp column {column:?} not found in dataset schema"))
+        })
+}
+
+/// Builds a Lance scan-stats callback that reports per-query object-store stats both as `query.*`
+/// metric distributions tagged by `rpc` and as `s3.*` attributes on `span`.
 ///
 /// Lance invokes the callback once, after the scan's plan finishes, with the aggregated
-/// [`ExecutionSummaryCounts`]. The callback only emits metrics through the infallible facade, so it
-/// never panics and never blocks the scan.
-fn execution_stats_callback(metrics: Arc<Metrics>, rpc: Rpc) -> ExecutionStatsCallback {
+/// [`ExecutionSummaryCounts`]. The callback emits metrics through the infallible facade and writes
+/// span attributes through the OpenTelemetry layer (a no-op when telemetry is disabled), so it
+/// never panics and never blocks the scan. `span` is the per-query-leg span captured at scan setup,
+/// a child of the per-RPC server span, so the RPC trace shows the object-store volume of each leg.
+fn execution_stats_callback(
+    metrics: Arc<Metrics>,
+    rpc: Rpc,
+    span: tracing::Span,
+    hook: Option<ScanStatsHook>,
+) -> ExecutionStatsCallback {
     Arc::new(move |counts: &ExecutionSummaryCounts| {
-        metrics.query_execution_stats(
-            rpc,
-            counts.iops as u64,
-            counts.bytes_read as u64,
-            counts.parts_loaded as u64,
-        );
+        let stats = ScanIoStats::from_counts(counts);
+        metrics.query_execution_stats(rpc, stats.iops, stats.bytes_read, stats.parts_loaded);
+        stats.attach_to_span(&span);
+        if let Some(hook) = &hook {
+            hook(&stats);
+        }
     })
 }
 
@@ -217,8 +365,7 @@ fn execution_stats_callback(metrics: Arc<Metrics>, rpc: Rpc) -> ExecutionStatsCa
 async fn run_vector_query(
     dataset: &Dataset,
     query: &VectorQuery,
-    metrics: &Arc<Metrics>,
-    rpc: Rpc,
+    context: &QueryContext<'_>,
 ) -> Result<Vec<Hit>, SearchError> {
     validate_k(query.k)?;
     if query.vector.is_empty() {
@@ -231,7 +378,12 @@ async fn run_vector_query(
     let key = Float32Array::from(query.vector.clone());
     let fetch = query.k + query.offset.unwrap_or(0);
     let mut scanner = dataset.scan();
-    scanner.scan_stats_callback(execution_stats_callback(metrics.clone(), rpc));
+    scanner.scan_stats_callback(execution_stats_callback(
+        context.metrics.clone(),
+        context.rpc,
+        tracing::Span::current(),
+        context.scan_stats_hook.cloned(),
+    ));
     scanner
         .nearest(&column_name, &key, fetch)
         .map_err(|err| classify_lance_error(&err))?;
@@ -260,7 +412,7 @@ async fn run_vector_query(
     if query.bypass_vector_index {
         scanner.use_index(false);
     }
-    let needs_row_id = query.with_row_id || rpc == Rpc::HybridSearch;
+    let needs_row_id = query.with_row_id || context.rpc == Rpc::HybridSearch;
     if needs_row_id {
         scanner.with_row_id();
     }
@@ -268,8 +420,12 @@ async fn run_vector_query(
         &mut scanner,
         dataset,
         &query.projection,
-        query.filter.as_ref(),
-        query.filter_mode,
+        ScanPredicate {
+            filter: query.filter.as_ref(),
+            filter_mode: query.filter_mode,
+            time_range: query.time_range.as_ref(),
+            event_timestamp_column: context.event_timestamp_column,
+        },
         query.k,
         query.offset,
     )?;
@@ -290,18 +446,22 @@ async fn run_vector_query(
 async fn run_text_query(
     dataset: &Dataset,
     query: &TextQuery,
-    metrics: &Arc<Metrics>,
-    rpc: Rpc,
+    context: &QueryContext<'_>,
 ) -> Result<Vec<Hit>, SearchError> {
     validate_k(query.k)?;
     let fetch = query.k + query.offset.unwrap_or(0);
     let fts = text_query_to_fts(query, fetch)?;
     let mut scanner = dataset.scan();
-    scanner.scan_stats_callback(execution_stats_callback(metrics.clone(), rpc));
+    scanner.scan_stats_callback(execution_stats_callback(
+        context.metrics.clone(),
+        context.rpc,
+        tracing::Span::current(),
+        context.scan_stats_hook.cloned(),
+    ));
     scanner
         .full_text_search(fts)
         .map_err(|err| classify_lance_error(&err))?;
-    let needs_row_id = query.with_row_id || rpc == Rpc::HybridSearch;
+    let needs_row_id = query.with_row_id || context.rpc == Rpc::HybridSearch;
     if needs_row_id {
         scanner.with_row_id();
     }
@@ -309,8 +469,12 @@ async fn run_text_query(
         &mut scanner,
         dataset,
         &query.projection,
-        query.filter.as_ref(),
-        query.filter_mode,
+        ScanPredicate {
+            filter: query.filter.as_ref(),
+            filter_mode: query.filter_mode,
+            time_range: query.time_range.as_ref(),
+            event_timestamp_column: context.event_timestamp_column,
+        },
         query.k,
         query.offset,
     )?;

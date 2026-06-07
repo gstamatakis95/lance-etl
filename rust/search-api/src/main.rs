@@ -94,7 +94,8 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let backend = Arc::new(
         LanceSearchBackend::new(provider)
             .with_prewarm_concurrency(config.prewarm_concurrency)
-            .with_metrics(metrics.clone()),
+            .with_metrics(metrics.clone())
+            .with_event_timestamp_column(config.event_timestamp_column.clone()),
     );
     let recall = RecallCapture::new(
         config.recall_sample_rate,

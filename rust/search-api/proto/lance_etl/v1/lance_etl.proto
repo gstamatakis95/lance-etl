@@ -256,6 +256,19 @@ message FilterList {
   repeated Filter filters = 1;
 }
 
+// An event-time window in epoch milliseconds, always applied to the event-timestamp column.
+//
+// The window is start-inclusive and end-exclusive. Either bound may be omitted to leave that side
+// unbounded. The service translates the window into a typed range predicate on the configured
+// event-timestamp column and ANDs it with any caller-provided filter, so a BTREE or zone-map on
+// that column prunes the scan.
+message TimeRange {
+  // Inclusive lower bound in epoch milliseconds. Omitted leaves the window open on the low side.
+  optional int64 start_ms = 1;
+  // Exclusive upper bound in epoch milliseconds. Omitted leaves the window open on the high side.
+  optional int64 end_ms = 2;
+}
+
 // Parameters for one nearest-neighbor query, reused by VectorSearch and the hybrid vector leg.
 message VectorQuery {
   // Query vector; its length must match the vector column dimension.
@@ -460,6 +473,9 @@ message VectorSearchRequest {
   VectorQuery query = 2;
   // Optional post-search reranking of the top candidates. Absent returns the order unchanged.
   Rerank rerank = 3;
+  // Optional event-time window. When set, restricts results to rows whose event-timestamp column
+  // falls in the window, ANDed with any filter on the query. Absent searches all event times.
+  TimeRange time_range = 4;
 }
 
 // Response for SearchService.VectorSearch.
@@ -484,6 +500,9 @@ message TextSearchRequest {
   TextQuery query = 2;
   // Optional post-search reranking of the top candidates. Absent returns the order unchanged.
   Rerank rerank = 3;
+  // Optional event-time window. When set, restricts results to rows whose event-timestamp column
+  // falls in the window, ANDed with any filter on the query. Absent searches all event times.
+  TimeRange time_range = 4;
 }
 
 // Response for SearchService.TextSearch.
@@ -514,6 +533,9 @@ message HybridSearchRequest {
   Fusion fusion = 5;
   // Optional post-fusion reranking of the top candidates. Absent returns the fused order unchanged.
   Rerank rerank = 6;
+  // Optional event-time window. When set, both legs restrict results to rows whose event-timestamp
+  // column falls in the window, ANDed with any per-leg filter. Absent searches all event times.
+  TimeRange time_range = 7;
 }
 
 // Response for SearchService.HybridSearch.

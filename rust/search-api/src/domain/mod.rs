@@ -35,7 +35,7 @@ pub use intake::{IntakeBatch, IntakeError, IntakeReport, Record, RecordSink, Rec
 pub use prewarm::{PrewarmReport, PrewarmSpec, PrewarmedIndex, Prewarmer};
 pub use query::{
     DistanceKind, FilterMode, FusedHit, Fuzziness, Hit, HybridQuery, HybridSearchOutcome, MatchSpec, PhraseSpec,
-    TextOperator, TextQuery, TextQueryNode, TextSearchOutcome, VectorQuery, VectorSearchOutcome,
+    TextOperator, TextQuery, TextQueryNode, TextSearchOutcome, TimeRange, VectorQuery, VectorSearchOutcome,
 };
 pub use rerank::{IdentityReranker, RerankRequest, RerankSpec, Reranker};
 pub use target::{DatasetRef, DatasetTarget};

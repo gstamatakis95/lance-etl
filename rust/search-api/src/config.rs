@@ -63,6 +63,12 @@ pub const DEFAULT_PREWARM_CONCURRENCY: usize = 4;
 /// Hardcoded: matches the standardized ETL and recall schema, so it is no longer an env knob.
 pub const DEFAULT_ID_COLUMN: &str = "vector_id";
 
+/// Default event-timestamp column a search time range is applied to.
+///
+/// The canonical ETL event clock. A request time range always filters this column. Override with
+/// `SEARCH_API_EVENT_TIMESTAMP_COLUMN` when a deployment names it differently.
+pub const DEFAULT_EVENT_TIMESTAMP_COLUMN: &str = "event_timestamp";
+
 /// Default DogStatsD address when neither `SEARCH_API_STATSD_ADDR` nor `DD_AGENT_HOST` is set.
 pub const DEFAULT_STATSD_ADDR: &str = "127.0.0.1:8125";
 
@@ -92,7 +98,7 @@ pub const DEFAULT_IO_BLOCK_SIZE_BYTES: usize = 256 * 1024;
 pub const DEFAULT_SERVE_BY_TAG: bool = false;
 
 /// Default serve tag resolved to a concrete version when serve-by-tag is enabled.
-pub const DEFAULT_SERVE_TAG: &str = "prod";
+pub const DEFAULT_SERVE_TAG: &str = "HEAD";
 
 /// Default TTL in seconds for trusting a resolved serve-tag version before re-reading the tag.
 ///
@@ -158,9 +164,13 @@ pub struct Config {
     /// resolved version so blue and green coexist and a tag flip is observed within the serve-tag
     /// TTL. Env: `SEARCH_API_SERVE_BY_TAG`.
     pub serve_by_tag: bool,
-    /// Tag serving resolves to a committed version when `serve_by_tag` is on (default `prod`).
+    /// Tag serving resolves to a committed version when `serve_by_tag` is on (default `HEAD`).
     /// Env: `SEARCH_API_SERVE_TAG`.
     pub serve_tag: String,
+    /// Column a request time range is applied to (default `event_timestamp`). A vector, text, or
+    /// hybrid request time range is translated into a typed range predicate on this column and
+    /// ANDed with any caller-provided filter. Env: `SEARCH_API_EVENT_TIMESTAMP_COLUMN`.
+    pub event_timestamp_column: String,
     /// Seconds a resolved serve-tag version is trusted before the tag JSON is re-read (default
     /// 10). Bounds how long a tag flip can go unobserved by a replica while keeping the
     /// steady-state per-request cost at zero extra manifest reads. Env:
@@ -180,8 +190,9 @@ impl Config {
     /// (default honors `DD_AGENT_HOST`), `SEARCH_API_TELEMETRY_DISABLED`,
     /// `SEARCH_API_RECALL_SAMPLE_RATE` (must lie in `[0, 1]`),
     /// `SEARCH_API_IO_CONCURRENCY` (default 256),
-    /// `SEARCH_API_SERVE_BY_TAG` (default false), `SEARCH_API_SERVE_TAG` (default `prod`), and
-    /// `SEARCH_API_SERVE_TAG_TTL_SECS` (default 10).
+    /// `SEARCH_API_SERVE_BY_TAG` (default false), `SEARCH_API_SERVE_TAG` (default `HEAD`),
+    /// `SEARCH_API_SERVE_TAG_TTL_SECS` (default 10), and `SEARCH_API_EVENT_TIMESTAMP_COLUMN`
+    /// (default `event_timestamp`).
     ///
     /// The disk cache TTL, byte-cache max range, janitor sweep interval, IO block size,
     /// object-store retry timeout, and the recall id column are fixed constants (see
@@ -212,6 +223,7 @@ impl Config {
             serve_by_tag: env_bool("SEARCH_API_SERVE_BY_TAG", DEFAULT_SERVE_BY_TAG)?,
             serve_tag: env_string("SEARCH_API_SERVE_TAG", DEFAULT_SERVE_TAG),
             serve_tag_ttl_secs: env_number("SEARCH_API_SERVE_TAG_TTL_SECS", DEFAULT_SERVE_TAG_TTL_SECS)?,
+            event_timestamp_column: env_string("SEARCH_API_EVENT_TIMESTAMP_COLUMN", DEFAULT_EVENT_TIMESTAMP_COLUMN),
         })
     }
 }
@@ -293,10 +305,11 @@ mod tests {
     }
 
     /// Env var names cleared so defaults apply in tests.
-    const OPTIONAL_VARS: [&str; 17] = [
+    const OPTIONAL_VARS: [&str; 18] = [
         "SEARCH_API_SERVE_BY_TAG",
         "SEARCH_API_SERVE_TAG",
         "SEARCH_API_SERVE_TAG_TTL_SECS",
+        "SEARCH_API_EVENT_TIMESTAMP_COLUMN",
         "SEARCH_API_DATASET_CACHE_CAPACITY",
         "SEARCH_API_INDEX_CACHE_BYTES",
         "SEARCH_API_METADATA_CACHE_BYTES",
@@ -332,8 +345,23 @@ mod tests {
             assert_eq!(config.io_concurrency, DEFAULT_IO_CONCURRENCY);
             assert_eq!(config.serve_by_tag, DEFAULT_SERVE_BY_TAG);
             assert_eq!(config.serve_tag, DEFAULT_SERVE_TAG);
+            assert_eq!(config.serve_tag, "HEAD", "the default serve tag is HEAD");
             assert_eq!(config.serve_tag_ttl_secs, DEFAULT_SERVE_TAG_TTL_SECS);
+            assert_eq!(config.event_timestamp_column, DEFAULT_EVENT_TIMESTAMP_COLUMN);
         });
+    }
+
+    #[test]
+    fn event_timestamp_column_env_override_applies() {
+        with_env(
+            &[
+                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
+                ("SEARCH_API_EVENT_TIMESTAMP_COLUMN", Some("ingested_at")),
+            ],
+            || {
+                assert_eq!(Config::from_env().unwrap().event_timestamp_column, "ingested_at");
+            },
+        );
     }
 
     #[test]
