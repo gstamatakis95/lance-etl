@@ -19,8 +19,10 @@ The companion narrative, with the live-verified numbers and the stale-branch cor
 | [0008](0008-observability-and-recall-audit.md) | Datadog observability, trace taps, and recall auditing | Accepted |
 | [0009](0009-compaction-index-coexistence.md) | Index-vs-compaction coexistence and the orphan-race guard | Accepted |
 | [0010](0010-stable-row-ids-rejected.md) | Move-stable row IDs | Rejected |
-| [0011](0011-ingested-at-column.md) | The `_ingested_at` ingestion-timestamp column | Accepted |
+| [0011](0011-ingested-at-column.md) | The `_ingested_at` ingestion-timestamp column | Superseded by [0016](0016-event-time-canonical-clock.md) |
 | [0012](0012-v2-manifest-paths.md) | V2 manifest paths fleet-wide | Accepted |
 | [0013](0013-blue-green-serving.md) | Tag-based blue/green serving | Proposed |
 | [0014](0014-drop-by-date-partitioning.md) | Drop by-date partitioning and cross-date fan-out | Accepted |
 | [0015](0015-cli-and-config-knob-reduction.md) | CLI and config knob reduction: opinionated defaults | Accepted |
+| [0016](0016-event-time-canonical-clock.md) | Event-time canonical clock: remove `_ingested_at`, use source event timestamp | Accepted |
+| [0017](0017-rust-intake-service.md) | Rust intake service with a pluggable record sink | Accepted |

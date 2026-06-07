@@ -22,9 +22,13 @@ instead of duplicating, so no separate bulk path is needed.
 An optional timestamp window filter (``window_start`` / ``window_end`` / ``window_column`` on :class:`ETLConfig`) can
 narrow the rows that reach the collapse and merge steps to those whose ``window_column`` value falls within
 ``[window_start, window_end)``.  Both bounds are ISO-8601 strings. An absent bound means the bound is open
-(no filter on that side). The
-filter is applied as a Spark ``DataFrame.filter`` call immediately after the Iceberg read so Spark can push it down into
-the Iceberg scan for partition pruning.
+(no filter on that side). The filter is applied as a Spark ``DataFrame.filter`` call immediately after the Iceberg read
+so Spark can push it down into the Iceberg scan for partition pruning.
+
+The single canonical time clock is the source event timestamp column named by ``ETLConfig.ts_col`` (default
+``"timestamp"``). Date-range queries are expressed as scalar range filters on that column, which can be pruned by a
+BTREE scalar index. There is no derived date column and no ingest-time column: the event timestamp is authoritative for
+ordering, collapse, and time-bounded serving. See ADR 0016 for the rationale and tradeoffs.
 
 Cross-contamination is prevented structurally: the dataset URI is a validated pure function of the routing columns and
 rows are shuffled by routing key, so a row can only reach its own dataset. Lance has no map type and structs are not
@@ -60,7 +64,6 @@ import pyarrow as pa
 import pyarrow.compute as pc
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import TimestampType
 from pyspark.sql.window import Window, WindowSpec
 
 from lance_etl.telemetry import (
@@ -74,15 +77,6 @@ from lance_etl.telemetry import (
 logger: logging.Logger = logging.getLogger(__name__)
 
 DEFAULT_PARTITION_COLS: tuple[str, str, str] = ("org_id", "tenant_id", "namespace")
-
-INGESTED_AT_COLUMN: str = "_ingested_at"
-"""Name of the ingestion-timestamp payload column stamped on every row during a run.
-
-The column is a payload column, never a routing or key column: it is excluded from the collapse keys, from
-``partition_cols`` routing, and from partition validation. ``when_matched_update_all`` refreshes it on updates so the
-value reflects the most recent ingestion. The leading underscore is a data-column string value (filterable through the
-gRPC allowlist), not a Python identifier, so it does not violate the no-leading-underscore code rule.
-"""
 
 PATH_COMPONENT_PATTERN: str = r"^[A-Za-z0-9._-]+$"
 """Allowed pattern for each routing-key path component.
@@ -136,7 +130,9 @@ class ETLConfig:
             key in place and a delete reaches the one dataset that holds it. No cross-dataset reader dedup is needed.
         vectors_col: Map column of vectors flattened into parallel arrays.
         metadata_col: Map column of metadata flattened into parallel arrays.
-        ts_col: Event timestamp column used for last-write-wins collapse.
+        ts_col: Source event timestamp column. Used for last-write-wins collapse and written into every dataset as the
+            single canonical time clock. Date-range queries on the written datasets are expressed as scalar range
+            filters on this column, pruned by a BTREE scalar index when one is configured.
         op_col: Operation column carrying insert, update, or delete.
         delete_op_values: Operation values treated as deletes. Others upsert.
         column_types: Map of column name to target Arrow type, for types Spark cannot express such as float16.
@@ -309,28 +305,6 @@ def conflict_bucket(conflicts: int) -> str:
     return "2+"
 
 
-def ensure_ingested_at_column(dataset: lance.LanceDataset, source_schema: pa.Schema) -> None:
-    """Evolve a pre-existing dataset that predates the ingestion-timestamp column so the merge can populate it.
-
-    Lance ``merge_insert`` rejects a source schema carrying a column the target lacks: ``check_compatible_schema``
-    accepts only a full match or a subset of the target schema, so a source column absent from the target fails both
-    and raises. A dataset created before :data:`INGESTED_AT_COLUMN` existed would therefore break the merge. Adding it
-    as an all-null nullable field via ``add_columns`` (a metadata-only commit) lets the subsequent merge upsert
-    populate it. The call is a no-op once the column is present, so steady-state runs incur nothing.
-
-    Args:
-        dataset: The opened target dataset to evolve in place.
-        source_schema: The schema of the upsert source table, supplying the column's Arrow type.
-    """
-    if INGESTED_AT_COLUMN in dataset.schema.names:
-        return
-    field_index: int = source_schema.get_field_index(INGESTED_AT_COLUMN)
-    if field_index < 0:
-        return
-    source_field: pa.Field = source_schema.field(field_index)
-    dataset.add_columns(pa.schema([pa.field(source_field.name, source_field.type)]))
-
-
 def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], group: pa.Table) -> tuple[int, int]:
     """Apply one dataset's terminal rows with merge upsert and physical delete.
 
@@ -339,15 +313,10 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
     routing key. ``enable_v2_manifest_paths=True`` is always passed on this bootstrap write because V2 manifest paths
     are a creation-time naming choice, so bootstrapping with V2 names makes every later open of the dataset a single
     object-store request instead of a version-count-proportional LIST. The rows themselves always flow through
-    ``merge_insert`` so a
-    re-upsert of an existing key updates it in place instead of duplicating it.
+    ``merge_insert`` so a re-upsert of an existing key updates it in place instead of duplicating it.
 
     The merge ``execute()`` return dict provides authoritative row counts (``num_inserted_rows``, ``num_updated_rows``,
     ``num_deleted_rows``). We report those rather than recomputing from the source table.
-
-    Schema evolution: a dataset created before :data:`INGESTED_AT_COLUMN` existed lacks that column, and
-    ``merge_insert`` rejects a source carrying a column the target lacks. :func:`ensure_ingested_at_column` adds it as a
-    metadata-only nullable column before the merge so pre-existing datasets do not fail.
 
     Conflict visibility: Lance does not surface its internal ``num_attempts`` through the pylance merge stats dict, so
     the retry count is captured by wrapping the merge in :func:`commit_with_retries`, whose ``on_conflict`` callback
@@ -395,8 +364,6 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
                     storage_options=config.storage_options,
                     enable_v2_manifest_paths=True,
                 )
-            else:
-                ensure_ingested_at_column(dataset_local, upserts.schema)
             builder = dataset_local.merge_insert(on=[config.key_col])
             if config.guard_updates_by_ts:
                 builder = builder.when_matched_update_all(condition=f"source.{config.ts_col} > target.{config.ts_col}")
@@ -609,24 +576,6 @@ class IcebergToLanceETL:
                 f"source is missing required columns: {missing} (every partition column must exist in the source)"
             )
 
-    def stamp_ingested_at(self, source: DataFrame) -> DataFrame:
-        """Stamp every row with the ingestion timestamp before collapse and routing.
-
-        Uses ``F.current_timestamp()`` cast to ``TimestampType``. Spark fixes ``current_timestamp`` to a single value
-        per query, which matches the relaxed accuracy requirement: one ingestion instant per run, identical across all
-        routed rows, is acceptable. The column is added before the collapse and the routing repartition so it lands in
-        every routed dataset and flows through ``merge_insert``. ``when_matched_update_all`` later refreshes it on
-        updates so the value reflects the most recent ingestion. The column is a payload column only: it is never a
-        collapse key, a routing column, or a partition-validation target.
-
-        Args:
-            source: The incremental source DataFrame.
-
-        Returns:
-            The DataFrame with the ingestion-timestamp column added.
-        """
-        return source.withColumn(INGESTED_AT_COLUMN, F.current_timestamp().cast(TimestampType()))
-
     def flatten_maps(self, source: DataFrame) -> DataFrame:
         """Flatten the vector and metadata maps into struct-free parallel arrays.
 
@@ -664,8 +613,9 @@ class IcebergToLanceETL:
     def run(self, spark: SparkSession, table: str, start_ms: int, end_ms: int) -> None:
         """Read, transform, and route one time range of Iceberg changes.
 
-        After the Iceberg incremental read an optional timestamp window filter is applied via
-        :meth:`apply_window_filter` before the collapse and routing shuffle.
+        Resolves the Iceberg snapshot bounds, reads the incremental rows, applies the optional timestamp window filter
+        via :meth:`apply_window_filter`, and delegates to :meth:`run_on_dataframe` for collapse and routing. The event
+        timestamp column (``config.ts_col``) is the single canonical clock for ordering and collapse.
 
         Args:
             spark: Active Spark session.
@@ -678,6 +628,12 @@ class IcebergToLanceETL:
     def run_on_dataframe(self, source: DataFrame) -> None:
         """Transform and route a pre-read increment.
 
+        Validates the source schema, flattens map columns, collapses to the last-write-wins terminal row per routing
+        key and vector id using the event timestamp, and routes each routing key's rows to its Lance dataset via
+        ``merge_insert``. The event timestamp column (``config.ts_col``) is the single canonical clock: it drives the
+        collapse order and is available for scalar range filters on the written datasets. No ingest-time column is
+        added.
+
         Args:
             source: A source DataFrame carrying the operation column.
         """
@@ -685,8 +641,7 @@ class IcebergToLanceETL:
         driver_telemetry: Telemetry = Telemetry.create(config.telemetry)
         with driver_telemetry.span("lance.etl.run") as run_span:
             self.validate_schema(source)
-            prepared: DataFrame = self.stamp_ingested_at(source)
-            collapsed: DataFrame = self.collapse(self.flatten_maps(prepared))
+            collapsed: DataFrame = self.collapse(self.flatten_maps(source))
             routing: list[str] = config.routing_cols()
             routed: DataFrame = collapsed.repartition(config.num_partitions, *[F.col(c) for c in routing])
             partition_stats_schema: pa.Schema = stats_schema(routing)

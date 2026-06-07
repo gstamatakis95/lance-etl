@@ -1,8 +1,9 @@
-"""Tests for the ingestion-timestamp column and merge conflict-visibility metrics.
+"""Tests confirming that no ingestion-timestamp column is written and event-time collapse is correct.
 
-Covers the ``_ingested_at`` payload column stamped by the Spark ETL (presence, population, timestamp type, exclusion
-from collapse keys and partition validation), the schema-evolution path that re-adds the column to a dataset created
-before it existed, and the conflict-count bucket tag plus retry counter emitted by :func:`apply_merge`.
+After ADR 0016, the ``_ingested_at`` column is removed. The source event timestamp (``ETLConfig.ts_col``,
+default ``"timestamp"``) is the single canonical clock. These tests assert that the written dataset schema
+does not carry ``_ingested_at``, that event-time last-write-wins collapse still works correctly, and that the
+merge-conflict visibility metrics continue to fire as expected.
 """
 
 from __future__ import annotations
@@ -16,13 +17,11 @@ from unittest.mock import MagicMock
 
 import lance
 import pyarrow as pa
-import pyarrow.types as pat
 import pytest
 from pyspark.sql import SparkSession
 
 from lance_etl import etl as etl_module
 from lance_etl.etl import (
-    INGESTED_AT_COLUMN,
     ETLConfig,
     IcebergToLanceETL,
     apply_merge,
@@ -30,6 +29,8 @@ from lance_etl.etl import (
     dataset_uri,
 )
 from lance_etl.telemetry import TelemetryConfig
+
+INGESTED_AT_COLUMN: str = "_ingested_at"
 
 SOURCE_DDL: str = (
     "vector_id string, org_id string, tenant_id string, namespace string, timestamp bigint, op string, "
@@ -48,7 +49,7 @@ def spark() -> Iterator[SparkSession]:
     os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
     session: SparkSession = (
         SparkSession.builder.master("local[2]")
-        .appName("lance-etl-ingested-at-tests")
+        .appName("lance-etl-event-time-tests")
         .config("spark.sql.shuffle.partitions", "4")
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.ui.enabled", "false")
@@ -70,69 +71,54 @@ def sample_rows() -> list[tuple]:
     ]
 
 
-class TestFreshIngest:
-    """A fresh ingest stamps every routed row with a populated timestamp column."""
+class TestNoIngestedAtColumn:
+    """The written dataset schema does not carry the removed ingestion-timestamp column."""
 
-    def test_column_present_and_populated_as_timestamp(
+    def test_column_absent_after_ingest(
         self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
     ) -> None:
-        """The default ``_ingested_at`` column appears, is a timestamp, and carries no nulls."""
+        """A fresh ingest does not produce an ``_ingested_at`` column in the written dataset.
+
+        This is the primary regression guard for ADR 0016: the column must not reappear.
+        """
         config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config, num_partitions=4)
         frame = spark.createDataFrame(sample_rows(), SOURCE_DDL)
         IcebergToLanceETL(config).run_on_dataframe(frame)
 
         table: pa.Table = lance.dataset(dataset_uri(config, "o1", "t1", "n1")).to_table()
-        assert INGESTED_AT_COLUMN in table.column_names
-        stamped: pa.ChunkedArray = table[INGESTED_AT_COLUMN]
-        assert pat.is_timestamp(stamped.type)
-        assert stamped.null_count == 0
+        assert INGESTED_AT_COLUMN not in table.column_names
 
-
-class TestSchemaEvolution:
-    """A dataset created before the column existed gains it on the next ingest."""
-
-    def test_existing_dataset_without_column_evolves(
+    def test_event_timestamp_column_present(
         self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
     ) -> None:
-        """Dropping the column then re-ingesting re-adds it and populates the updated rows.
+        """The event timestamp column (``ts_col``) is present in the written dataset.
 
-        This simulates a pre-existing dataset created before the ingestion-timestamp column was introduced, exercising
-        the explicit one-time ``add_columns`` evolution path in :func:`apply_merge`.
+        The event timestamp is the single canonical clock after ADR 0016.
         """
         config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config, num_partitions=4)
-        etl: IcebergToLanceETL = IcebergToLanceETL(config)
-        etl.run_on_dataframe(spark.createDataFrame(sample_rows(), SOURCE_DDL))
+        frame = spark.createDataFrame(sample_rows(), SOURCE_DDL)
+        IcebergToLanceETL(config).run_on_dataframe(frame)
 
-        uri: str = dataset_uri(config, "o1", "t1", "n1")
-        dataset: lance.LanceDataset = lance.dataset(uri)
-        dataset.drop_columns([INGESTED_AT_COLUMN])
-        assert INGESTED_AT_COLUMN not in lance.dataset(uri).schema.names
-
-        etl.run_on_dataframe(spark.createDataFrame(sample_rows(), SOURCE_DDL))
-
-        table: pa.Table = lance.dataset(uri).to_table()
-        assert INGESTED_AT_COLUMN in table.column_names
-        stamped: pa.ChunkedArray = table[INGESTED_AT_COLUMN]
-        assert pat.is_timestamp(stamped.type)
-        assert stamped.null_count == 0
+        table: pa.Table = lance.dataset(dataset_uri(config, "o1", "t1", "n1")).to_table()
+        assert config.ts_col in table.column_names
 
 
-class TestCollapseExclusion:
-    """The ingestion-timestamp column is excluded from the collapse dedup keys."""
+class TestCollapseEventTime:
+    """The event timestamp drives last-write-wins collapse correctly."""
 
-    def test_same_key_different_ingested_at_collapses(
+    def test_same_key_higher_timestamp_wins(
         self, spark: SparkSession, telemetry_config: TelemetryConfig, tmp_path: Path
     ) -> None:
-        """Two rows sharing the real key collapse to one even with differing ingestion timestamps."""
+        """Two rows sharing a key collapse to the one with the higher event timestamp."""
         config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config)
         etl: IcebergToLanceETL = IcebergToLanceETL(config)
         collapse_ddl: str = (
-            "org_id string, tenant_id string, namespace string, vector_id string, timestamp bigint, _ingested_at string"
+            "org_id string, tenant_id string, namespace string, vector_id string, timestamp bigint, op string"
         )
         frame = spark.createDataFrame(
             [
-                ("o1", "t1", "n1", "v1", 1, "2024-01-01 00:00:00"),
-                ("o1", "t1", "n1", "v1", 2, "2024-06-06 00:00:00"),
+                ("o1", "t1", "n1", "v1", 1, "insert"),
+                ("o1", "t1", "n1", "v1", 2, "insert"),
             ],
             collapse_ddl,
         )
@@ -143,24 +129,20 @@ class TestCollapseExclusion:
 
 
 class TestRoutingExclusion:
-    """The ingestion-timestamp column is never a routing or required column."""
+    """The event timestamp column is not a routing column."""
 
-    def test_not_required_by_validate_schema(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
-        """validate_schema passes without the ingestion-timestamp column in the source, and routing omits it."""
+    def test_ts_col_not_in_routing_cols(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
+        """The timestamp column is not listed in routing_cols."""
         config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config)
-        etl: IcebergToLanceETL = IcebergToLanceETL(config)
-        source: MagicMock = MagicMock()
-        source.columns = ["vector_id", "timestamp", "op", "vectors", "metadata", "org_id", "tenant_id", "namespace"]
-        etl.validate_schema(source)
-        assert INGESTED_AT_COLUMN not in config.routing_cols()
+        assert config.ts_col not in config.routing_cols()
 
 
 def fake_merge_dataset(execute_side_effect: list[Any]) -> MagicMock:
     """Build a mock dataset whose merge builder yields a controllable execute side effect.
 
-    The builder methods all return the builder so the fluent merge chain works, the schema already carries the
-    ingestion-timestamp column so the schema-evolution add is skipped, and ``execute`` replays the given side effect
-    (exceptions are raised, dicts are returned) to force a controlled number of commit conflicts.
+    The builder methods all return the builder so the fluent merge chain works, and ``execute`` replays the
+    given side effect (exceptions are raised, dicts are returned) to force a controlled number of commit
+    conflicts. The schema carries only ``vector_id`` so there is no ``_ingested_at`` to evolve.
 
     Args:
         execute_side_effect: The ``execute`` side-effect list, mixing conflict exceptions and a final stats dict.
@@ -176,21 +158,20 @@ def fake_merge_dataset(execute_side_effect: list[Any]) -> MagicMock:
     builder.execute.side_effect = execute_side_effect
     dataset: MagicMock = MagicMock()
     dataset.merge_insert.return_value = builder
-    dataset.schema.names = ["vector_id", "_ingested_at"]
+    dataset.schema.names = ["vector_id"]
     return dataset
 
 
 def conflict_group() -> pa.Table:
-    """Return a one-row upsert group carrying the op and ingestion-timestamp columns.
+    """Return a one-row upsert group carrying only the key and op columns.
 
     Returns:
-        A table with ``vector_id``, ``op``, and ``_ingested_at`` columns.
+        A table with ``vector_id`` and ``op`` columns. No ``_ingested_at`` column.
     """
     return pa.table(
         {
             "vector_id": pa.array(["v1"]),
             "op": pa.array(["insert"]),
-            "_ingested_at": pa.array([1_700_000_000_000_000], pa.timestamp("us")),
         }
     )
 

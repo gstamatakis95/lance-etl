@@ -48,6 +48,6 @@ REQUIRED_ETL_ARGV: list[str] = [
 
 
 def test_etl_has_no_ingested_at_flag() -> None:
-    """The ingestion-timestamp column name is baked, so no ``--ingested-at-col`` flag is exposed."""
+    """No ``--ingested-at-col`` flag is exposed because the ingestion-timestamp column was removed in ADR 0016."""
     args = build_parser().parse_args(REQUIRED_ETL_ARGV)
     assert not hasattr(args, "ingested_at_col")

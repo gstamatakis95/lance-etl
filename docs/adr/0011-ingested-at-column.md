@@ -1,11 +1,15 @@
 # 0011. The `_ingested_at` ingestion-timestamp column
 
-Status: Accepted
+Status: Superseded by [0016](0016-event-time-canonical-clock.md)
 
 ## Context
 
 We want a per-row ingestion-time signal for provenance and incremental bookkeeping. Accuracy can be relaxed: one
 value per run is acceptable and the same value across many rows is fine.
+
+This ADR was superseded when the column was removed entirely. The source event timestamp column (`ETLConfig.ts_col`,
+default `"timestamp"`) is now the single canonical clock. See [ADR 0016](0016-event-time-canonical-clock.md) for the
+full rationale, the tradeoff on ingest-age retention, and the new scalar-range-filter query model.
 
 ## Decision
 
@@ -24,3 +28,6 @@ so an explicit metadata-only `add_columns` runs before the merge. The stable-row
 (`_row_created_at_version`, `_row_last_updated_at_version`) are not a substitute: they are version integers not
 timestamps, only populated when stable row IDs are on (rejected in [0010](0010-stable-row-ids-rejected.md)), and
 not in the gRPC filter allowlist. So `_ingested_at` is the durable ingestion-time signal.
+
+This decision was reversed in [ADR 0016](0016-event-time-canonical-clock.md). The column is no longer stamped.
+All code paths that stamped, evolved, or referenced `_ingested_at` were removed.
