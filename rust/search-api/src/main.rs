@@ -23,6 +23,11 @@ type Backend = LanceSearchBackend<CachingDatasetProvider>;
 /// process sees a consistent value sourced from the service's own config rather than whatever
 /// the operator's shell happened to export.
 ///
+/// This must run while the process is still single-threaded, before the tokio runtime spawns
+/// any worker thread.  `set_var` is unsound once other threads exist, because a worker racing
+/// on `getenv` against this `set_var` is a data race under the C11/POSIX memory model.  `main`
+/// is therefore a synchronous entry point that calls this before building the runtime.
+///
 /// Knobs stamped here must not already be set in the environment; if they are (e.g. in a
 /// Kubernetes pod spec that overrides the default), `set_var` would silently overwrite them.
 /// The semantics are intentional: `SEARCH_API_*` vars take precedence over ambient env.
@@ -59,10 +64,16 @@ fn apply_lance_io_env(config: &Config) {
 /// Every RPC flows through the OpenTelemetry tower layer (health checks excluded), which extracts
 /// inbound trace context and opens the per-request server span. Telemetry failures never block or
 /// fail requests.
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     apply_lance_io_env(&config);
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    runtime.block_on(serve(config))
+}
+
+/// Runs the async service body on the already-built runtime: wires telemetry, provider, backend,
+/// and transport, then serves the gRPC API together with the standard gRPC health service.
+async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(if config.telemetry_disabled {
         Metrics::disabled()
     } else {

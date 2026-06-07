@@ -66,6 +66,12 @@ def test_build_delete_predicate() -> None:
     assert predicate == "vector_id IN ('a', 'b')"
 
 
+def test_build_delete_predicate_escapes_single_quotes() -> None:
+    """Embedded single quotes are doubled so the SQL IN list stays well-formed."""
+    predicate: str = build_delete_predicate("vector_id", pa.array(["a'b", "o''neil"]))
+    assert predicate == "vector_id IN ('a''b', 'o''''neil')"
+
+
 def test_apply_merge_bootstrap_and_counts(etl_config: ETLConfig, telemetry: Telemetry) -> None:
     """The first merge creates the dataset and reports merge-derived counts."""
     upserted, deleted = apply_merge(etl_config, telemetry, ROUTING_KEY, make_group(["a", "b", "c"]))

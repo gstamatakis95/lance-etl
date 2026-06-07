@@ -168,8 +168,9 @@ impl FanoutLeg {
 /// Typed facade over the DogStatsD client so call sites cannot invent metric names or tags.
 ///
 /// Tag policy: only `rpc`, `status`, `cold`, `cache`, `tier`, `outcome`, `reason`, `kind`,
-/// `leg`, and `filtered` — `org_id` never appears on metrics (30k orgs would explode the
-/// timeseries count). Org-level visibility comes from traces and logs.
+/// `leg`, `filtered`, `warmed`, and `changed` — `org_id`/`tenant_id`/`version` never appear on
+/// metrics (30k orgs would explode the timeseries count). Org-, tenant-, and version-level detail
+/// lives on traces and logs instead.
 pub struct Metrics {
     client: StatsdClient,
 }
@@ -285,6 +286,39 @@ impl Metrics {
     /// Current size of the open-dataset-handle LRU.
     pub fn dataset_handles(&self, entries: u64) {
         self.client.gauge_with_tags("cache.handles.entries", entries).send();
+    }
+
+    /// One serving cold open, tagged by whether the opened version had already been prewarmed on
+    /// this replica.
+    ///
+    /// `warmed:false` is the flip-without-prewarm signal: serving reached a version that prewarm
+    /// has not warmed, so the first queries on it pay the cold-cache cost. A healthy blue-green
+    /// rollout keeps this at `warmed:true`. No version tag (cardinality lives on the span).
+    pub fn serve_cold_open(&self, warmed: bool) {
+        self.client
+            .count_with_tags("serve.cold_open", 1)
+            .with_tag("warmed", if warmed { "true" } else { "false" })
+            .send();
+    }
+
+    /// One serve-tag re-resolution after the TTL lapsed, tagged by whether the resolved version
+    /// changed from the previous resolution.
+    ///
+    /// `changed:true` marks the moment a replica observes a tag flip, so the spread of these
+    /// across the fleet is the flip-propagation latency.
+    pub fn serve_tag_resolved(&self, changed: bool) {
+        self.client
+            .count_with_tags("serve.tag_resolved", 1)
+            .with_tag("changed", if changed { "true" } else { "false" })
+            .send();
+    }
+
+    /// The most recently prewarmed committed version on this process (last writer wins).
+    ///
+    /// A process-wide gauge (no per-dataset tag, to stay low-cardinality) that, read together
+    /// with the served version on traces, shows whether prewarm is keeping pace with the tag.
+    pub fn prewarm_last_version(&self, version: u64) {
+        self.client.gauge_with_tags("prewarm.last_version", version).send();
     }
 
     /// One cache lookup outcome.
@@ -642,6 +676,34 @@ mod tests {
                 .iter()
                 .any(|line| line.starts_with("search_api.throttle.new_rate:12.5|g")),
             "missing throttle rate gauge: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn blue_green_metrics_render_expected_names_and_tags() {
+        let (metrics, drain) = spy_metrics();
+        metrics.serve_cold_open(true);
+        metrics.serve_cold_open(false);
+        metrics.serve_tag_resolved(true);
+        metrics.serve_tag_resolved(false);
+        metrics.prewarm_last_version(42);
+        let lines = drain();
+        let expect = [
+            ("search_api.serve.cold_open:1|c", "warmed:true"),
+            ("search_api.serve.cold_open:1|c", "warmed:false"),
+            ("search_api.serve.tag_resolved:1|c", "changed:true"),
+            ("search_api.serve.tag_resolved:1|c", "changed:false"),
+            ("search_api.prewarm.last_version:42|g", ""),
+        ];
+        for (head, tag) in expect {
+            assert!(
+                lines.iter().any(|line| line.starts_with(head) && line.contains(tag)),
+                "missing {head} with {tag} in {lines:?}"
+            );
+        }
+        assert!(
+            !lines.iter().any(|line| line.contains("org")),
+            "blue-green metrics must never carry org/version tags: {lines:?}"
         );
     }
 

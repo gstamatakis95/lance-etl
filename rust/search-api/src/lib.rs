@@ -16,6 +16,34 @@
 //! - [`config`]: environment-driven runtime configuration.
 //! - [`telemetry`]: Datadog tracing/metrics/logging facade, free of Lance and proto types, usable
 //!   from every layer above `domain`.
+//!
+//! # Extension points
+//!
+//! Every cross-cutting behavior sits behind a trait (or, for fusion, a declarative enum) so a
+//! second implementation drops in without editing the layers around it. The rule of thumb the
+//! crate follows: domain traits speak only domain types, the `lance` module is the only place
+//! Lance types appear, and the `grpc` module is the only place proto/tonic types appear. To add a
+//! new implementation:
+//!
+//! - New search engine: implement [`domain::SearchBackend`] (and, to serve the full API,
+//!   [`domain::Prewarmer`] + [`domain::clusters::ClusterReader`]) over your engine, expressed
+//!   purely in domain types. The transport ([`grpc::SearchGrpc`]) is generic over these traits, so
+//!   it needs no change. [`lance::LanceSearchBackend`] is the reference implementation.
+//! - New dataset-resolution strategy (different URI layout, a catalog, a different blue-green
+//!   scheme): implement [`lance::DatasetProvider`]. It owns version/tag resolution and the
+//!   open-handle cache; the backend only states which version it wants via [`domain::DatasetRef`].
+//!   [`lance::CachingDatasetProvider`] is the reference implementation.
+//! - New hybrid fusion strategy: add a variant to [`domain::FusionSpec`] and a match arm to its
+//!   `fuse` method. Fusion is a pure function of the leg lists, so it is unit-testable with no
+//!   engine or server. Map it from proto in [`grpc::convert::fusion_from_proto`].
+//! - New version selector: extend [`domain::DatasetRef`]; resolve it in
+//!   [`lance::DatasetProvider`] implementations and map it from proto in `grpc::convert`.
+//! - New transport (e.g. HTTP/JSON): add a sibling of [`grpc`] that converts its wire types to and
+//!   from domain types and delegates to the same backend traits. The domain and engine layers are
+//!   untouched.
+//!
+//! Single-use helpers are intentionally left as concrete functions: a seam is added only where a
+//! second implementation would plausibly need one.
 
 pub mod cache;
 pub mod config;

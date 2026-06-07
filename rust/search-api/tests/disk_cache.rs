@@ -10,7 +10,7 @@ use std::sync::Arc;
 use common::{
     CountingWrapper, ReadCounts, TEST_DATASET_PATH, bin_file_count, build_indexed_dataset, test_config, test_target,
 };
-use search_api::domain::{PrewarmSpec, Prewarmer, SearchBackend, TextQuery, VectorQuery};
+use search_api::domain::{DatasetRef, PrewarmSpec, Prewarmer, SearchBackend, TextQuery, VectorQuery};
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
 use tempfile::TempDir;
 
@@ -51,6 +51,7 @@ async fn cold_process_serves_searches_from_disk_caches() {
                 index_names: vec![],
                 fts_with_position: true,
             },
+            DatasetRef::Latest,
         )
         .await
         .unwrap();
@@ -136,6 +137,7 @@ async fn tiny_budget_sweep_keeps_cache_within_bounds_and_searches_correct() {
                 index_names: vec![],
                 fts_with_position: true,
             },
+            DatasetRef::Latest,
         )
         .await
         .unwrap();

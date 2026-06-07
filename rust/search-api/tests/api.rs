@@ -195,6 +195,9 @@ async fn serve_full(tmp: &TempDir, metrics: Arc<Metrics>, recall: Option<RecallC
         io_concurrency: search_api::config::DEFAULT_IO_CONCURRENCY,
         io_block_size_bytes: search_api::config::DEFAULT_IO_BLOCK_SIZE_BYTES,
         object_store_timeout_secs: search_api::config::DEFAULT_OBJECT_STORE_TIMEOUT_SECS,
+        serve_by_tag: search_api::config::DEFAULT_SERVE_BY_TAG,
+        serve_tag: search_api::config::DEFAULT_SERVE_TAG.to_string(),
+        serve_tag_ttl_secs: search_api::config::DEFAULT_SERVE_TAG_TTL_SECS,
     };
     let provider = CachingDatasetProvider::with_telemetry(&config, metrics.clone());
     let backend = Arc::new(
@@ -671,6 +674,7 @@ async fn prewarm_rpc_warms_metadata_and_indexes() {
             all_indexes: true,
             index_names: vec![],
             fts_with_position: true,
+            version_ref: None,
         })
         .await
         .unwrap()
@@ -705,6 +709,7 @@ async fn prewarm_rpc_reports_per_index_errors_and_status_codes() {
             all_indexes: false,
             index_names: vec!["text_idx".into(), "no_such_index".into()],
             fts_with_position: false,
+            version_ref: None,
         })
         .await
         .unwrap()
@@ -722,6 +727,7 @@ async fn prewarm_rpc_reports_per_index_errors_and_status_codes() {
             all_indexes: false,
             index_names: vec![],
             fts_with_position: false,
+            version_ref: None,
         })
         .await
         .unwrap_err();
@@ -734,6 +740,7 @@ async fn prewarm_rpc_reports_per_index_errors_and_status_codes() {
             all_indexes: false,
             index_names: vec![],
             fts_with_position: false,
+            version_ref: None,
         })
         .await
         .unwrap_err();
@@ -746,6 +753,7 @@ async fn prewarm_rpc_reports_per_index_errors_and_status_codes() {
             all_indexes: false,
             index_names: vec![],
             fts_with_position: false,
+            version_ref: None,
         })
         .await
         .unwrap_err();

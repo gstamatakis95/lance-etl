@@ -9,7 +9,7 @@ use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
 
-use crate::domain::{ClusterReader, ClusterReport, ClusterSpec, DatasetTarget, SearchError};
+use crate::domain::{ClusterReader, ClusterReport, ClusterSpec, DatasetRef, DatasetTarget, SearchError};
 use crate::lance::backend::LanceSearchBackend;
 use crate::lance::error::classify_lance_error;
 use crate::lance::prewarm::VECTOR_DETAILS_SUFFIX;
@@ -131,7 +131,7 @@ impl<P: DatasetProvider> ClusterReader for LanceSearchBackend<P> {
     )]
     async fn clusters(&self, target: &DatasetTarget, spec: ClusterSpec) -> Result<ClusterReport, SearchError> {
         let date = target.single_date()?;
-        let dataset = self.provider.dataset(target, date).await?;
+        let dataset = self.provider.dataset(target, date, DatasetRef::Serve).await?;
         let started = Instant::now();
         let report = ivf_centroids(&dataset, spec.index_name.as_deref()).await?;
         self.metrics.clusters_read(started.elapsed());

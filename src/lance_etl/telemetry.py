@@ -7,9 +7,7 @@ events into Datadog. Telemetry clients are created per process via :meth:`Teleme
 Lance emits structured trace events (file audits, dataset events, object-store throttling, index I/O, and execution
 stats) through a non-blocking callback that :func:`attach_lance_event_bridge` registers. The bridge turns those events
 into Datadog counters, gauges, and distributions and forwards them as logs. The bridge attaches automatically the first
-time :meth:`Telemetry.create` runs in a process, so driver and executors both report Lance internals. The performance
-tuning that the Lance guide describes (compute and I/O thread pools, the scan read-ahead buffer, log and trace levels)
-is applied through :class:`LanceRuntimeConfig` and :func:`apply_lance_runtime`.
+time :meth:`Telemetry.create` runs in a process, so driver and executors both report Lance internals.
 
 Assumes a Datadog Agent reachable from every node for DogStatsD on the configured host and port. The ddtrace, datadog,
 and lance imports use version and availability fallbacks. Adjust the import block if installed versions differ.
@@ -18,7 +16,6 @@ and lance imports use version and availability fallbacks. Adjust the import bloc
 from __future__ import annotations
 
 import logging
-import os
 import random
 import time
 from collections.abc import Callable, Iterator
@@ -106,62 +103,6 @@ class TelemetryConfig:
     statsd_port: int = 8125
     metric_prefix: str = "lance.pipeline"
     constant_tags: list[str] = field(default_factory=list)
-
-
-@dataclass
-class LanceRuntimeConfig:
-    """Lance runtime tuning drawn from the Lance performance guide.
-
-    The thread-pool and buffer settings must be in the environment before Lance initializes its pools, so on Spark they
-    belong in the executor environment rather than being set inside a task. :func:`apply_lance_runtime` sets them on the
-    current process for the driver, and returns the variables it set so the caller can mirror them onto executors.
-
-    Attributes:
-        cpu_threads: Value for ``LANCE_CPU_THREADS``. Set this below the executor core count when several tasks share
-            an executor to avoid compute oversubscription.
-        io_threads: Value for ``LANCE_IO_THREADS``. Cloud stores often need 128 or 256 to saturate bandwidth.
-        io_buffer_size_bytes: Value for ``LANCE_DEFAULT_IO_BUFFER_SIZE``. Raise it alongside the I/O thread count.
-        lance_log: Value for ``LANCE_LOG`` controlling log filtering by level and target.
-        lance_tracing: Value for ``LANCE_TRACING`` controlling the trace level the event bridge observes. The key events
-            are emitted at ``info``.
-    """
-
-    cpu_threads: int | None = None
-    io_threads: int | None = None
-    io_buffer_size_bytes: int | None = None
-    lance_log: str | None = None
-    lance_tracing: str | None = None
-
-    def as_env(self) -> dict[str, str]:
-        """Return the environment variables for the set fields.
-
-        Returns:
-            A mapping of Lance environment variable names to string values,
-            containing only the fields that are set.
-        """
-        candidates: list[tuple[str, int | str | None]] = [
-            ("LANCE_CPU_THREADS", self.cpu_threads),
-            ("LANCE_IO_THREADS", self.io_threads),
-            ("LANCE_DEFAULT_IO_BUFFER_SIZE", self.io_buffer_size_bytes),
-            ("LANCE_LOG", self.lance_log),
-            ("LANCE_TRACING", self.lance_tracing),
-        ]
-        return {name: str(value) for name, value in candidates if value is not None}
-
-
-def apply_lance_runtime(config: LanceRuntimeConfig) -> dict[str, str]:
-    """Apply Lance runtime tuning to the current process environment.
-
-    Args:
-        config: The runtime tuning to apply.
-
-    Returns:
-        The environment variables that were set, for mirroring onto executors.
-    """
-    variables: dict[str, str] = config.as_env()
-    for name, value in variables.items():
-        os.environ[name] = value
-    return variables
 
 
 def commit_with_retries(

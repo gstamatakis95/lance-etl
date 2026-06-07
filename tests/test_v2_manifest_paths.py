@@ -1,10 +1,10 @@
 """Tests for V2 manifest paths on dataset bootstrap and the one-shot migration entry point.
 
-Covers the :class:`ETLConfig` default, the CLI flag wiring (both the default and the ``--no-v2-manifest-paths``
-override), and the real-Lance bootstrap layout: a dataset created through :func:`apply_merge` carries V2 manifest
-names (``_versions/{u64::MAX - version}.manifest`` zero-padded to 20 digits) while an opted-out dataset keeps the
-legacy V1 names. The migration tests prove :func:`migrate_dataset_manifest_paths` upgrades a V1 dataset to V2 in
-place and that the ``migrate-manifests`` CLI subcommand is wired.
+V2 manifest paths are now an opinionated always-on default with no CLI flag: the :class:`ETLConfig` default is the
+only knob and it is tunable in code. Covers that default, the real-Lance bootstrap layout (a dataset created through
+:func:`apply_merge` carries V2 manifest names ``_versions/{u64::MAX - version}.manifest`` zero-padded to 20 digits,
+while an opted-out config keeps the legacy V1 names), and the migration: :func:`migrate_dataset_manifest_paths`
+upgrades a V1 dataset to V2 in place and the ``migrate-manifests`` CLI subcommand is wired.
 """
 
 from __future__ import annotations
@@ -67,21 +67,15 @@ class TestETLConfigDefault:
 
 
 class TestCliWiring:
-    """The etl subcommand flows the default and the opt-out flag into args."""
+    """The etl subcommand parses without a V2 flag, and migrate-manifests is wired."""
 
-    def test_default_flows_true(self, tmp_path: Path) -> None:
-        """Without a flag the parsed args carry enable_v2_manifest_paths True."""
+    def test_etl_parses_without_v2_flag(self, tmp_path: Path) -> None:
+        """The opinionated CLI exposes no V2 manifest flag: the ETLConfig default governs the behavior."""
         args = build_parser().parse_args(
             ["etl", "--table", "t", "--start", "0", "--end", "1", "--base-uri", str(tmp_path)]
         )
-        assert args.enable_v2_manifest_paths is True
-
-    def test_no_flag_sets_false(self, tmp_path: Path) -> None:
-        """--no-v2-manifest-paths sets enable_v2_manifest_paths False."""
-        args = build_parser().parse_args(
-            ["etl", "--table", "t", "--start", "0", "--end", "1", "--base-uri", str(tmp_path), "--no-v2-manifest-paths"]
-        )
-        assert args.enable_v2_manifest_paths is False
+        assert args.command == "etl"
+        assert not hasattr(args, "enable_v2_manifest_paths")
 
     def test_migrate_subcommand_parses(self, tmp_path: Path) -> None:
         """The migrate-manifests subcommand parses with dataset-selection arguments."""

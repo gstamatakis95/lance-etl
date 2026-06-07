@@ -1561,9 +1561,7 @@ class FtsIndexHandler(IndexHandler):
             Returns:
                 ``True`` if a delta merge ran.
             """
-            telemetry_local: Telemetry = Telemetry.create(config.telemetry)
-            optimize_existing_index(target, index_name, config, telemetry_local)
-            return merge_index_deltas(target, index_name, config, telemetry_local)
+            return maintain_index_locally(target, index_name, config, Telemetry.create(config.telemetry))
 
         with telemetry.timed("index.build_ms", tags=[f"index:{index_name}"]):
             merged: list[bool] = spark.sparkContext.parallelize([uri], 1).map(maintain_one).collect()
@@ -1659,7 +1657,7 @@ class FtsIndexHandler(IndexHandler):
         if self.maintainable(dataset):
             return self.maintain(spark, uri, telemetry)
         if self.covered_fragments(dataset):
-            dataset.drop_index(self.index_name)
+            drop_stale_index(uri, self.index_name, config, telemetry)
             dataset = lance.dataset(uri, storage_options=config.storage_options)
 
         fragment_ids: list[int] = [fragment.fragment_id for fragment in dataset.get_fragments()]

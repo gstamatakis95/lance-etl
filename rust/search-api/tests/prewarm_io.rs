@@ -7,7 +7,9 @@ mod common;
 use std::sync::Arc;
 
 use common::{CountingWrapper, ReadCounts, TEST_DATASET_PATH, build_indexed_dataset, test_config, test_target};
-use search_api::domain::{FusionSpec, HybridQuery, PrewarmSpec, Prewarmer, SearchBackend, TextQuery, VectorQuery};
+use search_api::domain::{
+    DatasetRef, FusionSpec, HybridQuery, PrewarmSpec, Prewarmer, SearchBackend, TextQuery, VectorQuery,
+};
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
 use tempfile::TempDir;
 
@@ -35,6 +37,7 @@ async fn searches_after_prewarm_do_no_index_or_manifest_io() {
                 index_names: vec![],
                 fts_with_position: true,
             },
+            DatasetRef::Latest,
         )
         .await
         .unwrap();

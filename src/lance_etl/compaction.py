@@ -41,7 +41,7 @@ Requires pylance and the Datadog Agent on the executors.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import timedelta
@@ -204,11 +204,54 @@ def compaction_metrics_dict(metrics: CompactionMetrics) -> dict[str, int]:
     }
 
 
+def fan_out_per_dataset(
+    spark: SparkSession,
+    uris: list[str],
+    telemetry_config: TelemetryConfig,
+    per_dataset: Callable[[str, Telemetry], dict[str, Any]],
+    partitions: int,
+) -> list[dict[str, Any]]:
+    """Run an independent per-dataset operation across executors, one task per partition.
+
+    Each executor task creates its own telemetry facade and applies ``per_dataset`` to every URI in its partition. Used
+    by the small compaction tier, the manifest migration, and the serving-tag flip, all of which are embarrassingly
+    parallel one-call-per-dataset operations that differ only in the per-dataset callable.
+
+    Args:
+        spark: Active Spark session.
+        uris: Dataset URIs to process.
+        telemetry_config: Telemetry configuration created per executor process.
+        per_dataset: The operation to apply to one URI with an executor-local telemetry facade.
+        partitions: Upper bound on Spark partitions, capped at the URI count.
+
+    Returns:
+        One outcome dictionary per dataset.
+    """
+
+    def partition(part: Iterable[str]) -> Iterator[dict[str, Any]]:
+        """Apply the operation to one partition of dataset URIs on an executor.
+
+        Args:
+            part: Dataset URIs assigned to this executor task.
+
+        Yields:
+            One outcome dictionary per dataset.
+        """
+        executor_telemetry: Telemetry = Telemetry.create(telemetry_config)
+        for uri in part:
+            yield per_dataset(uri, executor_telemetry)
+
+    return spark.sparkContext.parallelize(uris, min(len(uris), partitions)).mapPartitions(partition).collect()
+
+
 def cleanup_dataset(uri: str, config: CompactionConfig, telemetry: Telemetry) -> int:
     """Prune old versions of a dataset after compaction.
 
     ``delete_unverified`` is never passed, so the 7-day unverified threshold keeps protecting executor-written rewrite
-    and index-segment files that are unreferenced until their driver commit.
+    and index-segment files that are unreferenced until their driver commit. ``error_if_tagged_old_versions=False`` is
+    passed so a tagged version a serving layer is pinned to (see :func:`update_serving_tag`) is left in place silently
+    instead of raising: cleanup skips tagged versions regardless of age, and the blue-green serving tag must keep its
+    version readable until the serving layer is flipped to a newer one.
 
     Args:
         uri: Dataset URI.
@@ -235,7 +278,11 @@ def cleanup_dataset(uri: str, config: CompactionConfig, telemetry: Telemetry) ->
     )
     dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
     with telemetry.timed("dataset.cleanup_ms"):
-        stats = dataset.cleanup_old_versions(older_than=older_than, retain_versions=config.retain_versions)
+        stats = dataset.cleanup_old_versions(
+            older_than=older_than,
+            retain_versions=config.retain_versions,
+            error_if_tagged_old_versions=False,
+        )
     telemetry.distribution("dataset.bytes_removed", stats.bytes_removed)
     return int(stats.bytes_removed)
 
@@ -301,28 +348,121 @@ def migrate_manifest_paths(
         run_span.set_tag("dataset_count", len(uris))
         if not uris:
             return []
-
-        def migrate_partition(partition: Iterable[str]) -> Iterator[dict[str, Any]]:
-            """Migrate one partition of dataset URIs on an executor.
-
-            Args:
-                partition: Dataset URIs assigned to this executor task.
-
-            Yields:
-                One outcome dictionary per dataset.
-            """
-            executor_telemetry: Telemetry = Telemetry.create(telemetry_config)
-            for uri in partition:
-                yield migrate_dataset_manifest_paths(uri, storage_options, executor_telemetry)
-
         with driver_telemetry.timed("run.migrate_manifest_ms"):
-            results: list[dict[str, Any]] = (
-                spark.sparkContext.parallelize(uris, min(len(uris), partitions))
-                .mapPartitions(migrate_partition)
-                .collect()
+            results: list[dict[str, Any]] = fan_out_per_dataset(
+                spark,
+                uris,
+                telemetry_config,
+                lambda uri, telemetry: migrate_dataset_manifest_paths(uri, storage_options, telemetry),
+                partitions,
             )
         driver_telemetry.gauge("run.manifests_migrated", len(results))
         logger.info("manifest migration: %d datasets migrated to V2 paths", len(results))
+        return results
+
+
+DEFAULT_SERVING_TAG: str = "prod"
+"""Default serving-tag name flipped during blue-green promotion."""
+
+
+def update_serving_tag(
+    uri: str,
+    target_version: int | None,
+    storage_options: dict[str, Any] | None,
+    telemetry: Telemetry,
+    tag: str = DEFAULT_SERVING_TAG,
+) -> dict[str, Any]:
+    """Point a serving tag at a target dataset version for blue-green promotion.
+
+    Creates the tag when it does not exist yet, otherwise updates it in place, through the Lance tags API
+    (``ds.tags.create`` / ``ds.tags.update``, ``python/python/lance/dataset.py:6857-6908``). A tagged version is
+    exempt from version cleanup: :func:`cleanup_dataset` passes ``error_if_tagged_old_versions=False`` and Lance never
+    prunes a tagged version regardless of age (``cleanup_old_versions`` docs), so the version a serving layer reads
+    stays readable across maintenance until the tag is flipped to a newer one.
+
+    The safe blue-green operational sequence is logged on every call because a tag move alone changes nothing for a
+    running serving process. Build the green version (ETL plus index plus compaction), prewarm the serving layer
+    against that explicit version, and only then flip the tag. The serving layer is never assumed to auto-refresh when
+    the tag moves: it must be told to re-resolve the tag, or it keeps serving the previous version.
+
+    Args:
+        uri: Dataset URI.
+        target_version: The dataset version to point the tag at. ``None`` selects the dataset's latest version.
+        storage_options: Object-store options forwarded to pylance.
+        telemetry: Telemetry facade for the current process.
+        tag: Serving-tag name to create or move. Defaults to :data:`DEFAULT_SERVING_TAG`.
+
+    Returns:
+        A statistics dictionary ``{"uri", "tag", "version", "created"}`` describing the flip.
+    """
+    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
+    version: int = dataset.version if target_version is None else target_version
+    created: bool = tag not in dataset.tags.list()
+    logger.info(
+        "blue-green tag flip for %s: 1) build green version %d, 2) prewarm the serving layer against version %d, "
+        "3) flip tag %r to version %d. A tag move does not refresh a running serving process: prewarm and re-resolve "
+        "the tag explicitly before relying on it.",
+        uri,
+        version,
+        version,
+        tag,
+        version,
+    )
+    with telemetry.timed("dataset.tag_update_ms", tags=[f"tag:{tag}"]):
+        if created:
+            dataset.tags.create(tag, version)
+            telemetry.incr("dataset.tag_created", tags=[f"tag:{tag}"])
+        else:
+            dataset.tags.update(tag, version)
+            telemetry.incr("dataset.tag_updated", tags=[f"tag:{tag}"])
+    return {"uri": uri, "tag": tag, "version": version, "created": created}
+
+
+def update_serving_tags(
+    spark: SparkSession,
+    dataset_uris: Iterable[str],
+    telemetry_config: TelemetryConfig,
+    storage_options: dict[str, Any] | None,
+    tag: str = DEFAULT_SERVING_TAG,
+    target_version: int | None = None,
+    partitions: int = 512,
+) -> list[dict[str, Any]]:
+    """Flip a serving tag across a fleet of datasets, one task per executor partition.
+
+    Each dataset's tag flip is an independent cheap metadata commit, so the work fans out across executors exactly
+    like the manifest migration. With ``target_version`` set, every dataset is pointed at that same version number,
+    which only makes sense for a single dataset; with ``target_version=None`` (the common fleet case) each dataset's
+    tag is moved to its own latest version, promoting the freshly built green version of each.
+
+    Args:
+        spark: Active Spark session.
+        dataset_uris: Datasets whose serving tag should be flipped.
+        telemetry_config: Telemetry configuration created per executor process.
+        storage_options: Object-store options forwarded to pylance.
+        tag: Serving-tag name to create or move. Defaults to :data:`DEFAULT_SERVING_TAG`.
+        target_version: Target version for every dataset, or ``None`` to use each dataset's latest version.
+        partitions: Maximum Spark partitions for the tag-flip job.
+
+    Returns:
+        One statistics dictionary per dataset.
+    """
+    driver_telemetry: Telemetry = Telemetry.create(telemetry_config)
+    with driver_telemetry.span("lance.serving_tag.run") as run_span:
+        uris: list[str] = list(dataset_uris)
+        run_span.set_tag("dataset_count", len(uris))
+        run_span.set_tag("tag", tag)
+        if not uris:
+            return []
+        with driver_telemetry.timed("run.serving_tag_ms"):
+            results: list[dict[str, Any]] = fan_out_per_dataset(
+                spark,
+                uris,
+                telemetry_config,
+                lambda uri, telemetry: update_serving_tag(uri, target_version, storage_options, telemetry, tag),
+                partitions,
+            )
+        driver_telemetry.gauge("run.tags_flipped", len(results))
+        logger.info("serving-tag flip: tag %r moved on %d datasets", tag, len(results))
         return results
 
 
@@ -619,23 +759,13 @@ class LanceCompactor:
             if not uris:
                 return []
 
-            def small_tier(partition: Iterable[str]) -> Iterator[dict[str, Any]]:
-                """Classify and compact one partition of dataset URIs on an executor.
-
-                Args:
-                    partition: Dataset URIs assigned to this executor task.
-
-                Yields:
-                    One outcome dictionary per dataset.
-                """
-                executor_telemetry: Telemetry = Telemetry.create(config.telemetry)
-                for uri in partition:
-                    yield classify_or_compact(uri, config, executor_telemetry)
-
-            partitions: int = min(len(uris), config.batch_partitions)
             with driver_telemetry.timed("run.small_tier_ms"):
-                outcomes: list[dict[str, Any]] = (
-                    spark.sparkContext.parallelize(uris, partitions).mapPartitions(small_tier).collect()
+                outcomes: list[dict[str, Any]] = fan_out_per_dataset(
+                    spark,
+                    uris,
+                    config.telemetry,
+                    lambda uri, telemetry: classify_or_compact(uri, config, telemetry),
+                    config.batch_partitions,
                 )
             results: list[dict[str, Any]] = [item for item in outcomes if item["tier"] == "small"]
             large_uris: list[str] = [item["uri"] for item in outcomes if item["tier"] == "large"]

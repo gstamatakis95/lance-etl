@@ -48,7 +48,9 @@ message DatasetTarget {
 message PrewarmRequest {
   // Dataset to prewarm. A date_range, when present, must cover exactly one day.
   DatasetTarget target = 1;
-  // Warm dataset metadata (manifest, transaction, index listing). Implied by warming any index.
+  // Warm dataset metadata (manifest, transaction, index listing). Implied by warming any index,
+  // since opening the dataset warms its metadata. When false with no index targets the prewarm is
+  // a no-op that never opens the dataset.
   bool metadata = 2;
   // Warm all indexes of the dataset; ignored when index_names is non-empty.
   bool all_indexes = 3;
@@ -56,6 +58,17 @@ message PrewarmRequest {
   repeated string index_names = 4;
   // Also pull FTS position data for inverted indexes (needed for phrase queries).
   bool fts_with_position = 5;
+  // Pins which committed version to warm. Additive and optional: when unset the latest version
+  // is warmed (the original behavior, so existing clients keep working). Setting an explicit
+  // version (or a tag that resolves to one) lets an operator warm a freshly built green version
+  // into every replica's caches BEFORE flipping the serve tag, so the first post-flip query is
+  // warm instead of cold.
+  oneof version_ref {
+    // Warm this exact committed version id.
+    uint64 version = 6;
+    // Warm the version this tag currently resolves to.
+    string tag = 7;
+  }
 }
 
 // Request for SearchService.Clusters.
@@ -98,6 +111,10 @@ message PrewarmResponse {
   uint64 total_duration_ms = 4;
   // Approximate bytes resident in the shared index cache after the call.
   uint64 index_cache_size_bytes = 5;
+  // The concrete committed version id that was actually warmed. With a tag (or serve-tag)
+  // target this is the version the tag resolved to at warm time, so the caller can confirm the
+  // green version is warm before flipping the serve tag onto it.
+  uint64 resolved_version = 6;
 }
 
 // Outcome of prewarming one index.

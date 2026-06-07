@@ -34,6 +34,16 @@ used downstream, so ``vectors`` and ``metadata`` are flattened with ``map_keys``
 ``{col}_values`` parallel list columns associated by index. ``conflict_retries`` makes concurrent runs on the same
 dataset safe. Any other failure propagates so the job fails fast.
 
+Small-and-big efficiency: the per-tenant population is power-law shaped (tens of thousands of orgs, most tiny, a few
+huge), so the ETL never does per-row work on the driver. The driver only resolves the Iceberg snapshot bounds from
+table metadata, short-circuits to an empty read when no snapshot landed in the window, and broadcasts the routing
+plan. All collapse, routing, and merge work runs in executors: rows shuffle by routing key into ``num_partitions``
+co-located partitions, and ``merge_partition`` groups each partition's rows by routing key and applies one keyed,
+idempotent ``merge_insert`` per dataset. A tiny org's increment is a small group merged in process on one executor at
+near-zero cost, a huge org's increment co-locates to its partition and merges there, and an org with no rows in the
+window produces no group and touches no dataset. Bootstrapping a brand-new tiny dataset is a single empty append plus
+merge, never a cluster-wide fan-out.
+
 Requires pylance and the Datadog Agent on the executors.
 """
 
@@ -370,7 +380,10 @@ def build_delete_predicate(key_col: str, keys: pa.Array) -> str:
     Returns:
         A SQL ``IN (...)`` predicate string.
     """
-    quoted: list[str] = [f"'{v}'" for v in keys.to_pylist()]
+    quoted: list[str] = []
+    for value in keys.to_pylist():
+        escaped: str = str(value).replace("'", "''")
+        quoted.append(f"'{escaped}'")
     joined: str = ", ".join(quoted)
     return f"{key_col} IN ({joined})"
 

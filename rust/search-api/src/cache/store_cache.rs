@@ -40,8 +40,17 @@ const TRANSACTIONS_DIR: &str = "_transactions";
 /// Directory holding index files.
 const INDICES_DIR: &str = "_indices";
 
-/// File name of the mutable latest-manifest pointer, which must never be cached.
+/// File name of the V1 mutable latest-manifest pointer, which must never be cached.
 const LATEST_MANIFEST_FILE: &str = "_latest.manifest";
+
+/// File name of the V2 mutable latest-version hint, which must never be cached.
+///
+/// V2 datasets advertise their newest version through `_versions/latest_version_hint.json` instead
+/// of the V1 `_latest.manifest`. Caching either would let a replica serve a stale latest pointer
+/// across a commit or a blue-green flip, so both are pinned to always-pass-through here. The hint
+/// already fails the `.manifest` suffix check, but naming it explicitly guards the never-cache
+/// invariant against a future refactor of the suffix logic.
+const LATEST_VERSION_HINT_FILE: &str = "latest_version_hint.json";
 
 /// Which class of immutable metadata object a path belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +65,8 @@ enum PathKind {
     Index,
 }
 
-/// Classifies a path. `None` means the path must always pass through (notably `data/`).
+/// Classifies a path. `None` means the path must always pass through (notably `data/` and the
+/// mutable latest-version pointers of both the V1 and V2 manifest naming schemes).
 fn classify(location: &ObjectPath) -> Option<PathKind> {
     let mut kind = None;
     for part in location.parts() {
@@ -68,10 +78,11 @@ fn classify(location: &ObjectPath) -> Option<PathKind> {
         });
     }
     let filename = location.filename().unwrap_or("");
+    if filename == LATEST_MANIFEST_FILE || filename == LATEST_VERSION_HINT_FILE {
+        return None;
+    }
     match kind {
-        Some(PathKind::Manifest) if filename.ends_with(".manifest") && filename != LATEST_MANIFEST_FILE => {
-            Some(PathKind::Manifest)
-        }
+        Some(PathKind::Manifest) if filename.ends_with(".manifest") => Some(PathKind::Manifest),
         Some(PathKind::Manifest) => None,
         other => other,
     }
@@ -560,6 +571,20 @@ mod tests {
         store.get(&path).await.unwrap().bytes().await.unwrap();
         store.get(&path).await.unwrap().bytes().await.unwrap();
         assert_eq!(counting.gets.load(Ordering::SeqCst), 2);
+        drop(tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn latest_version_hint_is_never_cached() {
+        let (tmp_dir, counting, store) = setup(4096, &[("ds/_versions/latest_version_hint.json", 64)]).await;
+        let path = ObjectPath::from("ds/_versions/latest_version_hint.json");
+        store.get(&path).await.unwrap().bytes().await.unwrap();
+        store.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(
+            counting.gets.load(Ordering::SeqCst),
+            2,
+            "the V2 latest-version hint must always pass through to the real store"
+        );
         drop(tmp_dir);
     }
 

@@ -63,6 +63,12 @@ pub const DEFAULT_IO_CONCURRENCY: usize = 256;
 /// random reads.  256 KiB is a practical balance for S3 given typical index page sizes.
 pub const DEFAULT_IO_BLOCK_SIZE_BYTES: usize = 256 * 1024;
 
+/// Default for whether serving resolves the configured serve tag instead of opening latest.
+///
+/// Off by default so the legacy latest-resolution behavior is preserved until an operator has
+/// verified prewarm-by-version and is ready to cut serving over to tag-based blue-green.
+pub const DEFAULT_SERVE_BY_TAG: bool = false;
+
 /// Default serve tag resolved to a concrete version when serve-by-tag is enabled.
 pub const DEFAULT_SERVE_TAG: &str = "prod";
 
@@ -151,6 +157,19 @@ pub struct Config {
     /// S3 throttle back-offs without breaching a typical search-service SLO.
     /// Env: `SEARCH_API_OBJECT_STORE_TIMEOUT_SECS`.
     pub object_store_timeout_secs: u64,
+    /// Whether serving resolves the configured serve tag to a concrete version instead of opening
+    /// the latest committed version (default false). When on, the provider keys its caches on the
+    /// resolved version so blue and green coexist and a tag flip is observed within the serve-tag
+    /// TTL. Env: `SEARCH_API_SERVE_BY_TAG`.
+    pub serve_by_tag: bool,
+    /// Tag serving resolves to a committed version when `serve_by_tag` is on (default `prod`).
+    /// Env: `SEARCH_API_SERVE_TAG`.
+    pub serve_tag: String,
+    /// Seconds a resolved serve-tag version is trusted before the tag JSON is re-read (default
+    /// 10). Bounds how long a tag flip can go unobserved by a replica while keeping the
+    /// steady-state per-request cost at zero extra manifest reads. Env:
+    /// `SEARCH_API_SERVE_TAG_TTL_SECS`.
+    pub serve_tag_ttl_secs: u64,
 }
 
 impl Config {
@@ -167,7 +186,9 @@ impl Config {
     /// (default honors `DD_AGENT_HOST`), `SEARCH_API_TELEMETRY_DISABLED`,
     /// `SEARCH_API_RECALL_SAMPLE_RATE` (must lie in `[0, 1]`),
     /// `SEARCH_API_IO_CONCURRENCY` (default 256), `SEARCH_API_IO_BLOCK_SIZE_BYTES`
-    /// (default 256 KiB), and `SEARCH_API_OBJECT_STORE_TIMEOUT_SECS` (default 120).
+    /// (default 256 KiB), `SEARCH_API_OBJECT_STORE_TIMEOUT_SECS` (default 120),
+    /// `SEARCH_API_SERVE_BY_TAG` (default false), `SEARCH_API_SERVE_TAG` (default `prod`), and
+    /// `SEARCH_API_SERVE_TAG_TTL_SECS` (default 10).
     pub fn from_env() -> Result<Self, String> {
         let base_uri = std::env::var("LANCE_ETL_BASE_URI")
             .map_err(|_| "LANCE_ETL_BASE_URI must be set".to_string())?
@@ -204,6 +225,9 @@ impl Config {
                 "SEARCH_API_OBJECT_STORE_TIMEOUT_SECS",
                 DEFAULT_OBJECT_STORE_TIMEOUT_SECS,
             )?,
+            serve_by_tag: env_bool("SEARCH_API_SERVE_BY_TAG", DEFAULT_SERVE_BY_TAG)?,
+            serve_tag: env_string("SEARCH_API_SERVE_TAG", DEFAULT_SERVE_TAG),
+            serve_tag_ttl_secs: env_number("SEARCH_API_SERVE_TAG_TTL_SECS", DEFAULT_SERVE_TAG_TTL_SECS)?,
         })
     }
 }
@@ -285,7 +309,10 @@ mod tests {
     }
 
     /// Env var names cleared so defaults apply in tests.
-    const OPTIONAL_VARS: [&str; 21] = [
+    const OPTIONAL_VARS: [&str; 24] = [
+        "SEARCH_API_SERVE_BY_TAG",
+        "SEARCH_API_SERVE_TAG",
+        "SEARCH_API_SERVE_TAG_TTL_SECS",
         "SEARCH_API_DATASET_CACHE_CAPACITY",
         "SEARCH_API_INDEX_CACHE_BYTES",
         "SEARCH_API_METADATA_CACHE_BYTES",
@@ -332,7 +359,28 @@ mod tests {
             assert_eq!(config.io_concurrency, DEFAULT_IO_CONCURRENCY);
             assert_eq!(config.io_block_size_bytes, DEFAULT_IO_BLOCK_SIZE_BYTES);
             assert_eq!(config.object_store_timeout_secs, DEFAULT_OBJECT_STORE_TIMEOUT_SECS);
+            assert_eq!(config.serve_by_tag, DEFAULT_SERVE_BY_TAG);
+            assert_eq!(config.serve_tag, DEFAULT_SERVE_TAG);
+            assert_eq!(config.serve_tag_ttl_secs, DEFAULT_SERVE_TAG_TTL_SECS);
         });
+    }
+
+    #[test]
+    fn serve_tag_env_overrides_apply() {
+        with_env(
+            &[
+                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
+                ("SEARCH_API_SERVE_BY_TAG", Some("true")),
+                ("SEARCH_API_SERVE_TAG", Some("green")),
+                ("SEARCH_API_SERVE_TAG_TTL_SECS", Some("3")),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert!(config.serve_by_tag);
+                assert_eq!(config.serve_tag, "green");
+                assert_eq!(config.serve_tag_ttl_secs, 3);
+            },
+        );
     }
 
     #[test]

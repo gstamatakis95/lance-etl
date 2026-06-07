@@ -1,5 +1,10 @@
-//! Shared helpers for the disk-cache integration tests: a tiny indexed dataset builder and a
-//! counting object-store wrapper that records which reads reach the real store.
+//! Shared helpers for the integration tests: a tiny indexed dataset builder and a counting
+//! object-store wrapper that records which reads reach the real store.
+//!
+//! Each test binary that includes this module uses only a subset of the helpers (for example the
+//! blue-green tests need the dataset builder and config but not the counting store), so the module
+//! allows dead code rather than forcing every binary to touch every helper.
+#![allow(dead_code)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -249,6 +254,9 @@ pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) 
         io_concurrency: search_api::config::DEFAULT_IO_CONCURRENCY,
         io_block_size_bytes: search_api::config::DEFAULT_IO_BLOCK_SIZE_BYTES,
         object_store_timeout_secs: search_api::config::DEFAULT_OBJECT_STORE_TIMEOUT_SECS,
+        serve_by_tag: search_api::config::DEFAULT_SERVE_BY_TAG,
+        serve_tag: search_api::config::DEFAULT_SERVE_TAG.to_string(),
+        serve_tag_ttl_secs: search_api::config::DEFAULT_SERVE_TAG_TTL_SECS,
     }
 }
 

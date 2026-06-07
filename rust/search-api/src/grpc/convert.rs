@@ -5,9 +5,9 @@ use serde_json::{Map, Value};
 
 use crate::domain::target::parse_date;
 use crate::domain::{
-    ClusterReport, ClusterSpec, CompareOp, DatasetTarget, DateRange, DistanceKind, Filter, FilterMode, FusedHit,
-    FusionSpec, Fuzziness, Hit, HybridQuery, Literal, MatchSpec, PhraseSpec, PrewarmReport, PrewarmSpec, SearchError,
-    TextOperator, TextQuery, TextQueryNode, VectorQuery,
+    ClusterReport, ClusterSpec, CompareOp, DatasetRef, DatasetTarget, DateRange, DistanceKind, Filter, FilterMode,
+    FusedHit, FusionSpec, Fuzziness, Hit, HybridQuery, Literal, MatchSpec, PhraseSpec, PrewarmReport, PrewarmSpec,
+    SearchError, TextOperator, TextQuery, TextQueryNode, VectorQuery,
 };
 use crate::pb;
 
@@ -39,6 +39,19 @@ pub fn prewarm_spec_from_proto(request: &pb::PrewarmRequest) -> PrewarmSpec {
         all_indexes: request.all_indexes,
         index_names: request.index_names.clone(),
         fts_with_position: request.fts_with_position,
+    }
+}
+
+/// Maps the additive prewarm `version_ref` oneof onto the version selector.
+///
+/// An unset selector means [`DatasetRef::Latest`] (warm the latest version, the original
+/// behavior). An explicit version or tag pins the version to warm, which is what lets an operator
+/// warm a green build before flipping the serve tag onto it.
+pub fn prewarm_ref_from_proto(request: &pb::PrewarmRequest) -> DatasetRef {
+    match &request.version_ref {
+        Some(pb::prewarm_request::VersionRef::Version(version)) => DatasetRef::Version(*version),
+        Some(pb::prewarm_request::VersionRef::Tag(tag)) => DatasetRef::Tag(tag.clone()),
+        None => DatasetRef::Latest,
     }
 }
 
@@ -84,6 +97,7 @@ pub fn prewarm_report_to_proto(report: PrewarmReport) -> pb::PrewarmResponse {
         metadata_duration_ms: report.metadata_duration.as_millis() as u64,
         total_duration_ms: report.total_duration.as_millis() as u64,
         index_cache_size_bytes: report.index_cache_size_bytes,
+        resolved_version: report.resolved_version,
     }
 }
 

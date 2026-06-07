@@ -47,7 +47,9 @@ surprise backfill. With a real data interval per run, explicit Airflow-native ba
 
 Each interval slot is submitted as an independent DAG run. The ETL's idempotent ``merge_insert`` ensures that
 replaying a slot converges rather than duplicating rows.  Parallelism is controlled by ``max_active_runs`` on the DAG
-(set to 3 here) so backfills do not overwhelm the cluster while keeping throughput reasonable.
+(set to 1) to prevent overlapping runs from racing concurrent index maintenance commits on the same dataset.  For
+backfills that need higher throughput, set ``max_active_runs`` via a DAG code change and ensure no two simultaneous
+runs target the same dataset.
 
 Deployment notes
 ----------------
@@ -79,7 +81,6 @@ Airflow Variables (all optional — defaults are listed in ``dag_params`` below)
     lance_etl_dd_env                 Datadog env tag (default: prod).
     lance_etl_dd_tags                Comma-separated ``key:value`` pairs forwarded as
                                      ``--dd-tag`` flags (default: empty).
-    lance_etl_num_partitions         Spark partition count for the ETL step (default: 512).
     lance_etl_executor_instances     spark.executor.instances override (default: 8).
     lance_etl_executor_memory        spark.executor.memory override (default: 8g).
     lance_etl_driver_memory          spark.driver.memory override (default: 4g).
@@ -125,7 +126,6 @@ dag_params: dict[str, str | int] = {
     "dd_service": "lance-pipeline",
     "dd_env": "prod",
     "dd_tags": "",
-    "num_partitions": 512,
     "executor_instances": 8,
     "executor_memory": "8g",
     "driver_memory": "4g",
@@ -232,8 +232,6 @@ def build_etl_application_args(params: dict) -> list[str]:
         "{{ data_interval_end | string }}",
         "--base-uri",
         resolve_variable("lance_base_uri", params),
-        "--num-partitions",
-        str(resolve_variable("num_partitions", params)),
         "--dd-service",
         resolve_variable("dd_service", params),
         "--dd-env",

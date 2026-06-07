@@ -21,8 +21,8 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::domain::{ClusterReader, DatasetTarget, Prewarmer, SearchBackend, SearchError};
 use crate::grpc::convert::{
     cluster_report_to_proto, cluster_spec_from_proto, dataset_target_from_proto, fused_hit_to_proto,
-    hybrid_query_from_proto, prewarm_report_to_proto, prewarm_spec_from_proto, text_hit_to_proto,
-    text_query_from_proto, vector_hit_to_proto, vector_query_from_proto,
+    hybrid_query_from_proto, prewarm_ref_from_proto, prewarm_report_to_proto, prewarm_spec_from_proto,
+    text_hit_to_proto, text_query_from_proto, vector_hit_to_proto, vector_query_from_proto,
 };
 use crate::pb::search_service_server::SearchService;
 use crate::pb::{
@@ -242,8 +242,15 @@ impl<B: SearchBackend + Prewarmer + ClusterReader> SearchService for SearchGrpc<
         let target = request.target.take();
         self.handle(Rpc::Prewarm, target, async |target| {
             let spec = prewarm_spec_from_proto(&request);
-            let report = self.backend.prewarm(target, spec).await.map_err(status_from_error)?;
-            tracing::Span::current().set_attribute("prewarm.index_count", report.indexes.len() as i64);
+            let reference = prewarm_ref_from_proto(&request);
+            let report = self
+                .backend
+                .prewarm(target, spec, reference)
+                .await
+                .map_err(status_from_error)?;
+            let span = tracing::Span::current();
+            span.set_attribute("prewarm.index_count", report.indexes.len() as i64);
+            span.set_attribute("prewarm.resolved_version", report.resolved_version as i64);
             Ok(prewarm_report_to_proto(report))
         })
         .await

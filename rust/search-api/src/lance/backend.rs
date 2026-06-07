@@ -16,8 +16,8 @@ use serde_json::{Map, Value};
 use tracing::Instrument;
 
 use crate::domain::{
-    DatasetTarget, DistanceKind, FilterMode, FusedHit, Hit, HybridQuery, ScoreOrder, SearchBackend, SearchError,
-    TextQuery, VectorQuery, VectorSearchOutcome, merge_hits,
+    DatasetRef, DatasetTarget, DistanceKind, FilterMode, FusedHit, Hit, HybridQuery, ScoreOrder, SearchBackend,
+    SearchError, TextQuery, VectorQuery, VectorSearchOutcome, merge_hits,
 };
 use crate::lance::error::classify_lance_error;
 use crate::lance::filter::filter_to_expr;
@@ -102,7 +102,7 @@ impl<P: DatasetProvider> LanceSearchBackend<P> {
             let span = tracing::info_span!("fanout.leg", leg.date = %day, leg.kind = leg.as_tag());
             async move {
                 let started = Instant::now();
-                let dataset = match self.provider.dataset(target, Some(day)).await {
+                let dataset = match self.provider.dataset(target, Some(day), DatasetRef::Serve).await {
                     Ok(dataset) => dataset,
                     Err(SearchError::NotFound(_)) => {
                         tracing::debug!(leg.date = %day, "fan-out leg skipped, dataset missing");
@@ -188,7 +188,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
         mut query: VectorQuery,
     ) -> Result<VectorSearchOutcome, SearchError> {
         let Some(range) = target.date_range else {
-            let dataset = self.provider.dataset(target, None).await?;
+            let dataset = self.provider.dataset(target, None, DatasetRef::Serve).await?;
             let hits = run_vector_query(&dataset, &query, &self.metrics, Rpc::VectorSearch).await?;
             return Ok(VectorSearchOutcome {
                 hits,
@@ -223,7 +223,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
     )]
     async fn text_search(&self, target: &DatasetTarget, mut query: TextQuery) -> Result<Vec<Hit>, SearchError> {
         let Some(range) = target.date_range else {
-            let dataset = self.provider.dataset(target, None).await?;
+            let dataset = self.provider.dataset(target, None, DatasetRef::Serve).await?;
             return run_text_query(&dataset, &query, &self.metrics, Rpc::TextSearch).await;
         };
         validate_k(query.k)?;
@@ -261,7 +261,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
         }
         let fusion = query.fusion;
         let Some(range) = target.date_range else {
-            let dataset = self.provider.dataset(target, None).await?;
+            let dataset = self.provider.dataset(target, None, DatasetRef::Serve).await?;
             let (vector_hits, text_hits) = tokio::join!(
                 run_vector_query(&dataset, &vector_query, &self.metrics, Rpc::HybridSearch),
                 run_text_query(&dataset, &text_query, &self.metrics, Rpc::HybridSearch),
