@@ -29,3 +29,6 @@ The companion narrative, with the live-verified numbers and the stale-branch cor
 | [0018](0018-ttl-expiration.md) | TTL data-expiration by event age | Accepted |
 | [0019](0019-namespace-migrate-utility.md) | Namespace copy/migrate utility | Accepted |
 | [0020](0020-map-pivot-to-concrete-columns.md) | Pivot named vectors and texts out of maps into concrete indexable columns | Accepted |
+| [0021](0021-grpc-event-time-range-search.md) | gRPC event-time range on the vector, text, and hybrid search RPCs | Accepted |
+| [0022](0022-object-store-request-tracing.md) | Object-store request counts and IO info on per-RPC search spans | Accepted |
+| [0023](0023-iceberg-table-optimization-job.md) | Iceberg source-table optimization job | Accepted |

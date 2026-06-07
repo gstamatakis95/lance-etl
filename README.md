@@ -66,7 +66,7 @@ cache (`DiskIndexCacheBackend` + `MetadataByteCache`) extends the session caches
 directory (default `/tmp/rust-search/cache`), so cold restarts skip the network for recently read
 indexes and metadata. Raw data bytes are never cached.
 
-Blue-green serving: a `prod` tag (or any named tag) is updated atomically with `tags.update`. When
+Blue-green serving: a `HEAD` tag (or any named tag) is updated atomically with `tags.update`. When
 `SEARCH_API_SERVE_BY_TAG=true`, the provider resolves the tag to a concrete version, keys its LRU
 and caches on that version, and re-reads the tag after `SEARCH_API_SERVE_TAG_TTL_SECS` seconds so
 a flip propagates within the TTL. The correct operational sequence is: build the green version,
@@ -88,7 +88,8 @@ prewarm every replica against the green version explicitly (use the `version` or
 | `telemetry.py` | `Telemetry`, `TelemetryConfig` | ddtrace spans, DogStatsD, Lance event bridge |
 | `cloud_storage.py` | `resolve_filesystem`, `discover_datasets` | pyarrow filesystem + recursive dataset discovery |
 | `arrow_types.py` | `resolve_arrow_type`, `resolve_type_map` | Arrow type specs (`fixed_size_list<float32,768>`) |
-| `cli.py` | `main`, `build_parser` | Seven subcommands: `etl`, `maintenance`, `index`, `recall`, `tag`, `migrate-manifests`, `migrate-namespace` |
+| `iceberg_optimize.py` | `IcebergOptimizer`, `IcebergOptimizeConfig`, `IcebergOptimizeReport` | Source Iceberg table maintenance via `CALL` procedures (`rewrite_data_files`, `rewrite_manifests`, `expire_snapshots`, opt-in `remove_orphan_files`). Distinct from the Lance maintenance job. |
+| `cli.py` | `main`, `build_parser` | Eight subcommands: `etl`, `maintenance`, `index`, `recall`, `tag`, `migrate-manifests`, `migrate-namespace`, `optimize-iceberg` |
 | `migrate_namespace.py` | `NamespaceMigrator`, `MigrateConfig` | One-off operator utility to copy a whole namespace to a new namespace name |
 
 ### Rust (`rust/search-api/src/`)
@@ -125,8 +126,10 @@ prewarm every replica against the green version explicitly (use the `version` or
 ### Airflow (`airflow/lance_etl_dag.py`)
 
 DAG `lance_etl_pipeline` running `etl -> maintenance -> index` as `SparkSubmitOperator` tasks with
-`max_active_runs=1`. Maintenance runs before indexing so fresh uncovered fragments are merged into
-large fragments before the index covers them, avoiding inline remap cost on every index commit.
+`max_active_runs=1`. An optional `optimize-iceberg` task, gated by the `lance_etl_optimize_iceberg_enabled`
+Variable (default off), runs before `etl` to maintain the upstream Iceberg source table. Maintenance runs
+before indexing so fresh uncovered fragments are merged into large fragments before the index covers them,
+avoiding inline remap cost on every index commit.
 Schedule is driven by the Airflow Variable `lance_etl_schedule` (default `@daily`).
 Data-interval windowing and `dag_run.conf` overrides are described in the module docstring. The
 `migrate-namespace` subcommand is a one-off operator tool run manually via the CLI and is not
@@ -146,12 +149,13 @@ can drive the entire `all` chain.
 
 ### Documentation (`docs/`)
 
-- `docs/adr/` — 19 Architecture Decision Records (0001 through 0019) covering distributed indexing,
+- `docs/adr/` — 23 Architecture Decision Records (0001 through 0023) covering distributed indexing,
   two-tier compaction, snapshot-id bounds, dynamic partition routing, gRPC layering, disk cache and
   prewarm, observability and recall audit, compaction/index coexistence, stable-row-id rejection,
   ingested-at column, V2 manifest paths, blue-green serving, by-date partitioning removal,
   CLI and config knob reduction, event-time canonical clock, Rust intake service, TTL expiration,
-  and namespace migrate utility.
+  namespace migrate utility, map pivot to concrete columns, gRPC event-time range search,
+  object-store request tracing, and Iceberg source-table optimization.
 - `docs/FINDINGS.md` — narrative companion to the ADRs: verified APIs, production patterns,
   scale design, coexistence results, and open items.
 - `docs/datadog-dashboard-guide.md` — guide to the Datadog dashboards shipped with the pipeline.
@@ -191,7 +195,7 @@ dataclasses (`ETLConfig`, `IndexJobConfig`, `MaintenanceConfig`) and stays tunab
 code, not from the command line.
 
 The entry point is installed as `lance-etl`. Subcommands: `etl`, `maintenance`, `index`, `recall`,
-`tag`, `migrate-manifests`, `migrate-namespace`.
+`tag`, `migrate-manifests`, `migrate-namespace`, `optimize-iceberg`.
 
 #### `etl` — read a snapshot window from Iceberg and upsert/delete into Lance datasets
 
@@ -350,13 +354,13 @@ What it measures:
 
 #### `tag` — blue-green serving-tag flip
 
-Updates a serving tag (default `prod`) to a target dataset version. Tagged versions are exempt from
+Updates a serving tag (default `HEAD`) to a target dataset version. Tagged versions are exempt from
 version cleanup.
 
 ```bash
 lance-etl tag \
   --base-uri s3://my-bucket/lance \
-  --tag prod \
+  --tag HEAD \
   --tag-version 42 \
   --dd-service lance-pipeline --dd-env prod
 ```
@@ -370,7 +374,7 @@ Safe operational sequence:
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--tag` | `prod` | Serving tag name to update |
+| `--tag` | `HEAD` | Serving tag name to update |
 | `--tag-version` | none | Target version. Omit to point the tag at each dataset's latest. |
 
 #### `migrate-manifests` — migrate to V2 manifest paths
@@ -416,6 +420,38 @@ Index column flags (`--vector-column`, `--scalar-column`, `--bitmap-column`, `--
 `--metric`, `--fts-with-position`, `--fts-base-tokenizer`, `--fts-language`) are shared with the
 `index` subcommand and are optional. When none are given, reindexing is skipped with a warning.
 
+#### `optimize-iceberg` — optimize the upstream Iceberg source table
+
+Runs Iceberg's own table maintenance procedures on the source Iceberg table, which is a separate
+store from the Lance datasets maintained by the `maintenance` subcommand.
+
+```bash
+lance-etl optimize-iceberg \
+  --table prod.vectors.events \
+  --dd-service lance-pipeline --dd-env prod
+```
+
+Four steps run in a fixed safe order. `rewrite_data_files` bin-packs small data files into larger
+ones (default on). `rewrite_manifests` rewrites the manifest list to align with the new file layout
+(default on, runs after rewrite to be consistent). `expire_snapshots` prunes snapshot history
+beyond a retention horizon — at least the last 5 snapshots are always kept regardless of age, and
+snapshots older than 7 days beyond that count are expired (default on). `remove_orphan_files`
+deletes files no live snapshot references — opt-in because it is the only step that can delete data
+files outright. Iceberg's own three-day safety horizon is respected so an in-flight write is never
+mistaken for an orphan.
+
+Each step is wrapped with telemetry timing and a metric. Heavy work runs distributed in Spark.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--table` | (required) | Fully-qualified Iceberg source table: `catalog.namespace.table` |
+| `--no-rewrite-data-files` | off | Skip the bin-pack rewrite of small data files |
+| `--no-rewrite-manifests` | off | Skip the manifest rewrite |
+| `--no-expire-snapshots` | off | Skip snapshot-history expiration |
+| `--remove-orphan-files` | off (opt-in) | Delete files no live snapshot references |
+| `--expire-retain-last` | `5` | Snapshots always retained regardless of age |
+| `--expire-older-than-days` | `7` | Age horizon in days for snapshot expiration |
+
 ### Running tests
 
 ```bash
@@ -454,8 +490,9 @@ Environment variables (`LANCE_ETL_BASE_URI` is required. All others are optional
 | `SEARCH_API_IO_CONCURRENCY` | `256` | Parallel in-flight object-store requests per dataset |
 | `SEARCH_API_RECALL_SAMPLE_RATE` | `0.0` (off) | Fraction of requests sampled for offline recall |
 | `SEARCH_API_SERVE_BY_TAG` | `false` | Resolve the serve tag instead of opening latest |
-| `SEARCH_API_SERVE_TAG` | `prod` | Tag name resolved when `SEARCH_API_SERVE_BY_TAG=true` |
+| `SEARCH_API_SERVE_TAG` | `HEAD` | Tag name resolved when `SEARCH_API_SERVE_BY_TAG=true` |
 | `SEARCH_API_SERVE_TAG_TTL_SECS` | `10` | Seconds a resolved tag version is trusted |
+| `SEARCH_API_EVENT_TIMESTAMP_COLUMN` | `event_timestamp` | Column that request `TimeRange` filters are applied to |
 | `SEARCH_API_STATSD_ADDR` | `127.0.0.1:8125` | DogStatsD UDP address (honors `DD_AGENT_HOST`) |
 | `SEARCH_API_TELEMETRY_DISABLED` | `false` | Disable trace export and DogStatsD (JSON logs only) |
 
@@ -469,17 +506,21 @@ Proto RPCs on `lance_etl.v1.SearchService`:
 
 | RPC | Key request fields | Purpose |
 |---|---|---|
-| `VectorSearch` | `target`, `query`, `rerank` | Nearest-neighbor search with optional rerank |
-| `TextSearch` | `target`, `query`, `rerank` | BM25 full-text search with optional rerank |
-| `HybridSearch` | `target`, `vector`, `text`, `k`, `fusion`, `rerank` | Fused vector + text (RRF or weighted) |
+| `VectorSearch` | `target`, `query`, `rerank`, `time_range` | Nearest-neighbor search with optional rerank and optional event-time window |
+| `TextSearch` | `target`, `query`, `rerank`, `time_range` | BM25 full-text search with optional rerank and optional event-time window |
+| `HybridSearch` | `target`, `vector`, `text`, `k`, `fusion`, `rerank`, `time_range` | Fused vector + text (RRF or weighted) with optional event-time window |
 | `Prewarm` | `target`, `metadata`, `all_indexes`, `index_names`, `version`/`tag` | Pull caches at a version or tag |
 | `Clusters` | `target`, `index_name` | Read IVF centroid vectors of the vector index |
 
 All requests carry a `DatasetTarget` (`org_id`, `tenant_id`, `namespace`), which resolves to the
 single dataset at `{base}/{org}/{tenant}/{namespace}.lance`. Filters are typed AST nodes (`Filter`
-oneof) — raw SQL strings are never accepted. Time-bounded queries are expressed as scalar range
-filters on the event timestamp column (backed by a BTREE scalar index) rather than as a
-multi-dataset fan-out.
+oneof) — raw SQL strings are never accepted. Event-time windowing is expressed as an optional
+`TimeRange { optional int64 start_ms; optional int64 end_ms }` (epoch milliseconds, start
+inclusive, end exclusive, either bound optional). The window always applies to the event-timestamp
+column (name from `SEARCH_API_EVENT_TIMESTAMP_COLUMN`, default `event_timestamp`) and is
+translated to a typed range predicate ANDed with any `Filter`, pruned by a BTREE or zone-map on
+that column. A `TimeRange` absent from the request leaves every search path behaving exactly as
+before.
 
 Proto RPCs on `lance_etl.v1.IntakeService`:
 
@@ -534,6 +575,8 @@ Configure via Airflow Variables:
 | `lance_etl_dd_tags` | empty | Comma-separated `key:value` constant tags |
 | `lance_etl_partition_by` | empty | Comma-separated partition columns for `--partition-by` |
 | `lance_etl_ttl_column` | empty (TTL off) | Per-row TTL column name forwarded to the `maintenance` step as `--ttl-column`. When set, the column must hold each row's lifetime as an Arrow `Duration`. Rows are expired before compaction by `ts_column + ttl_column < now`. Absent means TTL is off. |
+| `lance_etl_optimize_iceberg_enabled` | `false` | When truthy (`true`/`1`/`yes`), adds an optional `optimize-iceberg` task before `etl` that runs Iceberg's own source-table maintenance procedures (`rewrite_data_files`, `rewrite_manifests`, `expire_snapshots`). This is source-table maintenance and is distinct from the Lance `maintenance` task. |
+| `lance_etl_optimize_remove_orphan_files` | `false` | When truthy, the `optimize-iceberg` task also runs the destructive `remove_orphan_files` procedure. Only files older than Iceberg's three-day safety horizon are removed. Opt-in because this step can delete data files outright. |
 
 `lance_etl_index_flags` is required when index maintenance is desired. Without it the `index` step
 configures zero handlers and is a silent no-op. Example value:

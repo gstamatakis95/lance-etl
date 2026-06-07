@@ -161,10 +161,11 @@ The data plane is about throughput over thousands of datasets. The serving plane
 | `maintenance.py` | `MaintenanceJob`: per-row TTL expiration (opt-in), two-tier (small and large) compaction, version cleanup — applied in that order per dataset. Also contains blue-green tag helpers and manifest migration. |
 | `recall.py` | `RecallAuditJob`: replays Datadog-sampled queries as exact brute-force scans, scores recall@k, nDCG@k, MRR. |
 | `migrate_namespace.py` | `NamespaceMigrator`: copy-plus-optimize a whole namespace to a new name, source kept for rollback. |
+| `iceberg_optimize.py` | `IcebergOptimizer`: optimizes the upstream Iceberg source table via `CALL <catalog>.system.<procedure>` statements (`rewrite_data_files`, `rewrite_manifests`, `expire_snapshots`, opt-in `remove_orphan_files`). Distinct from `MaintenanceJob`, which optimizes Lance datasets. |
 | `telemetry.py` | `Telemetry`, `TelemetryConfig`, `LanceRuntimeConfig`, `commit_with_retries`, the Lance event bridge, and the shared retry-budget constants. |
 | `cloud_storage.py` | `resolve_filesystem` plus `discover_datasets` for cloud-agnostic pyarrow filesystem I/O (S3, GCS, Azure). |
 | `arrow_types.py` | `resolve_arrow_type` / `resolve_type_map` for CLI type specs. |
-| `cli.py` | Entry point: `etl`, `maintenance`, `index`, `recall`, `tag`, `migrate-manifests`, `migrate-namespace`. |
+| `cli.py` | Entry point: `etl`, `maintenance`, `index`, `recall`, `tag`, `migrate-manifests`, `migrate-namespace`, `optimize-iceberg`. |
 
 ### Benchmark package (`bench/`)
 
@@ -183,7 +184,7 @@ The `bench` package (`python -m bench`) drives the real pipeline and the live se
 
 ### Airflow (`airflow/lance_etl_dag.py`)
 
-A configurable-schedule DAG that runs `etl >> maintenance >> index`. Each stage maps to a `SparkSubmitOperator` that calls `python -m lance_etl.cli <subcommand>`. The `maintenance` task runs per-row TTL expiration (when `lance_etl_ttl_column` is set), two-tier compaction, and version cleanup in a single Spark job.
+A configurable-schedule DAG that runs `etl >> maintenance >> index`. An optional `optimize-iceberg` task, gated by the `lance_etl_optimize_iceberg_enabled` Variable (default off), runs before `etl` and optimizes the upstream Iceberg source table. Each stage maps to a `SparkSubmitOperator` that calls `python -m lance_etl.cli <subcommand>`. The `maintenance` task runs per-row TTL expiration (when `lance_etl_ttl_column` is set), two-tier compaction, and version cleanup in a single Spark job.
 
 ### Frameworks used
 
@@ -267,9 +268,9 @@ Two services share one binary, one port, one router, one health endpoint, and on
 
 | RPC | Purpose | Request / response shape (high level) |
 |---|---|---|
-| **VectorSearch** | Nearest-neighbor search on a vector column. | Request: target, `VectorQuery`, optional `Rerank`. Response: hits ordered nearest-first, each with a projected row and a distance. |
-| **TextSearch** | Full-text search via the INVERTED index. | Request: target, `TextQuery`, optional `Rerank`. Response: hits ordered best-first, each with a row and a BM25 score. |
-| **HybridSearch** | Runs a vector leg and a text leg, then fuses them. | Request: target, `VectorQuery`, `TextQuery`, fused `k`, `Fusion`, optional `Rerank`. Response: fused hits, each with a row and a fused score. |
+| **VectorSearch** | Nearest-neighbor search on a vector column. | Request: target, `VectorQuery`, optional `Rerank`, optional `TimeRange`. Response: hits ordered nearest-first, each with a projected row and a distance. |
+| **TextSearch** | Full-text search via the INVERTED index. | Request: target, `TextQuery`, optional `Rerank`, optional `TimeRange`. Response: hits ordered best-first, each with a row and a BM25 score. |
+| **HybridSearch** | Runs a vector leg and a text leg, then fuses them. | Request: target, `VectorQuery`, `TextQuery`, fused `k`, `Fusion`, optional `Rerank`, optional `TimeRange`. Response: fused hits, each with a row and a fused score. |
 | **Prewarm** | Pulls one dataset's metadata and index structures into local caches before traffic arrives. | Request: target, what to warm, and an optional explicit version or tag. Response: per-index outcomes, durations, cache size, and the resolved version warmed. |
 | **Clusters** | Reads the IVF centroids of a vector index. | Request: target, optional index name. Response: centroids in partition order, dimension, index name, partition count. |
 
@@ -283,6 +284,7 @@ Two services share one binary, one port, one router, one health endpoint, and on
 ### Notable contract rules
 
 - **Typed filter AST, no raw SQL.** Filters are a typed predicate tree (`Comparison`, `InList`, `IsNull`, `IsNotNull`, `Between`, `and`, `or`, `not`). Column names are validated against the dataset schema and an identifier allowlist. Literals become typed DataFusion `lit` expressions. Clients can never inject expression text (ADR 0005). An injection attempt such as a column named `id; DROP TABLE users` is rejected at the allowlist.
+- **Event-time windowing via TimeRange.** The three search RPCs accept an optional `TimeRange { optional int64 start_ms; optional int64 end_ms }` (epoch milliseconds, start inclusive, end exclusive, either bound optional). The window always applies to the event-timestamp column (operator-configured via `SEARCH_API_EVENT_TIMESTAMP_COLUMN`, default `event_timestamp`). The range is translated into a typed predicate ANDed with any caller-provided `Filter`, never as raw SQL. A BTREE or zone-map on that column prunes the scan. An absent `TimeRange` leaves every search path behaving exactly as before (ADR 0021).
 - **Fusion specs.** Hybrid fusion offers two strategies. **RRF** sums `1 / (rrf_k + rank)` across legs (default `rrf_k = 60`). **Weighted** min-max normalizes each leg into `[0, 1]` and combines them with a vector weight (default `0.7`). RRF is the default when no fusion message is set.
 - **Rerank seam.** Every search RPC accepts an optional `Rerank`. The only strategy today is `IdentityRerank` (keep order, optionally truncate to `top_n`). The trait is async and fallible so a cross-encoder or LLM reranker can slot in later without changing the request shape.
 - **Intake record writes.** `WRITE_OP_UPSERT` carries the full record (create or replace). `WRITE_OP_DELETE` reads only the id. Bad record writes fail per item rather than failing the whole batch, which suits streaming ingestion. The response reports only ids: `succeeded_ids` for accepted records and `failed_ids` for failures. A record whose id is itself empty or invalid is omitted from `failed_ids`. A bad target or a whole-sink failure still fails the request.
@@ -298,6 +300,7 @@ Two services share one binary, one port, one router, one health endpoint, and on
 
 ### End-to-end build and serve, in plain terms
 
+0. (Optional) The Iceberg source table is optimized via Iceberg's own maintenance procedures to bin-pack small files, rewrite manifests, and expire stale snapshots before the ETL reads it.
 1. New and changed records land in the Iceberg source table.
 2. The ETL job reads just the new window of changes, not the whole table.
 3. It collapses each id down to its latest state and routes it to the one dataset that owns it.
@@ -320,6 +323,7 @@ Two services share one binary, one port, one router, one health endpoint, and on
 
 ### Maintenance flows
 
+- **Source Iceberg table optimization.** The upstream Iceberg table that the ETL reads accumulates many small data files, a growing manifest list, and unbounded snapshot history when appended to on every run. The optional `optimize-iceberg` step runs Iceberg's own `CALL <catalog>.system.<procedure>` maintenance before `etl`: `rewrite_data_files` bin-packs small files, `rewrite_manifests` realigns manifests, `expire_snapshots` prunes history beyond a configurable retention horizon, and the opt-in `remove_orphan_files` deletes unreferenced files. This is distinct from the Lance maintenance job described below. (ADR 0023)
 - **Per-row TTL expiration.** Each row carries its own lifetime in a dedicated Arrow `Duration` column. The maintenance job deletes rows where `ts_column + ttl_column < now`, which Lance evaluates natively as timestamp-plus-duration column arithmetic. TTL is off by default. It runs only when `MaintenanceConfig.ttl_column` names a column present in the dataset schema. There are no global retention or enabled knobs. The delete runs before compaction so the compaction reclaims the vacated storage. (ADR 0018)
 - **Namespace migrate.** Every dataset in a source namespace is copied to a new namespace name, then optimized (write, recompact, reindex) in production order. The source is kept for rollback. Two-tier scale (ADR 0019).
 - **Recall audit.** A fraction of vector, text, and hybrid queries are sampled onto Datadog spans, including the dataset version that served them. An offline Spark job replays each query as an exact brute-force scan against that pinned version and scores recall@k, nDCG@k, and MRR (ADR 0008).
@@ -400,6 +404,24 @@ Each decision below cites its ADR. Accepted unless noted.
 - A whole namespace is copied to a new name, then optimized in production order (write, recompact, reindex), reusing `MaintenanceJob` and `LanceIndexer`.
 - The source is kept for a free blue-green rollback story. Reindex is skipped when no index columns are supplied because the columns cannot be guessed. Two-tier scale.
 
+### gRPC event-time range on search RPCs (ADR 0021)
+- An optional `TimeRange { optional int64 start_ms; optional int64 end_ms }` field is added to `VectorSearchRequest`, `TextSearchRequest`, and `HybridSearchRequest`.
+- The window always applies to the event-timestamp column, operator-configured via `SEARCH_API_EVENT_TIMESTAMP_COLUMN` (default `event_timestamp`).
+- The bound is a typed DataFusion literal matched to the column's Arrow type (timestamp or integer). The range predicate is ANDed with any caller-provided `Filter`, so the two compose.
+- A BTREE or zone-map on the event-timestamp column prunes the scan. Existing clients that never set `time_range` are unaffected.
+
+### Object-store request counts on per-RPC spans (ADR 0022)
+- The execution-stats callback that already emits `query.*` DogStatsD metrics also attaches `s3.*` attributes to the per-query-leg span: `s3.requests`, `s3.iops`, `s3.bytes_read`, `s3.parts_loaded`, `s3.indices_loaded`.
+- Attributes are counts only, with no org, tenant, or version identifier, so cardinality stays low.
+- A GET / HEAD / LIST breakdown is not emitted: Lance does not expose that in production builds.
+- The capture is infallible, matching ADR 0008. An unreachable Datadog Agent never panics and never fails a request.
+
+### Iceberg source-table optimization job (ADR 0023)
+- The pipeline now maintains two distinct stores: the per-tenant Lance datasets (via `MaintenanceJob`) and the upstream Iceberg source table (via `IcebergOptimizer`).
+- `IcebergOptimizer` issues `CALL <catalog>.system.<procedure>` statements via the Iceberg Spark session extensions. Steps run in a fixed safe order: `rewrite_data_files`, `rewrite_manifests`, `expire_snapshots`, and the opt-in `remove_orphan_files`.
+- Table identifiers are validated against a bare-identifier allowlist before any statement is constructed. Only validated names and typed `TIMESTAMP` literals reach the SQL, so no raw string injection is possible.
+- The job is exposed as the `optimize-iceberg` CLI subcommand and an optional Airflow task gated by `lance_etl_optimize_iceberg_enabled`. It runs before `etl` because it maintains the table the ETL reads.
+
 ---
 
 ## 9. Scale and performance
@@ -463,6 +485,13 @@ Both planes report to Datadog. Every emitter on the Rust side is infallible by c
 - **Tag cardinality is kept deliberately low: rpc and status only, never org or tenant.** This keeps the metrics bill and cardinality bounded across 30k tenants.
 - Two Lance trace surfaces are tapped: per-query execution stats (`query.iops`, `query.bytes_read`, `query.parts_loaded`) and the object-store throttle target (`throttle.errors`, `throttle.new_rate`).
 
+### Span attributes for object-store IO
+
+- Per-query-leg spans (`lance.vector_query` / `lance.text_query`) carry `s3.*` attributes sourced from the Lance execution-stats callback: `s3.requests`, `s3.iops`, `s3.bytes_read`, `s3.parts_loaded`, `s3.indices_loaded`.
+- These attributes are aggregate counts only. A GET / HEAD / LIST breakdown is not available in production Lance builds and is intentionally not emitted.
+- A hybrid request shows the object-store volume of each leg separately under the one RPC trace. A single-leg request has exactly one such child span.
+- No org, tenant, or version identifier is attached, so span cardinality remains low (ADR 0022).
+
 ### Logs
 
 - **JSON logs with trace correlation** on both sides, so a log line can be tied back to the span that produced it.
@@ -491,13 +520,15 @@ Both planes report to Datadog. Every emitter on the Rust side is infallible by c
 | `maintenance` | Per-dataset maintenance in order: per-row TTL expiration (when `--ttl-column` is set, deleting rows where `ts_column + ttl_column < now`), two-tier distributed compaction, and version cleanup. TTL is off by default. Pass `--ttl-column` to opt in. Pass `--ts-column` to name the event timestamp column (default `timestamp`). |
 | `index` | Build IVF_RQ vector, BTREE scalar, BITMAP, and full-text BM25 indexes over a set of datasets. |
 | `recall` | Replay Datadog-sampled queries as exact brute-force scans and report recall@k, nDCG@k, MRR. |
-| `tag` | Flip a serving tag (default `prod`) to a target dataset version for blue-green promotion. |
+| `tag` | Flip a serving tag (default `HEAD`) to a target dataset version for blue-green promotion. |
 | `migrate-manifests` | Migrate dataset manifest paths to the V2 naming scheme. |
 | `migrate-namespace` | Copy a whole namespace to a new namespace name. One-off operator tool, not scheduled. |
+| `optimize-iceberg` | Optimize the upstream Iceberg source table via Iceberg's own `CALL` maintenance procedures. Distinct from `maintenance`, which optimizes Lance datasets. Steps (all on by default except orphan removal): `rewrite_data_files`, `rewrite_manifests`, `expire_snapshots`, opt-in `remove_orphan_files`. |
 
 ### The Airflow DAG
 
-- The pipeline is `etl >> maintenance >> index`.
+- The base pipeline is `etl >> maintenance >> index`.
+- An optional `optimize-iceberg` task, gated by the `lance_etl_optimize_iceberg_enabled` Variable (default off), runs before `etl`. It optimizes the upstream Iceberg source table (bin-packs small files, rewrites manifests, expires old snapshots). The destructive `remove_orphan_files` step is further gated by `lance_etl_optimize_remove_orphan_files` (default off).
 - The `maintenance` task runs TTL expiration (when `lance_etl_ttl_column` is set), two-tier compaction, and version cleanup in a single Spark job. Setting `lance_etl_ttl_column` to the name of a per-row Duration column enables TTL. Leaving it empty makes the task compaction plus cleanup only.
 - **Maintenance runs before indexing on purpose.** It merges fresh uncovered fragments before any index covers them, so the large-tier inline index remap cost for fresh data disappears, and it serializes compaction and index commits per dataset within a run.
 - `max_active_runs=1` extends that serialization across runs so overlapping runs cannot race same-name index maintenance commits.
@@ -511,11 +542,11 @@ The order matters. **Always build, prewarm, then flip. Never flip, then warm.**
 1. Build the new (green) dataset version offline (for example via `index` or `migrate-namespace`).
 2. Tag green before any cleanup runs, so cleanup cannot delete it (`error_if_tagged_old_versions`).
 3. **Prewarm green by explicit version** on every serving replica (the Prewarm RPC accepts an explicit version or tag and returns the resolved version).
-4. Flip the `prod` tag to green with the `tag` subcommand (`update_serving_tags`).
+4. Flip the `HEAD` tag to green with the `tag` subcommand (`update_serving_tags`).
 5. Watch telemetry for a flip-without-prewarm signal (served version not equal to the most-recently-prewarmed version).
 6. To roll back, flip the tag back to the prior version.
 
-Note: the serving-side tag resolution and prewarm-before-flip safety are still **Proposed** (ADR 0013). The Python `tag` helper only writes the tag and logs the safe sequence. It never assumes the serving layer auto-refreshes.
+Note: the serving-side tag resolution and prewarm-before-flip safety are still **Proposed** (ADR 0013). The Python `tag` helper only writes the tag and logs the safe sequence. It never assumes the serving layer auto-refreshes. The default serving tag name is `HEAD`.
 
 ### Running a namespace migration
 

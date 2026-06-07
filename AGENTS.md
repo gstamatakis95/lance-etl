@@ -17,7 +17,8 @@ lance-etl/
     telemetry.py          Telemetry, TelemetryConfig, LanceRuntimeConfig, commit_with_retries
     cloud_storage.py      resolve_filesystem + discover_datasets for pyarrow filesystem I/O
     arrow_types.py        resolve_arrow_type / resolve_type_map (CLI type specs)
-    cli.py                Entry point: etl / maintenance / index / recall / tag / migrate-manifests / migrate-namespace
+    iceberg_optimize.py   IcebergOptimizer + IcebergOptimizeConfig: source Iceberg table maintenance via CALL procedures (rewrite_data_files, rewrite_manifests, expire_snapshots, opt-in remove_orphan_files)
+    cli.py                Entry point: etl / maintenance / index / recall / tag / migrate-manifests / migrate-namespace / optimize-iceberg
     migrate_namespace.py  NamespaceMigrator + MigrateConfig: one-off namespace copy/optimize utility
   bench/                  Benchmark package (python -m bench)
     cli.py                Subcommand dispatch: download / prepare / ingest / index / compact
@@ -74,10 +75,10 @@ lance-etl/
     src/main.rs           Binary entry point
     Cargo.toml            Workspace root for the crate
   airflow/
-    lance_etl_dag.py      Configurable-schedule Airflow DAG (etl >> maintenance >> index)
+    lance_etl_dag.py      Configurable-schedule Airflow DAG (optimize-iceberg [optional] >> etl >> maintenance >> index)
   tests/                  pytest suite (conftest.py + test_*.py)
   docs/
-    adr/                  19 Architecture Decision Records (0001-0019)
+    adr/                  23 Architecture Decision Records (0001-0023)
     FINDINGS.md           Narrative companion to the ADRs
   market-research/        Detailed evaluation notes, plans, and evidence underlying the ADRs
   claude/                 Original reference artifacts — IMMUTABLE, never edit
@@ -273,6 +274,11 @@ Key facts to internalize:
   process via `attach_lance_event_bridge`.
 - The Rust service emits `search_api.*` metrics via the typed `Metrics` facade. All metric emitters
   are infallible: an unreachable Datadog Agent never panics and never fails a request.
+- Per-query-leg spans (`lance.vector_query` / `lance.text_query`) carry `s3.*` attributes sourced
+  from Lance execution-stats events: `s3.requests`, `s3.iops`, `s3.bytes_read`, `s3.parts_loaded`,
+  `s3.indices_loaded`. These are aggregate counts only (no per-method GET/HEAD/LIST split, as
+  Lance does not expose that in production builds). They stay low cardinality: no org, tenant, or
+  version identifier is attached to span attributes.
 
 ---
 
