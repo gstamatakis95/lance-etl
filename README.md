@@ -201,12 +201,19 @@ lance-etl etl \
   --start 2024-01-15T00:00:00 \
   --end 2024-01-16T00:00:00 \
   --base-uri s3://my-bucket/lance \
-  --column-type vectors=fixed_size_list<float16,768> \
+  --vector-field embedding \
+  --text-field body \
+  --column-type embedding=fixed_size_list<float16,768> \
   --dd-service lance-pipeline --dd-env prod
 ```
 
 `--start` / `--end` accept ISO 8601 strings or epoch milliseconds and resolve to Iceberg
-snapshot-id bounds. `--column-type` can be repeated for each column needing a type cast.
+snapshot-id bounds. `--column-type` can be repeated for each column needing a type cast. The named
+vectors and texts in the source `vectors` / `texts` map columns are pivoted into concrete indexable
+columns: each `--vector-field` becomes a fixed-size-list column the IVF_RQ index can target (pair it
+with a matching `--column-type` cast) and each `--text-field` becomes a string column the INVERTED
+index can target. Undeclared map keys are dropped, a key absent from a row yields NULL, and the
+`metadata` map stays stored-only payload flattened into `metadata_keys` / `metadata_values` arrays.
 
 Partition routing:
 

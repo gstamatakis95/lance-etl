@@ -28,3 +28,4 @@ The companion narrative, with the live-verified numbers and the stale-branch cor
 | [0017](0017-rust-intake-service.md) | Rust intake service with a pluggable record sink | Accepted |
 | [0018](0018-ttl-expiration.md) | TTL data-expiration by event age | Accepted |
 | [0019](0019-namespace-migrate-utility.md) | Namespace copy/migrate utility | Accepted |
+| [0020](0020-map-pivot-to-concrete-columns.md) | Pivot named vectors and texts out of maps into concrete indexable columns | Accepted |

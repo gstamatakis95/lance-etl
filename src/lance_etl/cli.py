@@ -176,7 +176,8 @@ def load_dataset_uris(args: argparse.Namespace) -> list[str]:
 def run_etl(args: argparse.Namespace, spark: SparkSession) -> None:
     """Run the ETL subcommand.
 
-    Only the data and identity contract is taken from the CLI. The key/timestamp/op column names, the delete-op
+    Only the data and identity contract is taken from the CLI. The named vectors and texts to pivot out of the source
+    map columns are given by ``--vector-field`` and ``--text-field``. The key/timestamp/op column names, the delete-op
     encodings, the map column names, the window column, shuffle partition count, conflict-retry budget, retry timeout,
     and the timestamp update guard take their opinionated :class:`ETLConfig` defaults.
 
@@ -188,6 +189,8 @@ def run_etl(args: argparse.Namespace, spark: SparkSession) -> None:
         base_uri=args.base_uri,
         telemetry=build_telemetry_config(args),
         partition_cols=parse_partition_cols(args.partition_by) or list(DEFAULT_PARTITION_COLS),
+        vector_fields=list(args.vector_field or []),
+        text_fields=list(args.text_field or []),
         column_types=resolve_type_map(parse_key_values(args.column_type)),
         storage_options=parse_storage_options(args),
         iceberg_read_options=parse_key_values(args.iceberg_option),
@@ -443,6 +446,19 @@ def build_parser() -> argparse.ArgumentParser:
             "in this order. Every column must exist in the source table. Default: org_id,tenant_id,namespace. Each key "
             "lives in exactly one dataset, so the per-dataset merge_insert is the sole dedup."
         ),
+    )
+    etl.add_argument(
+        "--vector-field",
+        action="append",
+        help=(
+            "Named vector key in the source vectors map to pivot into a concrete fixed-size-list column, repeatable. "
+            "Pair each with a --column-type <field>=fixed_size_list<float32,dim> so the IVF_RQ index can target it."
+        ),
+    )
+    etl.add_argument(
+        "--text-field",
+        action="append",
+        help="Named text key in the source texts map to pivot into a concrete string column for FTS, repeatable.",
     )
     etl.add_argument("--column-type", action="append", help="Cast column as name=arrow_type")
     etl.add_argument("--iceberg-option", action="append", help="Iceberg read option key=value")

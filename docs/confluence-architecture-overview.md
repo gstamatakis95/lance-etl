@@ -156,7 +156,7 @@ The data plane is about throughput over thousands of datasets. The serving plane
 
 | Module | Responsibility |
 |---|---|
-| `etl.py` | `IcebergToLanceETL`: incremental Iceberg read, flatten maps, last-write-wins collapse, repartition by routing key, `merge_insert` upsert plus `when_matched_delete` into per-key Lance datasets. |
+| `etl.py` | `IcebergToLanceETL`: incremental Iceberg read, pivot named vectors and texts out of their maps into concrete indexable columns, flatten the metadata map, last-write-wins collapse, repartition by routing key, `merge_insert` upsert plus `when_matched_delete` into per-key Lance datasets. |
 | `indexing.py` | `LanceIndexer` plus per-type handlers (`VectorIndexHandler`, `BTreeIndexHandler`, `BitmapIndexHandler`, `FtsIndexHandler`). Builds indexes via the Lance segment API. |
 | `maintenance.py` | `MaintenanceJob`: per-row TTL expiration (opt-in), two-tier (small and large) compaction, version cleanup — applied in that order per dataset. Also contains blue-green tag helpers and manifest migration. |
 | `recall.py` | `RecallAuditJob`: replays Datadog-sampled queries as exact brute-force scans, scores recall@k, nDCG@k, MRR. |
@@ -228,7 +228,7 @@ Key points:
 
 - **Event time is authoritative.** It is used for ordering, collapse, and time-bounded serving. Date-range queries are expressed as scalar range filters on this column, pruned efficiently by a BTREE index.
 - **No ingest-time column.** This was deliberately removed (ADR 0016 supersedes 0011). The consequence is that receipt-based (ingest-age) retention is not expressible. Retention is by event age only.
-- **Maps, not structs.** Lance has no map type and structs are not used downstream, so the map columns are flattened into parallel `{col}_keys` / `{col}_values` list columns during ETL.
+- **Maps, not structs.** Lance has no map type and structs are not used downstream, so the maps are unpacked during ETL. Named vectors and texts are pivoted into concrete indexable columns (one column per declared field, the vector column cast to a fixed-size-list), while the metadata map stays stored-only payload flattened into parallel `metadata_keys` / `metadata_values` list columns.
 
 ### Index types
 
@@ -310,7 +310,7 @@ Two services share one binary, one port, one router, one health endpoint, and on
 ### End-to-end, engineer detail
 
 1. **Incremental Iceberg read.** The wall-clock window is resolved to `start-snapshot-id` / `end-snapshot-id` by querying the `{table}.snapshots` metadata table, because Iceberg 1.10 rejects `start-timestamp` / `end-timestamp` on batch scans. On first run with no prior snapshot, it falls back to a full batch scan pinned at the end bound (ADR 0003).
-2. **Flatten and collapse.** The two map columns are flattened into parallel list columns. Rows are collapsed to the last-write-wins terminal state per id using the event timestamp.
+2. **Pivot, flatten, and collapse.** The named vectors and texts are pivoted out of their map columns into concrete indexable columns and the metadata map is flattened into parallel list columns. Rows are collapsed to the last-write-wins terminal state per id using the event timestamp.
 3. **Repartition and route.** Rows are shuffled by routing key so each row can only reach its own dataset. The dataset URI is a validated pure function of the routing columns.
 4. **merge_insert.** Each routing key's rows are applied to exactly one Lance dataset with a `merge_insert` upsert plus `when_matched_delete`. Replayed or retried windows converge rather than duplicate, so backfills are just catch-up replays of the same job.
 5. **Distributed index build via the segment API.** The driver trains IVF centroids and one shared RaBitQ model, broadcasts them, executors build one index segment per fragment shard, and the driver merges and commits. Scalar and FTS indexes follow their own segment flows (ADR 0001).

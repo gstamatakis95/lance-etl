@@ -2,9 +2,11 @@
 
 Drives the production :meth:`lance_etl.etl.IcebergToLanceETL.run` end to end, source read included: the same
 configuration the ``lance-etl etl`` CLI would build (routing columns, last-write-wins collapse on ``updated_at``, the
-fixed-size-list vector cast, the routing shuffle, and the executor-side ``merge_insert``) plus the production
-``apply_window_filter`` pushdown. ``read_increment`` resolves the snapshot window through the ``{table}.snapshots``
-metadata table. The benchmark passes a snapshot window of ``[0, now]`` that brackets the table's entire history, so no
+named-vector / named-text pivot out of the ``vectors`` and ``texts`` maps into concrete ``vector`` and ``text``
+columns, the fixed-size-list cast of the pivoted ``vector`` column, the routing shuffle, and the executor-side
+``merge_insert``) plus the production ``apply_window_filter`` pushdown. ``read_increment`` resolves the snapshot window
+through the ``{table}.snapshots`` metadata table. The benchmark passes a snapshot window of ``[0, now]`` that brackets
+the table's entire history, so no
 snapshot precedes the window start and the read takes the production first-run fallback — a full batch scan pinned to
 the window's last snapshot via the ``snapshot-id`` option. The source table is written once by prepare, so the
 ``updated_at`` window filter is the per-batch slicer.
@@ -70,6 +72,8 @@ def etl_config(config: BenchConfig, dimension: int, window: tuple[str, str]) -> 
         base_uri=str(config.lance_root()),
         telemetry=bench_telemetry_config(),
         ts_col="updated_at",
+        vector_fields=["vector"],
+        text_fields=["text"],
         column_types=resolve_type_map({"vector": f"fixed_size_list<float32,{dimension}>"}),
         num_partitions=config.etl_partitions,
         window_start=window[0],

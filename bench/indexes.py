@@ -2,8 +2,10 @@
 
 Four index stages run sequentially over all per-tenant datasets so each index type gets its own wall-time measurement:
 IVF_RQ on ``vector`` (sweepable ``--num-partitions``, defaulting to the indexer's size-aware policy), BTREE on
-``vector_id``, BITMAP on the low-cardinality ``category`` column, and INVERTED (BM25) on ``text``. Each stage uses the
-production two-tier orchestration in ``lance_etl.indexing`` unchanged.
+``vector_id``, BITMAP on the low-cardinality ``category`` column, and INVERTED (BM25) on ``text``. The ``vector`` and
+``text`` columns are the concrete columns the ETL pivots out of the source ``vectors`` and ``texts`` maps, so the index
+handlers target them by name exactly as for any other concrete column. Each stage uses the production two-tier
+orchestration in ``lance_etl.indexing`` unchanged.
 """
 
 from __future__ import annotations

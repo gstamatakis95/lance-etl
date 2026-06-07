@@ -10,7 +10,7 @@ before touching any file.
 ```
 lance-etl/
   src/lance_etl/          Python package (production sources)
-    etl.py                IcebergToLanceETL: read, collapse, repartition, merge_insert
+    etl.py                IcebergToLanceETL: read, pivot maps to concrete cols, collapse, repartition, merge_insert
     indexing.py           LanceIndexer + per-type handlers (VectorIndex, BTree, Bitmap, Fts)
     maintenance.py        MaintenanceJob + MaintenanceConfig: cheap single-org DQ guard (zone-map pushdown count), per-row TTL expiration, two-tier compaction, version cleanup
     recall.py             RecallAuditJob: replay Datadog spans, score recall@k/nDCG@k/MRR

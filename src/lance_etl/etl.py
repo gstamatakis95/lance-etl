@@ -1,10 +1,11 @@
 """Iceberg-to-Lance ETL routing changes into per-tenant datasets.
 
-Reads a time range of changes from an Iceberg table that carries an operation column (insert, update, delete), flattens
-the two map columns into struct-free parallel arrays, collapses to the last-write-wins terminal state per vector id,
-casts columns to caller-supplied Arrow types, and applies each routing key's rows to exactly one Lance dataset
-identified by the configured ``partition_cols`` (default ``(org_id, tenant_id, namespace)``) with a ``merge_insert``
-upsert plus a ``when_matched_delete``.
+Reads a time range of changes from an Iceberg table that carries an operation column (insert, update, delete), pivots
+the declared named vectors and texts out of their map columns into concrete indexable columns, flattens the metadata
+map into struct-free parallel arrays, collapses to the last-write-wins terminal state per vector id, casts columns to
+caller-supplied Arrow types, and applies each routing key's rows to exactly one Lance dataset identified by the
+configured ``partition_cols`` (default ``(org_id, tenant_id, namespace)``) with a ``merge_insert`` upsert plus a
+``when_matched_delete``.
 
 Routing is dynamic: ``ETLConfig.partition_cols`` lists the columns whose values build the dataset path
 ``base_uri/<val1>/<val2>/.../<valN>.lance`` in order, and the collapse window, the routing repartition, and the
@@ -32,9 +33,13 @@ ordering, collapse, and time-bounded serving. See ADR 0016 for the rationale and
 
 Cross-contamination is prevented structurally: the dataset URI is a validated pure function of the routing columns and
 rows are shuffled by routing key, so a row can only reach its own dataset. Lance has no map type and structs are not
-used downstream, so ``vectors`` and ``metadata`` are flattened with ``map_keys``/``map_values`` into ``{col}_keys`` and
-``{col}_values`` parallel list columns associated by index. ``conflict_retries`` makes concurrent runs on the same
-dataset safe. Any other failure propagates so the job fails fast.
+used downstream, so the maps are unpacked before write. The ``vectors`` and ``texts`` maps are pivoted: each name in
+``vector_fields`` becomes a concrete column holding ``vectors[name]`` (cast to a fixed-size-list the IVF_RQ index can
+target) and each name in ``text_fields`` becomes a concrete string column holding ``texts[name]`` (the INVERTED/FTS
+index can target it). Undeclared map keys are dropped and a declared key absent from a row yields NULL for that column.
+The ``metadata`` map stays payload, flattened with ``map_keys``/``map_values`` into ``{col}_keys`` and ``{col}_values``
+parallel list columns associated by index. ``conflict_retries`` makes concurrent runs on the same dataset safe. Any
+other failure propagates so the job fails fast.
 
 Small-and-big efficiency: the per-tenant population is power-law shaped (tens of thousands of orgs, most tiny, a few
 huge), so the ETL never does per-row work on the driver. The driver only resolves the Iceberg snapshot bounds from
@@ -64,6 +69,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import MapType
 from pyspark.sql.window import Window, WindowSpec
 
 from lance_etl.telemetry import (
@@ -128,8 +134,20 @@ class ETLConfig:
             ``["org_id", "tenant_id", "namespace"]``, the stable identity trio. Each key lives in exactly one dataset,
             so the per-dataset ``merge_insert`` keyed on ``key_col`` is the sole dedup mechanism: a re-upsert updates a
             key in place and a delete reaches the one dataset that holds it. No cross-dataset reader dedup is needed.
-        vectors_col: Map column of vectors flattened into parallel arrays.
-        metadata_col: Map column of metadata flattened into parallel arrays.
+        vectors_col: Map column of named vectors pivoted into concrete columns, one per :attr:`vector_fields` entry.
+            Dropped after the pivot. Skipped when absent from the source. Lance has no map type, so the map itself is
+            never written.
+        texts_col: Map column of named text fields pivoted into concrete string columns, one per :attr:`text_fields`
+            entry. Dropped after the pivot. Skipped when absent from the source.
+        metadata_col: Map column of metadata flattened into ``{metadata_col}_keys`` / ``{metadata_col}_values`` parallel
+            arrays. Stays stored-only payload. Skipped when absent from the source.
+        vector_fields: Keys of :attr:`vectors_col` to pivot into concrete columns. Each name becomes a column holding
+            that key's value, cast to a fixed-size-list by :attr:`column_types` so the IVF_RQ index can target it. A key
+            absent from a row yields NULL for that column in that row. Undeclared keys are dropped. Each name is
+            validated against :data:`PATH_COMPONENT_PATTERN` and must not collide with another column.
+        text_fields: Keys of :attr:`texts_col` to pivot into concrete string columns. Each name becomes a string column
+            the INVERTED/FTS index can target. A key absent from a row yields NULL. Undeclared keys are dropped. Each
+            name is validated like :attr:`vector_fields`.
         ts_col: Source event timestamp column. Used for last-write-wins collapse and written into every dataset as the
             single canonical time clock. Date-range queries on the written datasets are expressed as scalar range
             filters on this column, pruned by a BTREE scalar index when one is configured.
@@ -155,7 +173,10 @@ class ETLConfig:
     key_col: str = "vector_id"
     partition_cols: list[str] = field(default_factory=lambda: list(DEFAULT_PARTITION_COLS))
     vectors_col: str = "vectors"
+    texts_col: str = "texts"
     metadata_col: str = "metadata"
+    vector_fields: list[str] = field(default_factory=list)
+    text_fields: list[str] = field(default_factory=list)
     ts_col: str = "timestamp"
     op_col: str = "op"
     delete_op_values: list[str] = field(default_factory=lambda: ["delete", "DELETE", "d"])
@@ -551,55 +572,114 @@ class IcebergToLanceETL:
         return filtered
 
     def validate_schema(self, source: DataFrame) -> None:
-        """Validate that the source carries every required column.
+        """Validate that the source carries every required column and that the pivot specification is safe.
 
-        Every partition column must exist in the source.
+        Every partition column, the key, timestamp, and op columns must exist in the source. When
+        :attr:`ETLConfig.vector_fields` is non-empty the :attr:`ETLConfig.vectors_col` map column must exist and be a
+        ``MapType``, and likewise for :attr:`ETLConfig.text_fields` and :attr:`ETLConfig.texts_col`. Every declared
+        pivot field name, and every map column name in use, is validated against :data:`PATH_COMPONENT_PATTERN`, and no
+        pivot field name may collide with an existing column or a reserved column (the routing, key, op, timestamp,
+        window, or flattened metadata key/value columns). The map columns themselves are optional payload sources that
+        are skipped gracefully when absent.
 
         Args:
             source: The incremental source DataFrame.
 
         Raises:
-            ValueError: If a required column is missing.
+            ValueError: If a required column is missing, a declared map column is absent or not a map, a pivot field
+                name fails the identifier allowlist, or a pivot field name collides with another column.
         """
         config: ETLConfig = self.config
-        required: list[str] = [
-            config.key_col,
-            config.ts_col,
-            config.op_col,
-            config.vectors_col,
-            config.metadata_col,
-            *config.routing_cols(),
-        ]
+        required: list[str] = [config.key_col, config.ts_col, config.op_col, *config.routing_cols()]
         missing: list[str] = [c for c in required if c not in source.columns]
         if missing:
             raise ValueError(
                 f"source is missing required columns: {missing} (every partition column must exist in the source)"
             )
+        self.validate_pivot(source)
 
-    def flatten_maps(self, source: DataFrame) -> DataFrame:
-        """Flatten the vector and metadata maps into struct-free parallel arrays.
+    def validate_pivot(self, source: DataFrame) -> None:
+        """Validate the named-vector and named-text pivot specification against the source schema.
 
         Args:
-            source: A DataFrame containing the two map columns.
+            source: The incremental source DataFrame.
 
-        Returns:
-            The DataFrame with both map columns replaced by parallel arrays.
+        Raises:
+            ValueError: If a declared map column is missing or not a ``MapType``, a map column name or pivot field name
+                fails :data:`PATH_COMPONENT_PATTERN`, or a pivot field name collides with another column.
         """
         config: ETLConfig = self.config
-        return (
-            source.withColumn(f"{config.vectors_col}_keys", F.map_keys(F.col(config.vectors_col)))
-            .withColumn(f"{config.vectors_col}_values", F.map_values(F.col(config.vectors_col)))
-            .drop(config.vectors_col)
-            .withColumn(f"{config.metadata_col}_keys", F.map_keys(F.col(config.metadata_col)))
-            .withColumn(f"{config.metadata_col}_values", F.map_values(F.col(config.metadata_col)))
-            .drop(config.metadata_col)
-        )
+        pattern: re.Pattern[str] = re.compile(PATH_COMPONENT_PATTERN)
+        field_types: dict[str, Any] = {field_def.name: field_def.dataType for field_def in source.schema.fields}
+        reserved: set[str] = {
+            config.key_col,
+            config.op_col,
+            config.ts_col,
+            config.window_column,
+            f"{config.metadata_col}_keys",
+            f"{config.metadata_col}_values",
+            *config.routing_cols(),
+        }
+        for map_col, pivot_fields, label in (
+            (config.vectors_col, config.vector_fields, "vector_fields"),
+            (config.texts_col, config.text_fields, "text_fields"),
+        ):
+            if not pivot_fields:
+                continue
+            if not pattern.match(map_col):
+                raise ValueError(f"map column {map_col!r} fails the identifier allowlist {PATH_COMPONENT_PATTERN}")
+            if map_col not in field_types:
+                raise ValueError(f"{label} declared but map column {map_col!r} is missing from the source")
+            if not isinstance(field_types[map_col], MapType):
+                raise ValueError(f"map column {map_col!r} must be a MapType to pivot {label}")
+            for name in pivot_fields:
+                if not pattern.match(name):
+                    raise ValueError(f"{label} name {name!r} fails the identifier allowlist {PATH_COMPONENT_PATTERN}")
+                if name in reserved or name in source.columns:
+                    raise ValueError(f"{label} name {name!r} collides with an existing or reserved column")
+                reserved.add(name)
+
+    def materialize_maps(self, source: DataFrame) -> DataFrame:
+        """Pivot the named vectors and texts into concrete columns and flatten the metadata map.
+
+        For each name in :attr:`ETLConfig.vector_fields` a concrete column ``name`` is created holding
+        ``vectors_col[name]``, after which the ``vectors_col`` map is dropped so the map never reaches Lance. The same
+        pivot turns each name in :attr:`ETLConfig.text_fields` into a concrete string column from ``texts_col``. A key
+        absent from a given row yields NULL for that column in that row, which is acceptable for optional fields.
+        Undeclared map keys are not materialized and are dropped with the map. The ``metadata_col`` map stays payload
+        and is flattened into ``{metadata_col}_keys`` / ``{metadata_col}_values`` parallel arrays. Each map column is
+        unpacked only when it is present in the source, so an absent map column is skipped gracefully.
+
+        Args:
+            source: A DataFrame containing the map columns.
+
+        Returns:
+            The DataFrame with the vector and text maps pivoted into concrete columns and the metadata map flattened.
+        """
+        config: ETLConfig = self.config
+        result: DataFrame = source
+        for map_col, pivot_fields in (
+            (config.vectors_col, config.vector_fields),
+            (config.texts_col, config.text_fields),
+        ):
+            if map_col not in result.columns:
+                continue
+            for name in pivot_fields:
+                result = result.withColumn(name, F.col(map_col).getItem(name))
+            result = result.drop(map_col)
+        if config.metadata_col in result.columns:
+            result = (
+                result.withColumn(f"{config.metadata_col}_keys", F.map_keys(F.col(config.metadata_col)))
+                .withColumn(f"{config.metadata_col}_values", F.map_values(F.col(config.metadata_col)))
+                .drop(config.metadata_col)
+            )
+        return result
 
     def collapse(self, source: DataFrame) -> DataFrame:
         """Reduce to the last-write-wins terminal event per id within a tenant.
 
         Args:
-            source: The flattened source DataFrame.
+            source: The map-materialized source DataFrame.
 
         Returns:
             One row per routing key and vector id, carrying the terminal op.
@@ -628,10 +708,12 @@ class IcebergToLanceETL:
     def run_on_dataframe(self, source: DataFrame) -> None:
         """Transform and route a pre-read increment.
 
-        Validates the source schema, flattens map columns, collapses to the last-write-wins terminal row per routing
-        key and vector id using the event timestamp, and routes each routing key's rows to its Lance dataset via
-        ``merge_insert``. The event timestamp column (``config.ts_col``) is the single canonical clock: it drives the
-        collapse order and is available for scalar range filters on the written datasets. No ingest-time column is
+        Validates the source schema, pivots the named vectors and texts into concrete columns and flattens the metadata
+        map, collapses to the last-write-wins terminal row per routing key and vector id using the event timestamp, and
+        routes each routing key's rows to its Lance dataset via ``merge_insert``. The pivoted vector columns are cast to
+        their fixed-size-list target by ``cast_table`` inside :func:`apply_merge`, so the order is pivot, then collapse,
+        then cast, then merge. The event timestamp column (``config.ts_col``) is the single canonical clock: it drives
+        the collapse order and is available for scalar range filters on the written datasets. No ingest-time column is
         added.
 
         Args:
@@ -641,7 +723,7 @@ class IcebergToLanceETL:
         driver_telemetry: Telemetry = Telemetry.create(config.telemetry)
         with driver_telemetry.span("lance.etl.run") as run_span:
             self.validate_schema(source)
-            collapsed: DataFrame = self.collapse(self.flatten_maps(source))
+            collapsed: DataFrame = self.collapse(self.materialize_maps(source))
             routing: list[str] = config.routing_cols()
             routed: DataFrame = collapsed.repartition(config.num_partitions, *[F.col(c) for c in routing])
             partition_stats_schema: pa.Schema = stats_schema(routing)

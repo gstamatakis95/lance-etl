@@ -2,11 +2,14 @@
 
 The base vectors are written into a local Iceberg table with exactly the schema the project's ETL expects: the routing
 columns (``org_id``, ``tenant_id``, ``namespace``), the merge key ``vector_id``, the operation column ``op``, the
-timestamp column ``updated_at`` (used as both the last-write-wins collapse column and the window-pushdown column), and
-the two required map columns ``vectors`` / ``metadata`` that the ETL flattens into parallel arrays. The actual
-embedding rides in a top-level ``vector array<float>`` column which the ingest phase casts to
-``fixed_size_list<float32, dim>`` through the ETL's ``--column-type`` flag, plus ``text`` (synthetic, cluster-seeded)
-and ``category`` (low-cardinality, for the bitmap index) columns that flow through the ETL untouched.
+timestamp column ``updated_at`` (used as both the last-write-wins collapse column and the window-pushdown column), the
+low-cardinality concrete ``category`` column (the bitmap index target, flows through the ETL untouched), and the three
+map columns ``vectors`` / ``texts`` / ``metadata``. The embedding rides in the ``vectors`` map under the key
+``"vector"`` and the synthetic cluster-seeded document rides in the ``texts`` map under the key ``"text"``: the ingest
+phase declares those as the ETL's ``vector_fields`` / ``text_fields`` so they are pivoted into concrete ``vector`` and
+``text`` columns, with the ``vector`` column cast to ``fixed_size_list<float32, dim>`` through the ETL's
+``column_types``. The ``metadata`` map carries the cluster id under ``"cluster"`` and stays flattened to
+``metadata_keys`` / ``metadata_values`` parallel arrays.
 
 Row generation runs inside Spark executors via ``mapInArrow``: each task reads its own row slice straight through the
 dataset adapter, assigns clusters against the driver-trained centroids, and emits Arrow batches. ``updated_at``
@@ -53,7 +56,7 @@ CATEGORY_CARDINALITY: int = 16
 KMEANS_SAMPLE_ROWS: int = 100_000
 SPARK_ROW_DDL: str = (
     "org_id string, tenant_id string, namespace string, vector_id string, op string, updated_at_us long, "
-    "vector array<float>, text string, category string, vectors map<string,array<float>>, "
+    "category string, vectors map<string,array<float>>, texts map<string,string>, "
     "metadata map<string,string>"
 )
 
@@ -72,10 +75,9 @@ def arrow_row_schema() -> pa.Schema:
             ("vector_id", pa.string()),
             ("op", pa.string()),
             ("updated_at_us", pa.int64()),
-            ("vector", pa.list_(pa.float32())),
-            ("text", pa.string()),
             ("category", pa.string()),
             ("vectors", pa.map_(pa.string(), pa.list_(pa.float32()))),
+            ("texts", pa.map_(pa.string(), pa.string())),
             ("metadata", pa.map_(pa.string(), pa.string())),
         ]
     )
@@ -145,7 +147,6 @@ def slice_record_batch(
     """
     vectors: np.ndarray = adapter.base_vector_slice(workspace, start, count)
     clusters: np.ndarray = assign_clusters(vectors, centroids)
-    norms: np.ndarray = np.linalg.norm(vectors, axis=1).astype(np.float32)
     indices: np.ndarray = np.arange(start, start + count, dtype=np.int64)
     org_ids: list[str] = [f"org{int(i) % tenants}" for i in indices]
     texts: list[str] = [
@@ -153,10 +154,7 @@ def slice_record_batch(
         for c, i in zip(clusters, indices, strict=True)
     ]
     flat_offsets: pa.Array = pa.array(np.arange(count + 1, dtype=np.int32) * vectors.shape[1])
-    vector_column: pa.ListArray = pa.ListArray.from_arrays(flat_offsets, pa.array(vectors.ravel(), pa.float32()))
-    norm_items: pa.ListArray = pa.ListArray.from_arrays(
-        pa.array(np.arange(count + 1, dtype=np.int32)), pa.array(norms, pa.float32())
-    )
+    vector_items: pa.ListArray = pa.ListArray.from_arrays(flat_offsets, pa.array(vectors.ravel(), pa.float32()))
     return pa.RecordBatch.from_arrays(
         [
             pa.array(org_ids, pa.string()),
@@ -165,10 +163,9 @@ def slice_record_batch(
             pa.array([str(int(i)) for i in indices], pa.string()),
             pa.array(["insert"] * count, pa.string()),
             pa.array(updated_at_micros(indices)),
-            vector_column,
-            pa.array(texts, pa.string()),
             pa.array([f"cat{int(c) % CATEGORY_CARDINALITY}" for c in clusters], pa.string()),
-            single_entry_map(["norm"] * count, norm_items),
+            single_entry_map(["vector"] * count, vector_items),
+            single_entry_map(["text"] * count, pa.array(texts, pa.string())),
             single_entry_map(["cluster"] * count, pa.array([str(int(c)) for c in clusters], pa.string())),
         ],
         schema=arrow_row_schema(),
