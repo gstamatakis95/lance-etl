@@ -43,7 +43,7 @@ from pyspark.sql import SparkSession
 from lance_etl.cloud_storage import discover_datasets
 from lance_etl.etl import DEFAULT_PARTITION_COLS, PATH_COMPONENT_PATTERN
 from lance_etl.indexing import IndexJobConfig, LanceIndexer, split_evenly
-from lance_etl.maintenance import MaintenanceConfig, MaintenanceJob, fan_out_per_dataset
+from lance_etl.maintenance import MaintenanceConfig, MaintenanceJob, fan_out_per_dataset, uri_components
 from lance_etl.telemetry import DEFAULT_COMMIT_RETRIES, Telemetry, TelemetryConfig, commit_with_retries
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -179,28 +179,6 @@ def validate_config(config: MigrateConfig) -> None:
             raise ValueError(f"invalid {label}: {value!r}")
 
 
-def dataset_components(base_uri: str, uri: str) -> list[str]:
-    """Split a discovered dataset URI into its routing-value path components.
-
-    Args:
-        base_uri: The root location the dataset was discovered under.
-        uri: The full dataset URI, ending in ``.lance``.
-
-    Returns:
-        The routing values in path order, with the trailing ``.lance`` removed from the last.
-
-    Raises:
-        ValueError: If the URI is not rooted at ``base_uri`` or does not end in ``.lance``.
-    """
-    root: str = base_uri.rstrip("/")
-    if not uri.startswith(f"{root}/") or not uri.endswith(LANCE_SUFFIX):
-        raise ValueError(f"dataset URI {uri!r} is not a .lance dataset rooted at {base_uri!r}")
-    relative: str = uri[len(root) + 1 :]
-    components: list[str] = relative.split("/")
-    components[-1] = components[-1][: -len(LANCE_SUFFIX)]
-    return components
-
-
 def build_dataset_uri(base_uri: str, components: list[str]) -> str:
     """Build a validated dataset URI from routing values.
 
@@ -235,7 +213,7 @@ def target_uri_for(config: MigrateConfig, source_uri: str) -> str:
     Raises:
         ValueError: If the source URI does not carry one value per configured partition column.
     """
-    components: list[str] = dataset_components(config.base_uri, source_uri)
+    components: list[str] = uri_components(config.base_uri, source_uri)
     if len(components) != len(config.partition_cols):
         raise ValueError(
             f"source URI {source_uri!r} has {len(components)} path components, expected {len(config.partition_cols)} "
@@ -258,7 +236,7 @@ def source_dataset_uris(config: MigrateConfig) -> list[str]:
     width: int = len(config.partition_cols)
     matched: list[str] = []
     for uri in discover_datasets(config.base_uri, config.storage_options):
-        components: list[str] = dataset_components(config.base_uri, uri)
+        components: list[str] = uri_components(config.base_uri, uri)
         if len(components) == width and components[index] == config.source_namespace:
             matched.append(uri)
     return matched

@@ -331,10 +331,12 @@ def expected_routing_values(base_uri: str, uri: str, partition_cols: list[str]) 
 def build_contamination_predicate(expected: dict[str, str], schema_names: list[str]) -> str | None:
     """Build a Lance SQL predicate that matches any row whose routing-column values differ from expected.
 
-    The predicate is an OR over ``"{col} != '{escaped_value}'"`` for each routing column that is present as a stored
-    column in the dataset schema. Columns absent from the schema are skipped because they are not stored as columns and
-    cannot be filtered. If none of the routing columns exist in the schema the function returns ``None``, signalling
-    that the check must be skipped.
+    The predicate is an OR over ``"({col} IS NULL OR {col} != '{escaped_value}')"`` for each routing column that is
+    present as a stored column in the dataset schema. The ``IS NULL`` arm is required because a row whose routing column
+    is NULL is itself contamination, and ``NULL != 'value'`` evaluates to NULL rather than true, so it would otherwise
+    escape the count. Columns absent from the schema are skipped because they are not stored as columns and cannot be
+    filtered. If none of the routing columns exist in the schema the function returns ``None``, signalling that the
+    check must be skipped.
 
     Each column name is validated against :data:`COLUMN_NAME_PATTERN` before use. Each expected value has its single
     quotes escaped by doubling (the standard SQL escaping rule) so a value containing a single quote cannot inject SQL.
@@ -356,7 +358,7 @@ def build_contamination_predicate(expected: dict[str, str], schema_names: list[s
         if col not in schema_names:
             continue
         escaped: str = value.replace("'", "''")
-        clauses.append(f"{col} != '{escaped}'")
+        clauses.append(f"({col} IS NULL OR {col} != '{escaped}')")
     if not clauses:
         return None
     return " OR ".join(clauses)

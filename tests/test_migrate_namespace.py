@@ -20,10 +20,10 @@ from conftest import make_vector_table
 from pyspark.sql import SparkSession
 
 from lance_etl.indexing import IndexJobConfig, bitmap_index_name
+from lance_etl.maintenance import uri_components
 from lance_etl.migrate_namespace import (
     MigrateConfig,
     NamespaceMigrator,
-    dataset_components,
     source_dataset_uris,
     target_uri_for,
     validate_config,
@@ -117,7 +117,7 @@ class TestPathHelpers:
     def test_dataset_components_strips_suffix(self) -> None:
         """A discovered URI splits into its routing values without the .lance suffix."""
         uri: str = "/data/org1/tenant1/nsA.lance"
-        assert dataset_components("/data", uri) == ["org1", "tenant1", "nsA"]
+        assert uri_components("/data", uri) == ["org1", "tenant1", "nsA"]
 
     def test_target_uri_swaps_only_namespace(self, telemetry_config: TelemetryConfig) -> None:
         """Only the namespace component changes; org and tenant are preserved."""

@@ -67,13 +67,17 @@ impl FusionSpec {
 /// 1-based ranks. Row JSON objects are merged across legs, first leg wins on key conflicts.
 fn rrf_fuse(rrf_k: f64, legs: Vec<Vec<Hit>>, k: usize) -> Vec<FusedHit> {
     let mut fused: HashMap<u64, FusedHit> = HashMap::new();
+    let mut order: Vec<u64> = Vec::new();
     for leg in legs {
         for (rank, hit) in leg.into_iter().enumerate() {
             let contribution = 1.0 / (rrf_k + (rank as f64) + 1.0);
-            let entry = fused.entry(hit.row_id).or_insert_with(|| FusedHit {
-                row_id: hit.row_id,
-                score: 0.0,
-                row: Map::new(),
+            let entry = fused.entry(hit.row_id).or_insert_with(|| {
+                order.push(hit.row_id);
+                FusedHit {
+                    row_id: hit.row_id,
+                    score: 0.0,
+                    row: Map::new(),
+                }
             });
             entry.score += contribution;
             for (key, value) in hit.row {
@@ -81,7 +85,7 @@ fn rrf_fuse(rrf_k: f64, legs: Vec<Vec<Hit>>, k: usize) -> Vec<FusedHit> {
             }
         }
     }
-    let mut ranked: Vec<FusedHit> = fused.into_values().collect();
+    let mut ranked: Vec<FusedHit> = order.into_iter().filter_map(|row_id| fused.remove(&row_id)).collect();
     ranked.sort_by(|left, right| {
         right
             .score
