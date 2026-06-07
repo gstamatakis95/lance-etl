@@ -119,8 +119,8 @@ The data plane is about throughput over thousands of datasets. The serving plane
    ============== RUST SERVING PLANE (tonic gRPC) ===============
    |                                                             |
    |   SearchService            IntakeService                    |
-   |   - VectorSearch           - Mutate                         |
-   |   - TextSearch             - MutateStream                   |
+   |   - VectorSearch           - Write                          |
+   |   - TextSearch             - WriteStream                    |
    |   - HybridSearch                                            |
    |   - Prewarm            +-- two-tier disk + memory cache     |
    |   - Clusters           +-- typed filter AST (no raw SQL)    |
@@ -135,7 +135,7 @@ The data plane is about throughput over thousands of datasets. The serving plane
 ### Split of responsibilities
 
 - **Driver vs executors (Spark).** The Spark driver only plans, broadcasts small read-only artifacts (such as trained centroids and version pins), and commits. All heavy reads, writes, index builds, and compaction run inside executor tasks. The driver never opens a dataset for row-level work.
-- **Read vs write (serving).** The SearchService only reads. The IntakeService only accepts mutations and forwards them to a pluggable sink. Neither opens a dataset for the other's job.
+- **Read vs write (serving).** The SearchService only reads. The IntakeService only accepts record writes and forwards them to a pluggable sink. Neither opens a dataset for the other's job.
 - **Engine vs transport (Rust).** The Rust crate is layered so that the query engine, the wire protocol, and the caching layer never leak into each other.
 
 ### Engineer-facing detail
@@ -262,7 +262,7 @@ Validation rejects an upsert with an empty id, an upsert carrying no metadata, v
 
 *Audience: engineers*
 
-Two services share one binary, one port, one router, one health endpoint, and one telemetry pipeline.
+Two services share one binary, one port, one router, one health endpoint, and one telemetry pipeline. They also share one proto file, `proto/lance_etl/v1/lance_etl.proto` (package `lance_etl.v1`), and one `DatasetTarget` message referenced by both.
 
 ### SearchService
 
@@ -278,16 +278,16 @@ Two services share one binary, one port, one router, one health endpoint, and on
 
 | RPC | Purpose | Request / response shape (high level) |
 |---|---|---|
-| **Mutate** | Apply one batch of mutations to a single dataset. | Request: target plus a list of `Mutation` (op plus record). Response: accepted count, rejected count, per-item errors. |
-| **MutateStream** | High-throughput client-streaming of mutation batches across possibly several datasets. | Stream of `MutateRequest`, each with its own target. One aggregated `MutateResponse` on half-close. |
+| **Write** | Apply one batch of record writes to a single dataset. | Request: target plus a list of `RecordWrite` (a `WriteOp` op plus a record). Response: `succeeded_ids` and `failed_ids` (record ids only). |
+| **WriteStream** | High-throughput client-streaming of record-write batches across possibly several datasets. | Stream of `WriteRecordsRequest`, each with its own target. One aggregated `WriteRecordsResponse` on half-close. |
 
 ### Notable contract rules
 
 - **Typed filter AST, no raw SQL.** Filters are a typed predicate tree (`Comparison`, `InList`, `IsNull`, `IsNotNull`, `Between`, `and`, `or`, `not`). Column names are validated against the dataset schema and an identifier allowlist. Literals become typed DataFusion `lit` expressions. Clients can never inject expression text (ADR 0005). An injection attempt such as a column named `id; DROP TABLE users` is rejected at the allowlist.
 - **Fusion specs.** Hybrid fusion offers two strategies. **RRF** sums `1 / (rrf_k + rank)` across legs (default `rrf_k = 60`). **Weighted** min-max normalizes each leg into `[0, 1]` and combines them with a vector weight (default `0.7`). RRF is the default when no fusion message is set.
 - **Rerank seam.** Every search RPC accepts an optional `Rerank`. The only strategy today is `IdentityRerank` (keep order, optionally truncate to `top_n`). The trait is async and fallible so a cross-encoder or LLM reranker can slot in later without changing the request shape.
-- **Intake mutations.** `OP_UPSERT` carries the full record (create or replace). `OP_DELETE` reads only the id. Bad mutations are rejected per item rather than failing the whole batch, which suits streaming ingestion. A bad target or a whole-sink failure still fails the request.
-- **RecordSink seam.** The write destination sits behind one domain trait, `RecordSink`. Today the only implementation is `StdoutSink`, which prints each mutation as one structured line. A future `KafkaSink` implements the same trait and replaces it at the single construction site in `main` with no other change (ADR 0017).
+- **Intake record writes.** `WRITE_OP_UPSERT` carries the full record (create or replace). `WRITE_OP_DELETE` reads only the id. Bad record writes fail per item rather than failing the whole batch, which suits streaming ingestion. The response reports only ids: `succeeded_ids` for accepted records and `failed_ids` for failures. A record whose id is itself empty or invalid is omitted from `failed_ids`. A bad target or a whole-sink failure still fails the request.
+- **RecordSink seam.** The write destination sits behind one domain trait, `RecordSink`. Today the only implementation is `StdoutSink`, which prints each record write as one structured line. A future `KafkaSink` implements the same trait and replaces it at the single construction site in `main` with no other change (ADR 0017).
 - **Canonical clock.** The intake record carries `event_timestamp_ms` only. There is no ingest timestamp, consistent with the ETL.
 - **Pre-release proto.** The proto carries no backward-compatibility guarantee. Breaking reshapes have been taken freely where warranted.
 
@@ -389,7 +389,7 @@ Each decision below cites its ADR. Accepted unless noted.
 - Roughly 30 rarely-varied knobs were removed. Universally-correct constants (for example `num_bits=1`, V2 manifest paths, compaction mode) became module constants. Schema column names and fine-grained tokenizer toggles became code-level dataclass fields, not CLI flags. Retry budgets were consolidated into single named constants in `telemetry.py`.
 
 ### Intake service with a pluggable sink (ADR 0017)
-- A second gRPC service accepts UPSERT and DELETE mutations over `Mutate` and `MutateStream`.
+- A second gRPC service accepts UPSERT and DELETE record writes over `Write` and `WriteStream`. It shares the single `lance_etl.v1` proto and the `DatasetTarget` message with the search service, and its response returns only `succeeded_ids` and `failed_ids`.
 - The destination sits behind the `RecordSink` trait. `StdoutSink` today, `KafkaSink` later, swappable in one line with no proto change. Intake never opens a dataset, so it carries no Lance dependency.
 
 ### TTL by event age (ADR 0018)
@@ -535,7 +535,7 @@ Note: the serving-side tag resolution and prewarm-before-flip safety are still *
 
 These are honest, verified against the ADRs.
 
-- **The intake sink is stdout-only today.** The IntakeService validates and routes mutations, but the only sink is `StdoutSink`, which prints them. The planned `KafkaSink` (for the ETL to consume) is a one-line swap behind the same trait, but it is not built yet (ADR 0017).
+- **The intake sink is stdout-only today.** The IntakeService validates and routes record writes, but the only sink is `StdoutSink`, which prints them. The planned `KafkaSink` (for the ETL to consume) is a one-line swap behind the same trait, but it is not built yet (ADR 0017).
 - **Blue-green serving is still Proposed, not implemented.** The Python tag helper and the design are ready, but the Rust serving-side tag resolution and prewarm-before-flip safety are not done. A prior attempt was interrupted and backed out to keep the crate compiling (ADR 0013).
 - **Reindex during migrate needs explicit index columns.** A namespace copy carries no indexes, and the columns to rebuild cannot be guessed, so reindex is skipped with a warning unless index column flags are supplied (ADR 0019).
 - **No receipt-based (ingest-age) retention.** There is no ingest-time column by design, so retention is by event age only. Adding ingest-age retention would require a fresh ADR with an explicit ingest-time design, not a revival of the removed `_ingested_at` column (ADR 0016, ADR 0018).

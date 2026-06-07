@@ -1,18 +1,18 @@
 //! Integration tests for the intake gRPC service: proto <-> domain conversion round-trips,
-//! validation rejections, the [`StdoutSink`] domain seam, and the unary Mutate RPC happy path
+//! validation rejections, the [`StdoutSink`] domain seam, and the unary Write RPC happy path
 //! served over a local TCP port with a tonic client.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use search_api::domain::{DatasetTarget, IntakeBatch, Mutation, MutationOp, Record, RecordSink, StdoutSink};
+use search_api::domain::{DatasetTarget, IntakeBatch, Record, RecordSink, RecordWrite, StdoutSink, WriteOp};
 use search_api::grpc::IntakeGrpc;
-use search_api::grpc::intake_convert::{mutation_from_proto, report_to_proto, target_from_proto};
-use search_api::intake_pb::intake_service_client::IntakeServiceClient;
-use search_api::intake_pb::intake_service_server::IntakeServiceServer;
-use search_api::intake_pb::{
-    DatasetTarget as PbTarget, FloatVector as PbFloatVector, MutateRequest, Mutation as PbMutation, MutationOp as PbOp,
-    Record as PbRecord,
+use search_api::grpc::intake_convert::{record_write_from_proto, report_to_proto, target_from_proto};
+use search_api::pb::intake_service_client::IntakeServiceClient;
+use search_api::pb::intake_service_server::IntakeServiceServer;
+use search_api::pb::{
+    DatasetTarget as PbTarget, FloatVector as PbFloatVector, Record as PbRecord, RecordWrite as PbRecordWrite,
+    WriteOp as PbOp, WriteRecordsRequest,
 };
 use search_api::telemetry::Metrics;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -44,9 +44,9 @@ fn pb_strings(entries: &[(&str, &str)]) -> HashMap<String, String> {
         .collect()
 }
 
-/// Builds a proto upsert mutation carrying one named vector, one text field, and one metadata key.
-fn pb_upsert(id: &str, vector: Vec<f32>) -> PbMutation {
-    PbMutation {
+/// Builds a proto upsert record write carrying one named vector, one text field, and one metadata key.
+fn pb_upsert(id: &str, vector: Vec<f32>) -> PbRecordWrite {
+    PbRecordWrite {
         op: PbOp::Upsert as i32,
         record: Some(PbRecord {
             id: id.to_string(),
@@ -58,9 +58,9 @@ fn pb_upsert(id: &str, vector: Vec<f32>) -> PbMutation {
     }
 }
 
-/// Builds a proto delete mutation for the given id.
-fn pb_delete(id: &str) -> PbMutation {
-    PbMutation {
+/// Builds a proto delete record write for the given id.
+fn pb_delete(id: &str) -> PbRecordWrite {
+    PbRecordWrite {
         op: PbOp::Delete as i32,
         record: Some(PbRecord {
             id: id.to_string(),
@@ -87,7 +87,7 @@ fn target_round_trips_and_rejects_bad_segments() {
 
 #[test]
 fn multi_vector_multi_text_upsert_round_trips_through_conversion() {
-    let mutation = PbMutation {
+    let write = PbRecordWrite {
         op: PbOp::Upsert as i32,
         record: Some(PbRecord {
             id: "a".to_string(),
@@ -97,8 +97,8 @@ fn multi_vector_multi_text_upsert_round_trips_through_conversion() {
             texts: pb_strings(&[("title", "green pear"), ("body", "a ripe green pear")]),
         }),
     };
-    match mutation_from_proto(mutation).unwrap() {
-        Mutation::Upsert(record) => {
+    match record_write_from_proto(write).unwrap() {
+        RecordWrite::Upsert(record) => {
             assert_eq!(record.id, "a");
             assert_eq!(record.event_timestamp_ms, 1_700_000_000_000);
             assert_eq!(
@@ -119,14 +119,14 @@ fn multi_vector_multi_text_upsert_round_trips_through_conversion() {
 
 #[test]
 fn delete_round_trips_through_conversion() {
-    let delete = mutation_from_proto(pb_delete("b")).unwrap();
-    assert_eq!(delete.op(), MutationOp::Delete);
+    let delete = record_write_from_proto(pb_delete("b")).unwrap();
+    assert_eq!(delete.op(), WriteOp::Delete);
     assert_eq!(delete.id(), "b");
 }
 
 #[test]
 fn metadata_only_upsert_is_accepted() {
-    let mutation = PbMutation {
+    let write = PbRecordWrite {
         op: PbOp::Upsert as i32,
         record: Some(PbRecord {
             id: "meta".to_string(),
@@ -136,8 +136,8 @@ fn metadata_only_upsert_is_accepted() {
             texts: HashMap::new(),
         }),
     };
-    match mutation_from_proto(mutation).unwrap() {
-        Mutation::Upsert(record) => {
+    match record_write_from_proto(write).unwrap() {
+        RecordWrite::Upsert(record) => {
             assert_eq!(record.metadata["only"], "metadata");
             assert!(record.vectors.is_empty());
             assert!(record.texts.is_empty());
@@ -147,8 +147,8 @@ fn metadata_only_upsert_is_accepted() {
 }
 
 #[test]
-fn validation_rejects_bad_mutations() {
-    let empty_named_vector = PbMutation {
+fn validation_rejects_bad_record_writes() {
+    let empty_named_vector = PbRecordWrite {
         op: PbOp::Upsert as i32,
         record: Some(PbRecord {
             id: "a".to_string(),
@@ -158,9 +158,9 @@ fn validation_rejects_bad_mutations() {
             texts: HashMap::new(),
         }),
     };
-    assert!(mutation_from_proto(empty_named_vector).is_err());
+    assert!(record_write_from_proto(empty_named_vector).is_err());
 
-    let fully_empty_upsert = PbMutation {
+    let fully_empty_upsert = PbRecordWrite {
         op: PbOp::Upsert as i32,
         record: Some(PbRecord {
             id: "a".to_string(),
@@ -170,12 +170,12 @@ fn validation_rejects_bad_mutations() {
             texts: HashMap::new(),
         }),
     };
-    assert!(mutation_from_proto(fully_empty_upsert).is_err());
+    assert!(record_write_from_proto(fully_empty_upsert).is_err());
 
-    let empty_id = mutation_from_proto(pb_upsert("", vec![1.0]));
+    let empty_id = record_write_from_proto(pb_upsert("", vec![1.0]));
     assert!(empty_id.is_err());
 
-    let unspecified = mutation_from_proto(PbMutation {
+    let unspecified = record_write_from_proto(PbRecordWrite {
         op: PbOp::Unspecified as i32,
         record: Some(PbRecord {
             id: "a".to_string(),
@@ -187,7 +187,7 @@ fn validation_rejects_bad_mutations() {
     });
     assert!(unspecified.is_err());
 
-    let no_record = mutation_from_proto(PbMutation {
+    let no_record = record_write_from_proto(PbRecordWrite {
         op: PbOp::Delete as i32,
         record: None,
     });
@@ -195,26 +195,26 @@ fn validation_rejects_bad_mutations() {
 }
 
 #[tokio::test]
-async fn stdout_sink_reports_accepted_counts() {
+async fn stdout_sink_reports_succeeded_ids() {
     let batch = IntakeBatch::new(
         DatasetTarget::new("org1", "tenant1", "ns1"),
         vec![
-            Mutation::Upsert(Record {
+            RecordWrite::Upsert(Record {
                 id: "a".to_string(),
                 event_timestamp_ms: 1,
                 metadata: BTreeMap::from([("k".to_string(), "v".to_string())]),
                 vectors: BTreeMap::from([("dense".to_string(), vec![1.0, 0.0])]),
                 texts: BTreeMap::new(),
             }),
-            Mutation::Delete { id: "b".to_string() },
+            RecordWrite::Delete { id: "b".to_string() },
         ],
     );
     let report = StdoutSink.accept(batch).await.unwrap();
-    assert_eq!(report.accepted, 2);
-    assert_eq!(report.rejected, 0);
+    assert_eq!(report.succeeded_ids, vec!["a".to_string(), "b".to_string()]);
+    assert!(report.failed_ids.is_empty());
     let proto = report_to_proto(report);
-    assert_eq!(proto.accepted, 2);
-    assert!(proto.errors.is_empty());
+    assert_eq!(proto.succeeded_ids, vec!["a".to_string(), "b".to_string()]);
+    assert!(proto.failed_ids.is_empty());
 }
 
 /// Serves the intake gRPC API on an ephemeral local port and returns a connected channel.
@@ -236,49 +236,46 @@ async fn serve() -> Channel {
 }
 
 #[tokio::test]
-async fn mutate_rpc_happy_path_accepts_a_batch() {
+async fn write_rpc_happy_path_accepts_a_batch() {
     let mut client = IntakeServiceClient::new(serve().await);
     let response = client
-        .mutate(MutateRequest {
+        .write(WriteRecordsRequest {
             target: pb_target(),
-            mutations: vec![pb_upsert("a", vec![1.0, 0.0, 0.0, 0.0]), pb_delete("b")],
+            writes: vec![pb_upsert("a", vec![1.0, 0.0, 0.0, 0.0]), pb_delete("b")],
         })
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(response.accepted, 2);
-    assert_eq!(response.rejected, 0);
-    assert!(response.errors.is_empty());
+    assert_eq!(response.succeeded_ids, vec!["a".to_string(), "b".to_string()]);
+    assert!(response.failed_ids.is_empty());
 }
 
 #[tokio::test]
-async fn mutate_rpc_reports_per_item_rejections() {
+async fn write_rpc_partitions_succeeded_and_failed_ids() {
     let mut client = IntakeServiceClient::new(serve().await);
     let response = client
-        .mutate(MutateRequest {
+        .write(WriteRecordsRequest {
             target: pb_target(),
-            mutations: vec![pb_upsert("good", vec![1.0]), pb_upsert("bad", vec![])],
+            writes: vec![pb_upsert("good", vec![1.0]), pb_upsert("bad", vec![])],
         })
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(response.accepted, 1);
-    assert_eq!(response.rejected, 1);
-    assert_eq!(response.errors.len(), 1);
-    assert_eq!(response.errors[0].id, "bad");
+    assert_eq!(response.succeeded_ids, vec!["good".to_string()]);
+    assert_eq!(response.failed_ids, vec!["bad".to_string()]);
 }
 
 #[tokio::test]
-async fn mutate_rpc_rejects_a_bad_target() {
+async fn write_rpc_rejects_a_bad_target() {
     let mut client = IntakeServiceClient::new(serve().await);
     let status = client
-        .mutate(MutateRequest {
+        .write(WriteRecordsRequest {
             target: Some(PbTarget {
                 org_id: "../escape".to_string(),
                 tenant_id: "tenant1".to_string(),
                 namespace: "ns1".to_string(),
             }),
-            mutations: vec![pb_upsert("a", vec![1.0])],
+            writes: vec![pb_upsert("a", vec![1.0])],
         })
         .await
         .unwrap_err();

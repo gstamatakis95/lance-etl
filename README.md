@@ -102,7 +102,7 @@ prewarm every replica against the green version explicitly (use the `version` or
 | `domain/clusters.rs` | `ClusterSpec`, `ClusterReport`, `ClusterReader` trait |
 | `domain/fusion.rs` | `FusionSpec` (Rrf and Weighted variants) and within-dataset fusion logic |
 | `domain/rerank.rs` | `Reranker` seam, `IdentityReranker` (no-op default) |
-| `domain/intake.rs` | `IntakeBatch`, `Record`, `Mutation`, `RecordSink` trait, `StdoutSink` placeholder |
+| `domain/intake.rs` | `IntakeBatch`, `Record`, `RecordWrite`, `WriteOp`, `RecordSink` trait, `StdoutSink` placeholder |
 | `cache/disk_cache.rs` | Hybrid disk + Moka `CacheBackend` for the Lance index cache |
 | `cache/store_cache.rs` | Read-through byte cache for immutable metadata |
 | `cache/layout.rs` | Versioned stamp dir, key hashing, atomic writes, TTL/budget sweep |
@@ -457,7 +457,10 @@ Environment variables (`LANCE_ETL_BASE_URI` is required. All others are optional
 `DD_AGENT_HOST` is read by the default statsd address resolver: when set, the default becomes
 `${DD_AGENT_HOST}:8125`. `SEARCH_API_STATSD_ADDR` overrides it unconditionally.
 
-Proto RPCs on `lance_etl.search.v1.SearchService`:
+Both services live in one proto file, `proto/lance_etl/v1/lance_etl.proto` (package `lance_etl.v1`),
+and share the `DatasetTarget` message.
+
+Proto RPCs on `lance_etl.v1.SearchService`:
 
 | RPC | Key request fields | Purpose |
 |---|---|---|
@@ -473,19 +476,22 @@ oneof) — raw SQL strings are never accepted. Time-bounded queries are expresse
 filters on the event timestamp column (backed by a BTREE scalar index) rather than as a
 multi-dataset fan-out.
 
-Proto RPCs on `lance_etl.intake.v1.IntakeService`:
+Proto RPCs on `lance_etl.v1.IntakeService`:
 
 | RPC | Streaming | Key request fields | Purpose |
 |---|---|---|---|
-| `Mutate` | unary | `target`, `mutations[]` | Apply one batch of mutations (UPSERT or DELETE) to a single dataset |
-| `MutateStream` | client-streaming | `target`, `mutations[]` per message | High-throughput stream of mutation batches. Returns one aggregated report on half-close. |
+| `Write` | unary | `target`, `writes[]` | Apply one batch of record writes (UPSERT or DELETE) to a single dataset |
+| `WriteStream` | client-streaming | `target`, `writes[]` per message | High-throughput stream of record-write batches. Returns one aggregated response on half-close. |
 
-Each mutation carries an `op` (UPSERT or DELETE) and a `Record`. A `Record` contains a string `id`,
-an `event_timestamp_ms` (epoch milliseconds — the canonical ETL clock, no separate ingestion
-timestamp), a `metadata` string map, a `vectors` map of named fixed-dimension float arrays (one per
-vector column), and a `texts` map of named text fields (one per FTS column). The dataset `target`
-on the request names `org_id`, `tenant_id`, and `namespace` and is never duplicated onto individual
-records. Validated batches are handed to a `RecordSink`. The only shipped sink is `StdoutSink` (a
+Each `RecordWrite` carries an `op` (`WriteOp`: UPSERT or DELETE) and a `Record`. A `Record` contains
+a string `id`, an `event_timestamp_ms` (epoch milliseconds — the canonical ETL clock, no separate
+ingestion timestamp), a `metadata` string map, a `vectors` map of named fixed-dimension float arrays
+(one per vector column), and a `texts` map of named text fields (one per FTS column). The dataset
+`target` on the request names `org_id`, `tenant_id`, and `namespace` and is never duplicated onto
+individual records. The `WriteRecordsResponse` returns only record ids: `succeeded_ids` for records
+the sink accepted and `failed_ids` for records that failed validation or sink acceptance. A record
+whose id is itself empty or invalid cannot be reported by id and is omitted from `failed_ids`.
+Validated batches are handed to a `RecordSink`. The only shipped sink is `StdoutSink` (a
 structured-print placeholder). A future `KafkaSink` implements the same `RecordSink` trait and
 replaces it at the construction site in `main` without changing the proto, transport, or domain
 types.

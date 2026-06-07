@@ -35,8 +35,7 @@ lance-etl/
     grpc_client.py        gRPC stub helpers for the search legs
     results.py            Phase artifact I/O (save_phase, load_phase, read_json, write_json)
   rust/search-api/        Rust gRPC search service (tonic, lance crate)
-    proto/                lance_etl/search/v1/search.proto
-                          lance_etl/intake/v1/intake.proto
+    proto/                lance_etl/v1/lance_etl.proto (one file: SearchService + IntakeService, shared DatasetTarget)
     src/domain/           Transport-agnostic types and traits
       target.rs           DatasetTarget, DatasetRef — dataset addressing (one dataset per request)
       query.rs            VectorQuery, TextQuery, HybridQuery, Hit, FusedHit
@@ -46,7 +45,7 @@ lance-etl/
       clusters.rs         ClusterSpec, ClusterReport, ClusterReader trait
       fusion.rs           FusionSpec (Rrf and Weighted variants) and within-dataset fusion logic
       rerank.rs           Reranker seam, IdentityReranker (no-op default)
-      intake.rs           IntakeBatch, Record, Mutation, RecordSink trait, StdoutSink placeholder
+      intake.rs           IntakeBatch, Record, RecordWrite, WriteOp, RecordSink trait, StdoutSink placeholder
       error.rs            SearchError
     src/cache/            Persistent two-tier caching layer (index + metadata, no raw data)
       layout.rs           Versioned stamp dir, key hashing, atomic writes, TTL/budget sweep

@@ -61,16 +61,16 @@ impl fmt::Display for IntakeError {
 
 impl std::error::Error for IntakeError {}
 
-/// The kind of mutation applied to a record.
+/// The kind of write applied to a record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MutationOp {
+pub enum WriteOp {
     /// Create the record if absent, otherwise replace it.
     Upsert,
     /// Delete the record by id.
     Delete,
 }
 
-impl MutationOp {
+impl WriteOp {
     /// Low-cardinality tag value for this operation.
     pub fn as_tag(self) -> &'static str {
         match self {
@@ -106,12 +106,12 @@ pub struct Record {
     pub texts: BTreeMap<String, String>,
 }
 
-/// One validated mutation: an operation paired with the record it acts on.
+/// One validated record write: an operation paired with the record it acts on.
 ///
-/// An [`MutationOp::Upsert`] carries the full record. A [`MutationOp::Delete`] reads only the id of
-/// the record, so its other fields are left at their defaults.
+/// An [`WriteOp::Upsert`] carries the full record. A [`WriteOp::Delete`] reads only the id of the
+/// record, so its other fields are left at their defaults.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Mutation {
+pub enum RecordWrite {
     /// Create or replace the record.
     Upsert(Record),
     /// Delete the record with this id.
@@ -121,16 +121,16 @@ pub enum Mutation {
     },
 }
 
-impl Mutation {
-    /// The operation kind of this mutation.
-    pub fn op(&self) -> MutationOp {
+impl RecordWrite {
+    /// The operation kind of this record write.
+    pub fn op(&self) -> WriteOp {
         match self {
-            Self::Upsert(_) => MutationOp::Upsert,
-            Self::Delete { .. } => MutationOp::Delete,
+            Self::Upsert(_) => WriteOp::Upsert,
+            Self::Delete { .. } => WriteOp::Delete,
         }
     }
 
-    /// The id of the record this mutation acts on.
+    /// The id of the record this write acts on.
     pub fn id(&self) -> &str {
         match self {
             Self::Upsert(record) => &record.id,
@@ -139,93 +139,76 @@ impl Mutation {
     }
 }
 
-/// A batch of mutations addressed to a single dataset, ready for a sink to accept.
+/// A batch of record writes addressed to a single dataset, ready for a sink to accept.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IntakeBatch {
-    /// Dataset the mutations belong to.
+    /// Dataset the record writes belong to.
     pub target: DatasetTarget,
-    /// Mutations to apply, in client order.
-    pub mutations: Vec<Mutation>,
+    /// Record writes to apply, in client order.
+    pub writes: Vec<RecordWrite>,
 }
 
 impl IntakeBatch {
-    /// Builds a batch from a target and its mutations.
-    pub fn new(target: DatasetTarget, mutations: Vec<Mutation>) -> Self {
-        Self { target, mutations }
+    /// Builds a batch from a target and its record writes.
+    pub fn new(target: DatasetTarget, writes: Vec<RecordWrite>) -> Self {
+        Self { target, writes }
     }
 
     /// Number of upserts in the batch.
     pub fn upsert_count(&self) -> u64 {
-        self.mutations
-            .iter()
-            .filter(|mutation| mutation.op() == MutationOp::Upsert)
-            .count() as u64
+        self.writes.iter().filter(|write| write.op() == WriteOp::Upsert).count() as u64
     }
 
     /// Number of deletes in the batch.
     pub fn delete_count(&self) -> u64 {
-        self.mutations
-            .iter()
-            .filter(|mutation| mutation.op() == MutationOp::Delete)
-            .count() as u64
+        self.writes.iter().filter(|write| write.op() == WriteOp::Delete).count() as u64
     }
-}
-
-/// One rejected mutation, carrying the offending record id and a client-safe reason.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IntakeItemError {
-    /// Record id the error refers to. Empty when the id itself was missing.
-    pub id: String,
-    /// Client-safe reason the mutation was rejected.
-    pub message: String,
 }
 
 /// Outcome of accepting one (or several, when aggregated) intake batch.
+///
+/// The outcome is expressed purely as record ids: those the sink accepted and those that failed
+/// validation or sink acceptance. A record whose id is itself empty or invalid cannot be reported
+/// by id, so it never appears in `failed_ids`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IntakeReport {
-    /// Number of mutations accepted by the sink.
-    pub accepted: u64,
-    /// Number of mutations rejected by validation or the sink.
-    pub rejected: u64,
-    /// Per-item errors for the rejected mutations, in encounter order.
-    pub errors: Vec<IntakeItemError>,
+    /// Ids of records successfully accepted by the sink, in encounter order.
+    pub succeeded_ids: Vec<String>,
+    /// Ids of records that failed validation or sink acceptance, in encounter order.
+    pub failed_ids: Vec<String>,
 }
 
 impl IntakeReport {
-    /// Records one accepted mutation.
-    pub fn accept(&mut self) {
-        self.accepted += 1;
+    /// Records one successfully accepted record id.
+    pub fn succeed(&mut self, id: impl Into<String>) {
+        self.succeeded_ids.push(id.into());
     }
 
-    /// Records one rejected mutation with its id and reason.
-    pub fn reject(&mut self, id: impl Into<String>, message: impl Into<String>) {
-        self.rejected += 1;
-        self.errors.push(IntakeItemError {
-            id: id.into(),
-            message: message.into(),
-        });
+    /// Records one failed record id.
+    pub fn fail(&mut self, id: impl Into<String>) {
+        self.failed_ids.push(id.into());
     }
 
-    /// Folds another report into this one, summing counts and concatenating errors.
+    /// Folds another report into this one, concatenating both id lists.
     pub fn merge(&mut self, other: IntakeReport) {
-        self.accepted += other.accepted;
-        self.rejected += other.rejected;
-        self.errors.extend(other.errors);
+        self.succeeded_ids.extend(other.succeeded_ids);
+        self.failed_ids.extend(other.failed_ids);
     }
 }
 
 /// The write seam: a destination any intake batch is handed to.
 ///
-/// Implementations receive an already-validated [`IntakeBatch`] and report what they accepted.
-/// The transport stays generic over this trait and never names a concrete destination. This is the
-/// extension point: [`StdoutSink`] is the placeholder, and a future `KafkaSink` drops in here as a
-/// second implementation without touching the proto, the transport, or the domain types.
+/// Implementations receive an already-validated [`IntakeBatch`] and report which record ids they
+/// accepted and which failed. The transport stays generic over this trait and never names a
+/// concrete destination. This is the extension point: [`StdoutSink`] is the placeholder, and a
+/// future `KafkaSink` drops in here as a second implementation without touching the proto, the
+/// transport, or the domain types.
 pub trait RecordSink: Send + Sync + 'static {
     /// Accepts a validated batch and reports the per-batch outcome.
     fn accept(&self, batch: IntakeBatch) -> impl Future<Output = Result<IntakeReport, IntakeError>> + Send;
 }
 
-/// Placeholder [`RecordSink`] that prints each mutation as one structured line to stdout.
+/// Placeholder [`RecordSink`] that prints each record write as one structured line to stdout.
 ///
 /// This exists so the intake service has a working, observable destination before the real one
 /// lands. The future `KafkaSink` will implement [`RecordSink`] the same way and replace this at the
@@ -238,9 +221,9 @@ impl RecordSink for StdoutSink {
     async fn accept(&self, batch: IntakeBatch) -> Result<IntakeReport, IntakeError> {
         let target = &batch.target;
         let mut report = IntakeReport::default();
-        for mutation in &batch.mutations {
-            match mutation {
-                Mutation::Upsert(record) => {
+        for write in &batch.writes {
+            match write {
+                RecordWrite::Upsert(record) => {
                     println!(
                         "intake upsert org={} tenant={} namespace={} id={} ts_ms={} vectors=[{}] texts=[{}] metadata_keys={}",
                         target.org_id,
@@ -253,14 +236,14 @@ impl RecordSink for StdoutSink {
                         record.metadata.len(),
                     );
                 }
-                Mutation::Delete { id } => {
+                RecordWrite::Delete { id } => {
                     println!(
                         "intake delete org={} tenant={} namespace={} id={}",
                         target.org_id, target.tenant_id, target.namespace, id,
                     );
                 }
             }
-            report.accept();
+            report.succeed(write.id().to_string());
         }
         Ok(report)
     }
@@ -284,9 +267,9 @@ fn format_text_names(texts: &BTreeMap<String, String>) -> String {
 mod tests {
     use super::*;
 
-    /// Builds an upsert mutation for the given id with one named vector and one text field.
-    fn upsert(id: &str) -> Mutation {
-        Mutation::Upsert(Record {
+    /// Builds an upsert record write for the given id with one named vector and one text field.
+    fn upsert(id: &str) -> RecordWrite {
+        RecordWrite::Upsert(Record {
             id: id.to_string(),
             event_timestamp_ms: 1_700_000_000_000,
             metadata: BTreeMap::from([("source".to_string(), "test".to_string())]),
@@ -299,38 +282,35 @@ mod tests {
     fn batch_counts_upserts_and_deletes() {
         let batch = IntakeBatch::new(
             DatasetTarget::new("org1", "tenant1", "ns1"),
-            vec![upsert("a"), upsert("b"), Mutation::Delete { id: "c".to_string() }],
+            vec![upsert("a"), upsert("b"), RecordWrite::Delete { id: "c".to_string() }],
         );
         assert_eq!(batch.upsert_count(), 2);
         assert_eq!(batch.delete_count(), 1);
-        assert_eq!(batch.mutations[2].op(), MutationOp::Delete);
-        assert_eq!(batch.mutations[2].id(), "c");
+        assert_eq!(batch.writes[2].op(), WriteOp::Delete);
+        assert_eq!(batch.writes[2].id(), "c");
     }
 
     #[tokio::test]
-    async fn stdout_sink_accepts_every_mutation() {
+    async fn stdout_sink_succeeds_every_record_write() {
         let batch = IntakeBatch::new(
             DatasetTarget::new("org1", "tenant1", "ns1"),
-            vec![upsert("a"), Mutation::Delete { id: "b".to_string() }],
+            vec![upsert("a"), RecordWrite::Delete { id: "b".to_string() }],
         );
         let report = StdoutSink.accept(batch).await.unwrap();
-        assert_eq!(report.accepted, 2);
-        assert_eq!(report.rejected, 0);
-        assert!(report.errors.is_empty());
+        assert_eq!(report.succeeded_ids, vec!["a".to_string(), "b".to_string()]);
+        assert!(report.failed_ids.is_empty());
     }
 
     #[test]
-    fn report_merge_sums_counts_and_concatenates_errors() {
+    fn report_merge_concatenates_id_lists() {
         let mut left = IntakeReport::default();
-        left.accept();
-        left.reject("x", "bad");
+        left.succeed("a");
+        left.fail("x");
         let mut right = IntakeReport::default();
-        right.accept();
-        right.reject("y", "worse");
+        right.succeed("b");
+        right.fail("y");
         left.merge(right);
-        assert_eq!(left.accepted, 2);
-        assert_eq!(left.rejected, 2);
-        assert_eq!(left.errors.len(), 2);
-        assert_eq!(left.errors[1].id, "y");
+        assert_eq!(left.succeeded_ids, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(left.failed_ids, vec!["x".to_string(), "y".to_string()]);
     }
 }

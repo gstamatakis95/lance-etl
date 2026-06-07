@@ -1,6 +1,31 @@
 # 0017. Rust intake service with a pluggable record sink
 
-Status: Accepted
+Status: Accepted (amended)
+
+## Amendment
+
+The original decision below described an intake-local `DatasetTarget`, a `Mutation`/`MutationOp`
+vocabulary, `Mutate`/`MutateStream` RPCs, and a `MutateResponse` reporting accepted and rejected
+counts plus per-item `ItemError`s. The proto layer was later consolidated and the vocabulary
+renamed. The current contract is:
+
+- One proto file, `proto/lance_etl/v1/lance_etl.proto` (package `lance_etl.v1`), holds both the
+  `SearchService` and the `IntakeService` and a single shared `DatasetTarget` message. There is no
+  intake-local target duplicate.
+- The write vocabulary replaces the mutation vocabulary. `WriteOp` (`WRITE_OP_UPSERT`,
+  `WRITE_OP_DELETE`) and `RecordWrite { WriteOp op; Record record; }` replace `MutationOp` and
+  `Mutation`. The RPCs are `Write(WriteRecordsRequest)` and `WriteStream(stream
+  WriteRecordsRequest)`. The domain mirrors the rename (`RecordWrite`, `WriteOp`), and the
+  `IntakeRpc` metric-tag enum reads `write` and `write_stream`. The `intake.*` metric names are
+  unchanged.
+- The response returns only record ids. `WriteRecordsResponse { repeated string succeeded_ids;
+  repeated string failed_ids; }` replaces the count-and-`ItemError` shape. `succeeded_ids` are the
+  records the sink accepted, `failed_ids` the records that failed validation or sink acceptance. A
+  record whose id is itself empty or invalid is omitted from `failed_ids` because it cannot be
+  reported by id. The domain `IntakeReport` carries the same two id lists.
+
+The `RecordSink` seam, the `StdoutSink` placeholder, the validation rules, the layering, and the
+no-raw-SQL guarantee are unchanged. The rest of this ADR is preserved as originally written.
 
 ## Context
 

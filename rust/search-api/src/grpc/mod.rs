@@ -11,7 +11,8 @@
 //!
 //! Submodules:
 //! - [`convert`]: pure conversions between search protobuf messages and domain types.
-//! - [`intake`]: the [`intake::IntakeGrpc`] transport over the [`crate::domain::RecordSink`] seam.
+//! - [`intake`]: the [`intake::IntakeGrpc`] transport over the [`crate::domain::RecordSink`] seam,
+//!   serving the `Write` and `WriteStream` RPCs.
 //! - [`intake_convert`]: pure conversions between intake protobuf messages and domain types.
 
 pub mod convert;

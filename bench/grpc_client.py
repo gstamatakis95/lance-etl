@@ -1,10 +1,11 @@
 """gRPC client utilities for the Rust search service.
 
-Client stubs are generated at runtime with ``grpcio-tools`` from the repository's proto file. The proto is copied flat
-into a generation directory before compilation because its natural package path (``lance_etl/search/v1``) would
-collide with the installed ``lance_etl`` Python package. The flattened modules (``search_pb2`` / ``search_pb2_grpc``)
-are imported off ``sys.path`` instead. This is simpler and more deterministic than server reflection, which would make
-the benchmark depend on the server having reflection enabled.
+Client stubs are generated at runtime with ``grpcio-tools`` from the repository's single proto file. The proto is
+copied flat into a generation directory before compilation because its natural package path (``lance_etl/v1``) would
+collide with the installed ``lance_etl`` Python package. The flattened modules (``lance_etl_pb2`` /
+``lance_etl_pb2_grpc``) are imported off ``sys.path`` instead. This is simpler and more deterministic than server
+reflection, which would make the benchmark depend on the server having reflection enabled. The one proto carries both
+the ``SearchService`` and the ``IntakeService``; the benchmark only drives the search side.
 
 Every request message addresses its dataset through a ``DatasetTarget`` built by :func:`dataset_target`, matching the
 ``{base}/{org_id}/{tenant_id}/{namespace}.lance`` layout the benchmark ingest phase writes. :func:`prewarm_dataset`
@@ -30,10 +31,10 @@ from bench.config import NAMESPACE, PROTO_PATH, TENANT_ID
 
 
 def generate_stubs(gen_dir: Path) -> Path:
-    """Compile the search proto into Python stubs under a generation directory.
+    """Compile the lance_etl proto into Python stubs under a generation directory.
 
     Args:
-        gen_dir: Directory receiving ``search_pb2.py`` and ``search_pb2_grpc.py``.
+        gen_dir: Directory receiving ``lance_etl_pb2.py`` and ``lance_etl_pb2_grpc.py``.
 
     Returns:
         The generation directory.
@@ -43,11 +44,11 @@ def generate_stubs(gen_dir: Path) -> Path:
         FileNotFoundError: If the repository proto file is missing.
     """
     if not PROTO_PATH.exists():
-        raise FileNotFoundError(f"search proto not found at {PROTO_PATH}")
+        raise FileNotFoundError(f"lance_etl proto not found at {PROTO_PATH}")
     gen_dir.mkdir(parents=True, exist_ok=True)
     proto_dir: Path = gen_dir / "proto"
     proto_dir.mkdir(exist_ok=True)
-    flat_proto: Path = proto_dir / "search.proto"
+    flat_proto: Path = proto_dir / "lance_etl.proto"
     shutil.copyfile(PROTO_PATH, flat_proto)
     include: str = str(resource_files("grpc_tools") / "_proto")
     arguments: list[str] = [
@@ -70,12 +71,12 @@ def load_stubs(gen_dir: Path) -> tuple[ModuleType, ModuleType]:
         gen_dir: The generation directory produced by :func:`generate_stubs`.
 
     Returns:
-        The ``search_pb2`` and ``search_pb2_grpc`` modules.
+        The ``lance_etl_pb2`` and ``lance_etl_pb2_grpc`` modules.
     """
     if str(gen_dir) not in sys.path:
         sys.path.insert(0, str(gen_dir))
-    pb2: ModuleType = importlib.import_module("search_pb2")
-    pb2_grpc: ModuleType = importlib.import_module("search_pb2_grpc")
+    pb2: ModuleType = importlib.import_module("lance_etl_pb2")
+    pb2_grpc: ModuleType = importlib.import_module("lance_etl_pb2_grpc")
     return pb2, pb2_grpc
 
 
