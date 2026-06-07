@@ -31,22 +31,24 @@ const DISTANCE_KEY: &str = "_distance";
 const SCORE_KEY: &str = "_score";
 
 /// Object-store IO statistics captured from one Lance scan and attached to the per-query-leg span
-/// as `s3.*` attributes, so a slow query can be drilled into by its object-store request volume.
+/// as `object_store.*` attributes, so a slow query can be drilled into by its object-store request
+/// volume. The attributes are provider-neutral: the service runs over AWS S3, Azure Blob, and GCS
+/// through Lance's provider-agnostic object store, so the names carry no provider prefix.
 ///
 /// Values are sourced from Lance's execution-stats callback ([`ExecutionSummaryCounts`]). Lance
 /// exposes aggregate counts only: a precise GET/HEAD/LIST breakdown is not available outside the
 /// `test-util` build, so this records the object-store request count and the IO totals that are.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScanIoStats {
-    /// Object-store requests made to the storage layer (`s3.requests`).
+    /// Object-store requests made to the storage layer (`object_store.requests`).
     pub requests: u64,
-    /// I/O operations after coalescing (`s3.iops`).
+    /// I/O operations after coalescing (`object_store.iops`).
     pub iops: u64,
-    /// Bytes pulled from storage (`s3.bytes_read`).
+    /// Bytes pulled from storage (`object_store.bytes_read`).
     pub bytes_read: u64,
-    /// Index partitions loaded from storage (`s3.parts_loaded`).
+    /// Index partitions loaded from storage (`object_store.parts_loaded`).
     pub parts_loaded: u64,
-    /// Top-level indices loaded from storage (`s3.indices_loaded`).
+    /// Top-level indices loaded from storage (`object_store.indices_loaded`).
     pub indices_loaded: u64,
 }
 
@@ -62,14 +64,14 @@ impl ScanIoStats {
         }
     }
 
-    /// Attaches every count to `span` as an `s3.*` attribute. Low cardinality: counts only, never
-    /// org/tenant ids.
+    /// Attaches every count to `span` as an `object_store.*` attribute. Low cardinality: counts
+    /// only, never org/tenant ids.
     fn attach_to_span(&self, span: &tracing::Span) {
-        span.set_attribute("s3.requests", self.requests as i64);
-        span.set_attribute("s3.iops", self.iops as i64);
-        span.set_attribute("s3.bytes_read", self.bytes_read as i64);
-        span.set_attribute("s3.parts_loaded", self.parts_loaded as i64);
-        span.set_attribute("s3.indices_loaded", self.indices_loaded as i64);
+        span.set_attribute("object_store.requests", self.requests as i64);
+        span.set_attribute("object_store.iops", self.iops as i64);
+        span.set_attribute("object_store.bytes_read", self.bytes_read as i64);
+        span.set_attribute("object_store.parts_loaded", self.parts_loaded as i64);
+        span.set_attribute("object_store.indices_loaded", self.indices_loaded as i64);
     }
 }
 
@@ -337,7 +339,7 @@ fn event_timestamp_data_type(dataset: &Dataset, column: &str) -> Result<DataType
 }
 
 /// Builds a Lance scan-stats callback that reports per-query object-store stats both as `query.*`
-/// metric distributions tagged by `rpc` and as `s3.*` attributes on `span`.
+/// metric distributions tagged by `rpc` and as `object_store.*` attributes on `span`.
 ///
 /// Lance invokes the callback once, after the scan's plan finishes, with the aggregated
 /// [`ExecutionSummaryCounts`]. The callback emits metrics through the infallible facade and writes

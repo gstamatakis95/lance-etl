@@ -31,6 +31,15 @@
 //! - `query.iops`, `query.bytes_read`, `query.parts_loaded` (distributions, tagged `rpc`).
 //! - `throttle.errors` (count), `throttle.new_rate` (gauge): untagged per-process throttle signal.
 //!
+//! Lance trace-event bridge, tapped from the Lance tracing targets by the
+//! [`traces::LanceEventMetricsLayer`] ([`metrics::Metrics::lance_io_event`],
+//! [`metrics::Metrics::lance_dataset_event`], [`metrics::Metrics::lance_file_audit`]):
+//! - `lance.io_events` (count, tagged `io_type`): an index open or partition load.
+//! - `lance.dataset_events` (count, tagged `event`): a dataset-lifecycle transition. `event:loading`
+//!   counts a dataset open.
+//! - `lance.file_audit` (count, tagged `mode` and `type`): a manifest/index/data/deletion file
+//!   create or delete. All three carry fixed low-cardinality Lance enums only, never a uri or path.
+//!
 //! Caches and handles ([`metrics::Metrics::cache_lookup`], `cache_insert_bytes`,
 //! `cache_disk_gauges`, `cache_evictions`, `cache_serialize_error`, `dataset_open`,
 //! `dataset_handles`, `dataset_handles_weighted`):
@@ -67,6 +76,9 @@ pub mod metrics;
 pub mod recall;
 pub mod traces;
 
-pub use metrics::{CacheName, EvictionReason, IntakeRpc, Metrics, PrewarmIndexKind, PrewarmStatus, Rpc, Tier};
+pub use metrics::{
+    CacheName, DatasetEvent, EvictionReason, FileAuditMode, FileAuditType, IntakeRpc, LanceIoType, Metrics,
+    PrewarmIndexKind, PrewarmStatus, Rpc, Tier,
+};
 pub use recall::{RecallCapture, RecallHook, RecallQueryType, RecallRecord};
-pub use traces::{TelemetryGuard, init_tracing};
+pub use traces::{LanceEventMetricsLayer, TelemetryGuard, init_tracing};

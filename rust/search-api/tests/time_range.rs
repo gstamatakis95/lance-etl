@@ -4,7 +4,7 @@
 //! backend directly to assert that a request time range restricts results to the window on the
 //! event-timestamp column (start inclusive, end exclusive, either bound optional), that an absent
 //! range behaves as before, that the range ANDs with a caller filter, and that the scan-stats
-//! capture path records `s3.*` object-store stats.
+//! capture path records `object_store.*` stats.
 
 mod common;
 

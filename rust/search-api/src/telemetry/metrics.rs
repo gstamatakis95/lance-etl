@@ -162,6 +162,176 @@ impl PrewarmIndexKind {
     }
 }
 
+/// Lance IO-event kinds used as the `io_type` metric tag on `lance.io_events`.
+///
+/// Mirrors the fixed `lance::io_events` enum from the Lance checkout
+/// (`lance_core::utils::tracing::IO_TYPE_*`). Low cardinality: six fixed variants, no ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanceIoType {
+    /// A scalar (BTree/bitmap/inverted/ngram) index was opened.
+    OpenScalarIndex,
+    /// A vector (IVF/HNSW) index was opened.
+    OpenVectorIndex,
+    /// The fragment-reuse system index was opened.
+    OpenFragReuseIndex,
+    /// The memory-WAL system index was opened.
+    OpenMemWalIndex,
+    /// A vector index partition was loaded from storage.
+    LoadVectorPart,
+    /// A scalar index partition was loaded from storage.
+    LoadScalarPart,
+}
+
+impl LanceIoType {
+    /// Tag value for this IO type.
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            Self::OpenScalarIndex => "open_scalar_index",
+            Self::OpenVectorIndex => "open_vector_index",
+            Self::OpenFragReuseIndex => "open_frag_reuse_index",
+            Self::OpenMemWalIndex => "open_mem_wal_index",
+            Self::LoadVectorPart => "load_vector_part",
+            Self::LoadScalarPart => "load_scalar_part",
+        }
+    }
+
+    /// Parses the Lance `type` field of a `lance::io_events` event into this enum.
+    pub fn from_lance(value: &str) -> Option<Self> {
+        match value {
+            "open_scalar_index" => Some(Self::OpenScalarIndex),
+            "open_vector_index" => Some(Self::OpenVectorIndex),
+            "open_frag_reuse_index" => Some(Self::OpenFragReuseIndex),
+            "open_mem_wal_index" => Some(Self::OpenMemWalIndex),
+            "load_vector_part" => Some(Self::LoadVectorPart),
+            "load_scalar_part" => Some(Self::LoadScalarPart),
+            _ => None,
+        }
+    }
+}
+
+/// Lance dataset-lifecycle events used as the `event` metric tag on `lance.dataset_events`.
+///
+/// Mirrors the fixed `lance::dataset_events` enum from the Lance checkout
+/// (`lance_core::utils::tracing::DATASET_*_EVENT`). `loading` fires on dataset open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatasetEvent {
+    /// A dataset version was opened (loaded).
+    Loading,
+    /// A write transaction is in progress.
+    Writing,
+    /// A transaction was committed.
+    Committed,
+    /// A column is being dropped.
+    DroppingColumn,
+    /// Rows are being deleted.
+    Deleting,
+    /// Fragments are being compacted.
+    Compacting,
+    /// Old versions are being cleaned up.
+    Cleaning,
+}
+
+impl DatasetEvent {
+    /// Tag value for this event.
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            Self::Loading => "loading",
+            Self::Writing => "writing",
+            Self::Committed => "committed",
+            Self::DroppingColumn => "dropping_column",
+            Self::Deleting => "deleting",
+            Self::Compacting => "compacting",
+            Self::Cleaning => "cleaning",
+        }
+    }
+
+    /// Parses the Lance `event` field of a `lance::dataset_events` event into this enum.
+    pub fn from_lance(value: &str) -> Option<Self> {
+        match value {
+            "loading" => Some(Self::Loading),
+            "writing" => Some(Self::Writing),
+            "committed" => Some(Self::Committed),
+            "dropping_column" => Some(Self::DroppingColumn),
+            "deleting" => Some(Self::Deleting),
+            "compacting" => Some(Self::Compacting),
+            "cleaning" => Some(Self::Cleaning),
+            _ => None,
+        }
+    }
+}
+
+/// Lance file-audit modes used as the `mode` metric tag on `lance.file_audit`.
+///
+/// Mirrors `lance_core::utils::tracing::AUDIT_MODE_*` from the Lance checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileAuditMode {
+    /// A file was created.
+    Create,
+    /// A file was deleted after verification.
+    Delete,
+    /// A file was deleted without verification.
+    DeleteUnverified,
+}
+
+impl FileAuditMode {
+    /// Tag value for this mode.
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Delete => "delete",
+            Self::DeleteUnverified => "delete_unverified",
+        }
+    }
+
+    /// Parses the Lance `mode` field of a `lance::file_audit` event into this enum.
+    pub fn from_lance(value: &str) -> Option<Self> {
+        match value {
+            "create" => Some(Self::Create),
+            "delete" => Some(Self::Delete),
+            "delete_unverified" => Some(Self::DeleteUnverified),
+            _ => None,
+        }
+    }
+}
+
+/// Lance file-audit file kinds used as the `type` metric tag on `lance.file_audit`.
+///
+/// Mirrors `lance_core::utils::tracing::AUDIT_TYPE_*` from the Lance checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileAuditType {
+    /// A manifest file.
+    Manifest,
+    /// An index file.
+    Index,
+    /// A data file.
+    Data,
+    /// A deletion file.
+    Deletion,
+}
+
+impl FileAuditType {
+    /// Tag value for this file type.
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            Self::Manifest => "manifest",
+            Self::Index => "index",
+            Self::Data => "data",
+            Self::Deletion => "deletion",
+        }
+    }
+
+    /// Parses the Lance `type` field of a `lance::file_audit` event into this enum.
+    pub fn from_lance(value: &str) -> Option<Self> {
+        match value {
+            "manifest" => Some(Self::Manifest),
+            "index" => Some(Self::Index),
+            "data" => Some(Self::Data),
+            "deletion" => Some(Self::Deletion),
+            _ => None,
+        }
+    }
+}
+
 /// Typed facade over the DogStatsD client so call sites cannot invent metric names or tags.
 ///
 /// Tag policy: only `rpc`, `status`, `cold`, `cache`, `tier`, `outcome`, `reason`, `kind`,
@@ -269,6 +439,40 @@ impl Metrics {
         if let Some(rate) = new_rate {
             self.client.gauge_with_tags("throttle.new_rate", rate).send();
         }
+    }
+
+    /// One Lance `io_events` event, counting an index open or partition load tagged by `io_type`.
+    ///
+    /// Sourced from Lance's `lance::io_events` tracing target. Counts only, tagged by the fixed
+    /// IO-type enum: no uri, org, or tenant ever appears on the tag.
+    pub fn lance_io_event(&self, io_type: LanceIoType) {
+        self.client
+            .count_with_tags("lance.io_events", 1)
+            .with_tag("io_type", io_type.as_tag())
+            .send();
+    }
+
+    /// One Lance `dataset_events` event, counting a dataset-lifecycle transition tagged by `event`.
+    ///
+    /// Sourced from Lance's `lance::dataset_events` tracing target. `event:loading` counts a
+    /// dataset open. Counts only, tagged by the fixed lifecycle enum: no uri or tenant on the tag.
+    pub fn lance_dataset_event(&self, event: DatasetEvent) {
+        self.client
+            .count_with_tags("lance.dataset_events", 1)
+            .with_tag("event", event.as_tag())
+            .send();
+    }
+
+    /// One Lance `file_audit` event, counting a file create/delete tagged by `mode` and `type`.
+    ///
+    /// Sourced from Lance's `lance::file_audit` tracing target. Counts only, tagged by the fixed
+    /// mode and file-type enums: the audited path never appears on the tag.
+    pub fn lance_file_audit(&self, mode: FileAuditMode, file_type: FileAuditType) {
+        self.client
+            .count_with_tags("lance.file_audit", 1)
+            .with_tag("mode", mode.as_tag())
+            .with_tag("type", file_type.as_tag())
+            .send();
     }
 
     /// Latency of one dataset resolution. `cold` marks resolutions that actually opened the
@@ -822,6 +1026,52 @@ mod tests {
             !lines.iter().any(|line| line.contains("intake.upserts")),
             "zero upsert counts must not be emitted: {lines:?}"
         );
+    }
+
+    #[test]
+    fn lance_event_metrics_render_expected_names_and_tags() {
+        let (metrics, drain) = spy_metrics();
+        metrics.lance_io_event(LanceIoType::OpenVectorIndex);
+        metrics.lance_dataset_event(DatasetEvent::Loading);
+        metrics.lance_file_audit(FileAuditMode::Create, FileAuditType::Manifest);
+        let lines = drain();
+        let expect = [
+            ("search_api.lance.io_events:1|c", vec!["io_type:open_vector_index"]),
+            ("search_api.lance.dataset_events:1|c", vec!["event:loading"]),
+            ("search_api.lance.file_audit:1|c", vec!["mode:create", "type:manifest"]),
+        ];
+        for (head, tags) in expect {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.starts_with(head) && tags.iter().all(|tag| line.contains(tag))),
+                "missing {head} with {tags:?} in {lines:?}"
+            );
+        }
+        assert!(
+            !lines.iter().any(|line| line.contains("org")),
+            "lance event metrics must never carry org/tenant tags: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn lance_event_tag_enums_parse_and_render_round_trip() {
+        assert_eq!(
+            LanceIoType::from_lance("load_scalar_part"),
+            Some(LanceIoType::LoadScalarPart)
+        );
+        assert_eq!(LanceIoType::from_lance("nope"), None);
+        assert_eq!(DatasetEvent::from_lance("committed"), Some(DatasetEvent::Committed));
+        assert_eq!(DatasetEvent::from_lance("nope"), None);
+        assert_eq!(
+            FileAuditMode::from_lance("delete_unverified"),
+            Some(FileAuditMode::DeleteUnverified)
+        );
+        assert_eq!(FileAuditType::from_lance("deletion"), Some(FileAuditType::Deletion));
+        assert_eq!(LanceIoType::OpenScalarIndex.as_tag(), "open_scalar_index");
+        assert_eq!(DatasetEvent::DroppingColumn.as_tag(), "dropping_column");
+        assert_eq!(FileAuditMode::Create.as_tag(), "create");
+        assert_eq!(FileAuditType::Data.as_tag(), "data");
     }
 
     #[test]

@@ -609,7 +609,10 @@ generates, and whether the object store is becoming a bottleneck.
 | `search_api.throttle.new_rate` | gauge | none | AIMD rate-limiter fill rate after a reduction. |
 
 These metrics have no `org` or `tenant` tags by design (cardinality policy, see Section 7). Per-
-dataset detail lives on traces.
+dataset detail lives on traces. The per-query stats also land on the per-query-leg span as
+provider-neutral `object_store.*` attributes (`object_store.requests`, `object_store.iops`,
+`object_store.bytes_read`, `object_store.parts_loaded`, `object_store.indices_loaded`). The names
+carry no provider prefix because the same path serves S3, Azure Blob, and GCS.
 
 **Widgets.**
 
@@ -623,6 +626,31 @@ dataset detail lives on traces.
 - **Throttle events (timeseries).** `sum:search_api.throttle.errors` and
   `avg:search_api.throttle.new_rate`. A declining rate gauge alongside rising errors means the AIMD
   controller is backing off.
+
+#### Rust service (Lance event bridge)
+
+The `LanceEventMetricsLayer` turns Lance's own tracing events into low-cardinality counters. The
+same events also appear as span events on the open and per-query-leg spans (see Section 4.1 traces).
+
+| Metric | Type | Tags | What it measures |
+|---|---|---|---|
+| `search_api.lance.io_events` | count | `io_type` | An index open or partition load. `io_type` is one of open_scalar_index, open_vector_index, open_frag_reuse_index, open_mem_wal_index, load_vector_part, load_scalar_part. |
+| `search_api.lance.dataset_events` | count | `event` | A dataset-lifecycle transition. `event` is one of loading, writing, committed, dropping_column, deleting, compacting, cleaning. `event:loading` counts a dataset open. |
+| `search_api.lance.file_audit` | count | `mode`, `type` | A file create or delete. `mode` is create, delete, or delete_unverified. `type` is manifest, index, data, or deletion. |
+
+**Widgets.**
+
+- **Index opens and part loads (timeseries).** `sum:search_api.lance.io_events by {io_type}`. A
+  spike in `open_*` events after a version flip means serving is opening indexes cold. Sustained
+  `load_*_part` volume means queries miss the index cache and fetch partitions from storage.
+- **Dataset opens (timeseries).** `sum:search_api.lance.dataset_events{event:loading}`. Tracks how
+  often replicas open dataset versions. Read against prewarm to confirm warm flips.
+- **File audit (timeseries).** `sum:search_api.lance.file_audit by {mode,type}`. Watch
+  `mode:delete` on `type:manifest` and `type:data` to confirm cleanup is running and to spot
+  unexpected deletes.
+
+These counters are discrete point events, not durations, so they show how often something happened
+and what fired within a span. They do not give an in-flight concurrency gauge.
 
 #### Python pipeline (bridged Lance events)
 

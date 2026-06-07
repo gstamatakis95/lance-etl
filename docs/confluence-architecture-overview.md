@@ -411,10 +411,11 @@ Each decision below cites its ADR. Accepted unless noted.
 - The bound is a typed DataFusion literal matched to the column's Arrow type (timestamp or integer). The range predicate is ANDed with any caller-provided `Filter`, so the two compose.
 - A BTREE or zone-map on the event-timestamp column prunes the scan. Existing clients that never set `time_range` are unaffected.
 
-### Object-store request counts on per-RPC spans (ADR 0022)
-- The execution-stats callback that already emits `query.*` DogStatsD metrics also attaches `s3.*` attributes to the per-query-leg span: `s3.requests`, `s3.iops`, `s3.bytes_read`, `s3.parts_loaded`, `s3.indices_loaded`.
-- Attributes are counts only, with no org, tenant, or version identifier, so cardinality stays low.
-- A GET / HEAD / LIST breakdown is not emitted: Lance does not expose that in production builds.
+### Lance trace-event bridge: object-store stats, IO/dataset/file events (ADR 0022)
+- The execution-stats callback that already emits `query.*` DogStatsD metrics also attaches provider-neutral `object_store.*` attributes to the per-query-leg span: `object_store.requests`, `object_store.iops`, `object_store.bytes_read`, `object_store.parts_loaded`, `object_store.indices_loaded`. The names carry no provider prefix because the same path serves S3, Azure Blob, and GCS.
+- Three more Lance tracing targets are force-admitted at `info` through the `EnvFilter` so they survive a narrowing `RUST_LOG`. The OTLP layer records each as a span event on the active span, so a dataset open shows its `loading` dataset event and index opens as span events on the `provider.dataset` span, and the per-query-leg spans carry the IO and file events of a scan.
+- A single `LanceEventMetricsLayer` (which subsumes the throttle tap) also turns each event into a low-cardinality counter: `lance.io_events` tagged `io_type`, `lance.dataset_events` tagged `event` (`event:loading` counts a dataset open), and `lance.file_audit` tagged `mode` and `type`. Tags are the fixed Lance enums, never a uri or path.
+- Attributes and tags are counts only, with no org, tenant, or version identifier, so cardinality stays low. A GET / HEAD / LIST breakdown is not emitted: Lance does not expose that in production builds. The bridged events are point events, so they count occurrences but do not give an in-flight concurrency gauge.
 - The capture is infallible, matching ADR 0008. An unreachable Datadog Agent never panics and never fails a request.
 
 ### Iceberg source-table optimization job (ADR 0023)
@@ -484,12 +485,13 @@ Both planes report to Datadog. Every emitter on the Rust side is infallible by c
 
 - A typed `Metrics` facade emits `search_api.*` and `intake.*` metrics.
 - **Tag cardinality is kept deliberately low: rpc and status only, never org or tenant.** This keeps the metrics bill and cardinality bounded across 30k tenants.
-- Two Lance trace surfaces are tapped: per-query execution stats (`query.iops`, `query.bytes_read`, `query.parts_loaded`) and the object-store throttle target (`throttle.errors`, `throttle.new_rate`).
+- Several Lance trace surfaces are tapped by the `LanceEventMetricsLayer`: per-query execution stats (`query.iops`, `query.bytes_read`, `query.parts_loaded`), the object-store throttle target (`throttle.errors`, `throttle.new_rate`), and the `lance::io_events`, `lance::dataset_events`, and `lance::file_audit` targets (`lance.io_events` tagged `io_type`, `lance.dataset_events` tagged `event`, `lance.file_audit` tagged `mode` and `type`).
 
-### Span attributes for object-store IO
+### Span attributes and span events for object-store IO
 
-- Per-query-leg spans (`lance.vector_query` / `lance.text_query`) carry `s3.*` attributes sourced from the Lance execution-stats callback: `s3.requests`, `s3.iops`, `s3.bytes_read`, `s3.parts_loaded`, `s3.indices_loaded`.
-- These attributes are aggregate counts only. A GET / HEAD / LIST breakdown is not available in production Lance builds and is intentionally not emitted.
+- Per-query-leg spans (`lance.vector_query` / `lance.text_query`) carry provider-neutral `object_store.*` attributes sourced from the Lance execution-stats callback: `object_store.requests`, `object_store.iops`, `object_store.bytes_read`, `object_store.parts_loaded`, `object_store.indices_loaded`. The names carry no provider prefix because the same path serves S3, Azure Blob, and GCS.
+- The bridged Lance events also surface as span events. A dataset open shows its `loading` dataset event and the index `open_*` IO events on the `provider.dataset` span, and a scan's IO and file events appear on the per-query-leg span.
+- These attributes are aggregate counts only. A GET / HEAD / LIST breakdown is not available in production Lance builds and is intentionally not emitted. The point events count occurrences but do not give an in-flight concurrency gauge.
 - A hybrid request shows the object-store volume of each leg separately under the one RPC trace. A single-leg request has exactly one such child span.
 - No org, tenant, or version identifier is attached, so span cardinality remains low (ADR 0022).
 

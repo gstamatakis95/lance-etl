@@ -118,7 +118,7 @@ prewarm every replica against the green version explicitly (use the `version` or
 | `grpc/convert.rs` | Proto <-> domain conversion for the search service |
 | `grpc/intake.rs` | `IntakeGrpc<S>`: tonic adapter over any `RecordSink` |
 | `grpc/intake_convert.rs` | Proto <-> domain conversion for the intake service |
-| `telemetry/traces.rs` | OTLP span export, JSON stdout logs with trace correlation |
+| `telemetry/traces.rs` | OTLP span export, JSON stdout logs with trace correlation, `LanceEventMetricsLayer` bridging Lance throttle/io/dataset/file-audit events |
 | `telemetry/metrics.rs` | Typed DogStatsD facade (`search_api.*` prefix, `Rpc` + `IntakeRpc` tag enums) |
 | `telemetry/recall.rs` | Deterministic sampled-query capture into `recall.*` span attributes |
 | `config.rs` | `Config` from environment variables |
