@@ -48,10 +48,10 @@ Five-layer design over tonic:
 
 | Layer | Crate path | Responsibility |
 |---|---|---|
-| `domain` | `crate::domain` | Engine-agnostic types: `Filter` AST, query types, rerank seam, traits |
+| `domain` | `crate::domain` | Engine-agnostic types: `Filter` AST, query types, rerank seam, intake record/sink, traits |
 | `cache` | `crate::cache` | Disk + Moka index cache and metadata byte cache, plugged into Lance seams |
 | `lance` | `crate::lance` | `LanceSearchBackend`, `CachingDatasetProvider`, typed AST -> DataFusion `Expr` |
-| `grpc` | `crate::grpc` | Thin tonic adapter: proto <-> domain conversion, `SearchGrpc<B>` over any backend |
+| `grpc` | `crate::grpc` | Tonic adapters: `SearchGrpc<B>` (search) and `IntakeGrpc<S>` (intake) |
 | `telemetry` | `crate::telemetry` | OTLP traces, DogStatsD metrics, JSON logs with trace correlation |
 
 The typed filter AST (`Filter` with `Compare`, `InList`, `IsNull`, `IsNotNull`, `Between`, `And`,
@@ -87,7 +87,9 @@ prewarm every replica against the green version explicitly (use the `version` or
 | `telemetry.py` | `Telemetry`, `TelemetryConfig` | ddtrace spans, DogStatsD, Lance event bridge |
 | `cloud_storage.py` | `resolve_filesystem`, `discover_datasets` | pyarrow filesystem + recursive dataset discovery |
 | `arrow_types.py` | `resolve_arrow_type`, `resolve_type_map` | Arrow type specs (`fixed_size_list<float32,768>`) |
-| `cli.py` | `main`, `build_parser` | Six subcommands: `etl`, `compact`, `index`, `recall`, `tag`, `migrate-manifests` |
+| `cli.py` | `main`, `build_parser` | Eight subcommands: `etl`, `compact`, `index`, `recall`, `tag`, `migrate-manifests`, `ttl`, `migrate-namespace` |
+| `ttl.py` | `TTLJob`, `TTLConfig` | Event-timestamp-based row expiration across a dataset fleet (opt-in, default off) |
+| `migrate_namespace.py` | `NamespaceMigrator`, `MigrateConfig` | One-off operator utility to copy a whole namespace to a new namespace name |
 
 ### Rust (`rust/search-api/src/`)
 
@@ -98,8 +100,9 @@ prewarm every replica against the green version explicitly (use the `version` or
 | `domain/backend.rs` | `SearchBackend` trait |
 | `domain/prewarm.rs` | `PrewarmSpec`, `PrewarmReport`, `Prewarmer` trait |
 | `domain/clusters.rs` | `ClusterSpec`, `ClusterReport`, `ClusterReader` trait |
-| `domain/fusion.rs` | `FusionSpec` (Rrf and Weighted variants) and fusion logic |
+| `domain/fusion.rs` | `FusionSpec` (Rrf and Weighted variants) and within-dataset fusion logic |
 | `domain/rerank.rs` | `Reranker` seam, `IdentityReranker` (no-op default) |
+| `domain/intake.rs` | `IntakeBatch`, `Record`, `Mutation`, `RecordSink` trait, `StdoutSink` placeholder |
 | `cache/disk_cache.rs` | Hybrid disk + Moka `CacheBackend` for the Lance index cache |
 | `cache/store_cache.rs` | Read-through byte cache for immutable metadata |
 | `cache/layout.rs` | Versioned stamp dir, key hashing, atomic writes, TTL/budget sweep |
@@ -110,20 +113,25 @@ prewarm every replica against the green version explicitly (use the `version` or
 | `lance/text.rs` | FTS query node tree -> Lance FTS parameters |
 | `lance/prewarm.rs` | `Prewarmer` impl over Lance prewarm APIs |
 | `lance/index_reader.rs` | IVF centroid extraction, `ClusterReader` impl |
-| `grpc/mod.rs` | `SearchGrpc<B>`: tonic service adapter |
-| `grpc/convert.rs` | Proto <-> domain conversion |
+| `grpc/mod.rs` | `SearchGrpc<B>`: tonic search service adapter |
+| `grpc/convert.rs` | Proto <-> domain conversion for the search service |
+| `grpc/intake.rs` | `IntakeGrpc<S>`: tonic adapter over any `RecordSink` |
+| `grpc/intake_convert.rs` | Proto <-> domain conversion for the intake service |
 | `telemetry/traces.rs` | OTLP span export, JSON stdout logs with trace correlation |
-| `telemetry/metrics.rs` | Typed DogStatsD facade (`search_api.*` prefix) |
+| `telemetry/metrics.rs` | Typed DogStatsD facade (`search_api.*` prefix, `Rpc` + `IntakeRpc` tag enums) |
 | `telemetry/recall.rs` | Deterministic sampled-query capture into `recall.*` span attributes |
 | `config.rs` | `Config` from environment variables |
 
 ### Airflow (`airflow/lance_etl_dag.py`)
 
 DAG `lance_etl_pipeline` running `etl -> compact -> index` as `SparkSubmitOperator` tasks with
-`max_active_runs=1`. Compaction runs before indexing so fresh uncovered fragments are merged into
-large fragments before the index covers them, avoiding inline remap cost on every index commit.
-Schedule is driven by the Airflow Variable `lance_etl_schedule` (default `@daily`). Data-interval
-windowing and `dag_run.conf` overrides are described in the module docstring.
+`max_active_runs=1`. An optional `ttl` task follows `index` when the Airflow Variable
+`lance_etl_ttl_enabled` is set to `true`. Compaction runs before indexing so fresh uncovered
+fragments are merged into large fragments before the index covers them, avoiding inline remap cost on
+every index commit. Schedule is driven by the Airflow Variable `lance_etl_schedule` (default
+`@daily`). Data-interval windowing and `dag_run.conf` overrides are described in the module
+docstring. The `migrate-namespace` subcommand is a one-off operator tool run manually via the CLI
+and is not scheduled here.
 
 ### Benchmark package (`bench/`)
 
@@ -139,11 +147,12 @@ can drive the entire `all` chain.
 
 ### Documentation (`docs/`)
 
-- `docs/adr/` — 15 Architecture Decision Records (0001 through 0015) covering distributed indexing,
+- `docs/adr/` — 19 Architecture Decision Records (0001 through 0019) covering distributed indexing,
   two-tier compaction, snapshot-id bounds, dynamic partition routing, gRPC layering, disk cache and
   prewarm, observability and recall audit, compaction/index coexistence, stable-row-id rejection,
-  ingested-at column, V2 manifest paths, blue-green serving, by-date partitioning removal, and
-  CLI and config knob reduction.
+  ingested-at column, V2 manifest paths, blue-green serving, by-date partitioning removal,
+  CLI and config knob reduction, event-time canonical clock, Rust intake service, TTL expiration,
+  and namespace migrate utility.
 - `docs/FINDINGS.md` — narrative companion to the ADRs: verified APIs, production patterns,
   scale design, coexistence results, and open items.
 - `market-research/` — detailed evaluation notes, plans, and evidence underlying the ADRs.
@@ -178,10 +187,11 @@ Datadog service) and what to build (partition routing, which index types, the di
 the FTS base tokenizer and language). Every tuning knob — the schema column names, shuffle
 partitions, retry budgets, compaction fragment sizing, IVF training parameters, fine-grained FTS
 tokenizer toggles, and two-tier thresholds — is set to an opinionated default in the configuration
-dataclasses (`ETLConfig`, `IndexJobConfig`, `CompactionConfig`) and stays tunable in code, not from
-the command line.
+dataclasses (`ETLConfig`, `IndexJobConfig`, `CompactionConfig`, `TTLConfig`) and stays tunable in
+code, not from the command line.
 
-The entry point is installed as `lance-etl`.
+The entry point is installed as `lance-etl`. Subcommands: `etl`, `compact`, `index`, `recall`,
+`tag`, `migrate-manifests`, `ttl`, `migrate-namespace`.
 
 #### `etl` — read a snapshot window from Iceberg and upsert/delete into Lance datasets
 
@@ -348,6 +358,59 @@ Migrates each dataset's manifest paths to the V2 naming scheme, turning every su
 open into a single object-store request. Not transactional: run only with the targeted datasets
 quiesced (no concurrent ingestion, compaction, or indexing).
 
+#### `ttl` — expire rows by event age
+
+```bash
+lance-etl ttl \
+  --base-uri s3://my-bucket/lance \
+  --retention-days 90 \
+  --dd-service lance-pipeline --dd-env prod
+```
+
+Deletes rows whose event timestamp (the canonical `ETLConfig.ts_col` column, default `timestamp`)
+is older than `now - retention`. Running this subcommand is the opt-in: the job is constructed with
+`enabled=True`. A BTREE scalar index on the timestamp column makes the predicate efficient.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--retention-days` | (required) | Retain rows within this many days of now |
+| `--timestamp-column` | `timestamp` | Event timestamp column name in each dataset |
+| `--no-compact` | off | Skip post-delete compaction (use when a separate compact step follows) |
+
+Dataset selection uses the same `--dataset-uri` / `--datasets-file` / `--base-uri` flags shared by
+`compact` and `index`.
+
+#### `migrate-namespace` — copy a whole namespace to a new name
+
+```bash
+lance-etl migrate-namespace \
+  --source-namespace legacy \
+  --target-namespace v2 \
+  --base-uri s3://my-bucket/lance \
+  --vector-column vector --metric cosine \
+  --dd-service lance-pipeline --dd-env prod
+```
+
+Copies every dataset whose namespace component equals `--source-namespace` to the same address with
+the namespace component replaced by `--target-namespace`. Source datasets are never deleted, so an
+operator can verify the new namespace and flip serving through the blue-green tag helpers before
+removing the source. Each target is recompacted and reindexed in production pipeline order after
+copying. This is a one-off operator tool and is not scheduled in the Airflow DAG.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--source-namespace` | (required) | Namespace value to copy from |
+| `--target-namespace` | (required) | Namespace value to copy to |
+| `--base-uri` | (required) | Root URI under which per-tenant datasets live |
+| `--partition-by` | `org_id,tenant_id,namespace` | Partition columns building the dataset path |
+| `--no-recompact` | off | Skip compaction of target datasets after copying |
+| `--no-reindex` | off | Skip index rebuild on target datasets after copying |
+| `--overwrite-target` | off | Allow overwriting target datasets that already exist |
+
+Index column flags (`--vector-column`, `--scalar-column`, `--bitmap-column`, `--text-column`,
+`--metric`, `--fts-with-position`, `--fts-base-tokenizer`, `--fts-language`) are shared with the
+`index` subcommand and are optional. When none are given, reindexing is skipped with a warning.
+
 ### Running tests
 
 ```bash
@@ -406,8 +469,26 @@ Proto RPCs on `lance_etl.search.v1.SearchService`:
 
 All requests carry a `DatasetTarget` (`org_id`, `tenant_id`, `namespace`), which resolves to the
 single dataset at `{base}/{org}/{tenant}/{namespace}.lance`. Filters are typed AST nodes (`Filter`
-oneof) — raw SQL strings are never accepted. Time-bounded queries are expressed as scalar filters on
-a timestamp column rather than as a multi-dataset fan-out.
+oneof) — raw SQL strings are never accepted. Time-bounded queries are expressed as scalar range
+filters on the event timestamp column (backed by a BTREE scalar index) rather than as a
+multi-dataset fan-out.
+
+Proto RPCs on `lance_etl.intake.v1.IntakeService`:
+
+| RPC | Streaming | Key request fields | Purpose |
+|---|---|---|---|
+| `Mutate` | unary | `target`, `mutations[]` | Apply one batch of mutations (UPSERT or DELETE) to a single dataset |
+| `MutateStream` | client-streaming | `target`, `mutations[]` per message | High-throughput stream of mutation batches. Returns one aggregated report on half-close. |
+
+Each mutation carries an `op` (UPSERT or DELETE) and a `Record`. A `Record` contains a string `id`,
+an `event_timestamp_ms` (epoch milliseconds — the canonical ETL clock, no separate ingestion
+timestamp), a `metadata` string map, a `vectors` map of named fixed-dimension float arrays (one per
+vector column), and a `texts` map of named text fields (one per FTS column). The dataset `target`
+on the request names `org_id`, `tenant_id`, and `namespace` and is never duplicated onto individual
+records. Validated batches are handed to a `RecordSink`. The only shipped sink is `StdoutSink` (a
+structured-print placeholder). A future `KafkaSink` implements the same `RecordSink` trait and
+replaces it at the construction site in `main` without changing the proto, transport, or domain
+types.
 
 The `Prewarm` RPC accepts `version` (explicit committed version id) or `tag` (resolves the named
 tag at call time) and returns `resolved_version`, enabling the safe green-before-flip workflow.
@@ -441,6 +522,8 @@ Configure via Airflow Variables:
 | `lance_etl_dd_env` | `prod` | Datadog env tag |
 | `lance_etl_dd_tags` | empty | Comma-separated `key:value` constant tags |
 | `lance_etl_partition_by` | empty | Comma-separated partition columns for `--partition-by` |
+| `lance_etl_ttl_enabled` | `false` | Set to `true` to add the optional TTL task after `index` |
+| `lance_etl_ttl_retention_days` | `90` | Retention window in days passed as `--retention-days` to the `ttl` step. Required when `lance_etl_ttl_enabled=true`. |
 
 `lance_etl_index_flags` is required when index maintenance is desired. Without it the `index` step
 configures zero handlers and is a silent no-op. Example value:

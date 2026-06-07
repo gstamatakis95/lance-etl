@@ -17,7 +17,9 @@ lance-etl/
     telemetry.py          Telemetry, TelemetryConfig, LanceRuntimeConfig, commit_with_retries
     cloud_storage.py      resolve_filesystem + discover_datasets for pyarrow filesystem I/O
     arrow_types.py        resolve_arrow_type / resolve_type_map (CLI type specs)
-    cli.py                Entry point: etl / compact / index / recall / tag / migrate-manifests
+    cli.py                Entry point: etl / compact / index / recall / tag / migrate-manifests / ttl / migrate-namespace
+    ttl.py                TTLJob + TTLConfig: event-timestamp-based row expiration (opt-in, default off)
+    migrate_namespace.py  NamespaceMigrator + MigrateConfig: one-off namespace copy/optimize utility
   bench/                  Benchmark package (python -m bench)
     cli.py                Subcommand dispatch: download / prepare / ingest / index / compact
                           / search / report / all
@@ -34,8 +36,9 @@ lance-etl/
     results.py            Phase artifact I/O (save_phase, load_phase, read_json, write_json)
   rust/search-api/        Rust gRPC search service (tonic, lance crate)
     proto/                lance_etl/search/v1/search.proto
+                          lance_etl/intake/v1/intake.proto
     src/domain/           Transport-agnostic types and traits
-      target.rs           DatasetTarget — dataset addressing (one dataset per request)
+      target.rs           DatasetTarget, DatasetRef — dataset addressing (one dataset per request)
       query.rs            VectorQuery, TextQuery, HybridQuery, Hit, FusedHit
       filter.rs           Typed predicate AST (no raw SQL)
       backend.rs          SearchBackend trait
@@ -43,6 +46,7 @@ lance-etl/
       clusters.rs         ClusterSpec, ClusterReport, ClusterReader trait
       fusion.rs           FusionSpec (Rrf and Weighted variants) and within-dataset fusion logic
       rerank.rs           Reranker seam, IdentityReranker (no-op default)
+      intake.rs           IntakeBatch, Record, Mutation, RecordSink trait, StdoutSink placeholder
       error.rs            SearchError
     src/cache/            Persistent two-tier caching layer (index + metadata, no raw data)
       layout.rs           Versioned stamp dir, key hashing, atomic writes, TTL/budget sweep
@@ -59,21 +63,23 @@ lance-etl/
       index_reader.rs     IVF centroid extraction, ClusterReader impl
       error.rs            Lance error classification into SearchError
     src/grpc/             Tonic transport
-      mod.rs              SearchGrpc<B>: tonic service adapter
-      convert.rs          Proto <-> domain conversion
+      mod.rs              SearchGrpc<B>: tonic service adapter (search) + IntakeGrpc<S> (intake)
+      convert.rs          Proto <-> domain conversion for the search service
+      intake.rs           IntakeGrpc<S>: tonic adapter over any RecordSink
+      intake_convert.rs   Proto <-> domain conversion for the intake service
     src/telemetry/        Datadog observability
       traces.rs           OTLP span export, JSON stdout logs with trace correlation
-      metrics.rs          Typed DogStatsD facade (Metrics struct + tag enums)
+      metrics.rs          Typed DogStatsD facade (Metrics struct + Rpc + IntakeRpc tag enums)
       recall.rs           Deterministic sampled-query capture into recall.* span attributes
     src/config.rs         Config from env vars
     src/lib.rs            Crate root
     src/main.rs           Binary entry point
     Cargo.toml            Workspace root for the crate
   airflow/
-    lance_etl_dag.py      Configurable-schedule Airflow DAG (etl >> compact >> index)
+    lance_etl_dag.py      Configurable-schedule Airflow DAG (etl >> compact >> index [>> ttl when enabled])
   tests/                  pytest suite (conftest.py + test_*.py)
   docs/
-    adr/                  15 Architecture Decision Records (0001-0015)
+    adr/                  19 Architecture Decision Records (0001-0019)
     FINDINGS.md           Narrative companion to the ADRs
   market-research/        Detailed evaluation notes, plans, and evidence underlying the ADRs
   claude/                 Original reference artifacts — IMMUTABLE, never edit
