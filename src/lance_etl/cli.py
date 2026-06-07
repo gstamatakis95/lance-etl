@@ -16,10 +16,12 @@ windows. ``maintenance`` runs per-dataset maintenance over a set of datasets: pe
 TTL column is named), two-tier distributed compaction, and version cleanup, in that order. ``index`` builds
 IVF_RQ vector, btree scalar, bitmap, and full-text BM25 indices over a set of datasets. ``recall`` replays
 Datadog-sampled vector queries as exact brute-force scans against the dataset versions that served them
-and reports recall@k. ``tag`` flips a serving tag (default ``prod``) to a target dataset version for
+and reports recall@k. ``tag`` flips a serving tag (default ``HEAD``) to a target dataset version for
 blue-green promotion. ``migrate-manifests`` migrates dataset manifest paths to the V2 naming scheme.
 ``migrate-namespace`` copies a whole namespace to a new namespace name; it is a one-off operator tool
-and is not scheduled.
+and is not scheduled. ``optimize-iceberg`` runs Iceberg's own source-table maintenance procedures
+(``rewrite_data_files``, ``rewrite_manifests``, ``expire_snapshots``, and the opt-in ``remove_orphan_files``)
+on the upstream Iceberg table; it is distinct from ``maintenance``, which optimizes the Lance datasets.
 
 Each subcommand builds a Spark session, runs the job, and exits non-zero on failure so an orchestrator
 can retry.
@@ -37,6 +39,12 @@ from pyspark.sql import SparkSession
 from lance_etl.arrow_types import resolve_type_map
 from lance_etl.cloud_storage import discover_datasets
 from lance_etl.etl import DEFAULT_PARTITION_COLS, ETLConfig, IcebergToLanceETL
+from lance_etl.iceberg_optimize import (
+    DEFAULT_EXPIRE_OLDER_THAN_DAYS,
+    DEFAULT_EXPIRE_RETAIN_LAST,
+    IcebergOptimizeConfig,
+    IcebergOptimizer,
+)
 from lance_etl.indexing import IndexJobConfig, LanceIndexer
 from lance_etl.maintenance import (
     MaintenanceConfig,
@@ -280,7 +288,7 @@ def run_recall(args: argparse.Namespace, spark: SparkSession) -> None:
 def run_tag(args: argparse.Namespace, spark: SparkSession) -> None:
     """Run the serving-tag subcommand for blue-green promotion.
 
-    Flips a serving tag (default ``prod``) to a target dataset version across the selected datasets. With no
+    Flips a serving tag (default ``HEAD``) to a target dataset version across the selected datasets. With no
     ``--tag-version`` the tag is moved to each dataset's latest version. The helper logs the safe operational
     sequence and never assumes the serving layer auto-refreshes on a tag move.
 
@@ -367,6 +375,34 @@ def run_migrate_namespace(args: argparse.Namespace, spark: SparkSession) -> None
     logger.info("migrate-namespace report: %s", report)
 
 
+def run_optimize_iceberg(args: argparse.Namespace, spark: SparkSession) -> None:
+    """Run the Iceberg source-table optimization subcommand.
+
+    Optimizes the upstream Iceberg source table via Iceberg's own ``CALL <catalog>.system.<procedure>`` maintenance
+    procedures: ``rewrite_data_files`` bin-packs small files, ``rewrite_manifests`` realigns manifests,
+    ``expire_snapshots`` prunes snapshot history, and the opt-in ``remove_orphan_files`` deletes unreferenced files.
+    This is distinct from the ``maintenance`` subcommand, which optimizes the per-tenant Lance datasets. The catalog
+    is supplied through the Spark configuration at submit time exactly like the ``etl`` subcommand's reads. Step toggles
+    and the bin-pack and orphan-file sizing take their opinionated :class:`IcebergOptimizeConfig` defaults.
+
+    Args:
+        args: Parsed command-line arguments.
+        spark: Active Spark session.
+    """
+    config: IcebergOptimizeConfig = IcebergOptimizeConfig(
+        table=args.table,
+        telemetry=build_telemetry_config(args),
+        rewrite_data_files=not args.no_rewrite_data_files,
+        rewrite_manifests=not args.no_rewrite_manifests,
+        expire_snapshots=not args.no_expire_snapshots,
+        remove_orphan_files=args.remove_orphan_files,
+        expire_retain_last=args.expire_retain_last,
+        expire_older_than_days=args.expire_older_than_days,
+    )
+    report = IcebergOptimizer(config).run(spark)
+    logger.info("optimize-iceberg report: %s", report)
+
+
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     """Add the identity and storage options shared by all subcommands.
 
@@ -426,7 +462,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     Returns:
         The parser with the ``etl``, ``maintenance``, ``index``, ``recall``, ``tag``, ``migrate-manifests``,
-        and ``migrate-namespace`` subcommands.
+        ``migrate-namespace``, and ``optimize-iceberg`` subcommands.
     """
     parser: argparse.ArgumentParser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--log-level", default="INFO")
@@ -558,13 +594,13 @@ def build_parser() -> argparse.ArgumentParser:
     tag: argparse.ArgumentParser = subparsers.add_parser(
         "tag",
         help=(
-            "Flip a serving tag (default 'prod') to a target dataset version for blue-green promotion. Tagged "
+            "Flip a serving tag (default 'HEAD') to a target dataset version for blue-green promotion. Tagged "
             "versions are exempt from version cleanup."
         ),
     )
     add_common_arguments(tag)
     add_dataset_arguments(tag)
-    tag.add_argument("--tag", default="prod", help="Serving tag name to update. Default: prod.")
+    tag.add_argument("--tag", default="HEAD", help="Serving tag name to update. Default: HEAD.")
     tag.add_argument(
         "--tag-version",
         type=int,
@@ -618,6 +654,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_index_column_arguments(migrate_namespace)
 
+    optimize_iceberg: argparse.ArgumentParser = subparsers.add_parser(
+        "optimize-iceberg",
+        help=(
+            "Optimize the upstream Iceberg source table via CALL maintenance procedures (rewrite_data_files, "
+            "rewrite_manifests, expire_snapshots, and the opt-in remove_orphan_files). Distinct from the Lance "
+            "'maintenance' subcommand which optimizes the Lance datasets."
+        ),
+    )
+    add_common_arguments(optimize_iceberg)
+    optimize_iceberg.add_argument(
+        "--table", required=True, help="Fully-qualified Iceberg source table: catalog.namespace.table."
+    )
+    optimize_iceberg.add_argument(
+        "--no-rewrite-data-files", action="store_true", help="Skip the bin-pack rewrite of small data files."
+    )
+    optimize_iceberg.add_argument("--no-rewrite-manifests", action="store_true", help="Skip the manifest rewrite.")
+    optimize_iceberg.add_argument(
+        "--no-expire-snapshots", action="store_true", help="Skip snapshot-history expiration."
+    )
+    optimize_iceberg.add_argument(
+        "--remove-orphan-files",
+        action="store_true",
+        help=(
+            "Delete files no live snapshot references. Opt-in and destructive. Only files older than Iceberg's safety "
+            "horizon are removed."
+        ),
+    )
+    optimize_iceberg.add_argument(
+        "--expire-retain-last",
+        type=int,
+        default=DEFAULT_EXPIRE_RETAIN_LAST,
+        help=f"Snapshots always retained regardless of age. Default: {DEFAULT_EXPIRE_RETAIN_LAST}.",
+    )
+    optimize_iceberg.add_argument(
+        "--expire-older-than-days",
+        type=int,
+        default=DEFAULT_EXPIRE_OLDER_THAN_DAYS,
+        help=f"Age horizon in days for snapshot expiration. Default: {DEFAULT_EXPIRE_OLDER_THAN_DAYS}.",
+    )
+
     return parser
 
 
@@ -642,6 +718,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "tag": run_tag,
         "migrate-manifests": run_migrate_manifests,
         "migrate-namespace": run_migrate_namespace,
+        "optimize-iceberg": run_optimize_iceberg,
     }
     try:
         runners[args.command](args, spark)

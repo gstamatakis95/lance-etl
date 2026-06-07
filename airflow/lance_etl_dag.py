@@ -13,6 +13,11 @@ Pipeline stages (in order):
     3. ``index``       — builds or incrementally maintains IVF_RQ vector and
                          btree/bitmap/FTS scalar indices over the same datasets.
 
+An optional source-table maintenance stage ``optimize-iceberg`` can be enabled via the Airflow Variable
+``lance_etl_optimize_iceberg_enabled`` (default off). When enabled it runs before ``etl`` and optimizes the upstream
+Iceberg source table with Iceberg's own ``CALL`` maintenance procedures. It is distinct from the Lance ``maintenance``
+stage that optimizes the Lance datasets.
+
 The ``migrate-namespace`` subcommand is a one-off operator tool run manually via the CLI and is not scheduled here.
 
 Compaction runs before indexing on purpose. The compaction planner cannot bin fragments with different
@@ -103,6 +108,17 @@ Airflow Variables (all optional — defaults are listed in ``dag_params`` below)
                                      ``--ttl-column``. Empty (the default) turns TTL off so maintenance is
                                      compaction plus cleanup only. When set, the column must hold each row's
                                      lifetime as an Arrow Duration and rows are expired before compaction.
+    lance_etl_optimize_iceberg_enabled
+                                     When truthy (``true``/``1``/``yes``), an optional ``optimize-iceberg`` task is
+                                     added before ``etl`` that runs Iceberg's own source-table maintenance
+                                     procedures (rewrite_data_files, rewrite_manifests, expire_snapshots) on the
+                                     source table. Default off, so the chain stays ``etl >> maintenance >> index``.
+                                     This is source-table maintenance and is distinct from the Lance ``maintenance``
+                                     task that optimizes the Lance datasets.
+    lance_etl_optimize_remove_orphan_files
+                                     When truthy, the optional ``optimize-iceberg`` task also runs the destructive
+                                     opt-in ``remove_orphan_files`` procedure (only files older than Iceberg's safety
+                                     horizon are removed). Default off.
 """
 
 from __future__ import annotations
@@ -297,6 +313,47 @@ def build_datasets_subcommand_args(subcommand: str, params: dict[str, str | int]
     return args
 
 
+def variable_is_truthy(name: str) -> bool:
+    """Return whether an Airflow Variable holds a truthy gate value.
+
+    Args:
+        name: The full Airflow Variable name to read.
+
+    Returns:
+        ``True`` when the value is one of ``true``, ``1``, or ``yes`` (case-insensitive).
+    """
+    return Variable.get(name, default_var="false").strip().lower() in ("true", "1", "yes")
+
+
+def build_optimize_iceberg_application_args(params: dict[str, str | int]) -> list[str]:
+    """Build the CLI argument list for the optional ``optimize-iceberg`` subcommand.
+
+    The subcommand targets the same source table as ``etl`` (the ``lance_etl_iceberg_table`` Variable) and carries the
+    shared Datadog identity flags. The destructive ``remove_orphan_files`` procedure is appended only when the
+    ``lance_etl_optimize_remove_orphan_files`` Variable is truthy. The step toggles and retention otherwise take their
+    opinionated CLI defaults.
+
+    Args:
+        params: DAG-run ``params`` dict.
+
+    Returns:
+        Argument list starting with the ``optimize-iceberg`` subcommand token.
+    """
+    args = [
+        "optimize-iceberg",
+        "--table",
+        resolve_variable("iceberg_table", params),
+        "--dd-service",
+        resolve_variable("dd_service", params),
+        "--dd-env",
+        resolve_variable("dd_env", params),
+    ]
+    args += build_dd_tag_flags(params)
+    if variable_is_truthy("lance_etl_optimize_remove_orphan_files"):
+        args += ["--remove-orphan-files"]
+    return args
+
+
 def make_lance_operator(
     task_id: str,
     conn_id: str,
@@ -374,5 +431,14 @@ with DAG(
     index_task = make_lance_operator(
         "index", spark_conn_id, build_datasets_subcommand_args("index", dag_params), spark_conf
     )
+
+    if variable_is_truthy("lance_etl_optimize_iceberg_enabled"):
+        optimize_iceberg_task = make_lance_operator(
+            "optimize-iceberg",
+            spark_conn_id,
+            build_optimize_iceberg_application_args(dag_params),
+            spark_conf,
+        )
+        optimize_iceberg_task >> etl_task
 
     etl_task >> maintenance_task >> index_task

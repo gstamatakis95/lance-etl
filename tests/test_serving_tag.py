@@ -34,9 +34,9 @@ def test_update_serving_tag_creates_at_latest(tmp_path: Path, telemetry: Telemet
     write_versions(uri, 2)
     result: dict[str, object] = update_serving_tag(uri, None, None, telemetry)
     assert result["created"] is True
-    assert result["tag"] == "prod"
+    assert result["tag"] == "HEAD"
     assert result["version"] == 2
-    assert lance.dataset(uri).tags.get_version("prod") == 2
+    assert lance.dataset(uri).tags.get_version("HEAD") == 2
 
 
 def test_update_serving_tag_moves_existing(tmp_path: Path, telemetry: Telemetry) -> None:
@@ -47,7 +47,7 @@ def test_update_serving_tag_moves_existing(tmp_path: Path, telemetry: Telemetry)
     moved: dict[str, object] = update_serving_tag(uri, 1, None, telemetry)
     assert moved["created"] is False
     assert moved["version"] == 1
-    assert lance.dataset(uri).tags.get_version("prod") == 1
+    assert lance.dataset(uri).tags.get_version("HEAD") == 1
 
 
 def test_cleanup_exempts_tagged_versions(tmp_path: Path, telemetry: Telemetry) -> None:
@@ -62,7 +62,7 @@ def test_cleanup_exempts_tagged_versions(tmp_path: Path, telemetry: Telemetry) -
     dataset: lance.LanceDataset = lance.dataset(uri)
     surviving: set[int] = {version["version"] for version in dataset.versions()}
     assert 1 in surviving
-    assert dataset.tags.get_version("prod") == 1
+    assert dataset.tags.get_version("HEAD") == 1
 
 
 def test_cleanup_without_exemption_would_raise(tmp_path: Path) -> None:
@@ -70,6 +70,6 @@ def test_cleanup_without_exemption_would_raise(tmp_path: Path) -> None:
     uri: str = str(tmp_path / "ds.lance")
     write_versions(uri, 3)
     dataset: lance.LanceDataset = lance.dataset(uri)
-    dataset.tags.create("prod", 1)
+    dataset.tags.create("HEAD", 1)
     with pytest.raises(OSError, match="tagged version"):
         dataset.cleanup_old_versions(retain_versions=1)

@@ -746,7 +746,7 @@ def migrate_manifest_paths(
         return results
 
 
-DEFAULT_SERVING_TAG: str = "prod"
+DEFAULT_SERVING_TAG: str = "HEAD"
 """Default serving-tag name flipped during blue-green promotion."""
 
 
