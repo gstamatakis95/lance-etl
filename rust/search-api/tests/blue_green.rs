@@ -5,12 +5,13 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use common::{TEST_DATASET_PATH, build_indexed_dataset, test_config, test_target};
+use common::{CountingWrapper, ReadCounts, TEST_DATASET_PATH, build_indexed_dataset, test_config, test_target};
 use lance::Dataset;
 use search_api::config::Config;
-use search_api::domain::{DatasetRef, PrewarmSpec, Prewarmer, SearchBackend, VectorQuery};
+use search_api::domain::{DatasetRef, PrewarmSpec, Prewarmer, SearchBackend, TextQuery, VectorQuery};
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
 use tempfile::TempDir;
 
@@ -98,4 +99,84 @@ async fn prewarm_by_tag_reports_the_resolved_version() {
         report.resolved_version, 1,
         "prewarm must report the tag-resolved version"
     );
+}
+
+#[tokio::test]
+async fn prewarm_by_version_serves_warm_through_a_tag_flip_in_a_cold_process() {
+    let data_tmp = TempDir::new().unwrap();
+    let cache_tmp = TempDir::new().unwrap();
+    let uri = format!("file-object-store://{}/{TEST_DATASET_PATH}", data_tmp.path().display());
+    build_indexed_dataset(&uri).await;
+
+    let dataset = Dataset::open(&uri).await.unwrap();
+    let green = dataset.version_id();
+    assert!(
+        green >= 2,
+        "the indexed build must produce several versions, got {green}"
+    );
+    dataset.tags().create("prod", 1u64).await.unwrap();
+
+    let config = serve_by_tag_config(data_tmp.path(), cache_tmp.path(), 10);
+
+    let counts_a = Arc::new(ReadCounts::default());
+    let provider_a = CachingDatasetProvider::with_inner_store_wrapper(
+        &config,
+        Some(Arc::new(CountingWrapper {
+            counts: counts_a.clone(),
+        })),
+    );
+    let backend_a = LanceSearchBackend::new(provider_a);
+    let report = backend_a
+        .prewarm(
+            &test_target(),
+            PrewarmSpec {
+                metadata: true,
+                all_indexes: true,
+                index_names: vec![],
+                fts_with_position: true,
+            },
+            DatasetRef::Version(green),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.resolved_version, green, "prewarm pinned the green version by id");
+    assert_eq!(report.indexes.len(), 2, "{report:?}");
+    assert!(report.indexes.iter().all(|index| index.error.is_none()), "{report:?}");
+    drop(backend_a);
+
+    dataset.tags().update("prod", green).await.unwrap();
+
+    let counts_b = Arc::new(ReadCounts::default());
+    let provider_b = CachingDatasetProvider::with_inner_store_wrapper(
+        &config,
+        Some(Arc::new(CountingWrapper {
+            counts: counts_b.clone(),
+        })),
+    );
+    let backend_b = LanceSearchBackend::new(provider_b);
+
+    let text = backend_b
+        .text_search(&test_target(), TextQuery::simple("lemon", 3))
+        .await
+        .unwrap();
+    assert_eq!(text.hits.len(), 1);
+    assert_eq!(
+        text.dataset_version,
+        Some(green),
+        "serve-by-tag must resolve prod onto the prewarmed green version"
+    );
+    let vector = backend_b.vector_search(&test_target(), probe()).await.unwrap();
+    assert_eq!(vector.dataset_version, Some(green));
+    assert_eq!(vector.hits.len(), 2);
+
+    let (indices_b, manifests_b, data_b) = counts_b.snapshot();
+    assert_eq!(
+        indices_b, 0,
+        "a cold process serving by tag must hit the disk index cache prewarm wrote by version, not the store"
+    );
+    assert_eq!(
+        manifests_b, 0,
+        "the green manifest prewarmed by version must be served from the disk byte cache once the tag resolves onto it"
+    );
+    assert!(data_b > 0, "raw data reads always pass through to the store");
 }

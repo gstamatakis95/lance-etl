@@ -6,7 +6,9 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{CountingWrapper, ReadCounts, TEST_DATASET_PATH, build_indexed_dataset, test_config, test_target};
+use common::{
+    CountingWrapper, ReadCounts, TEST_DATASET_PATH, bin_file_count, build_indexed_dataset, test_config, test_target,
+};
 use search_api::domain::{
     DatasetRef, FusionSpec, HybridQuery, PrewarmSpec, Prewarmer, SearchBackend, TextQuery, VectorQuery,
 };
@@ -44,6 +46,16 @@ async fn searches_after_prewarm_do_no_index_or_manifest_io() {
     assert!(report.metadata_warmed);
     assert_eq!(report.indexes.len(), 2);
     assert!(report.indexes.iter().all(|index| index.error.is_none()), "{report:?}");
+
+    let stamp = cache_tmp.path().join(search_api::cache::layout::stamp_dir_name());
+    assert!(
+        bin_file_count(&stamp.join("index")) > 0,
+        "prewarm must populate the disk index cache tier that vector/text scans read from"
+    );
+    assert!(
+        bin_file_count(&stamp.join("store")) > 0,
+        "prewarm must populate the metadata byte (store) cache tier that manifest/index-reopen reads consult"
+    );
 
     let (indices_before, manifests_before, data_before) = counts.snapshot();
 
