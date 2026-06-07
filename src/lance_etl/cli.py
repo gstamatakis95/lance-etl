@@ -198,13 +198,15 @@ def run_etl(args: argparse.Namespace, spark: SparkSession) -> None:
 
 
 def run_maintenance(args: argparse.Namespace, spark: SparkSession) -> None:
-    """Run the maintenance subcommand: per-row TTL expiration, compaction, and version cleanup.
+    """Run the maintenance subcommand: single-org DQ guard, per-row TTL expiration, compaction, and version cleanup.
 
     Maintenance has no per-deployment data contract beyond which datasets to process and the optional TTL columns.
     When ``--ttl-column`` names a per-row TTL (``Duration``) column, expired rows are deleted before compaction by the
-    predicate ``ts_column + ttl_column < now``. Absent the flag, TTL is off and the job is compaction plus cleanup
-    only. Fragment sizing, deletion materialization, two-tier thresholds, retry budgets, and version-cleanup retention
-    take their opinionated :class:`MaintenanceConfig` defaults.
+    predicate ``ts_column + ttl_column < now``. Absent the flag, TTL is off and the job is DQ guard plus compaction
+    plus cleanup. When ``--base-uri`` is supplied, the cheap single-org DQ guard runs before TTL and compaction,
+    deriving the expected routing-column values from each dataset URI. Fragment sizing, deletion materialization,
+    two-tier thresholds, retry budgets, and version-cleanup retention take their opinionated
+    :class:`MaintenanceConfig` defaults.
 
     Args:
         args: Parsed command-line arguments.
@@ -212,9 +214,12 @@ def run_maintenance(args: argparse.Namespace, spark: SparkSession) -> None:
     """
     config: MaintenanceConfig = MaintenanceConfig(
         telemetry=build_telemetry_config(args),
+        base_uri=args.base_uri or None,
         storage_options=parse_storage_options(args),
         ttl_column=args.ttl_column,
         ts_column=args.ts_column,
+        verify_single_org=not args.no_verify_single_org,
+        raise_on_contamination=args.raise_on_contamination,
     )
     MaintenanceJob(config).run(spark, load_dataset_uris(args))
 
@@ -481,6 +486,23 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Event timestamp column used as the TTL clock. Must match ETLConfig.ts_col. Only used when --ttl-column "
             "is set. Default: timestamp."
+        ),
+    )
+    maintenance.add_argument(
+        "--no-verify-single-org",
+        action="store_true",
+        help=(
+            "Disable the cheap single-org data-quality guard that runs before TTL and compaction. The guard requires "
+            "--base-uri to derive expected routing values from each dataset URI. Default: guard is on when --base-uri "
+            "is set."
+        ),
+    )
+    maintenance.add_argument(
+        "--raise-on-contamination",
+        action="store_true",
+        help=(
+            "Raise an error when the single-org DQ guard finds contaminating rows. Default: log an error and emit a "
+            "metric but continue maintenance."
         ),
     )
 

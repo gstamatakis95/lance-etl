@@ -28,3 +28,22 @@ in exactly one dataset, so the per-dataset `merge_insert` keyed on `key_col` is 
 `lance_etl_partition_derive` Airflow Variable and the `--partition-derive` CLI flag no longer exist. Generic
 `partition_cols` path routing (for example the default `org_id/tenant_id/namespace` trio or any other stable
 identity columns) is retained.
+
+**Amendment (single-org DQ guard):** Because each dataset must contain rows for only its own routing key, the
+`MaintenanceJob` now runs a cheap data-quality guard at the start of every maintenance pass. The guard calls
+`dataset.count_rows(filter=predicate)` where the predicate is an OR over `"{col} != '{expected}'"` for each
+routing column present as a stored column in the schema. The expected values are derived from the dataset URI
+relative to `MaintenanceConfig.base_uri` using the same `partition_cols` ordering that built the path. A clean
+dataset returns 0 and the guard costs at most a handful of metadata page reads. Lance prunes via zone-map and
+page statistics on the named columns so the scan never touches the vector payload.
+
+Pylance does not expose raw zone-map min/max from Python (`LanceFragment.metadata.to_json()` omits per-column
+statistics), so a "read zone-map bounds directly" approach is not available. The pushdown count is the next
+cheapest option: it is zone-map-accelerated and reads only the routing columns, not the vectors.
+
+The guard emits a `dataset.org_contamination` metric (a distribution carrying the contaminating row count) when
+contamination is found. The metric carries no org or tenant in its tags to keep cardinality low. When
+`MaintenanceConfig.raise_on_contamination` is `True`, a `ContaminationError` is raised after logging. The guard
+defaults on (`verify_single_org=True`) but requires `base_uri` to be set. When `base_uri` is `None` the guard is
+silently skipped. When none of the routing columns exist as stored columns in the schema the guard is also skipped
+with a warning.

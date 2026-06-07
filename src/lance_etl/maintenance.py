@@ -1,9 +1,12 @@
 """Per-dataset maintenance for a fleet of per-tenant Lance datasets: TTL, compaction, and version cleanup.
 
-A maintenance run applies three ordered steps to each dataset. First, when a per-row TTL column is configured, expired
-rows are deleted. Second, the dataset is compacted with the two-tier orchestration below. Third, old versions are
-pruned. The TTL delete runs before compaction so the compaction reclaims the storage the expired rows occupied, and the
-version cleanup runs at the end of each dataset's compaction so the freshly rewritten fragments are the ones retained.
+A maintenance run applies four ordered steps to each dataset. First, when :attr:`MaintenanceConfig.verify_single_org`
+is ``True`` (the default), a cheap zone-map-accelerated data-quality guard confirms that the dataset contains only rows
+belonging to its own org, tenant, and namespace routing key. Second, when a per-row TTL column is configured, expired
+rows are deleted. Third, the dataset is compacted with the two-tier orchestration below. Fourth, old versions are
+pruned. The DQ guard runs before TTL and compaction so contamination is reported immediately, TTL deletes run before
+compaction so the compaction reclaims the storage the expired rows occupied, and the version cleanup runs at the end of
+each dataset's compaction so the freshly rewritten fragments are the ones retained.
 
 Per-row TTL: rows expire individually by their own lifetime rather than by a single global retention window. The dataset
 carries a per-row TTL column holding each row's lifetime as an Arrow ``Duration`` value, and the event timestamp column
@@ -61,7 +64,7 @@ import logging
 import re
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -69,6 +72,7 @@ import lance
 from lance.optimize import Compaction, CompactionMetrics, CompactionTask, RewriteResult
 from pyspark.sql import SparkSession
 
+from lance_etl.etl import DEFAULT_PARTITION_COLS, PATH_COMPONENT_PATTERN
 from lance_etl.telemetry import (
     DEFAULT_COMMIT_RETRIES,
     DEFAULT_LARGE_COMMIT_RETRIES,
@@ -104,6 +108,9 @@ TIMESTAMP_LITERAL_FORMAT: str = "%Y-%m-%dT%H:%M:%S.%f"
 Produces ``YYYY-MM-DDTHH:MM:SS.ffffff`` (microsecond resolution), which DataFusion's SQL parser accepts as
 ``TIMESTAMP 'YYYY-MM-DDTHH:MM:SS.ffffff'``."""
 
+LANCE_SUFFIX: str = ".lance"
+"""Dataset directory suffix used when decomposing a URI into its routing-value components."""
+
 
 @dataclass
 class MaintenanceConfig:
@@ -111,7 +118,23 @@ class MaintenanceConfig:
 
     Attributes:
         telemetry: Telemetry configuration.
+        base_uri: Root location under which all per-tenant datasets live, matching the ETL ``base_uri``. When set,
+            the single-org DQ guard derives the expected routing-column values from each dataset URI relative to this
+            root. When ``None`` (the default), the DQ guard is skipped for all datasets regardless of
+            ``verify_single_org``.
         storage_options: Object-store options forwarded to pylance.
+        partition_cols: Columns whose values build each dataset path in order, matching the ETL routing. Used by the
+            single-org DQ guard to derive expected routing-column values from the dataset URI. Defaults to the stable
+            ``["org_id", "tenant_id", "namespace"]`` trio.
+        verify_single_org: When ``True`` (the default), run a cheap zone-map-accelerated pushdown count before TTL and
+            compaction to confirm that the dataset contains only rows whose routing-column values match the URI
+            components derived from the dataset path. A count of zero means clean. Contamination is logged as an error
+            and a ``dataset.org_contamination`` metric is emitted. When ``raise_on_contamination`` is also ``True``,
+            the contaminated dataset raises instead of proceeding to TTL and compaction. Skipped with a warning when
+            none of the routing columns exist as stored columns in the schema.
+        raise_on_contamination: When ``True``, a contaminated dataset raises
+            :class:`ContaminationError` after logging. When ``False`` (the default), contamination is logged and metered
+            but the maintenance run continues to TTL and compaction.
         ttl_column: Name of the per-row TTL column holding each row's lifetime as an Arrow ``Duration``. ``None`` (the
             default) turns TTL off: the TTL step is a strict no-op. When set, expired rows are deleted before
             compaction by the predicate ``{ts_column} + {ttl_column} < TIMESTAMP '{now}'``. The column name is
@@ -155,7 +178,11 @@ class MaintenanceConfig:
     """
 
     telemetry: TelemetryConfig
+    base_uri: str | None = None
     storage_options: dict[str, Any] | None = None
+    partition_cols: list[str] = field(default_factory=lambda: list(DEFAULT_PARTITION_COLS))
+    verify_single_org: bool = True
+    raise_on_contamination: bool = False
     ttl_column: str | None = None
     ts_column: str = "timestamp"
     target_rows_per_fragment: int | None = None
@@ -236,6 +263,150 @@ class MaintenanceConfig:
         return options
 
 
+class ContaminationError(Exception):
+    """Raised when a dataset contains rows that belong to a different routing key.
+
+    Raised only when :attr:`MaintenanceConfig.raise_on_contamination` is ``True``. The exception message includes the
+    dataset URI and the number of contaminating rows so operators can locate and remediate the affected dataset.
+    """
+
+
+def uri_components(base_uri: str, uri: str) -> list[str]:
+    """Split a dataset URI into its routing-value path components relative to a base URI.
+
+    Strips the base URI prefix and the trailing ``.lance`` suffix, then splits on ``/`` to yield one value per routing
+    column in path order. This is the same decomposition used by :mod:`lance_etl.migrate_namespace`.
+
+    Args:
+        base_uri: Root location the dataset lives under.
+        uri: Full dataset URI ending in ``.lance``.
+
+    Returns:
+        Routing values in path order with the ``.lance`` suffix removed from the last.
+
+    Raises:
+        ValueError: If the URI is not rooted at ``base_uri`` or does not end in ``.lance``.
+    """
+    root: str = base_uri.rstrip("/")
+    if not uri.startswith(f"{root}/") or not uri.endswith(LANCE_SUFFIX):
+        raise ValueError(f"dataset URI {uri!r} is not a .lance dataset rooted at {base_uri!r}")
+    relative: str = uri[len(root) + 1 :]
+    parts: list[str] = relative.split("/")
+    parts[-1] = parts[-1][: -len(LANCE_SUFFIX)]
+    return parts
+
+
+def expected_routing_values(base_uri: str, uri: str, partition_cols: list[str]) -> dict[str, str]:
+    """Derive the expected routing-column values for a dataset from its URI.
+
+    Decomposes the URI into path components relative to ``base_uri`` and maps each component to the corresponding entry
+    in ``partition_cols`` in order. Components are validated against :data:`lance_etl.etl.PATH_COMPONENT_PATTERN` before
+    mapping, so a malformed URI is rejected early rather than producing a bogus predicate.
+
+    Args:
+        base_uri: Root location the dataset lives under.
+        uri: Full dataset URI ending in ``.lance``.
+        partition_cols: Column names in dataset-path order.
+
+    Returns:
+        A mapping from each routing column name to its expected value derived from the URI.
+
+    Raises:
+        ValueError: If the URI cannot be decomposed, the component count does not match ``partition_cols``, or any
+            component fails the path-component allowlist.
+    """
+    parts: list[str] = uri_components(base_uri, uri)
+    if len(parts) != len(partition_cols):
+        raise ValueError(
+            f"URI {uri!r} has {len(parts)} path components but partition_cols has {len(partition_cols)} entries: "
+            f"{partition_cols}"
+        )
+    pattern: re.Pattern[str] = re.compile(PATH_COMPONENT_PATTERN)
+    for component in parts:
+        if not pattern.match(component):
+            raise ValueError(f"URI path component {component!r} fails the path-component allowlist")
+    return dict(zip(partition_cols, parts, strict=True))
+
+
+def build_contamination_predicate(expected: dict[str, str], schema_names: list[str]) -> str | None:
+    """Build a Lance SQL predicate that matches any row whose routing-column values differ from expected.
+
+    The predicate is an OR over ``"{col} != '{escaped_value}'"`` for each routing column that is present as a stored
+    column in the dataset schema. Columns absent from the schema are skipped because they are not stored as columns and
+    cannot be filtered. If none of the routing columns exist in the schema the function returns ``None``, signalling
+    that the check must be skipped.
+
+    Each column name is validated against :data:`COLUMN_NAME_PATTERN` before use. Each expected value has its single
+    quotes escaped by doubling (the standard SQL escaping rule) so a value containing a single quote cannot inject SQL.
+
+    Args:
+        expected: Mapping from routing column name to its expected value derived from the dataset URI.
+        schema_names: Column names present in the dataset schema.
+
+    Returns:
+        A SQL predicate string for :meth:`lance.LanceDataset.count_rows`, or ``None`` when no routing column is stored.
+
+    Raises:
+        ValueError: If any routing column name fails the identifier allowlist.
+    """
+    clauses: list[str] = []
+    for col, value in expected.items():
+        if not COLUMN_NAME_PATTERN.match(col):
+            raise ValueError(f"routing column {col!r} fails the identifier allowlist [A-Za-z_][A-Za-z0-9_]*")
+        if col not in schema_names:
+            continue
+        escaped: str = value.replace("'", "''")
+        clauses.append(f"{col} != '{escaped}'")
+    if not clauses:
+        return None
+    return " OR ".join(clauses)
+
+
+def verify_single_org(
+    dataset: lance.LanceDataset,
+    expected: dict[str, str],
+    routing_cols: list[str],
+) -> int:
+    """Count rows in a dataset whose routing-column values differ from the expected values for its URI.
+
+    Executes a single ``dataset.count_rows(filter=predicate)`` call where the predicate is an OR over
+    ``"{col} != '{expected[col]}'"`` for each routing column present as a stored column in the schema.
+    Lance prunes fragments via zone-map statistics on the named columns, so the scan never touches the
+    vector columns and the cost is proportional to the number of routing-column pages read, not the
+    vector payload. A clean dataset returns 0.
+
+    The check is skipped (returns 0 with a log warning) when none of the routing columns are stored as
+    columns in the dataset schema, because the path components alone encode the routing key and there is
+    nothing to filter against.
+
+    Args:
+        dataset: An open Lance dataset handle.
+        expected: Mapping from each routing column name to its expected string value for this dataset.
+            Column names must match the identifier allowlist ``[A-Za-z_][A-Za-z0-9_]*`` and expected
+            values are formatted as SQL string literals with single quotes escaped by doubling.
+        routing_cols: The routing column names in dataset-path order. Only columns present in both this
+            list and the dataset schema are included in the predicate.
+
+    Returns:
+        The number of contaminating rows (rows whose routing-column values differ from expected). Zero
+        means the dataset is clean.
+
+    Raises:
+        ValueError: If any routing column name fails the identifier allowlist.
+    """
+    schema_names: list[str] = dataset.schema.names
+    predicate: str | None = build_contamination_predicate(expected, schema_names)
+    if predicate is None:
+        logger.warning(
+            "dq: skipping single-org check for dataset at version %d: none of the routing columns %s "
+            "are present as stored columns in the schema",
+            dataset.version,
+            routing_cols,
+        )
+        return 0
+    return int(dataset.count_rows(filter=predicate))
+
+
 def validate_column_name(column: str, schema: Any) -> None:
     """Validate a TTL predicate column name against the identifier allowlist and dataset schema.
 
@@ -294,6 +465,55 @@ def compute_cutoff() -> datetime:
         The current UTC instant.
     """
     return datetime.now(tz=UTC)
+
+
+def check_single_org(uri: str, config: MaintenanceConfig, telemetry: Telemetry) -> int:
+    """Run the single-org DQ guard for one dataset URI and report contaminating row count.
+
+    Opens the dataset, derives the expected routing-column values from the URI and the configured ``partition_cols``,
+    and delegates to :func:`verify_single_org`. When contamination is found (count greater than zero) an error is
+    logged and a ``dataset.org_contamination`` metric is emitted carrying the count. When
+    :attr:`MaintenanceConfig.raise_on_contamination` is ``True`` a :class:`ContaminationError` is raised after
+    logging so the maintenance run fails fast on the affected dataset.
+
+    The check is silently skipped when the URI cannot be decomposed against ``config.base_uri`` (for example when
+    ``base_uri`` is not configured on the :class:`MaintenanceConfig`): the dataset is still compacted normally.
+
+    Args:
+        uri: Dataset URI.
+        config: Maintenance configuration with ``partition_cols`` set.
+        telemetry: Telemetry facade for the current process.
+
+    Returns:
+        The number of contaminating rows, or ``0`` when the check was skipped or the dataset is clean.
+
+    Raises:
+        ContaminationError: When contamination is found and :attr:`MaintenanceConfig.raise_on_contamination` is
+            ``True``.
+    """
+    if not config.base_uri:
+        return 0
+    try:
+        expected: dict[str, str] = expected_routing_values(config.base_uri, uri, config.partition_cols)
+    except ValueError as exc:
+        logger.warning("dq: cannot derive routing values for %s, skipping single-org check: %s", uri, exc)
+        return 0
+    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+    count: int = verify_single_org(dataset, expected, config.partition_cols)
+    if count > 0:
+        logger.error(
+            "dq: single-org contamination detected in %s: %d rows do not match expected routing values %s",
+            uri,
+            count,
+            expected,
+        )
+        telemetry.distribution("dataset.org_contamination", float(count))
+        if config.raise_on_contamination:
+            raise ContaminationError(
+                f"dataset {uri!r} contains {count} contaminating rows that do not match expected routing "
+                f"values {expected}; set raise_on_contamination=False to log-and-continue instead"
+            )
+    return count
 
 
 def delete_expired_rows(uri: str, config: MaintenanceConfig, cutoff: datetime, telemetry: Telemetry) -> dict[str, Any]:
@@ -693,7 +913,7 @@ def classify_or_compact(uri: str, config: MaintenanceConfig, telemetry: Telemetr
 
 
 class MaintenanceJob:
-    """Runs TTL expiration, two-tier compaction, and version cleanup over a fleet of Lance datasets."""
+    """Runs the single-org DQ guard, TTL expiration, two-tier compaction, and version cleanup over a Lance fleet."""
 
     def __init__(self, config: MaintenanceConfig) -> None:
         """Initialize the maintenance job.
@@ -702,6 +922,30 @@ class MaintenanceJob:
             config: Maintenance configuration.
         """
         self.config: MaintenanceConfig = config
+
+    def dq_tier(self, uris: list[str], telemetry: Telemetry) -> int:
+        """Run the single-org DQ guard over every dataset on the driver before TTL and compaction.
+
+        Each dataset's guard is a single cheap pushdown count over the routing columns. Running it on the driver avoids
+        the executor round-trip overhead for this read-only check. The total number of contaminating rows across all
+        datasets is returned so the caller can gauge it as a run-level metric.
+
+        Args:
+            uris: Dataset URIs to check.
+            telemetry: Driver telemetry facade.
+
+        Returns:
+            Total contaminating rows found across all datasets in this run. Zero means every dataset is clean.
+
+        Raises:
+            ContaminationError: When any dataset is contaminated and
+                :attr:`MaintenanceConfig.raise_on_contamination` is ``True``.
+        """
+        config: MaintenanceConfig = self.config
+        total: int = 0
+        for uri in uris:
+            total += check_single_org(uri, config, telemetry)
+        return total
 
     def expire_tier(self, spark: SparkSession, uris: list[str]) -> list[dict[str, Any]]:
         """Delete expired rows from every dataset in one fan-out pass before compaction.
@@ -927,10 +1171,15 @@ class MaintenanceJob:
         return results
 
     def run(self, spark: SparkSession, dataset_uris: Iterable[str]) -> list[dict[str, Any]]:
-        """Maintain every dataset: TTL expiration, then two-tier compaction, then version cleanup.
+        """Maintain every dataset: DQ guard, TTL expiration, two-tier compaction, then version cleanup.
+
+        When :attr:`MaintenanceConfig.verify_single_org` is ``True`` (the default), a cheap zone-map-accelerated
+        pushdown count runs on the driver for every dataset before any TTL or compaction work, confirming that each
+        dataset contains only rows belonging to its own routing key. Contamination is logged and metered. When
+        :attr:`MaintenanceConfig.raise_on_contamination` is also ``True``, a contaminated dataset raises immediately.
 
         When a per-row TTL column is configured, a single fan-out pass deletes every expired row from every dataset
-        first, so the compaction that follows reclaims the storage they occupied. The compaction itself runs in one
+        next, so the compaction that follows reclaims the storage they occupied. The compaction itself runs in one
         Spark job: each executor task classifies its dataset by fragment count and compacts it in process (including
         version cleanup) when small. Datasets above the fragment threshold are then compacted with the distributed plan
         path, several at a time from a driver thread pool on the FAIR scheduler pool. Failures propagate and fail the
@@ -949,8 +1198,20 @@ class MaintenanceJob:
             uris: list[str] = list(dataset_uris)
             run_span.set_tag("dataset_count", len(uris))
             run_span.set_tag("ttl_active", config.ttl_active())
+            run_span.set_tag("verify_single_org", config.verify_single_org)
             if not uris:
                 return []
+
+            if config.verify_single_org:
+                with driver_telemetry.timed("run.dq_ms"):
+                    contaminating_rows: int = self.dq_tier(uris, driver_telemetry)
+                run_span.set_tag("contaminating_rows", contaminating_rows)
+                driver_telemetry.gauge("run.contaminating_rows", contaminating_rows)
+                if contaminating_rows:
+                    logger.error(
+                        "dq: %d contaminating rows detected across the fleet; see per-dataset logs above",
+                        contaminating_rows,
+                    )
 
             if config.ttl_active():
                 with driver_telemetry.timed("run.ttl_ms"):

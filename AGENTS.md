@@ -12,7 +12,7 @@ lance-etl/
   src/lance_etl/          Python package (production sources)
     etl.py                IcebergToLanceETL: read, collapse, repartition, merge_insert
     indexing.py           LanceIndexer + per-type handlers (VectorIndex, BTree, Bitmap, Fts)
-    maintenance.py        MaintenanceJob + MaintenanceConfig: per-row TTL expiration, two-tier compaction, version cleanup
+    maintenance.py        MaintenanceJob + MaintenanceConfig: cheap single-org DQ guard (zone-map pushdown count), per-row TTL expiration, two-tier compaction, version cleanup
     recall.py             RecallAuditJob: replay Datadog spans, score recall@k/nDCG@k/MRR
     telemetry.py          Telemetry, TelemetryConfig, LanceRuntimeConfig, commit_with_retries
     cloud_storage.py      resolve_filesystem + discover_datasets for pyarrow filesystem I/O

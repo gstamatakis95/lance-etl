@@ -254,12 +254,21 @@ lance-etl maintenance \
   --dd-service lance-pipeline --dd-env prod
 ```
 
-Runs three ordered steps per dataset: per-row TTL expiration (when `--ttl-column` is set), two-tier
-distributed compaction, and version cleanup. TTL deletes expired rows before compaction so the
+Runs four ordered steps per dataset: a cheap single-org data-quality guard (when `--base-uri` is set),
+per-row TTL expiration (when `--ttl-column` is set), two-tier distributed compaction, and version cleanup.
+The DQ guard calls `dataset.count_rows(filter=predicate)` over only the partition columns to confirm each
+dataset contains rows for only its own routing key. TTL deletes expired rows before compaction so the
 compaction reclaims that storage.
 
 Dataset selection: `--dataset-uri` (repeatable), `--datasets-file`, or `--base-uri` (discovers all
 `*.lance` paths recursively). All tuning knobs use opinionated defaults from `MaintenanceConfig`.
+
+DQ guard flags (require `--base-uri`):
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--no-verify-single-org` | off (guard on) | Disable the single-org DQ guard. The guard requires `--base-uri` to derive expected routing values from each dataset URI. |
+| `--raise-on-contamination` | off | Raise an error when contamination is found instead of logging and continuing. |
 
 TTL flags:
 
