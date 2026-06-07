@@ -24,6 +24,12 @@ All lance `path:line` citations were spot-verified against the read-only checkou
 - [production-techniques.md](production-techniques.md) — round-2 techniques catalog (object store and
   multi-writer, lifecycle, ecosystem) with guide URL plus checkout path:line evidence, a maturity verdict, and
   an apply-to-lance-etl recommendation per technique, plus an appendix of unverified claims.
+- [rag-usecases.md](rag-usecases.md) — RAG-focused survey of how teams run Lance/LanceDB as the retrieval store
+  in production RAG and agent-memory systems, organized by five angles (architecture and freshness, retrieval
+  quality with hybrid plus rerank plus multivector, eval and observability, scale and multitenancy, named cases),
+  each finding tagged VERIFIED-CHECKOUT / VERIFIED-DOCS / BLOG with a relevance-to-lance-etl line, a ranked
+  gaps-and-candidate-features section (rerank hook, weighted fusion, nDCG in the recall job), and an
+  unverified-claims appendix.
 
 ## Round 2 takeaways
 
