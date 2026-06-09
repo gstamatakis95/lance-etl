@@ -276,31 +276,31 @@ class TestTtlOffIsNoop:
 
 
 class TestRunOrdering:
-    """A maintenance run expires every dataset before compacting any of them."""
+    """A maintenance run uses a consolidated per-dataset pass for DQ, TTL, and compaction."""
 
-    def test_all_deletes_run_before_any_compaction(
+    def test_consolidated_pass_runs_all_datasets(
         self, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The TTL pass completes for the whole fleet before the compaction pass begins."""
-        order: list[str] = []
+        """The consolidated fan-out calls maintain_one_dataset for every dataset in the fleet.
 
-        def record_delete(uri: str, config: MaintenanceConfig, cutoff: datetime, tel: Telemetry) -> dict[str, object]:
-            """Record a TTL delete in call order."""
+        With the single fan-out design, maintain_one_dataset handles DQ, TTL, and classify-or-compact
+        in one executor task per dataset. Patching maintain_one_dataset at the module level lets the
+        test observe that every URI is processed exactly once.
+        """
+        processed: list[str] = []
+
+        def record_maintain(
+            uri: str, config: MaintenanceConfig, cutoff: datetime | None, tel: Telemetry
+        ) -> dict[str, object]:
+            """Record that maintain_one_dataset was called for this URI."""
             del config, cutoff, tel
-            order.append(f"delete:{uri}")
-            return {"uri": uri, "rows_deleted": 1, "skipped": ""}
-
-        def record_compact(uri: str, config: MaintenanceConfig, tel: Telemetry) -> dict[str, object]:
-            """Record a compaction in call order and report the small tier."""
-            del config, tel
-            order.append(f"compact:{uri}")
+            processed.append(uri)
             return {"uri": uri, "tier": "small", "tasks": 1, "bytes_removed": 0, "fragments_removed": 0}
 
-        monkeypatch.setattr(maintenance, "delete_expired_rows", record_delete)
-        monkeypatch.setattr(maintenance, "classify_or_compact", record_compact)
+        monkeypatch.setattr(maintenance, "maintain_one_dataset", record_maintain)
         config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config, ttl_column="ttl")
         MaintenanceJob(config).run(FakeSpark(), ["a.lance", "b.lance"])
-        assert order == ["delete:a.lance", "delete:b.lance", "compact:a.lance", "compact:b.lance"]
+        assert processed == ["a.lance", "b.lance"]
 
     def test_run_expires_then_compacts_real_dataset(self, ttl_dataset: tuple[str, int, int]) -> None:
         """An end-to-end run deletes expired rows and compacts the survivors into one fragment."""

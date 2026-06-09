@@ -102,6 +102,7 @@ from lance_etl.indexing import (
     optimize_existing_index,
     scalar_index_name,
     serialize_segment,
+    vector_index_name,
 )
 from lance_etl.maintenance import MaintenanceConfig, MaintenanceJob, cleanup_dataset, compact_small_dataset
 from lance_etl.telemetry import Telemetry, TelemetryConfig, is_commit_conflict_error
@@ -659,7 +660,7 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
     )
     index_config: IndexJobConfig = IndexJobConfig(
         telemetry=telemetry_config,
-        vector_column="vector",
+        vector_columns=["vector"],
         num_partitions=8,
         vector_min_rows=1000,
         scalar_columns=["vector_id"],
@@ -669,9 +670,7 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
         commit_backoff_seconds=0.05,
         max_index_deltas=4,
     )
-    vector_handler: VectorIndexHandler = VectorIndexHandler(
-        index_config, "vector", index_config.resolved_vector_index_name()
-    )
+    vector_handler: VectorIndexHandler = VectorIndexHandler(index_config, "vector", vector_index_name("vector"))
     btree_handler: BTreeIndexHandler = BTreeIndexHandler(index_config, "vector_id", scalar_index_name("vector_id"))
     fts_handler: FtsIndexHandler = FtsIndexHandler(index_config, "text", fts_index_name("text"))
 
@@ -782,7 +781,7 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
     assert not failures, f"actors died: {failures}"
 
     head_required: set[str] = {
-        index_config.resolved_vector_index_name(),
+        vector_index_name("vector"),
         scalar_index_name("vector_id"),
         fts_index_name("text"),
     }
@@ -980,7 +979,7 @@ def test_vector_segment_commit_survives_compaction_orphan(tmp_path: Path, monkey
     telemetry: Telemetry = Telemetry.create(telemetry_config, attach_lance_bridge=False)
     shared: dict[str, Any] = {
         "telemetry": telemetry_config,
-        "vector_column": "vector",
+        "vector_columns": ["vector"],
         "num_partitions": 4,
         "vector_min_rows": 10,
         "num_shards": 8,
@@ -988,7 +987,7 @@ def test_vector_segment_commit_survives_compaction_orphan(tmp_path: Path, monkey
         "commit_backoff_seconds": 0.0,
     }
     build_config: IndexJobConfig = IndexJobConfig(**shared)
-    index_name: str = build_config.resolved_vector_index_name()
+    index_name: str = vector_index_name("vector")
     build_segment_index(uri, VectorIndexHandler(build_config, "vector", index_name), build_config, telemetry)
     assert unindexed_fragment_count(lance.dataset(uri), index_name) == 0
 

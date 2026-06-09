@@ -17,7 +17,6 @@ import pyarrow as pa
 import pytest
 
 from lance_etl.maintenance import (
-    MIN_CLEANUP_HORIZON_SECONDS,
     MaintenanceConfig,
     MaintenanceJob,
     cleanup_dataset,
@@ -267,7 +266,5 @@ def test_cleanup_horizon_floor_is_enforced(
     config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config, cleanup_older_than_seconds=60)
     with pytest.raises(ValueError, match="cleanup_older_than_seconds"):
         cleanup_dataset(dataset_uri, config, telemetry)
-    safe: MaintenanceConfig = MaintenanceConfig(
-        telemetry=telemetry_config, cleanup_older_than_seconds=MIN_CLEANUP_HORIZON_SECONDS
-    )
+    safe: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config, cleanup_older_than_seconds=6 * 3600)
     assert cleanup_dataset(dataset_uri, safe, telemetry) >= 0

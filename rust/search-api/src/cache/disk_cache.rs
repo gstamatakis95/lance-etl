@@ -89,6 +89,15 @@ impl DiskIndexCacheBackend {
     }
 
     /// Records a prefix → directory mapping, persisting the sidecar when the prefix is new.
+    ///
+    /// The write lock is held only for the in-memory map update, then dropped before the
+    /// synchronous filesystem write. Holding the lock across `std::fs::write` would block every
+    /// concurrent `insert` call (which calls this on the tokio reactor thread) for the entire
+    /// disk-flush duration — exactly the mass-cold-open scenario where many inserts fire at once.
+    /// The sidecar is a rebuildable hint: a lost write between the lock drop and the file write
+    /// means `invalidate_prefix` may miss some directories on the next process start, but the
+    /// janitor sweep reconciles the map from the actual directory listing, so eventual consistency
+    /// is acceptable.
     fn register_prefix(&self, prefix: &str, dir_name: &str) {
         {
             let map = self
@@ -107,7 +116,8 @@ impl DiskIndexCacheBackend {
             map.insert(prefix.to_string(), dir_name.to_string());
             map.clone()
         };
-        persist_prefixes(&self.root.join(PREFIXES_FILE), &snapshot);
+        let path = self.root.join(PREFIXES_FILE);
+        tokio::task::spawn_blocking(move || persist_prefixes(&path, &snapshot));
     }
 
     /// Deletes one disk entry after a read or decode failure, adjusting accounting.

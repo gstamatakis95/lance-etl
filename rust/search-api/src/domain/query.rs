@@ -74,8 +74,11 @@ pub struct VectorQuery {
     pub refine_factor: Option<u32>,
     /// HNSW ef-search parameter.
     pub ef: Option<usize>,
-    /// Search only indexed data (weak consistency, lower latency).
-    pub fast_search: bool,
+    /// Search only indexed data, skipping fragments added after the last index build (weak
+    /// consistency, lower latency). `Some(true)` forces fast search on; `Some(false)` forces it
+    /// off (needed for read-after-write freshness guarantees); `None` lets the server apply its
+    /// configured default, gated on whether the dataset has a vector index for the queried column.
+    pub fast_search: Option<bool>,
     /// Skip the vector index and do a flat (exact) scan.
     pub bypass_vector_index: bool,
     /// Optional typed predicate applied to the search.
@@ -227,6 +230,13 @@ pub struct TextQuery {
     pub with_row_id: bool,
     /// Number of leading hits to skip.
     pub offset: Option<usize>,
+    /// Search only indexed (INVERTED) data, skipping fragments appended after the last FTS index
+    /// build. `Some(true)` forces fast search on; `Some(false)` forces it off; `None` lets the
+    /// server apply its configured default, gated on whether the dataset has an FTS index for the
+    /// queried column. Fragments appended after the last index build are silently excluded when
+    /// `true` — callers that need read-after-write freshness must set `Some(false)` or leave it
+    /// `None` on datasets where the server default is off.
+    pub fast_search: Option<bool>,
 }
 
 impl TextQuery {
@@ -243,6 +253,7 @@ impl TextQuery {
             projection: Vec::new(),
             with_row_id: false,
             offset: None,
+            fast_search: None,
         }
     }
 

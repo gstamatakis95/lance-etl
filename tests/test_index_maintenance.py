@@ -65,7 +65,7 @@ def maintenance_config(**overrides: object) -> IndexJobConfig:
     """
     base: dict[str, object] = {
         "telemetry": TelemetryConfig(),
-        "vector_column": "vector",
+        "vector_columns": ["vector"],
         "num_partitions": 4,
         "vector_min_rows": 1,
         "scalar_columns": ["id"],

@@ -1,6 +1,6 @@
 # 0020. Pivot named vectors and texts out of maps into concrete indexable columns
 
-Status: Accepted
+Status: Superseded by [0024](0024-dynamic-map-pivot.md)
 
 ## Context
 

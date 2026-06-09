@@ -156,6 +156,7 @@ pub fn text_query_from_proto(
         projection: query.projection,
         with_row_id: query.with_row_id,
         offset: query.offset.map(|n| n as usize),
+        fast_search: query.fast_search,
     })
 }
 

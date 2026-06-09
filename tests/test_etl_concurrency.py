@@ -15,7 +15,7 @@ import lance
 import pyarrow as pa
 import pytest
 
-from lance_etl.etl import ETLConfig, apply_merge, build_delete_predicate, dataset_uri
+from lance_etl.etl import ETLConfig, apply_merge, dataset_uri
 from lance_etl.maintenance import MaintenanceConfig, compact_small_dataset
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
@@ -59,18 +59,6 @@ def make_group(keys: list[str], op: str = "insert", value: float = 1.0) -> pa.Ta
             "value": pa.array([value] * count, pa.float64()),
         }
     )
-
-
-def test_build_delete_predicate() -> None:
-    """The delete predicate renders a quoted SQL IN list."""
-    predicate: str = build_delete_predicate("vector_id", pa.array(["a", "b"]))
-    assert predicate == "vector_id IN ('a', 'b')"
-
-
-def test_build_delete_predicate_escapes_single_quotes() -> None:
-    """Embedded single quotes are doubled so the SQL IN list stays well-formed."""
-    predicate: str = build_delete_predicate("vector_id", pa.array(["a'b", "o''neil"]))
-    assert predicate == "vector_id IN ('a''b', 'o''''neil')"
 
 
 def test_apply_merge_bootstrap_and_counts(etl_config: ETLConfig, telemetry: Telemetry) -> None:

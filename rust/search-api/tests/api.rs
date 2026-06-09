@@ -161,6 +161,15 @@ async fn serve_full(
         serve_tag: search_api::config::DEFAULT_SERVE_TAG.to_string(),
         serve_tag_ttl_secs: search_api::config::DEFAULT_SERVE_TAG_TTL_SECS,
         event_timestamp_column: search_api::config::DEFAULT_EVENT_TIMESTAMP_COLUMN.to_string(),
+        default_minimum_nprobes: search_api::config::DEFAULT_MINIMUM_NPROBES,
+        default_maximum_nprobes: search_api::config::DEFAULT_MAXIMUM_NPROBES,
+        nprobes_ceiling: search_api::config::DEFAULT_NPROBES_CEILING,
+        default_refine_factor: search_api::config::DEFAULT_REFINE_FACTOR,
+        fast_search_default: search_api::config::DEFAULT_FAST_SEARCH,
+        request_timeout_ms: search_api::config::DEFAULT_REQUEST_TIMEOUT_MS,
+        max_concurrent_streams: search_api::config::DEFAULT_MAX_CONCURRENT_STREAMS,
+        concurrency_limit_per_connection: search_api::config::DEFAULT_CONCURRENCY_LIMIT_PER_CONNECTION,
+        prewarm_targets_path: None,
     };
     let provider = CachingDatasetProvider::with_telemetry(&config, metrics.clone());
     let backend = Arc::new(LanceSearchBackend::new(provider).with_metrics(metrics.clone()));

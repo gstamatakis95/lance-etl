@@ -8,6 +8,7 @@ use arrow_schema::DataType;
 use lance::Dataset;
 use lance::dataset::scanner::{ExecutionStatsCallback, ExecutionSummaryCounts, Scanner};
 use lance::deps::datafusion::logical_expr::Expr;
+use lance::index::DatasetIndexExt;
 use lance_core::ROW_ID;
 use lance_linalg::distance::DistanceType;
 use serde_json::{Map, Value};
@@ -79,6 +80,51 @@ impl ScanIoStats {
 /// object-store stat-capture path runs without inspecting exported spans.
 pub type ScanStatsHook = Arc<dyn Fn(&ScanIoStats) + Send + Sync>;
 
+/// Server-side ANN defaults applied when the corresponding request field is unset.
+///
+/// Kept in a small struct so they can be passed as one argument to [`run_vector_query`] without
+/// extending that function's parameter list every time a new knob is added.
+#[derive(Debug, Clone, Copy)]
+pub struct AnnDefaults {
+    /// Minimum IVF partitions probed when the request leaves probe knobs unset.
+    pub minimum_nprobes: usize,
+    /// Maximum IVF partitions probed when the request leaves probe knobs unset. Also the ceiling
+    /// clamped onto any client-supplied maximum. Never `None` at dispatch time so a prefilter
+    /// whale query cannot traverse every partition.
+    pub maximum_nprobes: usize,
+    /// Hard ceiling on any client-supplied nprobes / minimum_nprobes / maximum_nprobes.
+    pub nprobes_ceiling: usize,
+    /// Refine factor applied when the request leaves `refine_factor` unset. 0 disables it.
+    pub default_refine_factor: u32,
+    /// Whether to apply `fast_search` when the dataset has an index for the queried column.
+    pub fast_search_default: bool,
+}
+
+impl AnnDefaults {
+    /// Populates defaults from the service config.
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            minimum_nprobes: config.default_minimum_nprobes,
+            maximum_nprobes: config.default_maximum_nprobes,
+            nprobes_ceiling: config.nprobes_ceiling,
+            default_refine_factor: config.default_refine_factor,
+            fast_search_default: config.fast_search_default,
+        }
+    }
+}
+
+impl Default for AnnDefaults {
+    fn default() -> Self {
+        Self {
+            minimum_nprobes: crate::config::DEFAULT_MINIMUM_NPROBES,
+            maximum_nprobes: crate::config::DEFAULT_MAXIMUM_NPROBES,
+            nprobes_ceiling: crate::config::DEFAULT_NPROBES_CEILING,
+            default_refine_factor: crate::config::DEFAULT_REFINE_FACTOR,
+            fast_search_default: crate::config::DEFAULT_FAST_SEARCH,
+        }
+    }
+}
+
 /// Search backend executing queries with Lance scanners over datasets from a [`DatasetProvider`].
 pub struct LanceSearchBackend<P: DatasetProvider> {
     pub(crate) provider: P,
@@ -86,11 +132,12 @@ pub struct LanceSearchBackend<P: DatasetProvider> {
     pub(crate) metrics: Arc<crate::telemetry::Metrics>,
     pub(crate) event_timestamp_column: String,
     pub(crate) scan_stats_hook: Option<ScanStatsHook>,
+    pub(crate) ann_defaults: AnnDefaults,
 }
 
 impl<P: DatasetProvider> LanceSearchBackend<P> {
     /// Creates a backend over the given dataset provider with the default prewarm concurrency, the
-    /// default event-timestamp column, and telemetry disabled.
+    /// default event-timestamp column, telemetry disabled, and default ANN server-side knobs.
     pub fn new(provider: P) -> Self {
         Self {
             provider,
@@ -98,6 +145,7 @@ impl<P: DatasetProvider> LanceSearchBackend<P> {
             metrics: Arc::new(crate::telemetry::Metrics::disabled()),
             event_timestamp_column: crate::config::DEFAULT_EVENT_TIMESTAMP_COLUMN.to_string(),
             scan_stats_hook: None,
+            ann_defaults: AnnDefaults::default(),
         }
     }
 
@@ -125,14 +173,21 @@ impl<P: DatasetProvider> LanceSearchBackend<P> {
         self
     }
 
-    /// Bundles the per-query execution context (metrics facade, RPC tag, event-timestamp column,
-    /// and scan-stats hook) borrowed for one search leg.
+    /// Applies server-side ANN defaults (probe counts, refine factor, fast-search gate).
+    pub fn with_ann_defaults(mut self, defaults: AnnDefaults) -> Self {
+        self.ann_defaults = defaults;
+        self
+    }
+
+    /// Bundles the per-query execution context (metrics, RPC tag, event-timestamp column,
+    /// scan-stats hook, and ANN defaults) borrowed for one search leg.
     fn context(&self, rpc: Rpc) -> QueryContext<'_> {
         QueryContext {
             metrics: &self.metrics,
             rpc,
             event_timestamp_column: &self.event_timestamp_column,
             scan_stats_hook: self.scan_stats_hook.as_ref(),
+            ann_defaults: self.ann_defaults,
         }
     }
 }
@@ -147,6 +202,8 @@ struct QueryContext<'a> {
     event_timestamp_column: &'a str,
     /// Optional observer of the captured scan IO stats (test seam).
     scan_stats_hook: Option<&'a ScanStatsHook>,
+    /// Server-side ANN defaults: probe counts, refine factor, and fast-search gate.
+    ann_defaults: AnnDefaults,
 }
 
 impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
@@ -362,7 +419,90 @@ fn execution_stats_callback(
     })
 }
 
+/// Returns true when the dataset has at least one committed vector index on `column`.
+///
+/// Used to gate the `fast_search` default for the vector leg: `fast_search = true` on a dataset
+/// with no vector index causes Lance to return an empty result immediately (scanner.rs
+/// ~3804-3807), so the default must be skipped for the unindexed small-org tier. This check is
+/// O(#indices) against the in-memory manifest and does not perform any IO.
+async fn dataset_has_vector_index(dataset: &Dataset, column: &str) -> bool {
+    let Ok(metas) = dataset.load_indices().await else {
+        return false;
+    };
+    use crate::lance::prewarm::VECTOR_DETAILS_SUFFIX;
+    metas.iter().any(|meta| {
+        let is_vector = meta
+            .index_details
+            .as_ref()
+            .is_some_and(|details| details.type_url.ends_with(VECTOR_DETAILS_SUFFIX));
+        if !is_vector {
+            return false;
+        }
+        let field_id = match meta.fields.first() {
+            Some(id) => *id,
+            None => return false,
+        };
+        dataset
+            .schema()
+            .field_path(field_id)
+            .map(|path| path == column)
+            .unwrap_or(false)
+    })
+}
+
+/// Returns true when the dataset has at least one committed FTS (INVERTED) index covering
+/// `column`.
+///
+/// Used to gate the `fast_search` default for the text leg: `fast_search = true` on a dataset
+/// with no FTS index causes Lance to return an empty result immediately (scanner.rs ~3527), so the
+/// default must not fire for the unindexed small-org tier. Without this guard, fresh fragments
+/// appended between nightly index runs would be silently excluded even when no index exists. This
+/// check is O(#indices) against the in-memory manifest and does not perform any IO.
+async fn dataset_has_fts_index(dataset: &Dataset, columns: &[String]) -> bool {
+    let Ok(metas) = dataset.load_indices().await else {
+        return false;
+    };
+    use crate::lance::prewarm::INVERTED_DETAILS_SUFFIX;
+    metas.iter().any(|meta| {
+        let is_fts = meta
+            .index_details
+            .as_ref()
+            .is_some_and(|details| details.type_url.ends_with(INVERTED_DETAILS_SUFFIX));
+        if !is_fts {
+            return false;
+        }
+        if columns.is_empty() {
+            return true;
+        }
+        meta.fields.iter().any(|field_id| {
+            dataset
+                .schema()
+                .field_path(*field_id)
+                .map(|path| columns.iter().any(|col| col.as_str() == path))
+                .unwrap_or(false)
+        })
+    })
+}
+
 /// Runs one nearest-neighbor query against an open dataset.
+///
+/// Server-side ANN defaults from [`QueryContext::ann_defaults`] are applied when the request
+/// leaves the corresponding knobs unset:
+///
+/// - `minimum_nprobes`: floored to `ann_defaults.minimum_nprobes` (default 8) so whale datasets
+///   with 4096+ IVF partitions probe enough partitions for useful recall even with no client
+///   tuning.
+/// - `maximum_nprobes`: always set to at most `ann_defaults.nprobes_ceiling` (default 64) so a
+///   selective prefilter can never drive Lance to probe every partition. When the request supplies
+///   `nprobes` (a single fixed value) the ceiling is also clamped there.
+/// - `refine_factor`: set to `ann_defaults.default_refine_factor` (default 2) when the request
+///   leaves it unset, recovering recall lost to 1-bit RaBitQ quantisation.
+/// - `fast_search`: the effective value resolves as
+///   `query.fast_search.unwrap_or(default && has_vector_index)`. An explicit client value —
+///   including `false` for read-after-write freshness — always wins. When the request leaves it
+///   unset, the server default is applied only when the dataset has a vector index for the queried
+///   column, keeping unindexed datasets unaffected (where `fast_search = true` would produce empty
+///   results, scanner.rs ~3804-3807).
 #[tracing::instrument(name = "lance.vector_query", skip_all, fields(search.k = query.k))]
 async fn run_vector_query(
     dataset: &Dataset,
@@ -379,6 +519,8 @@ async fn run_vector_query(
     };
     let key = Float32Array::from(query.vector.clone());
     let fetch = query.k + query.offset.unwrap_or(0);
+    let d = &context.ann_defaults;
+    let ceiling = d.nprobes_ceiling;
     let mut scanner = dataset.scan();
     scanner.scan_stats_callback(execution_stats_callback(
         context.metrics.clone(),
@@ -393,22 +535,33 @@ async fn run_vector_query(
         scanner.distance_metric(distance_to_lance(distance));
     }
     if let Some(nprobes) = query.nprobes {
-        scanner.nprobes(nprobes);
+        let clamped = nprobes.min(ceiling);
+        scanner.nprobes(clamped);
+        scanner.maximum_nprobes(clamped);
     } else {
-        if let Some(minimum) = query.minimum_nprobes {
-            scanner.minimum_nprobes(minimum);
-        }
-        if let Some(maximum) = query.maximum_nprobes {
-            scanner.maximum_nprobes(maximum);
-        }
+        let min = query.minimum_nprobes.unwrap_or(d.minimum_nprobes).min(ceiling);
+        let max = query.maximum_nprobes.unwrap_or(d.maximum_nprobes).min(ceiling);
+        scanner.minimum_nprobes(min);
+        scanner.maximum_nprobes(max.max(min));
     }
-    if let Some(refine_factor) = query.refine_factor {
+    let effective_refine = query.refine_factor.or({
+        if d.default_refine_factor > 0 {
+            Some(d.default_refine_factor)
+        } else {
+            None
+        }
+    });
+    if let Some(refine_factor) = effective_refine {
         scanner.refine(refine_factor);
     }
     if let Some(ef) = query.ef {
         scanner.ef(ef);
     }
-    if query.fast_search {
+    let apply_fast_search = match query.fast_search {
+        Some(value) => value,
+        None => d.fast_search_default && dataset_has_vector_index(dataset, &column_name).await,
+    };
+    if apply_fast_search {
         scanner.fast_search();
     }
     if query.bypass_vector_index {
@@ -444,6 +597,15 @@ async fn run_vector_query(
 }
 
 /// Runs one full-text query against an open dataset.
+///
+/// When the dataset is under continuous ingest, each new fragment appended after the last FTS
+/// index build adds a flat-scan cost proportional to the fragment size. The effective
+/// `fast_search` value resolves as
+/// `query.fast_search.unwrap_or(default && has_fts_index)`. An explicit client value — including
+/// `false` for read-after-write freshness — always wins. When the request leaves it unset the
+/// server default is applied only when the dataset has an FTS index covering the queried columns,
+/// keeping unindexed datasets unaffected (where `fast_search = true` would produce empty results,
+/// scanner.rs ~3527).
 #[tracing::instrument(name = "lance.text_query", skip_all, fields(search.k = query.k))]
 async fn run_text_query(
     dataset: &Dataset,
@@ -463,6 +625,14 @@ async fn run_text_query(
     scanner
         .full_text_search(fts)
         .map_err(|err| classify_lance_error(&err))?;
+    let d = &context.ann_defaults;
+    let apply_fast_search = match query.fast_search {
+        Some(value) => value,
+        None => d.fast_search_default && dataset_has_fts_index(dataset, &query.columns).await,
+    };
+    if apply_fast_search {
+        scanner.fast_search();
+    }
     let needs_row_id = query.with_row_id || context.rpc == Rpc::HybridSearch;
     if needs_row_id {
         scanner.with_row_id();

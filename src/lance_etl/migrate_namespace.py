@@ -20,8 +20,7 @@ driver shards the source fragment ids, executors read their shard and write new 
 driver commits all fragments in one transaction. The driver only plans, lists, and commits. All heavy read and write
 I/O runs in executors. Every commit goes through :func:`lance_etl.telemetry.commit_with_retries`.
 
-Every path component, including the source and target namespace names, is validated against the same allowlist the ETL
-uses (:data:`lance_etl.etl.PATH_COMPONENT_PATTERN`) so a namespace name can never inject a traversal or collide a route.
+The source and target namespace names are validated to be non-empty strings before any work runs.
 
 Requires pylance and the Datadog Agent on the executors.
 """
@@ -30,7 +29,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
@@ -41,15 +39,40 @@ from lance.fragment import FragmentMetadata, write_fragments
 from pyspark.sql import SparkSession
 
 from lance_etl.cloud_storage import discover_datasets
-from lance_etl.etl import DEFAULT_PARTITION_COLS, PATH_COMPONENT_PATTERN
+from lance_etl.etl import ROUTING_COLS
 from lance_etl.indexing import IndexJobConfig, LanceIndexer, split_evenly
-from lance_etl.maintenance import MaintenanceConfig, MaintenanceJob, fan_out_per_dataset, uri_components
+from lance_etl.maintenance import MaintenanceConfig, MaintenanceJob, fan_out_per_dataset
 from lance_etl.telemetry import DEFAULT_COMMIT_RETRIES, Telemetry, TelemetryConfig, commit_with_retries
 
 logger: logging.Logger = logging.getLogger(__name__)
 
 LANCE_SUFFIX: str = ".lance"
 """Suffix that marks a dataset directory in a discovered path component."""
+
+
+def uri_components(base_uri: str, uri: str) -> list[str]:
+    """Split a dataset URI into its routing-value path components relative to a base URI.
+
+    Strips the base URI prefix and the trailing ``.lance`` suffix, then splits on ``/`` to yield one
+    value per routing column in path order.
+
+    Args:
+        base_uri: Root location the dataset lives under.
+        uri: Full dataset URI ending in ``.lance``.
+
+    Returns:
+        Routing values in path order with the ``.lance`` suffix removed from the last.
+
+    Raises:
+        ValueError: If the URI is not rooted at ``base_uri`` or does not end in ``.lance``.
+    """
+    root: str = base_uri.rstrip("/")
+    if not uri.startswith(f"{root}/") or not uri.endswith(LANCE_SUFFIX):
+        raise ValueError(f"dataset URI {uri!r} is not a .lance dataset rooted at {base_uri!r}")
+    relative: str = uri[len(root) + 1 :]
+    parts: list[str] = relative.split("/")
+    parts[-1] = parts[-1].removesuffix(LANCE_SUFFIX)
+    return parts
 
 
 @dataclass
@@ -94,7 +117,7 @@ class MigrateConfig:
     target_namespace: str
     base_uri: str
     telemetry: TelemetryConfig
-    partition_cols: list[str] = field(default_factory=lambda: list(DEFAULT_PARTITION_COLS))
+    partition_cols: list[str] = field(default_factory=lambda: list(ROUTING_COLS))
     namespace_col: str = "namespace"
     storage_options: dict[str, Any] | None = None
     recompact: bool = True
@@ -161,7 +184,7 @@ def validate_config(config: MigrateConfig) -> None:
         config: The configuration to validate.
 
     Raises:
-        ValueError: If the namespaces are equal, fail validation, are missing from the partition columns, or the
+        ValueError: If the namespaces are equal or empty, are missing from the partition columns, or the
             partition list is empty or carries duplicates.
     """
     if not config.partition_cols:
@@ -173,10 +196,9 @@ def validate_config(config: MigrateConfig) -> None:
         raise ValueError(f"namespace_col {config.namespace_col!r} is not in partition_cols {config.partition_cols}")
     if config.source_namespace == config.target_namespace:
         raise ValueError("source_namespace and target_namespace must differ; a copy cannot clobber its own source")
-    pattern: re.Pattern[str] = re.compile(PATH_COMPONENT_PATTERN)
     for label, value in (("source_namespace", config.source_namespace), ("target_namespace", config.target_namespace)):
-        if not pattern.match(value):
-            raise ValueError(f"invalid {label}: {value!r}")
+        if not value:
+            raise ValueError(f"{label} must be a non-empty string, got {value!r}")
 
 
 def build_dataset_uri(base_uri: str, components: list[str]) -> str:
@@ -184,17 +206,16 @@ def build_dataset_uri(base_uri: str, components: list[str]) -> str:
 
     Args:
         base_uri: The root location the dataset lives under.
-        components: The routing values in path order.
+        components: The routing values in path order. Each must be a non-empty string.
 
     Returns:
         The dataset URI ``base_uri/<val1>/.../<valN>.lance`` confined to the routing-key prefix.
 
     Raises:
-        ValueError: If any component fails the path-component allowlist, which prevents traversal and route collisions.
+        ValueError: If any component is not a non-empty string.
     """
-    pattern: re.Pattern[str] = re.compile(PATH_COMPONENT_PATTERN)
     for component in components:
-        if not pattern.match(component):
+        if not component:
             raise ValueError(f"invalid routing component: {component!r}")
     base: str = base_uri.rstrip("/")
     return f"{base}/{'/'.join(components)}{LANCE_SUFFIX}"

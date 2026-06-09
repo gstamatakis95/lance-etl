@@ -83,6 +83,91 @@ pub const DEFAULT_RECALL_SAMPLE_RATE: f64 = 0.0;
 /// not independent request opens.
 pub const DEFAULT_IO_CONCURRENCY: usize = 256;
 
+/// Default minimum number of IVF partitions probed per vector query.
+///
+/// Lance's own default is 1, which means a whale dataset with 4096+ IVF partitions probes a
+/// single partition — correct for filter-heavy prefilter queries but disastrous for recall on
+/// unfiltered or lightly filtered queries. Raising this to 8 gives a practical recall floor for
+/// IVF_RQ datasets with up to ~512 partitions without meaningfully affecting flat-KNN latency on
+/// the small-org tail (those datasets have no index and ignore this knob entirely).
+pub const DEFAULT_MINIMUM_NPROBES: usize = 8;
+
+/// Default maximum number of IVF partitions probed per vector query.
+///
+/// When a prefilter is highly selective, Lance will probe as many partitions as needed to satisfy
+/// the filter — up to ALL partitions if the filter passes very few rows (scanner.rs ~1664-1674).
+/// Setting a finite ceiling prevents a single whale query under a rare org-specific filter from
+/// traversing the entire index, which would destroy p99 for every concurrent tenant. 32 gives
+/// roughly 4x coverage over [`DEFAULT_MINIMUM_NPROBES`] and keeps worst-case probe latency well
+/// under the 500 ms p99 target on 1B-row IVF_RQ datasets.
+pub const DEFAULT_MAXIMUM_NPROBES: usize = 32;
+
+/// Hard ceiling applied to any client-supplied nprobes / minimum_nprobes / maximum_nprobes.
+///
+/// Clients that self-tune their probe count can drift high during load testing and survive into
+/// production configs. The ceiling guarantees that even an operator mistake or a misconfigured
+/// client cannot submit a whale query that linearly scans every IVF partition. 64 is 2× the
+/// [`DEFAULT_MAXIMUM_NPROBES`] and still fast enough (<200 ms) on a 1B-row IVF_RQ dataset over
+/// S3 with warm caches.
+pub const DEFAULT_NPROBES_CEILING: usize = 64;
+
+/// Default refine factor: re-rank this many candidates per requested k with exact distances.
+///
+/// With 1-bit RaBitQ encoding (IVF_RQ 1-bit), the compressed distances used during partition
+/// scan are coarse approximations. Fetching 2 × k candidates and re-ranking them with full
+/// float32 vectors via `refine_factor = 2` recovers the recall lost to quantisation at modest
+/// extra IO. Setting this to 0 in the env disables the default (the query then uses whatever
+/// Lance chooses — currently `None`, which means no refinement).
+pub const DEFAULT_REFINE_FACTOR: u32 = 2;
+
+/// Default for whether the service applies `fast_search` when an index exists for the queried
+/// column.
+///
+/// `fast_search = true` tells Lance to query only indexed fragments and skip fragments added after
+/// the last index build, trading freshness for bounded latency. The unindexed tail is served stale
+/// until the next nightly index run. On datasets with NO index at all (the small-org unindexed
+/// tier), `fast_search` causes Lance to return an empty result immediately (scanner.rs:3804-3807
+/// for vector, scanner.rs:~3527 for FTS), so this flag is guarded: it is only applied when the
+/// dataset has at least one matching index for the queried column or columns. An explicit
+/// per-request `fast_search` value — including `false` for read-after-write freshness — always
+/// wins over this server default for both the vector and text legs.
+pub const DEFAULT_FAST_SEARCH: bool = true;
+
+/// Default request timeout in milliseconds applied to every incoming gRPC call.
+///
+/// 800 ms is chosen to be comfortably below the 1 s client-side deadline most callers use while
+/// leaving 200 ms headroom for serialization and network overhead. Slow cold-opens or high-nprobes
+/// whale queries that exceed this budget are cancelled rather than allowed to pile up and exhaust
+/// the runtime's available concurrency. Env: `SEARCH_API_REQUEST_TIMEOUT_MS`.
+pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 800;
+
+/// Default maximum concurrent streams (and connections) the gRPC server admits.
+///
+/// Caps the number of in-flight requests per connection at the tonic transport layer, protecting
+/// the tokio runtime against queue saturation when a slow whale query stalls the executor pool.
+/// 256 matches the per-process IO concurrency budget, which ensures the runtime is never asked to
+/// do more in-flight work than it has IO threads to service. Env: `SEARCH_API_MAX_CONCURRENT_STREAMS`.
+pub const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 256;
+
+/// Default concurrency limit per gRPC connection.
+///
+/// Applied via tonic's `concurrency_limit_per_connection` builder. Works with
+/// `http2_max_concurrent_streams` at the H2 frame level to provide back-pressure at the service
+/// layer: once this many requests are in flight on a single connection, new ones are queued at
+/// the tower layer rather than spawned immediately.
+pub const DEFAULT_CONCURRENCY_LIMIT_PER_CONNECTION: usize = 256;
+
+/// Path to the startup prewarm targets file (empty = disabled).
+///
+/// When set, the service reads this file on startup and prewarms each listed dataset in a
+/// background task before it would otherwise be opened cold by a live request. This eliminates
+/// the cold-open penalty for designated whale datasets on every rolling deploy. The file format
+/// is one target per line: `{org_id}/{tenant_id}/{namespace}` using the same path segments the
+/// service resolves to `{base_uri}/{org_id}/{tenant_id}/{namespace}.lance`. Blank lines and lines
+/// with invalid segments are skipped with a warning. Errors per target are logged but never fatal.
+/// Env: `SEARCH_API_PREWARM_TARGETS_PATH`.
+pub const DEFAULT_PREWARM_TARGETS_PATH: &str = "";
+
 /// Fixed minimum object-store request size in bytes (IO buffer / block size) — 256 KiB.
 ///
 /// Passed as `ObjectStoreParams::block_size` when opening every dataset.  Larger values
@@ -125,7 +210,19 @@ pub struct Config {
     /// flat count). Handles are weighed by clamped open fragment count, so many cheap tiny handles
     /// coexist while a few heavy whale handles are bounded. Env: `SEARCH_API_DATASET_CACHE_CAPACITY`.
     pub dataset_cache_capacity: u64,
-    /// Byte budget for the in-memory tier of the shared session index cache.
+    /// Byte budget for the Lance index cache.
+    ///
+    /// Dual role depending on whether disk caching is enabled:
+    /// - Disk caching ON: sizes the in-memory hot tier of the two-tier disk cache backend
+    ///   (`DiskIndexCacheBackend`). The on-disk tier is bounded separately by
+    ///   `disk_index_cache_bytes`. Hot entries evict from Moka under this budget while their
+    ///   serialised copies persist on disk.
+    /// - Disk caching OFF: sizes the Lance session's in-process Moka index cache directly
+    ///   (the only index cache tier).
+    ///
+    /// In both cases this budget covers IVF centroid pages, RaBitQ codebook pages, and HNSW
+    /// graph pages — the data structures that dominate search latency on cold opens.
+    /// Env: `SEARCH_API_INDEX_CACHE_BYTES`.
     pub index_cache_bytes: usize,
     /// Byte budget for the shared session metadata cache.
     pub metadata_cache_bytes: usize,
@@ -176,6 +273,68 @@ pub struct Config {
     /// steady-state per-request cost at zero extra manifest reads. Env:
     /// `SEARCH_API_SERVE_TAG_TTL_SECS`.
     pub serve_tag_ttl_secs: u64,
+    /// Minimum number of IVF partitions probed when the request does not specify `nprobes` (default 8).
+    ///
+    /// Lance's own default is 1, which delivers broken recall on whale datasets with many
+    /// partitions. This floor ensures every untuned request probes at least enough partitions for
+    /// useful recall. Env: `SEARCH_API_DEFAULT_MINIMUM_NPROBES`.
+    pub default_minimum_nprobes: usize,
+    /// Maximum number of IVF partitions probed when the request does not specify `maximum_nprobes`
+    /// (default 32). Also applied as a ceiling on any client-supplied `maximum_nprobes` when it
+    /// exceeds `nprobes_ceiling`. When a prefilter is selective, Lance would otherwise probe every
+    /// partition — see `scanner.rs` ~1664-1674 — which is unbounded latency on whale datasets.
+    /// Env: `SEARCH_API_DEFAULT_MAXIMUM_NPROBES`.
+    pub default_maximum_nprobes: usize,
+    /// Hard ceiling applied to any client-supplied nprobes / minimum_nprobes / maximum_nprobes
+    /// (default 64). Prevents a misconfigured client or operator from submitting a whale query
+    /// that linearly scans every IVF partition, destroying p99 for all concurrent tenants.
+    /// Env: `SEARCH_API_NPROBES_CEILING`.
+    pub nprobes_ceiling: usize,
+    /// Refine factor applied when the request leaves `refine_factor` unset (default 2).
+    ///
+    /// With 1-bit RaBitQ quantisation, compressed distances are coarse. Fetching `k * refine_factor`
+    /// candidates and re-ranking with exact float32 vectors recovers quantisation loss at modest
+    /// extra IO. Set to 0 to disable the default and let Lance choose (no refinement). Requests that
+    /// explicitly set `refine_factor` always win. Env: `SEARCH_API_DEFAULT_REFINE_FACTOR`.
+    pub default_refine_factor: u32,
+    /// Whether the service applies `fast_search` by default when the dataset has a matching index
+    /// for the queried column (default true).
+    ///
+    /// When on, indexed fragments are returned immediately and fragments added after the last index
+    /// build are skipped until the next index run (index-only freshness). The default is guarded:
+    /// it fires only when the dataset has a vector index (for the vector leg) or an FTS index (for
+    /// the text leg) covering the queried column — so unindexed datasets on the small-org tier are
+    /// unaffected and flat scans work normally. An explicit per-request `fast_search` value —
+    /// including `false` for read-after-write freshness — always wins over this default.
+    /// Env: `SEARCH_API_FAST_SEARCH_DEFAULT`.
+    pub fast_search_default: bool,
+    /// Wall-clock timeout in milliseconds applied to every incoming gRPC call (default 800).
+    ///
+    /// Requests that exceed this budget are cancelled with DEADLINE_EXCEEDED, freeing executor
+    /// capacity for the next request. Sized below a typical 1 s client-side deadline to ensure
+    /// the server cancels before the client times out, avoiding orphan work. Set to 0 to disable
+    /// the server-side timeout entirely. Env: `SEARCH_API_REQUEST_TIMEOUT_MS`.
+    pub request_timeout_ms: u64,
+    /// Maximum number of concurrent HTTP/2 streams admitted per connection (default 256).
+    ///
+    /// Sent to clients in the HTTP/2 SETTINGS frame. Combined with
+    /// `concurrency_limit_per_connection`, this provides two layers of back-pressure at the tonic
+    /// transport and tower service layers. Env: `SEARCH_API_MAX_CONCURRENT_STREAMS`.
+    pub max_concurrent_streams: u32,
+    /// Maximum number of in-flight requests the tower layer admits per connection (default 256).
+    ///
+    /// Requests that exceed this limit are queued at the tower layer rather than immediately
+    /// spawned onto the runtime, protecting the executor thread pool from oversubscription during
+    /// burst traffic. Env: `SEARCH_API_CONCURRENCY_LIMIT_PER_CONNECTION`.
+    pub concurrency_limit_per_connection: usize,
+    /// Path to the startup prewarm targets file (empty = disabled).
+    ///
+    /// File format: one target per line as `{org_id}/{tenant_id}/{namespace}`. The service reads
+    /// this file on startup and prewarms each dataset in a background task, eliminating cold-open
+    /// latency for designated whale datasets on rolling deploys. Blank lines and malformed segments
+    /// are skipped with a warning. Per-target errors are logged but never fatal to startup.
+    /// Env: `SEARCH_API_PREWARM_TARGETS_PATH`.
+    pub prewarm_targets_path: Option<std::path::PathBuf>,
 }
 
 impl Config {
@@ -191,8 +350,17 @@ impl Config {
     /// `SEARCH_API_RECALL_SAMPLE_RATE` (must lie in `[0, 1]`),
     /// `SEARCH_API_IO_CONCURRENCY` (default 256),
     /// `SEARCH_API_SERVE_BY_TAG` (default false), `SEARCH_API_SERVE_TAG` (default `HEAD`),
-    /// `SEARCH_API_SERVE_TAG_TTL_SECS` (default 10), and `SEARCH_API_EVENT_TIMESTAMP_COLUMN`
-    /// (default `event_timestamp`).
+    /// `SEARCH_API_SERVE_TAG_TTL_SECS` (default 10),
+    /// `SEARCH_API_EVENT_TIMESTAMP_COLUMN` (default `event_timestamp`),
+    /// `SEARCH_API_DEFAULT_MINIMUM_NPROBES` (default 8),
+    /// `SEARCH_API_DEFAULT_MAXIMUM_NPROBES` (default 32),
+    /// `SEARCH_API_NPROBES_CEILING` (default 64),
+    /// `SEARCH_API_DEFAULT_REFINE_FACTOR` (default 2, set 0 to disable),
+    /// `SEARCH_API_FAST_SEARCH_DEFAULT` (default true),
+    /// `SEARCH_API_REQUEST_TIMEOUT_MS` (default 800, set 0 to disable),
+    /// `SEARCH_API_MAX_CONCURRENT_STREAMS` (default 256),
+    /// `SEARCH_API_CONCURRENCY_LIMIT_PER_CONNECTION` (default 256), and
+    /// `SEARCH_API_PREWARM_TARGETS_PATH` (default empty, disabled).
     ///
     /// The disk cache TTL, byte-cache max range, janitor sweep interval, IO block size,
     /// object-store retry timeout, and the recall id column are fixed constants (see
@@ -224,6 +392,25 @@ impl Config {
             serve_tag: env_string("SEARCH_API_SERVE_TAG", DEFAULT_SERVE_TAG),
             serve_tag_ttl_secs: env_number("SEARCH_API_SERVE_TAG_TTL_SECS", DEFAULT_SERVE_TAG_TTL_SECS)?,
             event_timestamp_column: env_string("SEARCH_API_EVENT_TIMESTAMP_COLUMN", DEFAULT_EVENT_TIMESTAMP_COLUMN),
+            default_minimum_nprobes: env_number("SEARCH_API_DEFAULT_MINIMUM_NPROBES", DEFAULT_MINIMUM_NPROBES)?,
+            default_maximum_nprobes: env_number("SEARCH_API_DEFAULT_MAXIMUM_NPROBES", DEFAULT_MAXIMUM_NPROBES)?,
+            nprobes_ceiling: env_number("SEARCH_API_NPROBES_CEILING", DEFAULT_NPROBES_CEILING)?,
+            default_refine_factor: env_number("SEARCH_API_DEFAULT_REFINE_FACTOR", DEFAULT_REFINE_FACTOR)?,
+            fast_search_default: env_bool("SEARCH_API_FAST_SEARCH_DEFAULT", DEFAULT_FAST_SEARCH)?,
+            request_timeout_ms: env_number("SEARCH_API_REQUEST_TIMEOUT_MS", DEFAULT_REQUEST_TIMEOUT_MS)?,
+            max_concurrent_streams: env_number("SEARCH_API_MAX_CONCURRENT_STREAMS", DEFAULT_MAX_CONCURRENT_STREAMS)?,
+            concurrency_limit_per_connection: env_number(
+                "SEARCH_API_CONCURRENCY_LIMIT_PER_CONNECTION",
+                DEFAULT_CONCURRENCY_LIMIT_PER_CONNECTION,
+            )?,
+            prewarm_targets_path: {
+                let raw = env_string("SEARCH_API_PREWARM_TARGETS_PATH", DEFAULT_PREWARM_TARGETS_PATH);
+                if raw.is_empty() {
+                    None
+                } else {
+                    Some(std::path::PathBuf::from(raw))
+                }
+            },
         })
     }
 }
@@ -305,7 +492,7 @@ mod tests {
     }
 
     /// Env var names cleared so defaults apply in tests.
-    const OPTIONAL_VARS: [&str; 18] = [
+    const OPTIONAL_VARS: [&str; 27] = [
         "SEARCH_API_SERVE_BY_TAG",
         "SEARCH_API_SERVE_TAG",
         "SEARCH_API_SERVE_TAG_TTL_SECS",
@@ -324,6 +511,15 @@ mod tests {
         "SEARCH_API_RECALL_SAMPLE_RATE",
         "SEARCH_API_IO_CONCURRENCY",
         "DD_AGENT_HOST",
+        "SEARCH_API_DEFAULT_MINIMUM_NPROBES",
+        "SEARCH_API_DEFAULT_MAXIMUM_NPROBES",
+        "SEARCH_API_NPROBES_CEILING",
+        "SEARCH_API_DEFAULT_REFINE_FACTOR",
+        "SEARCH_API_FAST_SEARCH_DEFAULT",
+        "SEARCH_API_REQUEST_TIMEOUT_MS",
+        "SEARCH_API_MAX_CONCURRENT_STREAMS",
+        "SEARCH_API_CONCURRENCY_LIMIT_PER_CONNECTION",
+        "SEARCH_API_PREWARM_TARGETS_PATH",
     ];
 
     #[test]
@@ -348,6 +544,18 @@ mod tests {
             assert_eq!(config.serve_tag, "HEAD", "the default serve tag is HEAD");
             assert_eq!(config.serve_tag_ttl_secs, DEFAULT_SERVE_TAG_TTL_SECS);
             assert_eq!(config.event_timestamp_column, DEFAULT_EVENT_TIMESTAMP_COLUMN);
+            assert_eq!(config.default_minimum_nprobes, DEFAULT_MINIMUM_NPROBES);
+            assert_eq!(config.default_maximum_nprobes, DEFAULT_MAXIMUM_NPROBES);
+            assert_eq!(config.nprobes_ceiling, DEFAULT_NPROBES_CEILING);
+            assert_eq!(config.default_refine_factor, DEFAULT_REFINE_FACTOR);
+            assert_eq!(config.fast_search_default, DEFAULT_FAST_SEARCH);
+            assert_eq!(config.request_timeout_ms, DEFAULT_REQUEST_TIMEOUT_MS);
+            assert_eq!(config.max_concurrent_streams, DEFAULT_MAX_CONCURRENT_STREAMS);
+            assert_eq!(
+                config.concurrency_limit_per_connection,
+                DEFAULT_CONCURRENCY_LIMIT_PER_CONNECTION
+            );
+            assert!(config.prewarm_targets_path.is_none());
         });
     }
 

@@ -2,26 +2,39 @@
 
 The CLI is deliberately small and opinionated. It exposes only the arguments that are genuinely
 per-deployment: the data and identity contract (which table, which window, where datasets live, which
-Datadog service) and what to build (partition routing, which index types, the distance metric, and the
-FTS base tokenizer and language). Every tuning knob — the schema column names, shuffle partitions, retry
-budgets, commit backoff, compaction fragment sizing, IVF training parameters, the fine-grained FTS
-tokenizer toggles, and two-tier thresholds — is set to a sensible opinionated default in the configuration dataclasses
+Datadog service) and what to build (which index types, the distance metric, and the FTS base tokenizer
+and language). Every tuning knob — shuffle partitions, retry budgets, commit backoff, compaction fragment
+sizing, IVF training parameters, the fine-grained FTS tokenizer toggles (including position storage), and
+two-tier thresholds — is set to a sensible opinionated default in the configuration dataclasses
 (:class:`lance_etl.etl.ETLConfig`, :class:`lance_etl.indexing.IndexJobConfig`,
 :class:`lance_etl.maintenance.MaintenanceConfig`). Those fields stay tunable in code, just not from the
 command line.
 
 Provides the following subcommands. ``etl`` reads a time range from an Iceberg table and routes the
-changes into per-tenant Lance datasets. Backfills are catch-up replays of this same job over historical
-windows. ``maintenance`` runs per-dataset maintenance over a set of datasets: per-row TTL expiration (when a
-TTL column is named), two-tier distributed compaction, and version cleanup, in that order. ``index`` builds
-IVF_RQ vector, btree scalar, bitmap, and full-text BM25 indices over a set of datasets. ``recall`` replays
-Datadog-sampled vector queries as exact brute-force scans against the dataset versions that served them
-and reports recall@k. ``tag`` flips a serving tag (default ``HEAD``) to a target dataset version for
-blue-green promotion. ``migrate-manifests`` migrates dataset manifest paths to the V2 naming scheme.
-``migrate-namespace`` copies a whole namespace to a new namespace name; it is a one-off operator tool
-and is not scheduled. ``optimize-iceberg`` runs Iceberg's own source-table maintenance procedures
-(``rewrite_data_files``, ``rewrite_manifests``, ``expire_snapshots``, and the opt-in ``remove_orphan_files``)
-on the upstream Iceberg table; it is distinct from ``maintenance``, which optimizes the Lance datasets.
+changes into per-tenant Lance datasets. Routing always uses the fixed trio ``org_id``, ``tenant_id``,
+``namespace`` (see ``ROUTING_COLS`` in :mod:`lance_etl.etl`). The source table's map columns (``vectors``,
+``texts``, ``metadata``) are pivoted dynamically: every key present in the data becomes a concrete column
+with no per-field declaration required on the command line. When ``--changed-uris-path`` is supplied the
+driver writes one changed-dataset URI per line to that object-store path after each run so downstream
+maintenance and index tasks can scope their work to only the datasets touched in the window. Backfills are
+catch-up replays of this same job over historical windows. ``maintenance`` runs per-dataset maintenance
+over a set of datasets: per-row TTL expiration (when a TTL column is named), two-tier distributed
+compaction, and version cleanup, in that order. ``index`` builds IVF_RQ vector, btree scalar, bitmap, and
+full-text BM25 indices over a set of datasets. ``recall`` replays Datadog-sampled vector queries as exact
+brute-force scans against the dataset versions that served them and reports recall@k. ``tag`` flips a
+serving tag (default ``HEAD``) to a target dataset version for blue-green promotion. ``migrate-manifests``
+migrates dataset manifest paths to the V2 naming scheme. ``migrate-namespace`` copies a whole namespace to
+a new namespace name. It is a one-off operator tool and is not scheduled. ``optimize-iceberg`` runs
+Iceberg's own source-table maintenance procedures (``rewrite_data_files``, ``rewrite_manifests``,
+``expire_snapshots``, and the opt-in ``remove_orphan_files``) on the upstream Iceberg table. It is
+distinct from ``maintenance``, which optimizes the Lance datasets.
+
+Dataset-URI sources for ``maintenance``, ``index``, ``tag``, and ``migrate-manifests``: a single run may
+combine ``--dataset-uri`` (individual URIs), ``--datasets-file`` (one URI per line), and ``--base-uri``
+(recursive fleet discovery under a root). At least one source must be supplied or ``load_dataset_uris``
+raises ``ValueError``. A ``--datasets-file`` that exists but is empty contributes no URIs and is not an
+error. Idle-window state files written by the ETL are therefore safe to pass: an empty file is a clean
+no-op for maintenance and index tasks.
 
 Each subcommand builds a Spark session, runs the job, and exits non-zero on failure so an orchestrator
 can retry.
@@ -36,9 +49,8 @@ from datetime import UTC, datetime
 
 from pyspark.sql import SparkSession
 
-from lance_etl.arrow_types import resolve_type_map
 from lance_etl.cloud_storage import discover_datasets
-from lance_etl.etl import DEFAULT_PARTITION_COLS, ETLConfig, IcebergToLanceETL
+from lance_etl.etl import ROUTING_COLS, ETLConfig, IcebergToLanceETL
 from lance_etl.iceberg_optimize import (
     DEFAULT_EXPIRE_OLDER_THAN_DAYS,
     DEFAULT_EXPIRE_RETAIN_LAST,
@@ -114,13 +126,14 @@ def parse_storage_options(args: argparse.Namespace) -> dict[str, str] | None:
 
 
 def parse_partition_cols(value: str | None) -> list[str] | None:
-    """Parse the comma-separated ``--partition-by`` column list.
+    """Parse the comma-separated ``--partition-by`` column list used by ``migrate-namespace``.
 
     Args:
         value: The raw flag value, or None when the flag is absent.
 
     Returns:
-        The column names in dataset-path order, or None when the flag is absent so the configuration default applies.
+        The column names in dataset-path order, or None when the flag is absent so the
+        configuration default applies.
 
     Raises:
         ValueError: If the flag is present but lists no columns.
@@ -157,37 +170,55 @@ def build_telemetry_config(args: argparse.Namespace) -> TelemetryConfig:
 def load_dataset_uris(args: argparse.Namespace) -> list[str]:
     """Collect dataset URIs from arguments, an optional file, and base-URI discovery.
 
-    When ``--base-uri`` is supplied, every ``*.lance`` dataset under it is discovered recursively at any depth, so
-    deeper partition hierarchies produced by custom ``--partition-by`` layouts are picked up alongside the historical
-    three-level layout.
+    Three sources are combined in order: explicit ``--dataset-uri`` flags, a ``--datasets-file`` (one URI per
+    line), and recursive discovery under ``--base-uri``. A ``--datasets-file`` that exists but is empty
+    contributes no URIs and is not an error, so an idle-window state file written by the ETL passes
+    through cleanly. Callers that receive an empty list should treat it as a no-op rather than raise.
+
+    When ``--base-uri`` is supplied, every ``*.lance`` dataset under it is discovered recursively at any
+    depth, so the standard three-level ``org_id/tenant_id/namespace`` layout and any deeper
+    ``migrate-namespace`` hierarchies are both picked up.
 
     Args:
         args: Parsed command-line arguments.
 
     Returns:
-        The list of dataset URIs.
+        The list of dataset URIs, which may be empty when all sources are empty.
 
     Raises:
-        ValueError: If no dataset URIs are provided or discovered.
+        ValueError: If neither ``--datasets-file`` nor ``--base-uri`` nor ``--dataset-uri`` was supplied
+            at all (configuration error), distinguished from the case where all sources were supplied but
+            happened to produce no URIs.
     """
+    has_any_source: bool = bool(args.dataset_uri or args.datasets_file or args.base_uri)
+    if not has_any_source:
+        raise ValueError(
+            "no dataset URI source configured: supply at least one of --dataset-uri, --datasets-file, or --base-uri"
+        )
     uris: list[str] = list(args.dataset_uri or [])
     if args.datasets_file:
         with open(args.datasets_file, encoding="utf-8") as handle:
             uris.extend(line.strip() for line in handle if line.strip())
     if args.base_uri:
         uris.extend(discover_datasets(args.base_uri, parse_storage_options(args)))
-    if not uris:
-        raise ValueError("no dataset URIs provided")
     return uris
 
 
 def run_etl(args: argparse.Namespace, spark: SparkSession) -> None:
     """Run the ETL subcommand.
 
-    Only the data and identity contract is taken from the CLI. The named vectors and texts to pivot out of the source
-    map columns are given by ``--vector-field`` and ``--text-field``. The key/timestamp/op column names, the delete-op
-    encodings, the map column names, the window column, shuffle partition count, conflict-retry budget, retry timeout,
-    and the timestamp update guard take their opinionated :class:`ETLConfig` defaults.
+    Only the data and identity contract is taken from the CLI. Routing uses the fixed trio
+    ``org_id``, ``tenant_id``, ``namespace`` encoded in ``ROUTING_COLS``. The source table's
+    map columns (``vectors``, ``texts``, ``metadata``) are pivoted dynamically: every key present
+    in the data becomes a concrete column with no per-field CLI declaration. The key/timestamp/op
+    column names, the delete-op encodings, the map column names, the window column, shuffle
+    partition count, conflict-retry budget, and retry timeout take their opinionated
+    :class:`ETLConfig` defaults.
+
+    When ``--changed-uris-path`` is supplied the ETL driver writes one changed-dataset URI per line
+    to that object-store path after each run. The file is always written (even when no datasets
+    changed) so downstream maintenance and index tasks can scope their work to the datasets the ETL
+    actually touched in this window.
 
     Args:
         args: Parsed command-line arguments.
@@ -196,43 +227,43 @@ def run_etl(args: argparse.Namespace, spark: SparkSession) -> None:
     config: ETLConfig = ETLConfig(
         base_uri=args.base_uri,
         telemetry=build_telemetry_config(args),
-        partition_cols=parse_partition_cols(args.partition_by) or list(DEFAULT_PARTITION_COLS),
-        vector_fields=list(args.vector_field or []),
-        text_fields=list(args.text_field or []),
-        column_types=resolve_type_map(parse_key_values(args.column_type)),
         storage_options=parse_storage_options(args),
         iceberg_read_options=parse_key_values(args.iceberg_option),
         window_start=args.window_start,
         window_end=args.window_end,
+        changed_uris_path=args.changed_uris_path,
     )
     IcebergToLanceETL(config).run(spark, args.table, parse_epoch_ms(args.start), parse_epoch_ms(args.end))
 
 
 def run_maintenance(args: argparse.Namespace, spark: SparkSession) -> None:
-    """Run the maintenance subcommand: single-org DQ guard, per-row TTL expiration, compaction, and version cleanup.
+    """Run the maintenance subcommand: per-row TTL expiration, compaction, and version cleanup.
 
-    Maintenance has no per-deployment data contract beyond which datasets to process and the optional TTL columns.
-    When ``--ttl-column`` names a per-row TTL (``Duration``) column, expired rows are deleted before compaction by the
-    predicate ``ts_column + ttl_column < now``. Absent the flag, TTL is off and the job is DQ guard plus compaction
-    plus cleanup. When ``--base-uri`` is supplied, the cheap single-org DQ guard runs before TTL and compaction,
-    deriving the expected routing-column values from each dataset URI. Fragment sizing, deletion materialization,
+    Maintenance has no per-deployment data contract beyond which datasets to process and the optional
+    TTL columns. When ``--ttl-column`` names a per-row TTL (``Duration``) column, expired rows are
+    deleted before compaction by the predicate ``ts_column + ttl_column < now``. Absent the flag,
+    TTL is off and the job is compaction plus cleanup. Fragment sizing, deletion materialization,
     two-tier thresholds, retry budgets, and version-cleanup retention take their opinionated
     :class:`MaintenanceConfig` defaults.
+
+    An empty dataset list (for example from an idle-window state file) is a clean no-op: the job
+    logs and returns without touching any datasets.
 
     Args:
         args: Parsed command-line arguments.
         spark: Active Spark session.
     """
+    uris: list[str] = load_dataset_uris(args)
+    if not uris:
+        logger.info("maintenance: no datasets in the URI list, nothing to do")
+        return
     config: MaintenanceConfig = MaintenanceConfig(
         telemetry=build_telemetry_config(args),
-        base_uri=args.base_uri or None,
         storage_options=parse_storage_options(args),
         ttl_column=args.ttl_column,
         ts_column=args.ts_column,
-        verify_single_org=not args.no_verify_single_org,
-        raise_on_contamination=args.raise_on_contamination,
     )
-    MaintenanceJob(config).run(spark, load_dataset_uris(args))
+    MaintenanceJob(config).run(spark, uris)
 
 
 def run_index(args: argparse.Namespace, spark: SparkSession) -> None:
@@ -241,28 +272,34 @@ def run_index(args: argparse.Namespace, spark: SparkSession) -> None:
     The CLI selects what to build (which columns get which index type) and the data-shape knobs that cannot be
     defaulted (the distance metric, the FTS base tokenizer, and the FTS language). IVF training parameters, partition
     counts, shard counts, the vector row floor, delta and retrain bounds, retry budgets, and the fine-grained FTS
-    tokenizer toggles (lower-case, stemming, stop-word removal, ASCII folding) take their opinionated
-    :class:`IndexJobConfig` defaults. ``--rebuild`` remains as the operational escape hatch for tokenizer or
-    parameter changes that need a full reindex.
+    tokenizer toggles (lower-case, stemming, stop-word removal, ASCII folding, and position storage) take their
+    opinionated :class:`IndexJobConfig` defaults. ``--rebuild`` remains as the operational escape hatch for tokenizer
+    or parameter changes that need a full reindex.
+
+    An empty dataset list (for example from an idle-window state file) is a clean no-op: the job logs and returns
+    without touching any datasets.
 
     Args:
         args: Parsed command-line arguments.
         spark: Active Spark session.
     """
+    uris: list[str] = load_dataset_uris(args)
+    if not uris:
+        logger.info("index: no datasets in the URI list, nothing to do")
+        return
     config: IndexJobConfig = IndexJobConfig(
         telemetry=build_telemetry_config(args),
         storage_options=parse_storage_options(args),
-        vector_column=args.vector_column,
+        vector_columns=list(args.vector_column or []),
         metric=args.metric,
         scalar_columns=list(args.scalar_column or []),
         bitmap_columns=list(args.bitmap_column or []),
         text_columns=list(args.text_column or []),
-        fts_with_position=args.fts_with_position,
         fts_base_tokenizer=args.fts_base_tokenizer,
         fts_language=args.fts_language,
         rebuild=args.rebuild,
     )
-    LanceIndexer(config).run(spark, load_dataset_uris(args))
+    LanceIndexer(config).run(spark, uris)
 
 
 def run_recall(args: argparse.Namespace, spark: SparkSession) -> None:
@@ -338,6 +375,10 @@ def run_migrate_namespace(args: argparse.Namespace, spark: SparkSession) -> None
     are provided, ``index`` is left as ``None`` and reindexing is skipped with a warning from the
     migrator. Pass ``--overwrite-target`` to allow clobbering existing target datasets.
 
+    The ``--partition-by`` flag is specific to this subcommand: it overrides the default
+    ``org_id,tenant_id,namespace`` routing for fleets where a custom hierarchy was written. The ETL
+    itself always uses the fixed ``ROUTING_COLS`` trio and does not expose this flag.
+
     Args:
         args: Parsed command-line arguments.
         spark: Active Spark session.
@@ -348,12 +389,11 @@ def run_migrate_namespace(args: argparse.Namespace, spark: SparkSession) -> None
         index_config = IndexJobConfig(
             telemetry=build_telemetry_config(args),
             storage_options=parse_storage_options(args),
-            vector_column=args.vector_column,
+            vector_columns=list(args.vector_column or []),
             metric=args.metric,
             scalar_columns=list(args.scalar_column or []),
             bitmap_columns=list(args.bitmap_column or []),
             text_columns=list(args.text_column or []),
-            fts_with_position=args.fts_with_position,
             fts_base_tokenizer=args.fts_base_tokenizer,
             fts_language=args.fts_language,
             rebuild=False,
@@ -365,7 +405,7 @@ def run_migrate_namespace(args: argparse.Namespace, spark: SparkSession) -> None
         base_uri=args.base_uri,
         telemetry=build_telemetry_config(args),
         storage_options=parse_storage_options(args),
-        partition_cols=partition_cols or list(DEFAULT_PARTITION_COLS),
+        partition_cols=partition_cols or list(ROUTING_COLS),
         recompact=not args.no_recompact,
         reindex=not args.no_reindex,
         overwrite_target=args.overwrite_target,
@@ -423,6 +463,10 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
 def add_dataset_arguments(parser: argparse.ArgumentParser) -> None:
     """Add dataset-selection options shared by maintenance, index, tag, and migrate-manifests.
 
+    Three sources may be combined: ``--dataset-uri`` for individual URIs, ``--datasets-file`` for a
+    newline-delimited URI list, and ``--base-uri`` for recursive fleet discovery. At least one must be
+    supplied.
+
     Args:
         parser: The subcommand parser to extend.
     """
@@ -432,8 +476,8 @@ def add_dataset_arguments(parser: argparse.ArgumentParser) -> None:
         "--base-uri",
         default=None,
         help=(
-            "Discover datasets recursively under this URI: every *.lance path at any depth is included, so custom "
-            "--partition-by hierarchies are picked up alongside the default three-level layout."
+            "Discover datasets recursively under this URI: every *.lance path at any depth is included, "
+            "covering the standard org_id/tenant_id/namespace three-level layout."
         ),
     )
 
@@ -444,15 +488,22 @@ def add_index_column_arguments(parser: argparse.ArgumentParser) -> None:
     These flags select which columns receive which index type. When no flags are given the indexer
     builds no handlers and the step is a no-op (or skipped with a warning in the migrator).
 
+    ``--vector-column`` is repeatable: each use appends one column name to the list of vector columns that
+    receive an IVF_RQ index. Multiple vector columns are supported when a dataset carries more than one
+    embedding (for example a dense vector and a sparse vector).
+
+    The ``fts_with_position`` field (whether token positions are stored for phrase queries) is a
+    tokenizer-schema contract: changing it requires a full ``--rebuild`` and must be set in
+    :class:`~lance_etl.indexing.IndexJobConfig` in code rather than toggled per invocation.
+
     Args:
         parser: The subcommand parser to extend.
     """
-    parser.add_argument("--vector-column", default=None, help="Vector column to index with IVF_RQ")
+    parser.add_argument("--vector-column", action="append", help="Vector column to index with IVF_RQ, repeatable")
     parser.add_argument("--metric", default="L2", help="Vector distance metric: L2, cosine, or dot")
     parser.add_argument("--scalar-column", action="append", help="Scalar column for a btree index")
     parser.add_argument("--bitmap-column", action="append", help="Column for a bitmap index")
     parser.add_argument("--text-column", action="append", help="Text column for a full-text BM25 index")
-    parser.add_argument("--fts-with-position", action="store_true", help="Store token positions for phrase queries")
     parser.add_argument("--fts-base-tokenizer", default=None, help="FTS base tokenizer name")
     parser.add_argument("--fts-language", default=None, help="FTS stemming and stop-word language")
 
@@ -474,29 +525,6 @@ def build_parser() -> argparse.ArgumentParser:
     etl.add_argument("--start", required=True, help="ISO 8601 or epoch milliseconds")
     etl.add_argument("--end", required=True, help="ISO 8601 or epoch milliseconds")
     etl.add_argument("--base-uri", required=True)
-    etl.add_argument(
-        "--partition-by",
-        default=None,
-        help=(
-            "Comma-separated columns routing each row to its dataset. The path is base_uri/<val1>/.../<valN>.lance "
-            "in this order. Every column must exist in the source table. Default: org_id,tenant_id,namespace. Each key "
-            "lives in exactly one dataset, so the per-dataset merge_insert is the sole dedup."
-        ),
-    )
-    etl.add_argument(
-        "--vector-field",
-        action="append",
-        help=(
-            "Named vector key in the source vectors map to pivot into a concrete fixed-size-list column, repeatable. "
-            "Pair each with a --column-type <field>=fixed_size_list<float32,dim> so the IVF_RQ index can target it."
-        ),
-    )
-    etl.add_argument(
-        "--text-field",
-        action="append",
-        help="Named text key in the source texts map to pivot into a concrete string column for FTS, repeatable.",
-    )
-    etl.add_argument("--column-type", action="append", help="Cast column as name=arrow_type")
     etl.add_argument("--iceberg-option", action="append", help="Iceberg read option key=value")
     etl.add_argument(
         "--window-start",
@@ -512,6 +540,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "ISO-8601 upper bound (exclusive) for the source timestamp window pushdown filter applied to the "
             "configured window column after the Iceberg read.  Absent means the upper bound is open (no filter)."
+        ),
+    )
+    etl.add_argument(
+        "--changed-uris-path",
+        default=None,
+        help=(
+            "Object-store path where the ETL driver writes one changed-dataset URI per line after each run. "
+            "The file is always written (even when empty) so downstream maintenance and index tasks can scope "
+            "their work to the datasets actually touched in this window. Absent means the list is not written."
         ),
     )
 
@@ -534,27 +571,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     maintenance.add_argument(
         "--ts-column",
-        default="timestamp",
+        default="event_timestamp",
         help=(
             "Event timestamp column used as the TTL clock. Must match ETLConfig.ts_col. Only used when --ttl-column "
-            "is set. Default: timestamp."
-        ),
-    )
-    maintenance.add_argument(
-        "--no-verify-single-org",
-        action="store_true",
-        help=(
-            "Disable the cheap single-org data-quality guard that runs before TTL and compaction. The guard requires "
-            "--base-uri to derive expected routing values from each dataset URI. Default: guard is on when --base-uri "
-            "is set."
-        ),
-    )
-    maintenance.add_argument(
-        "--raise-on-contamination",
-        action="store_true",
-        help=(
-            "Raise an error when the single-org DQ guard finds contaminating rows. Default: log an error and emit a "
-            "metric but continue maintenance."
+            "is set. Default: event_timestamp."
         ),
     )
 

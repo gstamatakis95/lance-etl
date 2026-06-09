@@ -59,7 +59,7 @@ def index_config() -> IndexJobConfig:
     """
     return IndexJobConfig(
         telemetry=TelemetryConfig(),
-        vector_column="vector",
+        vector_columns=["vector"],
         num_partitions=4,
         vector_min_rows=1,
         scalar_columns=["id"],

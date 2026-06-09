@@ -2,14 +2,16 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use search_api::config::Config;
-use search_api::domain::StdoutSink;
+use search_api::domain::{DatasetRef, DatasetTarget, PrewarmSpec, Prewarmer, StdoutSink};
 use search_api::grpc::{IntakeGrpc, SearchGrpc};
-use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
+use search_api::lance::{AnnDefaults, CachingDatasetProvider, LanceSearchBackend};
 use search_api::pb::intake_service_server::IntakeServiceServer;
 use search_api::pb::search_service_server::SearchServiceServer;
 use search_api::telemetry::{self, Metrics, RecallCapture};
+use tokio::sync::Semaphore;
 use tonic::transport::Server;
 use tonic_tracing_opentelemetry::middleware::filters::reject_healthcheck;
 use tonic_tracing_opentelemetry::middleware::server::OtelGrpcLayer;
@@ -75,6 +77,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.block_on(serve(config))
 }
 
+/// Parses a prewarm-targets file and returns the successfully parsed targets.
+///
+/// Each line is expected to be `{org_id}/{tenant_id}/{namespace}`. Blank lines and lines with
+/// fewer than three slash-separated segments or invalid path segment characters are skipped with
+/// a warning. A file that cannot be read at all is also warned and yields an empty list.
+fn parse_prewarm_targets(path: &std::path::Path) -> Vec<DatasetTarget> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = %err, "failed to read prewarm targets file");
+            return Vec::new();
+        }
+    };
+    content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let parts: Vec<&str> = line.splitn(3, '/').collect();
+            if parts.len() != 3 {
+                tracing::warn!(line = %line, "prewarm targets: skipping malformed line (expected org/tenant/namespace)");
+                return None;
+            }
+            let target = DatasetTarget::new(parts[0], parts[1], parts[2]);
+            match target.validate() {
+                Ok(()) => Some(target),
+                Err(err) => {
+                    tracing::warn!(line = %line, error = %err, "prewarm targets: skipping line with invalid path segment");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
 /// Runs the async service body on the already-built runtime: wires telemetry, provider, backend,
 /// and transport, then serves the gRPC API together with the standard gRPC health service.
 async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -91,12 +130,58 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             search_api::config::DEFAULT_DISK_CACHE_SWEEP_SECS,
         ));
     }
+    let ann_defaults = AnnDefaults::from_config(&config);
     let backend = Arc::new(
         LanceSearchBackend::new(provider)
             .with_prewarm_concurrency(config.prewarm_concurrency)
             .with_metrics(metrics.clone())
-            .with_event_timestamp_column(config.event_timestamp_column.clone()),
+            .with_event_timestamp_column(config.event_timestamp_column.clone())
+            .with_ann_defaults(ann_defaults),
     );
+
+    if let Some(targets_path) = &config.prewarm_targets_path {
+        let targets = parse_prewarm_targets(targets_path);
+        if !targets.is_empty() {
+            let backend_for_prewarm = backend.clone();
+            let concurrency = config.prewarm_concurrency;
+            tokio::spawn(async move {
+                let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
+                let mut tasks = tokio::task::JoinSet::new();
+                for target in targets {
+                    let backend = backend_for_prewarm.clone();
+                    let semaphore = semaphore.clone();
+                    tasks.spawn(async move {
+                        let permit = semaphore.acquire_owned().await;
+                        let spec = PrewarmSpec {
+                            metadata: true,
+                            all_indexes: true,
+                            ..Default::default()
+                        };
+                        match backend.prewarm(&target, spec, DatasetRef::Latest).await {
+                            Ok(report) => tracing::info!(
+                                org_id = %target.org_id,
+                                tenant_id = %target.tenant_id,
+                                namespace = %target.namespace,
+                                resolved_version = report.resolved_version,
+                                indexes_warmed = report.indexes.len(),
+                                "startup prewarm succeeded"
+                            ),
+                            Err(err) => tracing::warn!(
+                                org_id = %target.org_id,
+                                tenant_id = %target.tenant_id,
+                                namespace = %target.namespace,
+                                error = %err,
+                                "startup prewarm failed"
+                            ),
+                        }
+                        drop(permit);
+                    });
+                }
+                while tasks.join_next().await.is_some() {}
+            });
+        }
+    }
+
     let recall = RecallCapture::new(
         config.recall_sample_rate,
         search_api::config::DEFAULT_ID_COLUMN,
@@ -112,7 +197,13 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .set_serving::<IntakeServiceServer<IntakeGrpc<StdoutSink>>>()
         .await;
     tracing::info!(address = %addr, "search-api listening");
-    Server::builder()
+    let mut server_builder = Server::builder()
+        .concurrency_limit_per_connection(config.concurrency_limit_per_connection)
+        .max_concurrent_streams(config.max_concurrent_streams);
+    if config.request_timeout_ms > 0 {
+        server_builder = server_builder.timeout(Duration::from_millis(config.request_timeout_ms));
+    }
+    server_builder
         .layer(OtelGrpcLayer::default().filter(reject_healthcheck))
         .add_service(health_service)
         .add_service(SearchServiceServer::new(service))

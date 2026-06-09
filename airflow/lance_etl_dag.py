@@ -2,16 +2,30 @@
 
 Pipeline stages (in order):
     1. ``etl``         — reads a bounded source window from the Iceberg source table and
-                         upserts/deletes into per-tenant Lance datasets.
-    2. ``maintenance`` — per-dataset maintenance over the updated datasets: per-row TTL
-                         expiration (only when a TTL column is configured via the Airflow
-                         Variable ``lance_etl_ttl_column``), two-tier distributed
-                         compaction, and version cleanup, in that order. TTL deletes
-                         expired rows before compaction so the compaction reclaims them.
-                         When ``lance_etl_ttl_column`` is unset the TTL step is a no-op
-                         and the task is compaction plus cleanup only.
+                         upserts/deletes into per-tenant Lance datasets. Routing uses the fixed
+                         trio ``org_id``, ``tenant_id``, ``namespace`` (``ROUTING_COLS`` in
+                         :mod:`lance_etl.etl`). After each run the driver writes one
+                         changed-dataset URI per line to a per-window state file at
+                         ``<lance_base_uri>/.etl_state/<int_timestamp>.uris`` (always written,
+                         even when empty). Downstream stages use this file to scope their work
+                         to only the datasets touched in this window.
+    2. ``maintenance`` — per-dataset maintenance over the datasets the ETL touched. Per-row
+                         TTL expiration (only when a TTL column is configured via the Airflow
+                         Variable ``lance_etl_ttl_column``), two-tier distributed compaction,
+                         and version cleanup, in that order. TTL deletes expired rows before
+                         compaction so the compaction reclaims them. When
+                         ``lance_etl_ttl_column`` is unset the TTL step is a no-op and the
+                         task is compaction plus cleanup only.
     3. ``index``       — builds or incrementally maintains IVF_RQ vector and
-                         btree/bitmap/FTS scalar indices over the same datasets.
+                         btree/bitmap/FTS scalar indices over the same datasets the ETL
+                         touched.
+
+Scheduled runs scope maintenance and index to the per-window changed-URIs file written by
+the ETL. Idle windows produce an empty state file, which is a clean no-op for both tasks.
+A manual trigger with ``{"full_fleet": true}`` in the configuration JSON sweeps the entire
+static datasets file (``lance_etl_datasets_file``) instead. Run this override periodically
+(for example weekly) so TTL expiration, compaction, and cleanup eventually cover cold datasets
+that have not changed recently.
 
 An optional source-table maintenance stage ``optimize-iceberg`` can be enabled via the Airflow Variable
 ``lance_etl_optimize_iceberg_enabled`` (default off). When enabled it runs before ``etl`` and optimizes the upstream
@@ -84,8 +98,14 @@ Airflow Variables (all optional — defaults are listed in ``dag_params`` below)
     lance_etl_schedule               Airflow schedule expression (default: ``@daily``).
     lance_etl_iceberg_table          Fully-qualified Iceberg table name.
     lance_etl_lance_base_uri         Base URI under which per-tenant datasets live.
-    lance_etl_datasets_file          Path to a file with one dataset URI per line
-                                     (required by the ``index`` and ``maintenance`` steps).
+    lance_etl_datasets_file          Path to a file listing every dataset URI (one per line).
+                                     This is the full-fleet fallback used when a manual trigger
+                                     sets ``{"full_fleet": true}`` in the run configuration.
+                                     Scheduled runs scope maintenance and index to the
+                                     per-window changed-URIs file instead. Run a full-fleet
+                                     sweep periodically (for example weekly) to ensure TTL
+                                     expiration, compaction, and cleanup eventually cover cold
+                                     datasets that were not touched by recent ETL windows.
     lance_etl_index_flags            Shell-tokenized index column-selection flags appended verbatim to the
                                      ``index`` subcommand, e.g.
                                      ``--vector-column vector --metric cosine --scalar-column updated_at
@@ -100,10 +120,9 @@ Airflow Variables (all optional — defaults are listed in ``dag_params`` below)
                                      ``--dd-tag`` flags (default: empty).
     lance_etl_executor_instances     spark.executor.instances override (default: 8).
     lance_etl_executor_memory        spark.executor.memory override (default: 8g).
-    lance_etl_driver_memory          spark.driver.memory override (default: 4g).
-    lance_etl_partition_by           Comma-separated partition columns forwarded as
-                                     ``--partition-by``. Empty (the default) omits the flag so the
-                                     ETL keeps the current org_id/tenant_id/namespace routing.
+    lance_etl_driver_memory          spark.driver.memory override (default: 8g). The index stage
+                                     trains IVF centroids on the driver and needs at least 8g for
+                                     the largest datasets.
     lance_etl_ttl_column             Per-row TTL column name forwarded to the ``maintenance`` step as
                                      ``--ttl-column``. Empty (the default) turns TTL off so maintenance is
                                      compaction plus cleanup only. When set, the column must hold each row's
@@ -155,7 +174,7 @@ dag_params: dict[str, str | int] = {
     "dd_tags": "",
     "executor_instances": 8,
     "executor_memory": "8g",
-    "driver_memory": "4g",
+    "driver_memory": "8g",
     "spark_conf_overrides": "{}",
 }
 
@@ -176,6 +195,27 @@ def resolve_variable(key: str, params: dict[str, str | int], param_key: str | No
         The resolved string value.
     """
     return Variable.get(f"lance_etl_{key}", default_var=str(params[param_key if param_key is not None else key]))
+
+
+def build_changed_uris_path(params: dict[str, str | int]) -> str:
+    """Return the per-run object-store path for the changed-dataset URI list as a Jinja expression.
+
+    The path is ``<lance_base_uri>/.etl_state/<int_timestamp>.uris``.  The ``int_timestamp``
+    component is resolved at task-execution time via ``data_interval_end.int_timestamp`` so the key
+    contains no colons and is safe as an object-store key across all supported backends.
+
+    The returned string is a complete Jinja expression (``{{ ... }}``) that concatenates the
+    resolved base URI with the runtime timestamp.  It is safe to embed inside a larger Jinja
+    conditional because the base URI and suffix are string literals within that expression.
+
+    Args:
+        params: DAG-run ``params`` dict.
+
+    Returns:
+        A Jinja expression string that evaluates to the full changed-URIs path at task runtime.
+    """
+    base_uri: str = resolve_variable("lance_base_uri", params)
+    return f"{{{{ '{base_uri}/.etl_state/' ~ data_interval_end.int_timestamp ~ '.uris' }}}}"
 
 
 def build_base_spark_conf(params: dict[str, str | int]) -> dict[str, str]:
@@ -242,6 +282,8 @@ def build_etl_application_args(params: dict[str, str | int]) -> list[str]:
     pushdown filter on the Iceberg read.  The Iceberg snapshot range (``--start`` / ``--end``) continues to use the
     data interval directly so Iceberg partition pruning covers the snapshot history regardless of the window filter.
 
+    Routing always uses the fixed ``org_id``, ``tenant_id``, ``namespace`` trio and no routing flag is emitted.
+
     Args:
         params: DAG-run ``params`` dict.
 
@@ -266,10 +308,9 @@ def build_etl_application_args(params: dict[str, str | int]) -> list[str]:
         "{{ dag_run.conf.get('start', data_interval_start) | string }}",
         "--window-end",
         "{{ dag_run.conf.get('end', data_interval_end) | string }}",
+        "--changed-uris-path",
+        build_changed_uris_path(params),
     ]
-    partition_by: str = Variable.get("lance_etl_partition_by", default_var="").strip()
-    if partition_by:
-        args += ["--partition-by", partition_by]
     args += build_dd_tag_flags(params)
     return args
 
@@ -278,12 +319,24 @@ def build_datasets_subcommand_args(subcommand: str, params: dict[str, str | int]
     """Build the CLI argument list for a datasets-file subcommand (``index`` or ``maintenance``).
 
     Both subcommands share the same required flags: the datasets file, the Datadog service/env tags, and any
-    user-supplied tag pairs.  The leading subcommand token differs.  The ``index`` subcommand additionally needs
-    column-selection flags: with no ``--vector-column`` / ``--scalar-column`` / ``--bitmap-column`` / ``--text-column``
-    the indexer configures zero handlers and the Spark job is a silent no-op.  Those flags are read verbatim from the
-    ``lance_etl_index_flags`` Airflow Variable (shell-tokenized) so operators control exactly which index types are
-    maintained without editing this file.  The ``maintenance`` subcommand additionally appends ``--ttl-column`` when the
-    ``lance_etl_ttl_column`` Variable is set, which turns on per-row TTL expiration before compaction.
+    user-supplied tag pairs.  The leading subcommand token differs.
+
+    Scheduled runs scope maintenance and index to only the datasets the ETL touched in the window.  A manual
+    trigger that sets ``dag_run.conf["full_fleet"]`` to a truthy value sweeps the full static datasets file
+    instead.  The selection is expressed as a Jinja conditional that resolves at task-execution time:
+
+    .. code-block:: text
+
+        {{ '<static_file>' if dag_run.conf.get('full_fleet') else '<changed_uris_path>' }}
+
+    The ``index`` subcommand additionally needs column-selection flags: with no ``--vector-column`` /
+    ``--scalar-column`` / ``--bitmap-column`` / ``--text-column`` the indexer configures zero handlers and the
+    Spark job is a silent no-op.  Those flags are read verbatim from the ``lance_etl_index_flags`` Airflow
+    Variable (shell-tokenized) so operators control exactly which index types are maintained without editing this
+    file.
+
+    The ``maintenance`` subcommand additionally appends ``--ttl-column`` when the ``lance_etl_ttl_column``
+    Variable is set (turns on per-row TTL expiration before compaction).
 
     Args:
         subcommand: The CLI subcommand token, either ``"index"`` or ``"maintenance"``.
@@ -292,10 +345,17 @@ def build_datasets_subcommand_args(subcommand: str, params: dict[str, str | int]
     Returns:
         Argument list starting with ``subcommand``.
     """
+    static_file: str = resolve_variable("datasets_file", params)
+    base_uri: str = resolve_variable("lance_base_uri", params)
+    changed_prefix: str = f"{base_uri}/.etl_state/"
+    datasets_value: str = (
+        f"{{{{ '{static_file}' if dag_run.conf.get('full_fleet') else"
+        f" '{changed_prefix}' ~ data_interval_end.int_timestamp ~ '.uris' }}}}"
+    )
     args = [
         subcommand,
         "--datasets-file",
-        resolve_variable("datasets_file", params),
+        datasets_value,
         "--dd-service",
         resolve_variable("dd_service", params),
         "--dd-env",

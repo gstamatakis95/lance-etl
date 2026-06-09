@@ -1,15 +1,17 @@
 """Build the Iceberg source table, synthetic text corpus, and ground-truth artifacts.
 
-The base vectors are written into a local Iceberg table with exactly the schema the project's ETL expects: the routing
-columns (``org_id``, ``tenant_id``, ``namespace``), the merge key ``vector_id``, the operation column ``op``, the
-timestamp column ``updated_at`` (used as both the last-write-wins collapse column and the window-pushdown column), the
-low-cardinality concrete ``category`` column (the bitmap index target, flows through the ETL untouched), and the three
-map columns ``vectors`` / ``texts`` / ``metadata``. The embedding rides in the ``vectors`` map under the key
-``"vector"`` and the synthetic cluster-seeded document rides in the ``texts`` map under the key ``"text"``: the ingest
-phase declares those as the ETL's ``vector_fields`` / ``text_fields`` so they are pivoted into concrete ``vector`` and
-``text`` columns, with the ``vector`` column cast to ``fixed_size_list<float32, dim>`` through the ETL's
-``column_types``. The ``metadata`` map carries the cluster id under ``"cluster"`` and stays flattened to
-``metadata_keys`` / ``metadata_values`` parallel arrays.
+The base vectors are written into a local Iceberg table with exactly the schema the project's ETL
+expects: the routing columns (``org_id``, ``tenant_id``, ``namespace``), the merge key
+``vector_id``, the operation column ``op``, the timestamp column ``updated_at`` (used as both the
+last-write-wins collapse column and the window-pushdown column), the low-cardinality concrete
+``category`` column (the bitmap index target, flows through the ETL untouched), and the three map
+columns ``vectors`` / ``texts`` / ``metadata``. The embedding rides in the ``vectors`` map under
+the key ``"vector"`` and the synthetic cluster-seeded document rides in the ``texts`` map under
+the key ``"text"``. The ETL dynamically pivots every map key into a concrete column per dataset
+group on the executor, so the ``vector`` and ``text`` keys become concrete columns automatically.
+The ``vector`` column type override in the ingest config ensures the inferred FSL dimension is
+always correct. The ``metadata`` map carries the cluster id under ``"cluster"`` and is pivoted
+into a concrete ``cluster`` string column in the dataset.
 
 Row generation runs inside Spark executors via ``mapInArrow``: each task reads its own row slice straight through the
 dataset adapter, assigns clusters against the driver-trained centroids, and emits Arrow batches. ``updated_at``

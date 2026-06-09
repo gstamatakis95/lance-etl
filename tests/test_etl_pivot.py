@@ -1,10 +1,10 @@
-"""Tests for the named-vector and named-text map pivot in the ETL.
+"""Tests for the dynamic map-column pivot in the ETL.
 
-The ETL pivots declared keys of the ``vectors`` and ``texts`` map columns into concrete indexable columns: a named
-vector becomes a fixed-size-list column the IVF_RQ index can target and a named text field becomes a string column the
-INVERTED index can target. Undeclared map keys are dropped, a declared key absent from a row yields NULL, and the
-``metadata`` map stays flattened into parallel key/value arrays. These tests cover the end-to-end Spark pivot and the
-``validate_schema`` safety checks (missing map column, colliding name, and invalid identifier).
+Every key of the ``vectors``, ``texts``, and ``metadata`` map columns becomes a concrete column in
+the written Lance dataset. The key is the column name and the value is the column value. The pivot
+runs per-dataset on the executor so each org's dataset contains only the keys that org uses. These
+tests cover the end-to-end Spark pivot and the ``validate_schema`` safety checks (present-but-wrong
+map column type, and a map column that is not a map).
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -26,9 +27,9 @@ from pyspark.sql.types import (
     StringType,
     StructField,
     StructType,
+    TimestampType,
 )
 
-from lance_etl.arrow_types import resolve_type_map
 from lance_etl.etl import ETLConfig, IcebergToLanceETL, dataset_uri
 from lance_etl.telemetry import TelemetryConfig
 
@@ -56,11 +57,15 @@ def spark() -> Iterator[SparkSession]:
     session.stop()
 
 
+TS: datetime = datetime(2024, 1, 1, tzinfo=UTC)
+
+
 def source_schema() -> StructType:
     """Return the Spark schema of the pivot test source with the three map columns.
 
     Returns:
-        A schema carrying the routing, key, timestamp, and op columns plus the vectors, texts, and metadata maps.
+        A schema carrying the routing, key, timestamp, window, and op columns plus the vectors,
+        texts, and metadata maps, matching the SQL contract column types.
     """
     return StructType(
         [
@@ -68,7 +73,8 @@ def source_schema() -> StructType:
             StructField("org_id", StringType(), False),
             StructField("tenant_id", StringType(), False),
             StructField("namespace", StringType(), False),
-            StructField("timestamp", StringType(), False),
+            StructField("event_timestamp", TimestampType(), False),
+            StructField("processing_timestamp", TimestampType(), False),
             StructField("op", StringType(), False),
             StructField("vectors", MapType(StringType(), ArrayType(FloatType())), True),
             StructField("texts", MapType(StringType(), StringType()), True),
@@ -78,34 +84,35 @@ def source_schema() -> StructType:
 
 
 def pivot_config(tmp_path: Path, telemetry_config: TelemetryConfig) -> ETLConfig:
-    """Build an ETL configuration that pivots a named vector and a named text field.
+    """Build an ETL configuration that exercises the dynamic map pivot.
 
     Args:
         tmp_path: Pytest-provided temporary directory.
         telemetry_config: The test telemetry configuration.
 
     Returns:
-        A configuration declaring ``vector_fields=["vector"]`` and ``text_fields=["text"]``.
+        An ETLConfig using all defaults. The ``vectors``, ``texts``, and ``metadata`` map columns are
+        pivoted dynamically: every key present in the data becomes a concrete column with its type
+        inferred from the Arrow data.
     """
     return ETLConfig(
         base_uri=str(tmp_path),
         telemetry=telemetry_config,
-        vector_fields=["vector"],
-        text_fields=["text"],
-        column_types=resolve_type_map({"vector": f"fixed_size_list<float32,{DIMENSION}>"}),
         num_partitions=4,
     )
 
 
 class TestPivotEndToEnd:
-    """The ETL pivots declared map keys into concrete indexable columns and flattens metadata."""
+    """The ETL pivots all map keys into concrete indexable columns."""
 
     def test_pivot_writes_concrete_columns(
         self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
     ) -> None:
-        """A named vector and text become concrete typed columns while metadata stays flattened.
+        """Every distinct map key becomes a concrete typed column in the written dataset.
 
-        Undeclared map keys are dropped and a declared key absent from a row yields NULL.
+        Vector keys land as fixed-size-list columns, text keys as string columns, and metadata
+        keys as string columns. The map columns themselves are not written to Lance. A key absent
+        from a row yields NULL for that column in that row.
         """
         config: ETLConfig = pivot_config(tmp_path, telemetry_config)
         vector_a: list[float] = [float(i) for i in range(DIMENSION)]
@@ -116,13 +123,14 @@ class TestPivotEndToEnd:
                 "o1",
                 "t1",
                 "n1",
-                "1",
+                TS,
+                TS,
                 "insert",
                 {"vector": vector_a, "ignored": vector_b},
                 {"text": "alpha"},
                 {"k": "a"},
             ),
-            ("v2", "o1", "t1", "n1", "1", "insert", {"vector": vector_b}, {}, {"k": "b"}),
+            ("v2", "o1", "t1", "n1", TS, TS, "insert", {"vector": vector_b}, {}, {"k": "b"}),
         ]
         frame = spark.createDataFrame(rows, source_schema())
         IcebergToLanceETL(config).run_on_dataframe(frame)
@@ -130,26 +138,27 @@ class TestPivotEndToEnd:
         table: pa.Table = lance.dataset(dataset_uri(config, "o1", "t1", "n1")).to_table().sort_by("vector_id")
         assert table.schema.field("vector").type == pa.list_(pa.float32(), DIMENSION)
         assert table.schema.field("text").type == pa.string()
+        assert table.schema.field("k").type == pa.string()
         assert "vectors" not in table.column_names
         assert "texts" not in table.column_names
         assert "metadata" not in table.column_names
-        assert "metadata_keys" in table.column_names
-        assert "metadata_values" in table.column_names
+        assert "metadata_keys" not in table.column_names
+        assert "metadata_values" not in table.column_names
 
         by_id: dict[str, int] = {vid: i for i, vid in enumerate(table["vector_id"].to_pylist())}
         assert table["vector"].to_pylist()[by_id["v1"]] == vector_a
         assert table["text"].to_pylist()[by_id["v1"]] == "alpha"
         assert table["text"].to_pylist()[by_id["v2"]] is None
-        assert table["metadata_keys"].to_pylist()[by_id["v1"]] == ["k"]
-        assert table["metadata_values"].to_pylist()[by_id["v1"]] == ["a"]
+        assert table["k"].to_pylist()[by_id["v1"]] == "a"
+        assert table["k"].to_pylist()[by_id["v2"]] == "b"
 
     def test_pivoted_columns_are_index_eligible(
         self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
     ) -> None:
         """The pivoted vector column carries a fixed-size-list type and the text column a string type.
 
-        These are exactly the column types the IVF_RQ and INVERTED index handlers require, so a tiny FTS index can be
-        built directly over the pivoted text column.
+        These are exactly the column types the IVF_RQ and INVERTED index handlers require, so a
+        tiny FTS index can be built directly over the pivoted text column.
         """
         config: ETLConfig = pivot_config(tmp_path, telemetry_config)
         rows: list[tuple] = [
@@ -158,7 +167,8 @@ class TestPivotEndToEnd:
                 "o1",
                 "t1",
                 "n1",
-                "1",
+                TS,
+                TS,
                 "insert",
                 {"vector": [float(i)] * DIMENSION},
                 {"text": f"word{i} common"},
@@ -177,15 +187,21 @@ class TestPivotEndToEnd:
         assert "text_idx" in names
 
 
-class TestValidatePivot:
-    """validate_schema rejects an unsafe or inconsistent pivot specification."""
+class TestValidateSchema:
+    """validate_schema rejects a map column that is present but not a MapType."""
+
+    TIMESTAMP_COLS: set[str] = {"event_timestamp", "processing_timestamp"}
 
     def make_source(self, columns: list[str], map_fields: dict[str, object] | None = None) -> MagicMock:
         """Build a mock DataFrame exposing the given columns and schema field types.
 
+        Timestamp columns (``event_timestamp``, ``processing_timestamp``) default to
+        ``TimestampType`` so the schema satisfies the SQL contract. All other columns default to
+        ``StringType`` unless overridden via ``map_fields``.
+
         Args:
             columns: The column names the mock reports.
-            map_fields: Mapping of column name to its Spark data type, defaulting every map column to a string map.
+            map_fields: Mapping of column name to its Spark data type, overriding the defaults.
 
         Returns:
             A mock with ``columns`` and a ``schema.fields`` list of named typed fields.
@@ -194,7 +210,11 @@ class TestValidatePivot:
         source: MagicMock = MagicMock()
         source.columns = columns
         source.schema.fields = [
-            StructField(name, types.get(name, StringType()), True)
+            StructField(
+                name,
+                types.get(name, TimestampType() if name in self.TIMESTAMP_COLS else StringType()),
+                True,
+            )
             for name in columns  # type: ignore[arg-type]
         ]
         return source
@@ -203,49 +223,41 @@ class TestValidatePivot:
         """Return the always-required non-map columns.
 
         Returns:
-            The key, timestamp, op, and routing columns.
+            The key, timestamp, op, window, and routing columns matching the SQL contract defaults.
         """
-        return ["vector_id", "timestamp", "op", "org_id", "tenant_id", "namespace"]
+        return [
+            "vector_id",
+            "event_timestamp",
+            "processing_timestamp",
+            "op",
+            "org_id",
+            "tenant_id",
+            "namespace",
+        ]
 
-    def test_missing_map_column_raises(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
-        """Declaring vector_fields without the vectors map column fails validation."""
-        config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config, vector_fields=["vector"])
-        source: MagicMock = self.make_source(self.base_columns())
-        with pytest.raises(ValueError, match="missing from the source"):
-            IcebergToLanceETL(config).validate_schema(source)
-
-    def test_non_map_column_raises(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
-        """A declared vectors column that is not a MapType fails validation."""
-        config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config, vector_fields=["vector"])
+    def test_non_map_vectors_column_raises(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
+        """A vectors column present in the source but not a MapType fails validation."""
+        config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config)
         source: MagicMock = self.make_source([*self.base_columns(), "vectors"], {"vectors": StringType()})
         with pytest.raises(ValueError, match="must be a MapType"):
             IcebergToLanceETL(config).validate_schema(source)
 
-    def test_colliding_field_name_raises(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
-        """A pivot field name that collides with an existing column fails validation."""
-        config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config, vector_fields=["org_id"])
-        source: MagicMock = self.make_source(
-            [*self.base_columns(), "vectors"],
-            {"vectors": MapType(StringType(), ArrayType(FloatType()))},
-        )
-        with pytest.raises(ValueError, match="collides with an existing or reserved column"):
+    def test_non_map_metadata_column_raises(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
+        """A metadata column present but not a MapType fails validation."""
+        config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config)
+        source: MagicMock = self.make_source([*self.base_columns(), "metadata"], {"metadata": StringType()})
+        with pytest.raises(ValueError, match="must be a MapType"):
             IcebergToLanceETL(config).validate_schema(source)
 
-    def test_invalid_field_name_raises(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
-        """A pivot field name failing the identifier allowlist fails validation."""
-        config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config, vector_fields=["bad/name"])
-        source: MagicMock = self.make_source(
-            [*self.base_columns(), "vectors"],
-            {"vectors": MapType(StringType(), ArrayType(FloatType()))},
-        )
-        with pytest.raises(ValueError, match="identifier allowlist"):
-            IcebergToLanceETL(config).validate_schema(source)
+    def test_absent_map_column_passes(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
+        """A map column absent from the source is allowed; the pivot step skips it gracefully."""
+        config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config)
+        source: MagicMock = self.make_source(self.base_columns())
+        IcebergToLanceETL(config).validate_schema(source)
 
-    def test_valid_pivot_passes(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
-        """A well-formed vector and text pivot specification passes validation."""
-        config: ETLConfig = ETLConfig(
-            base_uri=str(tmp_path), telemetry=telemetry_config, vector_fields=["vector"], text_fields=["text"]
-        )
+    def test_valid_map_columns_pass(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
+        """All three map columns present as MapType passes validation."""
+        config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config)
         source: MagicMock = self.make_source(
             [*self.base_columns(), "vectors", "texts", "metadata"],
             {

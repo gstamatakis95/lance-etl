@@ -289,8 +289,11 @@ message VectorQuery {
   optional uint32 refine_factor = 8;
   // HNSW ef-search parameter.
   optional uint32 ef = 9;
-  // Search only indexed data (weak consistency, lower latency).
-  bool fast_search = 10;
+  // Search only indexed data, skipping fragments added after the last index build (weak
+  // consistency, lower latency). When set explicitly the client value always wins; when absent the
+  // server applies its configured default only when the dataset has a vector index for the queried
+  // column — so unindexed datasets and read-after-write clients are both served correctly.
+  optional bool fast_search = 10;
   // Skip the vector index and do a flat (exact) scan.
   bool bypass_vector_index = 11;
   // Optional typed predicate applied to the search.
@@ -422,6 +425,12 @@ message TextQuery {
   bool with_row_id = 9;
   // Number of leading hits to skip.
   optional uint64 offset = 10;
+  // Search only indexed (INVERTED) data, skipping fragments appended after the last FTS index
+  // build. When set explicitly the client value always wins; when absent the server applies its
+  // configured default only when the dataset has an FTS index for the queried column — bounding
+  // tail latency from the unindexed fragment flat-scan under continuous ingest without losing
+  // freshness for datasets that have no FTS index at all.
+  optional bool fast_search = 11;
 }
 
 // Fusion strategy for merging the hybrid legs.

@@ -68,10 +68,10 @@ def test_maintenance_parses_required_args() -> None:
 
 
 def test_maintenance_ttl_defaults_off() -> None:
-    """``maintenance`` defaults: ttl_column=None (off), ts_column=timestamp."""
+    """``maintenance`` defaults: ttl_column=None (off), ts_column=event_timestamp."""
     args = build_parser().parse_args(REQUIRED_MAINTENANCE_ARGV)
     assert args.ttl_column is None
-    assert args.ts_column == "timestamp"
+    assert args.ts_column == "event_timestamp"
 
 
 def test_maintenance_ttl_column_flag() -> None:

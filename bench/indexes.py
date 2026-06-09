@@ -37,7 +37,7 @@ def index_stages(config: BenchConfig) -> list[tuple[str, IndexJobConfig]]:
         (
             "vector_ivf_rq",
             IndexJobConfig(
-                vector_column="vector",
+                vector_columns=["vector"],
                 num_partitions=config.ivf_partitions,
                 metric=adapter_for(config).metric,
                 vector_min_rows=config.vector_row_floor,

@@ -1,9 +1,9 @@
 """Tests confirming that no ingestion-timestamp column is written and event-time collapse is correct.
 
 After ADR 0016, the ``_ingested_at`` column is removed. The source event timestamp (``ETLConfig.ts_col``,
-default ``"timestamp"``) is the single canonical clock. These tests assert that the written dataset schema
-does not carry ``_ingested_at``, that event-time last-write-wins collapse still works correctly, and that the
-merge-conflict visibility metrics continue to fire as expected.
+default ``"event_timestamp"``) is the single canonical clock. These tests assert that the written dataset
+schema does not carry ``_ingested_at``, that event-time last-write-wins collapse still works correctly, and
+that the merge-conflict visibility metrics continue to fire as expected.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -22,18 +23,20 @@ from pyspark.sql import SparkSession
 
 from lance_etl import etl as etl_module
 from lance_etl.etl import (
+    ROUTING_COLS,
     ETLConfig,
     IcebergToLanceETL,
     apply_merge,
-    conflict_bucket,
     dataset_uri,
 )
 from lance_etl.telemetry import TelemetryConfig
 
 INGESTED_AT_COLUMN: str = "_ingested_at"
+TS: datetime = datetime(2024, 1, 1, tzinfo=UTC)
 
 SOURCE_DDL: str = (
-    "vector_id string, org_id string, tenant_id string, namespace string, timestamp bigint, op string, "
+    "vector_id string, org_id string, tenant_id string, namespace string, "
+    "event_timestamp timestamp, processing_timestamp timestamp, op string, "
     "vectors map<string,array<float>>, metadata map<string,string>"
 )
 
@@ -63,11 +66,11 @@ def sample_rows() -> list[tuple]:
     """Return two insert rows routed to a single ``o1/t1/n1`` dataset.
 
     Returns:
-        Two row tuples matching :data:`SOURCE_DDL`.
+        Two row tuples matching :data:`SOURCE_DDL` with proper timestamp values.
     """
     return [
-        ("v1", "o1", "t1", "n1", 1, "insert", {"emb": [1.0, 2.0]}, {"k": "a"}),
-        ("v2", "o1", "t1", "n1", 1, "insert", {"emb": [3.0, 4.0]}, {"k": "b"}),
+        ("v1", "o1", "t1", "n1", TS, TS, "insert", {"emb": [1.0, 2.0]}, {"k": "a"}),
+        ("v2", "o1", "t1", "n1", TS, TS, "insert", {"emb": [3.0, 4.0]}, {"k": "b"}),
     ]
 
 
@@ -110,31 +113,33 @@ class TestCollapseEventTime:
         self, spark: SparkSession, telemetry_config: TelemetryConfig, tmp_path: Path
     ) -> None:
         """Two rows sharing a key collapse to the one with the higher event timestamp."""
+        ts_low: datetime = datetime(2024, 1, 1, tzinfo=UTC)
+        ts_high: datetime = datetime(2024, 1, 2, tzinfo=UTC)
         config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config)
         etl: IcebergToLanceETL = IcebergToLanceETL(config)
         collapse_ddl: str = (
-            "org_id string, tenant_id string, namespace string, vector_id string, timestamp bigint, op string"
+            "org_id string, tenant_id string, namespace string, vector_id string, event_timestamp timestamp, op string"
         )
         frame = spark.createDataFrame(
             [
-                ("o1", "t1", "n1", "v1", 1, "insert"),
-                ("o1", "t1", "n1", "v1", 2, "insert"),
+                ("o1", "t1", "n1", "v1", ts_low, "insert"),
+                ("o1", "t1", "n1", "v1", ts_high, "insert"),
             ],
             collapse_ddl,
         )
         collapsed = etl.collapse(frame)
         rows: list[Any] = collapsed.collect()
         assert len(rows) == 1
-        assert rows[0]["timestamp"] == 2
+        assert rows[0]["event_timestamp"].date() == ts_high.date()
 
 
 class TestRoutingExclusion:
     """The event timestamp column is not a routing column."""
 
     def test_ts_col_not_in_routing_cols(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
-        """The timestamp column is not listed in routing_cols."""
+        """The timestamp column is not listed in ROUTING_COLS."""
         config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config)
-        assert config.ts_col not in config.routing_cols()
+        assert config.ts_col not in ROUTING_COLS
 
 
 def fake_merge_dataset(execute_side_effect: list[Any]) -> MagicMock:
@@ -176,34 +181,11 @@ def conflict_group() -> pa.Table:
     )
 
 
-def distribution_tags(telemetry: MagicMock, name: str) -> list[str]:
-    """Return the tags of the first distribution call with the given metric name.
-
-    Args:
-        telemetry: The mock telemetry facade.
-        name: The metric name to look up.
-
-    Returns:
-        The tags passed to that distribution call.
-    """
-    for call in telemetry.distribution.call_args_list:
-        if call.args[0] == name:
-            return call.kwargs["tags"]
-    raise AssertionError(f"no distribution call named {name!r}")
-
-
 class TestConflictVisibility:
-    """The merge timing carries a conflict bucket tag and a retry counter is emitted on conflicts."""
+    """Each retryable commit conflict increments the retry counter directly."""
 
-    def test_bucket_function(self) -> None:
-        """The bucket function maps counts to the low-cardinality tag values."""
-        assert conflict_bucket(0) == "0"
-        assert conflict_bucket(1) == "1"
-        assert conflict_bucket(2) == "2+"
-        assert conflict_bucket(9) == "2+"
-
-    def test_conflicts_tag_bucket_and_emit_counter(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
-        """Two forced conflicts tag merge_ms with conflicts:2+ and emit the retry counter with value 2."""
+    def test_conflicts_increment_counter(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
+        """Two forced conflicts increment dataset.merge_conflict_retries twice."""
         stats: dict[str, Any] = {"num_inserted_rows": 1, "num_updated_rows": 0, "num_deleted_rows": 0}
         dataset: MagicMock = fake_merge_dataset(
             [
@@ -223,14 +205,11 @@ class TestConflictVisibility:
         assert upserted == 1
         assert deleted == 0
         assert dataset.merge_insert.return_value.execute.call_count == 3
-        assert distribution_tags(telemetry, "dataset.merge_ms") == ["conflicts:2+"]
         counter_calls = [c for c in telemetry.incr.call_args_list if c.args[0] == "dataset.merge_conflict_retries"]
-        assert len(counter_calls) == 1
-        assert counter_calls[0].kwargs["value"] == 2
-        assert counter_calls[0].kwargs["tags"] == ["conflicts:2+"]
+        assert len(counter_calls) == 2
 
-    def test_no_conflict_bucket_zero_no_counter(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
-        """A clean merge tags merge_ms with conflicts:0 and emits no retry counter."""
+    def test_no_conflict_no_counter(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
+        """A clean merge emits no retry counter."""
         dataset: MagicMock = fake_merge_dataset(
             [{"num_inserted_rows": 1, "num_updated_rows": 0, "num_deleted_rows": 0}]
         )
@@ -242,6 +221,5 @@ class TestConflictVisibility:
             patch.setattr(etl_module.lance, "dataset", MagicMock(return_value=dataset))
             apply_merge(config, telemetry, ("o1", "t1", "n1"), conflict_group())
 
-        assert distribution_tags(telemetry, "dataset.merge_ms") == ["conflicts:0"]
         counter_calls = [c for c in telemetry.incr.call_args_list if c.args[0] == "dataset.merge_conflict_retries"]
         assert counter_calls == []
