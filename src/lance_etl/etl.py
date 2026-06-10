@@ -1,112 +1,26 @@
 """Iceberg-to-Lance ETL routing changes into per-tenant datasets.
 
-Reads a time range of changes from an Iceberg table that carries an operation column (insert,
-update, delete), dynamically pivots all keys of every map column into concrete indexable columns,
-collapses to the last-write-wins terminal state per vector id, and applies each routing key's rows
-to exactly one Lance dataset identified by the fixed routing trio ``(org_id, tenant_id, namespace)``
-with a ``merge_insert`` upsert plus a ``when_matched_delete`` merge-delete for the physical-delete
-path.
+Reads a time range of changes from an Iceberg table, pivots all map-column keys into concrete
+indexable columns per dataset group, collapses to last-write-wins per vector id, and routes each
+``(org_id, tenant_id, namespace)`` group to its own Lance dataset via ``merge_insert`` upsert plus
+``when_matched_delete`` for physical deletes.
 
-The source schema is the contract defined in ``docs/iceberg-source-table.sql``. Input types
-carry no uncertainty: vectors are ``MAP<STRING, ARRAY<FLOAT>>``, texts and metadata are
-``MAP<STRING, STRING>``, and ttl is ``BIGINT`` (seconds). There are no caller-supplied type maps.
-All casts are contract-driven and automatic: vector columns are cast to inferred fixed-size lists
-and the TTL column is cast to ``pa.duration("s")`` when present.
+The source schema contract is in ``docs/iceberg-source-table.sql``. ``validate_schema`` enforces
+it: routing columns, key, op, and timestamp columns are required; map and TTL columns are optional
+but must carry contracted types when present.
 
-Map pivot (executor-side, per dataset group)
---------------------------------------------
-The source Iceberg table carries three map columns: ``vectors`` (``MAP<STRING, ARRAY<FLOAT>>``,
-named float-array embeddings), ``texts`` (``MAP<STRING, STRING>``, named text fields), and
-``metadata`` (``MAP<STRING, STRING>``, arbitrary string metadata). Lance has no map type, so all
-three maps are fully unpacked before write.
+Routing is fixed: the dataset path is ``base_uri/org_id/tenant_id/namespace.lance``. The trio
+``(org_id, tenant_id, namespace)`` maps each row to exactly one dataset URI with no cross-org
+sharing.
 
-The pivot is performed by :func:`pivot_map_columns` on the executor, applied to each routing
-key's upsert table immediately before the cast and merge steps. For each map column present in
-the Arrow table schema, :func:`pivot_map_columns` discovers all distinct keys present in that
-table (within this dataset group), skips any key that collides with an already-present column or
-reserved name (counted and metered), and calls ``pyarrow.compute.map_lookup`` with
-``occurrence="last"`` to extract the per-row value for each valid key as a new column. The map
-column itself is then dropped. Because the discovery and pivot happen per executor per routing key
-group, different org datasets can have completely different pivot column sets: an org that only
-uses ``embedding_v2`` in its ``vectors`` map gets exactly one pivoted vector column, and another
-org's ``embedding_v1`` column never appears in the first org's dataset.
+The per-dataset Lance schema is grow-only. Columns are never removed; new keys are absorbed via
+``add_columns`` schema evolution on first appearance.
 
-Vector columns extracted from the ``vectors`` map arrive as ``list<float32>`` (the Arrow
-representation of Spark ``ARRAY<FLOAT>``). :func:`pivot_map_columns` infers the fixed-size-list
-dimension from the first non-null entry in each extracted column. A vector column whose every
-value is null is kept as a nullable ``list<float32>`` column (no FSL cast is attempted, since no
-dimension can be inferred). If the inner value type is not already float32, it is cast to float32
-as defensive normalization (Spark may widen ARRAY<FLOAT> to float64 in some environments).
+Every window is an idempotent merge keyed by vector id: replayed or retried windows converge
+instead of duplicating. No separate bulk path is needed for backfills.
 
-Metadata keys become real, filter-eligible, scalar-index-ready columns: a row with
-``metadata["region"] = "eu-west"`` produces a ``region STRING`` column in that org's dataset,
-which downstream BTREE or BITMAP scalar indexes can cover.
-
-Grow-only dataset schema guarantee: the per-dataset Lance schema is strictly additive. Keys that
-stop appearing in the source leave their column in place with NULL values for new rows, so existing
-readers and indexes are never broken. New keys that appear in a later ETL window are absorbed by
-the existing ``add_columns`` schema evolution in :func:`apply_merge` without any operator
-intervention: the first batch that carries the new key adds a nullable column to the dataset schema
-and subsequent writes fill it normally. No code path ever removes a dataset column.
-
-Colliding keys are silently skipped: no key error is ever fatal, they are counted in
-the return value of :func:`pivot_map_columns`, and :func:`apply_merge` emits a
-``dataset.invalid_map_keys`` metric and a WARNING log line when the count is non-zero.
-
-Routing is fixed: the dataset path is ``base_uri/org_id/tenant_id/namespace.lance`` per the
-source contract in ``docs/iceberg-source-table.sql``. The collapse window, the routing
-repartition, and the per-partition Arrow ``group_by`` all derive from :data:`ROUTING_COLS`.
-
-Each key lives in exactly one dataset, so the ``merge_insert`` keyed on ``key_col`` is the sole
-dedup mechanism: a re-upsert of an existing key updates it in place and a delete reaches the one
-dataset that holds it. No cross-dataset reader deduplication is required.
-
-Backfills are catch-up replays: rerun this same incremental job over the historical windows with
-the orchestrator (for example Airflow). Because every window is an idempotent merge keyed by
-vector id, a replayed or retried window converges instead of duplicating, so no separate bulk path
-is needed.
-
-An optional timestamp window filter (``window_start`` / ``window_end`` / ``window_column`` on
-:class:`ETLConfig`) can narrow the rows that reach the collapse and merge steps to those whose
-``window_column`` value falls within ``[window_start, window_end)``. Both bounds are ISO-8601
-strings validated with ``datetime.fromisoformat``. An absent bound means the bound is open (no
-filter on that side). The filter is applied as a Spark ``DataFrame.filter`` call immediately after
-the Iceberg read so Spark can push it down into the Iceberg scan for partition pruning.
-
-The single canonical time clock is the source event timestamp column named by
-``ETLConfig.ts_col`` (default ``"event_timestamp"``). Date-range queries are expressed as scalar
-range filters on that column, which can be pruned by a BTREE scalar index. There is no derived
-date column and no ingest-time column: the event timestamp is authoritative for ordering, collapse,
-and time-bounded serving. See ADR 0016 for the rationale and tradeoffs.
-
-Cross-contamination is prevented structurally: the dataset URI is a validated pure function of the
-routing columns and rows are shuffled by routing key, so a row can only reach its own dataset. The
-map columns are unpacked before write, and because the pivot is per-dataset the schemas stay
-minimal with no cross-org column pollution.
-
-Physical deletes use ``merge_insert(...).when_matched_delete().execute(deletes)`` with the same
-:func:`commit_with_retries` wrapper as the upsert path, so retries re-read the dataset at the
-latest version and ``when_matched_delete`` touches only rows whose key matches the source
-key-only table.
-
-The optional ``changed_uris_path`` on :class:`ETLConfig` accepts an object-store path. When set,
-the driver writes one dataset URI per line (sorted, UTF-8) to that path after every run, listing
-exactly the datasets touched in the window, for downstream maintenance and index jobs to consume.
-The file is always written, even when empty (zero datasets touched), so consumers can distinguish
-an idle window from a missing run.
-
-Small-and-big efficiency: the per-tenant population is power-law shaped (tens of thousands of orgs,
-most tiny, a few huge), so the ETL never does per-row work on the driver. The driver only resolves
-the Iceberg snapshot bounds from table metadata, short-circuits to an empty read when no snapshot
-landed in the window, and broadcasts the routing plan. All collapse, routing, and merge work runs
-in executors: rows shuffle by routing key into ``num_partitions`` co-located partitions, and
-``merge_partition`` groups each partition's rows by routing key and applies one keyed, idempotent
-``merge_insert`` per dataset. A tiny org's increment is a small group merged in process on one
-executor at near-zero cost, a huge org's increment co-locates to its partition and merges there,
-and an org with no rows in the window produces no group and touches no dataset. Bootstrapping a
-brand-new tiny dataset is a single empty append plus merge, never a cluster-wide fan-out.
-
-Requires pylance and the Datadog Agent on the executors.
+Heavy work (dataset reads, writes, pivot, merge) runs exclusively in Spark executors.
+The driver only resolves snapshot bounds, short-circuits on empty windows, and collects stats.
 """
 
 from __future__ import annotations
@@ -135,7 +49,6 @@ from pyspark.sql.types import (
 )
 from pyspark.sql.window import Window, WindowSpec
 
-from lance_etl.cloud_storage import resolve_filesystem, write_object
 from lance_etl.telemetry import (
     DEFAULT_CONFLICT_RETRIES,
     DEFAULT_RETRY_TIMEOUT,
@@ -151,11 +64,10 @@ ROUTING_COLS: tuple[str, str, str] = ("org_id", "tenant_id", "namespace")
 
 
 def stats_schema() -> pa.Schema:
-    """Build the per-dataset stats schema for the fixed routing columns.
+    """Build the per-dataset stats schema (routing columns + upserted/deleted counters).
 
     Returns:
-        A schema with one string column per routing column plus ``upserted`` and ``deleted``
-        counters.
+        A schema with one string column per routing column plus ``upserted`` and ``deleted``.
     """
     fields: list[tuple[str, pa.DataType]] = [(column, pa.string()) for column in ROUTING_COLS]
     fields.extend([("upserted", pa.int64()), ("deleted", pa.int64())])
@@ -163,10 +75,10 @@ def stats_schema() -> pa.Schema:
 
 
 def stats_spark_ddl() -> str:
-    """Build the Spark DDL string matching :func:`stats_schema`.
+    """Return the Spark DDL string matching :func:`stats_schema` for use as ``mapInArrow`` output schema.
 
     Returns:
-        A DDL string usable as the ``mapInArrow`` output schema.
+        A DDL string with routing columns as string plus upserted/deleted as bigint.
     """
     columns: str = ", ".join(f"`{column}` string" for column in ROUTING_COLS)
     return f"{columns}, `upserted` bigint, `deleted` bigint"
@@ -180,40 +92,19 @@ class ETLConfig:
         base_uri: Root location under which per-tenant datasets live.
         telemetry: Telemetry configuration.
         key_col: Unique vector id column and per-dataset merge key.
-        ts_col: Source event timestamp column. Used for last-write-wins collapse and written into
-            every dataset as the single canonical time clock. Date-range queries on the written
-            datasets are expressed as scalar range filters on this column, pruned by a BTREE scalar
-            index when one is configured. Defaults to ``"event_timestamp"`` matching the SQL
-            contract.
+        ts_col: Source event timestamp — single canonical clock for collapse and range queries.
         op_col: Operation column carrying insert, update, or delete.
-        delete_op_values: Operation values treated as deletes. Others upsert.
-        ttl_col: Name of the optional per-row lifetime column in the source (``BIGINT`` seconds
-            per the SQL contract). When present in the upsert table with an integer type, it is
-            cast automatically to ``pa.duration("s")`` so the maintenance TTL predicate
-            ``event_timestamp + ttl < now`` evaluates natively. An absent column means no cast is
-            performed.
+        delete_op_values: Operation values treated as deletes.
+        ttl_col: Optional per-row lifetime column (BIGINT seconds). Cast to ``pa.duration("s")`` when present.
         storage_options: Object-store options forwarded to pylance.
         num_partitions: Shuffle partitions for routing co-location.
         conflict_retries: Retry budget for concurrent merge commits.
-        retry_timeout: Total time budget for conflict retries. Raised above the 30-second Lance
-            default to give headroom on hot multi-tenant datasets.
+        retry_timeout: Total time budget for conflict retries.
         iceberg_read_options: Extra Iceberg reader options merged into the read.
-        window_start: ISO-8601 lower bound (inclusive) for the source timestamp window filter.
-            Absent means open. Validated with ``datetime.fromisoformat`` at filter-application
-            time; a malformed value raises ``ValueError`` before any Spark work runs.
-        window_end: ISO-8601 upper bound (exclusive) for the source timestamp window filter.
-            Absent means open. Validated with ``datetime.fromisoformat`` at filter-application
-            time.
-        window_column: Column used for the timestamp window pushdown filter. Defaults to
-            ``"processing_timestamp"`` matching the SQL contract.
-        retry_backoff_seconds: Base backoff in seconds for the Python-side commit-conflict retry
-            loop that observes the merge conflict count. Tests set this to ``0.0`` to avoid
-            sleeping.
-        changed_uris_path: When set, the driver writes one dataset URI per line (UTF-8, sorted) to
-            this object-store path after the run, listing exactly the datasets touched in the
-            window. The file is always written, even when no datasets were touched (empty file), so
-            consumers can distinguish an idle window from a missing run. Downstream maintenance and
-            index jobs consume this list to limit their scope to touched datasets.
+        window_start: ISO-8601 inclusive lower bound for the window pushdown filter. Open when absent.
+        window_end: ISO-8601 exclusive upper bound for the window pushdown filter. Open when absent.
+        window_column: Column for the timestamp window filter.
+        retry_backoff_seconds: Base backoff (seconds) for the commit-conflict retry loop.
     """
 
     base_uri: str
@@ -232,26 +123,20 @@ class ETLConfig:
     window_end: str | None = None
     window_column: str = "processing_timestamp"
     retry_backoff_seconds: float = 0.5
-    changed_uris_path: str | None = None
 
 
 def dataset_uri(config: ETLConfig, *components: str) -> str:
-    """Build the validated dataset URI for one routing key.
-
-    The path is ``base_uri/org_id/tenant_id/namespace.lance`` per :data:`ROUTING_COLS`, which is
-    byte-identical to the historical layout.
+    """Build the validated dataset URI ``base_uri/org_id/tenant_id/namespace.lance``.
 
     Args:
         config: ETL configuration.
         *components: One routing value per column in :data:`ROUTING_COLS`, in path order.
 
     Returns:
-        The dataset URI confined to the routing-key prefix.
+        The dataset URI for the given routing key.
 
     Raises:
-        ValueError: If the component count does not match three (the fixed routing depth), or any
-            component is not a non-empty string. NULL routing rows are filtered upstream in
-            ``merge_partition`` before this function is called.
+        ValueError: If the component count is not three or any component is an empty string.
     """
     if len(components) != len(ROUTING_COLS):
         raise ValueError(
@@ -269,22 +154,18 @@ def apply_fsl_cast(
     col_name: str,
     invalid_counts: dict[str, int],
 ) -> pa.Table:
-    """Cast one extracted vector column to a fixed-size list, inferring dimension from data.
+    """Cast a vector column to ``fixed_size_list<float32, dim>``, inferring dim from first non-null value.
 
-    The dimension is the length of the first non-null value. A column whose every value is null is
-    left unchanged, since no dimension can be inferred. Rows whose length differs from the inferred
-    dimension are replaced with null and counted into ``invalid_counts``, then the whole column is
-    cast to ``fixed_size_list<float32, dim>`` in one step (Arrow casts the inner values to float32
-    as part of the same cast, covering sources widened to float64).
+    Rows whose length differs from the inferred dimension are nulled out and counted into
+    ``invalid_counts``. A fully-null column is returned unchanged (no dimension to infer).
 
     Args:
-        table: The table containing the column to cast.
+        table: Table containing the column.
         col_name: Name of the column to cast.
         invalid_counts: Mutable accumulator for wrong-dimension row counts, updated in place.
 
     Returns:
-        The table with the column cast to a fixed-size list type, or unchanged when no dimension
-        is available.
+        Table with the column cast, or unchanged when no dimension can be inferred.
     """
     column: pa.ChunkedArray = table.column(col_name)
     lengths: pa.ChunkedArray = pc.list_value_length(column)
@@ -302,41 +183,20 @@ def apply_fsl_cast(
 
 
 def pivot_map_columns(table: pa.Table, config: ETLConfig) -> tuple[pa.Table, dict[str, int]]:
-    """Expand every map column into concrete per-key columns on the executor.
+    """Expand every map column into concrete per-key columns for this dataset group.
 
-    For each of the contract map columns ``vectors``, ``texts``, and ``metadata`` that is present
-    in ``table`` as a ``pa.MapType`` column, this function:
-
-    1. Discovers all distinct keys present in this table's data (within this dataset group) by
-       scanning the map key arrays of each chunk and collecting unique non-null values.
-    2. Checks that the key does not collide with an already-present column or a reserved name
-       (routing columns, the key, op, timestamp, and window columns). Colliding keys are skipped.
-    3. Calls ``pyarrow.compute.map_lookup(column, query_key=key, occurrence="last")`` to extract
-       the per-row value for that key as a new ``ChunkedArray``. Rows where the key is absent
-       yield null.
-    4. Appends the extracted column to the table under the key's name.
-    5. After all keys of that map column are processed, drops the map column from the table.
-
-    For columns derived from the ``vectors`` map, the extracted value type is
-    ``list<float32>`` (contract: ``ARRAY<FLOAT>``). Each such column is then routed through
-    :func:`apply_fsl_cast`: the dimension is inferred from the first non-null entry and the inner
-    type is normalized to float32 if needed. A vectors-map column whose every value is null is
-    kept as a nullable ``list<float32>`` column with no FSL cast applied.
-
-    Colliding-key counts are returned under ``"invalid_map_keys"`` and wrong-dimension vector row
-    counts under ``"invalid_vector_rows"``. Neither is fatal. A key that collides with an existing
-    or reserved column is skipped and counted. Any key string that does not collide is accepted as
-    a column name as-is.
+    Processes ``vectors``, ``texts``, and ``metadata`` in order. For each map column, all distinct
+    keys in this group become new columns via ``map_lookup(occurrence="last")``. Keys colliding with
+    an existing or reserved column are skipped. Vector columns are passed through
+    :func:`apply_fsl_cast`. The map column is dropped after its keys are extracted.
 
     Args:
         table: The upsert table for one dataset group, after Spark serialisation.
         config: ETL configuration providing the set of reserved column names.
 
     Returns:
-        A ``(result_table, counts)`` pair where ``result_table`` has all map columns replaced by
-        their per-key concrete columns and ``counts`` carries ``"invalid_map_keys"`` (skipped
-        colliding keys) and ``"invalid_vector_rows"`` (null-outs from wrong-dimension vectors)
-        when non-zero.
+        ``(result_table, counts)`` where ``counts`` carries ``"invalid_map_keys"`` and
+        ``"invalid_vector_rows"`` when non-zero.
     """
     routing_reserved: set[str] = {
         config.key_col,
@@ -412,122 +272,41 @@ def group_by_routing(table: pa.Table, routing_cols: list[str]) -> Iterator[tuple
         yield key, table.filter(mask)
 
 
-def emit_changed_uris(config: ETLConfig, uris: list[str]) -> None:
-    """Write the sorted unique list of touched dataset URIs to ``config.changed_uris_path``.
-
-    Resolves the target filesystem via :func:`~lance_etl.cloud_storage.resolve_filesystem` and
-    writes one URI per line (UTF-8) to the configured path. The file is always written, even when
-    ``uris`` is empty, so consumers can distinguish an idle window from a missing run. This
-    function is a no-op when ``config.changed_uris_path`` is None.
-
-    Args:
-        config: ETL configuration; ``changed_uris_path`` must be set.
-        uris: The dataset URIs touched during the run, in any order.
-    """
-    if config.changed_uris_path is None:
-        return
-    content: bytes = "\n".join(sorted(set(uris))).encode("utf-8")
-    filesystem, path = resolve_filesystem(config.changed_uris_path, config.storage_options)
-    write_object(filesystem, path, content)
-
-
 def apply_ttl_cast(table: pa.Table, ttl_col: str) -> pa.Table:
-    """Cast the TTL column from an integer type to ``pa.duration("s")`` when present.
-
-    The source contract defines ``ttl`` as a ``BIGINT`` (seconds). This function casts it to
-    ``pa.duration("s")`` so the maintenance TTL predicate ``event_timestamp + ttl < now``
-    evaluates natively in Arrow. If the column is absent or already a duration type, the table is
-    returned unchanged. Only integer types (int32, int64, and their unsigned counterparts) trigger
-    the cast; other types are left untouched.
+    """Cast the integer TTL column to ``pa.duration("s")`` so Arrow time arithmetic works natively.
 
     Args:
-        table: The upsert table after pivot, potentially carrying the TTL column.
+        table: The upsert table after pivot.
         ttl_col: Name of the TTL column per ``ETLConfig.ttl_col``.
 
     Returns:
-        The table with the TTL column cast to ``pa.duration("s")``, or unchanged when the column
-        is absent or already a duration type.
+        Table with the TTL column cast to ``pa.duration("s")``, or unchanged when absent or
+        non-integer.
     """
-    if ttl_col not in table.schema.names:
+    if ttl_col not in table.schema.names or not pa.types.is_integer(table.schema.field(ttl_col).type):
         return table
-    col_type: pa.DataType = table.schema.field(ttl_col).type
-    if pa.types.is_duration(col_type):
-        return table
-    if not pa.types.is_integer(col_type):
-        return table
-    col_idx: int = table.schema.get_field_index(ttl_col)
-    return table.set_column(col_idx, ttl_col, table.column(ttl_col).cast(pa.duration("s")))
+    idx: int = table.schema.get_field_index(ttl_col)
+    return table.set_column(idx, ttl_col, table.column(ttl_col).cast(pa.duration("s")))
 
 
 def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], group: pa.Table) -> tuple[int, int]:
-    """Apply one dataset's terminal rows with merge upsert and merge-delete.
+    """Pivot, cast, and merge one dataset group via upsert and physical delete.
 
-    The per-dataset Lance schema is grow-only: columns are only ever added, never removed. Keys
-    that stop appearing in the source leave their column in place with NULL values for new rows,
-    so existing readers and indexes are never broken. New keys appearing in a later ETL window are
-    absorbed by ``add_columns`` schema evolution without operator intervention.
-
-    Before merging, the upsert table is passed through :func:`pivot_map_columns` to expand all map
-    columns (``vectors``, ``texts``, ``metadata``) into concrete per-key columns. Every distinct
-    key present in this routing key's data becomes a column: key equals column name, value equals
-    column value, absent keys yield null. Keys that collide with an existing or reserved column are
-    silently skipped and counted; the total is emitted as ``dataset.invalid_map_keys`` with a
-    WARNING log line naming the URI when non-zero.
-
-    After pivot, vector columns (from the vectors map) carry wrong-dimension null-outs counted via
-    the ``dataset.invalid_vector_rows`` metric (accumulated by :func:`apply_fsl_cast` inside
-    :func:`pivot_map_columns`). The TTL column, when present with an integer type, is cast to
-    ``pa.duration("s")`` by :func:`apply_ttl_cast` so the maintenance predicate evaluates natively.
-    The deletes path is key-only and needs no cast.
-
-    Bootstrap strategy: when the dataset does not exist yet, an empty table is written with
-    ``lance.write_dataset(..., mode='append')``, which creates the dataset if absent. If a
-    concurrent first writer wins the creation race, the bootstrap write may raise ``OSError``; in
-    that case the loser falls back to re-opening the existing dataset with ``lance.dataset(...)``.
-    ``enable_v2_manifest_paths=True`` is always passed on this bootstrap write because V2 manifest
-    paths are a creation-time naming choice, so bootstrapping with V2 names makes every later open
-    of the dataset a single object-store request instead of a version-count-proportional LIST. The
-    rows themselves always flow through ``merge_insert`` so a re-upsert of an existing key updates
-    it in place instead of duplicating it.
-
-    Schema evolution: before executing the upsert, the columns present in ``upserts`` but absent
-    from the existing dataset schema are added as all-NULL columns via
-    ``LanceDataset.add_columns(pa.schema(missing_fields))``. This is a metadata-only operation
-    and is idempotent: if a retry re-enters this path after the schema was already evolved, the
-    missing-field check finds nothing to add. Schema evolution runs only on the non-bootstrap path;
-    for a fresh dataset the schema is inferred directly from ``upserts``.
-
-    Physical deletes use ``merge_insert(on=[key_col]).when_matched_delete().execute(deletes)``
-    wrapped in :func:`commit_with_retries` with the same retry budget and backoff as the upsert
-    path. The ``deletes`` table is a key-only subschema, which is a valid source for
-    ``merge_insert``. The action re-reads the dataset at the latest version on every retry so each
-    attempt observes the current state.
-
-    The merge ``execute()`` return dict provides authoritative row counts
-    (``num_inserted_rows``, ``num_updated_rows``, ``num_deleted_rows``). We report those rather
-    than recomputing from the source table.
-
-    Conflict visibility: Lance does not surface its internal ``num_attempts`` through the pylance
-    merge stats dict, so each retryable commit conflict observed by :func:`commit_with_retries`
-    increments the ``dataset.merge_conflict_retries`` counter directly via the ``on_conflict``
-    callback, on both the upsert and the merge-delete path. The builder keeps its own
-    ``conflict_retries`` so Lance's internal handling of write contention
-    (``Error::TooMuchWriteContention``, which is intentionally not a retryable marker for the
-    Python loop) is unchanged; the Python wrapper is a strictly-additive outer layer for
-    commit-conflict markers and never reduces the existing retry budget.
-
-    The merge builder always uses ``when_matched_update_all()`` with no condition because the
-    last-write-wins collapse already orders by event timestamp upstream, so every row in the upsert
-    table is already the correct terminal state.
+    Pivots map columns, casts TTL, bootstraps a new dataset with V2 manifest paths when absent
+    (concurrent-bootstrap race caught with OSError fallback), evolves schema via ``add_columns``
+    when new keys appear (idempotent on retry), then runs ``merge_insert`` with
+    ``when_matched_update_all()``. Physical deletes use ``when_matched_delete()`` on a key-only
+    table. Both paths go through :func:`commit_with_retries` with ``on_conflict`` incrementing
+    ``dataset.merge_conflict_retries``.
 
     Args:
         config: ETL configuration.
         telemetry: Telemetry facade for the current executor.
-        key: The routing key, one value per column in :data:`ROUTING_COLS` in path order.
+        key: Routing key values in :data:`ROUTING_COLS` order.
         group: Rows for this routing key carrying the op column.
 
     Returns:
-        The counts of upserted (inserted + updated) and deleted rows.
+        Counts of upserted (inserted + updated) and deleted rows.
     """
     uri: str = dataset_uri(config, *key)
     is_delete: pa.Array = pc.is_in(group[config.op_col], value_set=pa.array(config.delete_op_values))
@@ -560,23 +339,14 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
     if upserts.num_rows:
 
         def run_merge() -> dict[str, Any]:
-            """Open or bootstrap the dataset, evolve its schema if needed, and execute the merge upsert once.
+            """Open (or bootstrap) the dataset, evolve schema for new columns, and execute the merge upsert.
 
-            The dataset is opened fresh on every call so retries always see the latest committed
-            version. When the dataset does not exist yet, an empty bootstrap write creates it; if
-            a concurrent writer wins that race the resulting ``OSError`` is caught and the dataset
-            is opened instead. After opening, any columns present in ``upserts`` but absent from
-            the dataset schema are added as all-NULL columns via
-            ``add_columns(pa.schema(missing_fields))`` before executing the merge. This
-            schema-evolution step is idempotent: a retry that re-enters after the schema was
-            already evolved finds no missing fields.
-
-            The merge builder uses ``when_matched_update_all()`` with no condition: the
-            last-write-wins collapse upstream already produces the correct terminal state for every
-            key, so no additional timestamp guard is needed.
+            Re-opens the dataset on every call so retries see the latest version. ``add_columns``
+            schema evolution is idempotent: a retry that re-enters after evolution finds no missing
+            fields.
 
             Returns:
-                The merge statistics dictionary with the authoritative row counts.
+                Merge statistics dictionary with authoritative row counts.
             """
             try:
                 dataset_local: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
@@ -623,14 +393,10 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
     if deletes.num_rows:
 
         def run_delete() -> dict[str, Any]:
-            """Re-open the dataset at the latest version and execute the merge-delete once.
-
-            Uses ``merge_insert(on=[key_col]).when_matched_delete().execute(deletes)`` so only
-            rows whose key matches the source key-only table are removed. Skips when the dataset
-            does not exist.
+            """Re-open the dataset and execute ``when_matched_delete`` on the key-only deletes table.
 
             Returns:
-                The merge statistics dictionary, or an empty dict when the dataset was absent.
+                Merge statistics dictionary, or an empty dict when the dataset does not exist.
             """
             try:
                 delete_dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
@@ -661,17 +427,10 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
 def snapshot_id_bounds(
     spark: SparkSession, table: str, start_ms: int, end_ms: int
 ) -> tuple[int | None, int | None, bool]:
-    """Resolve a wall-clock window to Iceberg snapshot-id bounds via the snapshots metadata table.
+    """Resolve a wall-clock window to Iceberg snapshot-id bounds via ``{table}.snapshots``.
 
-    Queries ``{table}.snapshots`` and walks the snapshots in ``committed_at`` order. The start
-    bound is the last snapshot committed strictly before ``start_ms`` — the state the previous
-    window already processed, used as the exclusive ``start-snapshot-id`` of an incremental append
-    scan. The end bound is the last snapshot committed at or before ``end_ms`` — the inclusive
-    ``end-snapshot-id``. Either bound is None when no snapshot satisfies it. The third element
-    reports whether any snapshot was committed inside the window itself (``start_ms <=
-    committed_at <= end_ms``). Callers must gate the empty-window short circuit on that flag
-    rather than on ``start_id == end_id``, which conflates a genuinely empty window with bound ids
-    that merely resolve to the same historical snapshot.
+    Gate the empty-window short circuit on ``has_new_snapshots``, not on ``start_id == end_id``:
+    equal ids can mean a genuinely empty window or two bounds resolving to the same snapshot.
 
     Args:
         spark: Active Spark session.
@@ -680,9 +439,7 @@ def snapshot_id_bounds(
         end_ms: Window end in epoch milliseconds.
 
     Returns:
-        ``(start_id, end_id, has_new_snapshots)`` where the ids are None when no snapshot
-        satisfies the bound and ``has_new_snapshots`` is True when at least one snapshot was
-        committed within the window.
+        ``(start_id, end_id, has_new_snapshots)`` — ids are None when no snapshot satisfies the bound.
     """
     snapshots: DataFrame = spark.read.format("iceberg").load(f"{table}.snapshots")
     committed: list[tuple[int, int]] = sorted(
@@ -729,19 +486,12 @@ class IcebergToLanceETL:
         self.config: ETLConfig = config
 
     def read_increment(self, spark: SparkSession, table: str, start_ms: int, end_ms: int) -> DataFrame:
-        """Read the rows committed to an Iceberg table within a wall-clock window.
+        """Read the rows committed within a wall-clock window using snapshot-id bounds.
 
-        Iceberg 1.10 rejects the ``start-timestamp`` / ``end-timestamp`` read options outside
-        changelog scans (``SparkScanBuilder``: "Cannot set start-timestamp or end-timestamp for
-        incremental scans and batch scan. They are only valid for changelog scans."), so the window
-        is first resolved to snapshot ids through :func:`snapshot_id_bounds` over the
-        ``{table}.snapshots`` metadata table. When a snapshot exists strictly before the window
-        start, the read is an incremental append scan bounded by ``start-snapshot-id`` (exclusive)
-        and ``end-snapshot-id`` (inclusive). When the table has no snapshot before the window start
-        (first run), the read falls back to a full batch scan pinned to the window's last snapshot
-        via ``snapshot-id``. When no snapshot at all resolves the end bound, or when no snapshot
-        was committed inside the window, an empty DataFrame with the current table schema is
-        returned. ``iceberg_read_options`` are merged into every non-empty read.
+        Resolves the window to snapshot ids via :func:`snapshot_id_bounds` (Iceberg 1.10 rejects
+        ``start-timestamp``/``end-timestamp`` outside changelog scans). Falls back to a full scan
+        pinned to ``snapshot-id`` when no prior snapshot exists. Returns an empty DataFrame when
+        no snapshot landed in the window.
 
         Args:
             spark: Active Spark session.
@@ -765,33 +515,26 @@ class IcebergToLanceETL:
         return reader.load(table)
 
     def apply_window_filter(self, source: DataFrame) -> DataFrame:
-        """Apply the optional timestamp window pushdown filter.
+        """Filter source rows to ``[window_start, window_end)`` on ``config.window_column``.
 
-        Filters ``source`` to rows where ``config.window_column`` falls within
-        ``[window_start, window_end)``. Both bounds are ISO-8601 strings. Each configured bound is
-        validated by ``datetime.fromisoformat`` before interpolation; the 'Z' UTC designator (e.g.
-        ``"2024-01-01T00:00:00Z"``) is accepted natively on Python 3.11+. A bound string that does
-        not parse raises ``ValueError`` with a clear message before any Spark work runs. An absent
-        bound leaves that side of the interval open. The filter is applied as a ``DataFrame.filter``
-        SQL-string predicate before any shuffle so Spark can push it down into the Iceberg scan for
-        partition pruning. When neither bound is set the DataFrame is returned unchanged (full-table
-        behaviour).
+        Each bound is validated with ``datetime.fromisoformat`` before any Spark work runs.
+        Returns source unchanged when neither bound is set.
 
         Args:
-            source: The incremental source DataFrame produced by :meth:`read_increment`.
+            source: The incremental source DataFrame.
 
         Returns:
-            The filtered DataFrame, or the original if no window bounds are configured.
+            Filtered DataFrame, or the original when no bounds are configured.
 
         Raises:
-            ValueError: If a configured bound string is not a valid ISO-8601 datetime.
+            ValueError: If a bound string is not a valid ISO-8601 datetime.
         """
         config: ETLConfig = self.config
         if config.window_start is None and config.window_end is None:
             return source
 
         def parse_bound(value: str) -> str:
-            """Validate an ISO-8601 bound string and return it unchanged for interpolation.
+            """Validate and return an ISO-8601 bound string.
 
             Args:
                 value: The bound string to validate.
@@ -819,96 +562,78 @@ class IcebergToLanceETL:
         return filtered
 
     def validate_schema(self, source: DataFrame) -> None:
-        """Verify the source schema against the SQL contract in ``docs/iceberg-source-table.sql``.
+        """Verify the source schema against the contract in ``docs/iceberg-source-table.sql``.
 
-        Checks that every required column exists with the expected Spark type and that optional
-        columns, when present, carry their contracted types. Extra payload columns not listed here
-        are allowed and pass through unchanged. Key-level validation (identifier allowlist,
-        collision checks) happens at merge time in :func:`pivot_map_columns` per routing-key
-        group, since different orgs use different map keys.
-
-        Required column presence and types:
-          - Routing columns (``org_id``, ``tenant_id``, ``namespace``), ``key_col``, and
-            ``op_col``: ``StringType``.
-          - ``ts_col`` and ``window_column``: ``TimestampType`` or ``TimestampNTZType``.
-
-        Optional columns — when present, must be MapType (wrong type raises):
-          - ``vectors``: must be a MapType with ``ArrayType(FloatType|DoubleType)`` values.
-          - ``texts`` and ``metadata``: must be a MapType with ``StringType`` values.
-          - ``ttl_col``: ``LongType`` or ``IntegerType``.
+        All violations are collected and reported together. Extra payload columns are allowed.
 
         Args:
             source: The incremental source DataFrame.
 
         Raises:
-            ValueError: If any required column is missing, a required column has the wrong type,
-                or an optional column is present with a type that violates the contract. All
-                violations are collected and reported together in one message that references
-                ``docs/iceberg-source-table.sql`` as the authoritative contract.
+            ValueError: If any required column is missing or any column violates its contracted
+                type. The message lists every violation and references the SQL contract.
         """
         config: ETLConfig = self.config
-        field_types: dict[str, Any] = {f.name: f.dataType for f in source.schema.fields}
+        ft: dict[str, Any] = {f.name: f.dataType for f in source.schema.fields}
         violations: list[str] = []
 
-        string_cols: list[str] = [*ROUTING_COLS, config.key_col, config.op_col]
-        for col in string_cols:
-            if col not in field_types:
-                violations.append(f"  missing required column {col!r} (expected StringType)")
-            elif not isinstance(field_types[col], StringType):
-                violations.append(f"  column {col!r}: expected StringType, got {type(field_types[col]).__name__}")
+        def is_string(t: Any) -> bool:
+            """Return True when t is a StringType."""
+            return isinstance(t, StringType)
 
-        ts_cols: list[str] = [config.ts_col, config.window_column]
-        for col in ts_cols:
-            if col not in field_types:
-                violations.append(f"  missing required column {col!r} (expected TimestampType or TimestampNTZType)")
-            elif not isinstance(field_types[col], (TimestampType, TimestampNTZType)):
-                violations.append(
-                    f"  column {col!r}: expected TimestampType or TimestampNTZType,"
-                    f" got {type(field_types[col]).__name__}"
-                )
+        def is_timestamp(t: Any) -> bool:
+            """Return True when t is a TimestampType or TimestampNTZType."""
+            return isinstance(t, (TimestampType, TimestampNTZType))
 
-        if "vectors" in field_types:
-            vt = field_types["vectors"]
-            if not (
-                isinstance(vt, MapType)
-                and isinstance(vt.keyType, StringType)
-                and isinstance(vt.valueType, ArrayType)
-                and isinstance(vt.valueType.elementType, (FloatType, DoubleType))
-            ):
-                violations.append(
-                    f"  column 'vectors' must be a MapType(StringType, ArrayType(FloatType|DoubleType)), got {vt}"
-                )
-
-        for col in ("texts", "metadata"):
-            if col in field_types:
-                ct = field_types[col]
-                if not (
-                    isinstance(ct, MapType)
-                    and isinstance(ct.keyType, StringType)
-                    and isinstance(ct.valueType, StringType)
-                ):
-                    violations.append(f"  column {col!r} must be a MapType(StringType, StringType), got {ct}")
-
-        if config.ttl_col in field_types and not isinstance(field_types[config.ttl_col], (LongType, IntegerType)):
-            violations.append(
-                f"  column {config.ttl_col!r}: expected LongType or IntegerType,"
-                f" got {type(field_types[config.ttl_col]).__name__}"
+        def is_vector_map(t: Any) -> bool:
+            """Return True when t is MapType(StringType, ArrayType(FloatType|DoubleType))."""
+            return (
+                isinstance(t, MapType)
+                and isinstance(t.keyType, StringType)
+                and isinstance(t.valueType, ArrayType)
+                and isinstance(t.valueType.elementType, (FloatType, DoubleType))
             )
+
+        def is_string_map(t: Any) -> bool:
+            """Return True when t is MapType(StringType, StringType)."""
+            return isinstance(t, MapType) and isinstance(t.keyType, StringType) and isinstance(t.valueType, StringType)
+
+        def is_integer(t: Any) -> bool:
+            """Return True when t is LongType or IntegerType."""
+            return isinstance(t, (LongType, IntegerType))
+
+        required_checks: list[tuple[str, Any, str]] = [
+            *[(col, is_string, "StringType") for col in [*ROUTING_COLS, config.key_col, config.op_col]],
+            *[
+                (col, is_timestamp, "TimestampType or TimestampNTZType")
+                for col in [config.ts_col, config.window_column]
+            ],
+        ]
+        for col, predicate, expected in required_checks:
+            if col not in ft:
+                violations.append(f"  missing required column {col!r} (expected {expected})")
+            elif not predicate(ft[col]):
+                violations.append(f"  column {col!r}: expected {expected}, got {type(ft[col]).__name__}")
+
+        optional_checks: list[tuple[str, Any, str]] = [
+            ("vectors", is_vector_map, "MapType(StringType, ArrayType(FloatType|DoubleType))"),
+            ("texts", is_string_map, "MapType(StringType, StringType)"),
+            ("metadata", is_string_map, "MapType(StringType, StringType)"),
+            (config.ttl_col, is_integer, "LongType or IntegerType"),
+        ]
+        for col, predicate, expected in optional_checks:
+            if col in ft and not predicate(ft[col]):
+                violations.append(f"  column {col!r} must be a {expected}, got {ft[col]}")
 
         if violations:
             detail: str = "\n".join(violations)
             raise ValueError(f"Source schema violates the contract in docs/iceberg-source-table.sql:\n{detail}")
 
     def collapse(self, source: DataFrame) -> DataFrame:
-        """Reduce to the last-write-wins terminal event per id within a tenant.
+        """Reduce to the last-write-wins terminal event per (routing key, vector id).
 
-        The window orders by ``config.ts_col`` descending with nulls last, so NULL-timestamp rows
-        lose to any timestamped row. Within equal timestamps, a deterministic tiebreaker is
-        applied: ``xxhash64`` over every non-MapType column of the DataFrame, ascending, so the
-        winner is stable across retries and the result is reproducible given the same input rows.
-        MapType columns are excluded because Spark's ``xxhash64`` cannot hash map values. Map
-        columns that remain in the Spark DataFrame at this stage (they are not pivoted until merge
-        time on the executor) are silently excluded from the tiebreaker hash for that reason.
+        Orders by ``ts_col`` descending NULLS LAST; ties broken by ``xxhash64`` over all
+        non-MapType columns ascending (MapType columns cannot be hashed by Spark).
 
         Args:
             source: The source DataFrame with map columns still intact.
@@ -927,12 +652,7 @@ class IcebergToLanceETL:
         return source.withColumn("row_num", F.row_number().over(window)).where(F.col("row_num") == 1).drop("row_num")
 
     def run(self, spark: SparkSession, table: str, start_ms: int, end_ms: int) -> None:
-        """Read, transform, and route one time range of Iceberg changes.
-
-        Resolves the Iceberg snapshot bounds, reads the incremental rows, applies the optional
-        timestamp window filter via :meth:`apply_window_filter`, and delegates to
-        :meth:`run_on_dataframe` for collapse and routing. The event timestamp column
-        (``config.ts_col``) is the single canonical clock for ordering and collapse.
+        """Read one Iceberg window and route it via :meth:`run_on_dataframe`.
 
         Args:
             spark: Active Spark session.
@@ -943,29 +663,10 @@ class IcebergToLanceETL:
         self.run_on_dataframe(self.apply_window_filter(self.read_increment(spark, table, start_ms, end_ms)))
 
     def run_on_dataframe(self, source: DataFrame) -> None:
-        """Transform and route a pre-read increment.
+        """Validate, collapse, shuffle, and merge a pre-read increment into per-tenant Lance datasets.
 
-        Validates the source schema against the contract in ``docs/iceberg-source-table.sql``,
-        collapses to the last-write-wins terminal row per routing key and vector id using the event
-        timestamp, and routes each routing key's rows to its Lance dataset via ``merge_insert``.
-        Map columns (``vectors``, ``texts``, ``metadata``) ride through the Spark shuffle intact
-        and are pivoted on the executor inside :func:`apply_merge` via :func:`pivot_map_columns`.
-        Vector columns are cast to inferred fixed-size lists and the TTL column is cast to
-        ``pa.duration("s")`` automatically. The order is: validate, collapse, shuffle, pivot+cast,
-        merge. The event timestamp column (``config.ts_col``) is the single canonical clock: it
-        drives the collapse order and is available for scalar range filters on the written datasets.
-        No ingest-time column is added.
-
-        Routing rows with a null value in any routing column are silently dropped before the
-        group-by: rows that cannot be routed to a dataset URI are invalid and routing them would
-        raise ``ValueError`` from :func:`dataset_uri`. The count of dropped rows is emitted as
-        ``dataset.null_routing_rows`` and logged at WARNING level.
-
-        Stats collection uses a single Spark action (``collect()``) over the ``mapInArrow``
-        output. Each row in the collected result represents one touched dataset. Totals are
-        aggregated in Python on the driver over the bounded result set (bounded by fleet size).
-        When ``config.changed_uris_path`` is set, the sorted list of touched dataset URIs is
-        written to that path via :func:`emit_changed_uris` after totals are computed.
+        Order: validate schema, collapse LWW, repartition by routing key, pivot+cast+merge on
+        executors. Null routing rows are dropped and counted as ``dataset.null_routing_rows``.
 
         Args:
             source: A source DataFrame carrying the operation column.
@@ -980,12 +681,7 @@ class IcebergToLanceETL:
             partition_stats_schema: pa.Schema = stats_schema()
 
             def merge_partition(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
-                """Merge one Spark partition's datasets on an executor.
-
-                Before grouping by routing key, rows with a null value in any routing column are
-                filtered out. Such rows cannot be routed to a valid dataset URI and routing them
-                would raise ``ValueError``. The count of dropped rows is emitted as
-                ``dataset.null_routing_rows`` and logged at WARNING.
+                """Merge all routing-key groups in one Spark partition.
 
                 Args:
                     batches: Arrow batches for this task.
@@ -1044,7 +740,3 @@ class IcebergToLanceETL:
                 upserted,
                 deleted,
             )
-
-            if config.changed_uris_path is not None:
-                touched_uris: list[str] = [dataset_uri(config, *[str(row[c]) for c in routing]) for row in rows]
-                emit_changed_uris(config, touched_uris)

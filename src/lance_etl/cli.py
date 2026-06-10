@@ -14,9 +14,7 @@ Provides the following subcommands. ``etl`` reads a time range from an Iceberg t
 changes into per-tenant Lance datasets. Routing always uses the fixed trio ``org_id``, ``tenant_id``,
 ``namespace`` (see ``ROUTING_COLS`` in :mod:`lance_etl.etl`). The source table's map columns (``vectors``,
 ``texts``, ``metadata``) are pivoted dynamically: every key present in the data becomes a concrete column
-with no per-field declaration required on the command line. When ``--changed-uris-path`` is supplied the
-driver writes one changed-dataset URI per line to that object-store path after each run so downstream
-maintenance and index tasks can scope their work to only the datasets touched in the window. Backfills are
+with no per-field declaration required on the command line. Backfills are
 catch-up replays of this same job over historical windows. ``maintenance`` runs per-dataset maintenance
 over a set of datasets: per-row TTL expiration (when a TTL column is named), two-tier distributed
 compaction, and version cleanup, in that order. ``index`` builds IVF_RQ vector, btree scalar, bitmap, and
@@ -215,11 +213,6 @@ def run_etl(args: argparse.Namespace, spark: SparkSession) -> None:
     partition count, conflict-retry budget, and retry timeout take their opinionated
     :class:`ETLConfig` defaults.
 
-    When ``--changed-uris-path`` is supplied the ETL driver writes one changed-dataset URI per line
-    to that object-store path after each run. The file is always written (even when no datasets
-    changed) so downstream maintenance and index tasks can scope their work to the datasets the ETL
-    actually touched in this window.
-
     Args:
         args: Parsed command-line arguments.
         spark: Active Spark session.
@@ -231,7 +224,6 @@ def run_etl(args: argparse.Namespace, spark: SparkSession) -> None:
         iceberg_read_options=parse_key_values(args.iceberg_option),
         window_start=args.window_start,
         window_end=args.window_end,
-        changed_uris_path=args.changed_uris_path,
     )
     IcebergToLanceETL(config).run(spark, args.table, parse_epoch_ms(args.start), parse_epoch_ms(args.end))
 
@@ -540,15 +532,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "ISO-8601 upper bound (exclusive) for the source timestamp window pushdown filter applied to the "
             "configured window column after the Iceberg read.  Absent means the upper bound is open (no filter)."
-        ),
-    )
-    etl.add_argument(
-        "--changed-uris-path",
-        default=None,
-        help=(
-            "Object-store path where the ETL driver writes one changed-dataset URI per line after each run. "
-            "The file is always written (even when empty) so downstream maintenance and index tasks can scope "
-            "their work to the datasets actually touched in this window. Absent means the list is not written."
         ),
     )
 
