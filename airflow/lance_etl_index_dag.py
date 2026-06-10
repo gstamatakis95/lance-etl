@@ -15,10 +15,12 @@ Column-selection flags are passed verbatim from the ``lance_etl_index_flags`` Va
 silent no-op. Operators control exactly which index types are maintained by setting this
 Variable without editing the DAG file.
 
-IVF centroid training runs on the Spark driver. The driver memory must be at least 8g
-for the largest datasets. The default ``lance_etl_driver_memory`` value of ``8g`` satisfies
-this requirement. Raise it via the Variable if your fleet contains datasets larger than
-the default training budget.
+IVF centroid training runs on a single Spark executor task, not the driver. The executor
+memory (``lance_etl_executor_memory``, default ``8g``) must be large enough for the training
+sample, which is bounded by ``train_sample_memory_budget_bytes`` (default 8 GiB). The
+default executor memory of ``8g`` satisfies this requirement for most fleets. Driver memory
+requirements drop to segment merge and commit bookkeeping only, so the driver does not need
+to be sized for the training sample.
 
 COEXISTENCE
 -----------
@@ -56,8 +58,9 @@ Airflow Variables consumed by this DAG:
     lance_etl_executor_memory
         ``spark.executor.memory`` override (default ``8g``).
     lance_etl_driver_memory
-        ``spark.driver.memory`` override (default ``8g``). The index job trains IVF
-        centroids on the driver and needs at least 8g for the largest datasets.
+        ``spark.driver.memory`` override (default ``8g``). Training now runs on an executor,
+        so driver memory covers only segment merge and commit bookkeeping. The default 8g is
+        generous for this workload and rarely needs adjustment.
     lance_etl_spark_conf_overrides
         JSON object of extra Spark conf key/value pairs (default ``{}``).
     lance_etl_spark_conn_id

@@ -356,3 +356,98 @@ def test_fts_commit_index_raises_on_missing_fragments(dataset_uri: str, telemetr
     stale_ids: list[int] = [*fragment_ids_of(dataset_uri), 9999]
     with pytest.raises(ValueError, match="no longer exist"):
         handler.commit_index(dataset_uri, dataset, "00000000-0000-0000-0000-000000000000", stale_ids, telemetry)
+
+
+def test_promoted_small_tier_index_triggers_full_rebuild(dataset_uri: str, telemetry: Telemetry) -> None:
+    """An index built by the small tier (no stored config) is fully rebuilt on the segment path.
+
+    The small tier's plain ``create_index`` mints its own IVF centroids and RaBitQ rotation and
+    writes no config KV. When the dataset crosses the fragment threshold, the segment path must
+    target every fragment so the retrained model replaces the old delta instead of appending a
+    delta on a different model, whose later merge would silently corrupt the index.
+    """
+    config: IndexJobConfig = maintenance_config()
+    index_dataset_locally(dataset_uri, config)
+    assert load_vector_config(lance.dataset(dataset_uri), "vector") is None
+
+    append_fragment(dataset_uri, rows=ROWS_PER_FRAGMENT, start_id=ROWS)
+    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
+    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    targets: list[int] = handler.target_fragments(dataset)
+    assert targets == fragment_ids_of(dataset_uri)
+    assert handler.full_rebuild is True
+
+    artifacts: object | None = handler.prepare(dataset, dataset_uri, telemetry)
+    assert handler.reused_artifacts is False
+    documents: list[str] = []
+    for group in split_evenly(targets, 2):
+        segment: Index = handler.build_segment(lance.dataset(dataset_uri, version=dataset.version), group, artifacts)
+        documents.append(serialize_segment(segment))
+    commit_segments(dataset_uri, documents, "vector", "vector_idx", True, config, telemetry)
+
+    refreshed: lance.LanceDataset = lance.dataset(dataset_uri)
+    assert index_delta_count(refreshed, "vector_idx") == 1
+    assert handler.target_fragments(refreshed) == fragment_ids_of(dataset_uri)
+
+    fresh_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    assert fresh_handler.target_fragments(refreshed) == []
+
+
+def test_full_rebuild_is_sticky_across_replans(dataset_uri: str, telemetry: Telemetry) -> None:
+    """Once a retrain trigger fires, replans keep targeting every fragment after the config refresh."""
+    config: IndexJobConfig = maintenance_config()
+    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
+    artifacts: object | None = handler.prepare(dataset, dataset_uri, telemetry)
+    documents: list[str] = []
+    for group in split_evenly(fragment_ids_of(dataset_uri), 2):
+        segment: Index = handler.build_segment(lance.dataset(dataset_uri, version=dataset.version), group, artifacts)
+        documents.append(serialize_segment(segment))
+    commit_segments(dataset_uri, documents, "vector", "vector_idx", True, config, telemetry)
+
+    cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
+    assert cfg is not None
+    patched_cfg: dict[str, object] = dict(cfg)
+    patched_cfg["rows_at_train"] = ROWS // 8
+    write_vector_config(dataset_uri, "vector", patched_cfg, config, telemetry)
+
+    retrain_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    current: lance.LanceDataset = lance.dataset(dataset_uri)
+    assert retrain_handler.target_fragments(current) == fragment_ids_of(dataset_uri)
+    retrain_handler.prepare(current, dataset_uri, telemetry)
+    refreshed_cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
+    assert refreshed_cfg is not None
+    assert refreshed_cfg["rows_at_train"] == ROWS
+    assert retrain_handler.target_fragments(lance.dataset(dataset_uri)) == fragment_ids_of(dataset_uri)
+
+
+def test_small_tier_rebuild_clears_stale_vector_config(dataset_uri: str, telemetry: Telemetry) -> None:
+    """A small-tier ``create_index`` build removes a stored config left by an earlier segment build."""
+    config: IndexJobConfig = maintenance_config()
+    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
+    artifacts: object | None = handler.prepare(dataset, dataset_uri, telemetry)
+    documents: list[str] = []
+    for group in split_evenly(fragment_ids_of(dataset_uri), 2):
+        segment: Index = handler.build_segment(lance.dataset(dataset_uri, version=dataset.version), group, artifacts)
+        documents.append(serialize_segment(segment))
+    commit_segments(dataset_uri, documents, "vector", "vector_idx", True, config, telemetry)
+    assert load_vector_config(lance.dataset(dataset_uri), "vector") is not None
+
+    index_dataset_locally(dataset_uri, maintenance_config(rebuild=True))
+    assert load_vector_config(lance.dataset(dataset_uri), "vector") is None
+
+
+def test_prepare_trains_when_config_present_but_index_absent(dataset_uri: str, telemetry: Telemetry) -> None:
+    """A stored config without a committed index falls through to training instead of raising."""
+    config: IndexJobConfig = maintenance_config()
+    seed_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    seed_handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
+    assert load_vector_config(lance.dataset(dataset_uri), "vector") is not None
+    names: set[str] = {description.name for description in lance.dataset(dataset_uri).describe_indices()}
+    assert "vector_idx" not in names
+
+    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    artifacts: object | None = handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
+    assert artifacts is not None
+    assert handler.reused_artifacts is False

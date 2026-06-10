@@ -28,6 +28,7 @@ from lance_etl.indexing.handlers import (
     VectorIndexHandler,
 )
 from lance_etl.indexing.optimize import (
+    clear_vector_config,
     drop_existing_index,
     index_delta_count,
     load_vector_config,
@@ -58,6 +59,7 @@ from lance_etl.indexing.segments import (
     live_fragment_ids,
     serialize_segment,
     split_evenly,
+    train_vector_artifacts,
 )
 
 __all__ = [
@@ -81,6 +83,7 @@ __all__ = [
     "scalar_index_name",
     "vector_config_key",
     "vector_index_name",
+    "clear_vector_config",
     "drop_existing_index",
     "index_delta_count",
     "load_vector_config",
@@ -104,4 +107,5 @@ __all__ = [
     "live_fragment_ids",
     "serialize_segment",
     "split_evenly",
+    "train_vector_artifacts",
 ]

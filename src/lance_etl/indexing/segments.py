@@ -1,9 +1,10 @@
-"""Segment serialisation, IVF centroid I/O, and the build-and-commit loop.
+"""Segment serialisation, IVF centroid I/O, executor-offloaded training, and the build-and-commit loop.
 
 Provides all the primitives needed by the distributed index build: serialise/deserialise
 uncommitted segment metadata, IPC-encode/decode IVF centroids, shard fragment lists, validate
-live fragments, commit collected segments with conflict retries, and the outer
-build-and-commit-segments loop that handles stale-fragment replans.
+live fragments, commit collected segments with conflict retries, the picklable
+:func:`train_vector_artifacts` used to offload IVF centroid training to a Spark executor, and the
+outer build-and-commit-segments loop that handles stale-fragment replans.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ from typing import Any
 import lance
 import pyarrow as pa
 from lance.dataset import Index
+from lance.indices import IndicesBuilder
+from lance.lance import indices as native_indices
 
 from lance_etl.indexing.config import IndexJobConfig
 from lance_etl.telemetry import Telemetry, commit_with_retries
@@ -28,7 +31,12 @@ STALE_FRAGMENT_MARKERS: tuple[str, ...] = ("would orphan fragments", "no longer 
 """Error-message substrings that identify a segment commit invalidated by a concurrent compaction."""
 
 TRAIN_SEMAPHORE: threading.Semaphore = threading.Semaphore(1)
-"""Process-level semaphore that serialises concurrent IVF trainings from the driver thread pool."""
+"""Process-level semaphore that serialises IVF training tasks so two samples never co-locate on one executor.
+
+When training is offloaded to Spark, driver threads that are waiting for a training slot idle
+rather than consuming driver RAM or CPU. The semaphore still bounds concurrency when the
+fallback in-process path is used (e.g. in tests or no-Spark callers).
+"""
 
 
 def centroids_to_ipc(centroids: pa.Array) -> bytes:
@@ -207,6 +215,54 @@ def commit_index_with_retries(
     )
 
 
+def train_vector_artifacts(
+    uri: str,
+    column: str,
+    num_partitions: int,
+    sample_rate: int,
+    max_iters: int,
+    num_bits: int,
+    distance_type: str,
+    storage_options: dict[str, Any] | None,
+) -> tuple[bytes, str]:
+    """Train IVF centroids and mint a RaBitQ model for one vector column.
+
+    This is a module-level picklable function so it can be shipped to a Spark executor via
+    ``parallelize([uri], 1).map(functools.partial(train_vector_artifacts, column=..., ...))``.
+    All parameters are primitives or a plain dict so the closure serialises without capturing any
+    handler or telemetry state. The function opens the dataset itself, trains the IVF centroids,
+    IPC-serialises them, and mints a fresh RaBitQ model JSON string. The caller is responsible for
+    timing and telemetry.
+
+    Args:
+        uri: Dataset URI to open for training.
+        column: The vector column to train on.
+        num_partitions: The IVF partition count to train.
+        sample_rate: Rows sampled per partition during IVF training.
+        max_iters: Maximum k-means iterations.
+        num_bits: RaBitQ bits per sub-dimension.
+        distance_type: Lance distance type string (e.g. ``"l2"``).
+        storage_options: Object-store options forwarded to lance.
+
+    Returns:
+        A tuple of ``(centroids_ipc_bytes, rabitq_model_json)``. The bytes are an Arrow IPC stream
+        decodeable by :func:`centroids_from_ipc`. The JSON string is validated by lance when passed
+        to ``create_index_uncommitted``.
+    """
+    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
+    builder: IndicesBuilder = IndicesBuilder(dataset, column)
+    ivf_model = builder.train_ivf(
+        num_partitions=num_partitions,
+        distance_type=distance_type,
+        sample_rate=sample_rate,
+        max_iters=max_iters,
+    )
+    centroids_ipc: bytes = centroids_to_ipc(ivf_model.centroids)
+    dimension: int = builder.dimension
+    rabitq_model: str = native_indices.build_rq_model(dimension=dimension, num_bits=num_bits)
+    return centroids_ipc, rabitq_model
+
+
 def build_scalar_segment(
     dataset: lance.LanceDataset,
     fragment_ids: list[int],
@@ -325,16 +381,22 @@ def commit_segments(
     config: IndexJobConfig,
     telemetry: Telemetry,
 ) -> int:
-    """Commit built segments, retrying conflicts to coexist with writers.
+    """Commit built segments, merging once and retrying only the cheap commit on conflicts.
 
-    Each attempt validates the segments against the latest fragment set first. A concurrent
-    compaction can rewrite fragments between the segment build and this commit, and a blind retry
-    at the new head version would then publish segments pointing at fragments that no longer exist,
-    silently corrupting search results. Stale segments are dropped with a metric instead. When
-    every segment is stale the commit is skipped and ``0`` is returned. When a surviving segment
-    overlaps a wider existing segment that a compaction remapped over a rewritten fragment, lance
-    raises the ``"would orphan fragments"`` ``ValueError``, which propagates so the caller can
-    re-resolve and rebuild.
+    The expensive work runs exactly once, outside the retry loop: stale segments (those whose
+    fragments were rewritten between build and commit) are dropped with a metric, and the fresh
+    survivors are merged when the index type requires it. For a large dataset that merge streams
+    the segment index files through the driver, so re-running it on every benign commit conflict
+    would amplify a manifest race into repeated whale-scale work. The retried action is therefore
+    only open, validate, and commit: each attempt re-opens the dataset at the latest version,
+    verifies every prepared segment still covers only live fragments, and commits. When a
+    concurrent rewrite invalidates the prepared segments mid-retry, the action raises a
+    ``ValueError`` carrying the ``"no longer exist"`` stale-fragment marker so the caller's
+    replan loop re-resolves and rebuilds, the same recovery path as the lance
+    ``"would orphan fragments"`` error.
+
+    When every built segment is stale before the merge, the commit is skipped and ``0`` is
+    returned.
 
     Args:
         uri: Dataset URI.
@@ -350,35 +412,44 @@ def commit_segments(
         stale and the commit was skipped.
 
     Raises:
-        ValueError: If publishing the fresh segments would orphan fragments held by a wider
-            existing segment, so the caller must re-resolve the fragment set and rebuild.
+        ValueError: If the prepared segments went stale during commit retries, or if publishing
+            them would orphan fragments held by a wider existing segment. Either way the caller
+            must re-resolve the fragment set and rebuild.
         OSError | RuntimeError: If commits keep conflicting past the retry budget.
     """
-    segments: list[Index] = [deserialize_segment(document) for document in segment_documents]
     tags: list[str] = [f"index:{index_name}"]
+    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+    live: set[int] = live_fragment_ids(dataset)
+    segments: list[Index] = [deserialize_segment(document) for document in segment_documents]
+    fresh: list[Index] = [segment for segment in segments if set(segment.fragment_ids) <= live]
+    stale: int = len(segments) - len(fresh)
+    if stale:
+        telemetry.incr("index.stale_segments_dropped", value=stale, tags=tags)
+        logger.warning(
+            "dropping %d stale segments for %s on %s: their fragments were rewritten between build and commit",
+            stale,
+            index_name,
+            uri,
+        )
+    if not fresh:
+        logger.warning("every segment for %s on %s is stale; skipping commit, next run re-covers", index_name, uri)
+        return 0
+    if merge and len(fresh) > 1:
+        to_commit: list[Index] = [dataset.merge_existing_index_segments(fresh)]
+    else:
+        to_commit = fresh
 
     def action() -> int:
-        """Drop stale segments, merge if needed, and commit at the latest version."""
-        dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-        live: set[int] = live_fragment_ids(dataset)
-        fresh: list[Index] = [segment for segment in segments if set(segment.fragment_ids) <= live]
-        stale: int = len(segments) - len(fresh)
-        if stale:
-            telemetry.incr("index.stale_segments_dropped", value=stale, tags=tags)
-            logger.warning(
-                "dropping %d stale segments for %s on %s: their fragments were rewritten between build and commit",
-                stale,
-                index_name,
-                uri,
-            )
-        if not fresh:
-            logger.warning("every segment for %s on %s is stale; skipping commit, next run re-covers", index_name, uri)
-            return 0
-        if merge and len(fresh) > 1:
-            merged = dataset.merge_existing_index_segments(fresh)
-            dataset.commit_existing_index_segments(index_name, column, [merged])
-        else:
-            dataset.commit_existing_index_segments(index_name, column, fresh)
+        """Re-open at the latest version, verify the prepared segments are live, and commit."""
+        latest: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+        current: set[int] = live_fragment_ids(latest)
+        for segment in to_commit:
+            if not set(segment.fragment_ids) <= current:
+                raise ValueError(
+                    f"prepared segments for {index_name} cover fragments that no longer exist after a "
+                    f"concurrent rewrite; the merge is stale and the build must re-resolve"
+                )
+        latest.commit_existing_index_segments(index_name, column, to_commit)
         telemetry.incr("index.committed", tags=tags)
         return len(fresh)
 
@@ -391,6 +462,7 @@ def build_and_commit_segments(
     config: IndexJobConfig,
     telemetry: Telemetry,
     build_documents: Callable[[list[list[int]], int, object | None], list[str]],
+    spark: Any | None = None,
 ) -> dict[str, int]:
     """Build per-shard segments and commit them, rebuilding when a concurrent compaction makes the plan stale.
 
@@ -418,6 +490,8 @@ def build_and_commit_segments(
         build_documents: Builds one serialized segment per shard for the given fragment groups,
             pinned to the given dataset version, using the broadcast artifacts. Supplied by the
             distributed and in-process callers so the rebuild loop is shared.
+        spark: Active Spark session forwarded to ``handler.prepare`` for executor-offloaded IVF
+            training. When ``None`` the handler trains in-process (test or no-cluster fallback).
 
     Returns:
         A mapping with the total ``segments`` committed and the ``fragments`` targeted on the first
@@ -433,7 +507,7 @@ def build_and_commit_segments(
             first_targets = len(targets)
         if not targets:
             return {"segments": total_segments, "fragments": first_targets}
-        artifacts: object | None = handler.prepare(dataset, uri, telemetry)
+        artifacts: object | None = handler.prepare(dataset, uri, telemetry, spark=spark)
         version: int = dataset.version
         groups: list[list[int]] = split_evenly(targets, config.num_shards)
         documents: list[str] = build_documents(groups, version, artifacts)

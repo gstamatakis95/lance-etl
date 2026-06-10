@@ -64,7 +64,9 @@ class IndexJobConfig:
         train_sample_rate: Rows sampled per IVF partition when training centroids.
         train_max_iters: Maximum k-means iterations when training the IVF.
         retrain_growth_factor: Retrain when row count exceeds this multiple of ``rows_at_train`` in the config.
-        train_sample_memory_budget_bytes: Driver RAM cap for the IVF training sample; caps partition count.
+        train_sample_memory_budget_bytes: Executor RAM cap for the IVF training sample; caps partition count.
+            The sample lands in executor heap, so this budget should track executor sizing (the default 8g
+            executor covers the 8 GiB default).
         max_stale_replans: Rebuild-everything cycles in ``build_and_commit_segments`` before giving up.
     """
 
@@ -279,11 +281,12 @@ def degrade_num_partitions(planned: int, rows: int, sample_rate: int) -> int:
 
 
 def memory_bounded_num_partitions(planned: int, dimension: int, config: IndexJobConfig) -> int:
-    """Cap the planned IVF partition count so the training sample fits within the driver memory budget.
+    """Cap the planned IVF partition count so the training sample fits within the executor memory budget.
 
     ``train_ivf`` loads ``planned * config.train_sample_rate`` float32 vectors of length
-    ``dimension`` into driver RAM. This function floors the planned count to what
-    ``config.train_sample_memory_budget_bytes`` can accommodate. The result is always at least 1.
+    ``dimension`` into executor heap (training is offloaded to a single Spark task). This function
+    floors the planned count to what ``config.train_sample_memory_budget_bytes`` can accommodate on
+    a single executor. The result is always at least 1.
 
     Args:
         planned: The partition count derived by policy or degraded for row count.

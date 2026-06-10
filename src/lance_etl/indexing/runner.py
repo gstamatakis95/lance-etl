@@ -30,13 +30,15 @@ from lance_etl.indexing.handlers import (
     IndexHandler,
     VectorIndexHandler,
 )
-from lance_etl.indexing.optimize import maintain_index_locally
+from lance_etl.indexing.optimize import clear_vector_config, load_vector_config, maintain_index_locally
 from lance_etl.telemetry import Telemetry
 
 logger: logging.Logger = logging.getLogger(__name__)
 
 
-def index_skip_reason(dataset: lance.LanceDataset, config: IndexJobConfig) -> str | None:
+def index_skip_reason(
+    dataset: lance.LanceDataset, config: IndexJobConfig, check_vector_artifacts: bool = True
+) -> str | None:
     """Return a reason string when all configured indices are current, or None to proceed.
 
     Evaluates derived dataset state from the already-open handle so no extra object-store I/O is
@@ -46,13 +48,23 @@ def index_skip_reason(dataset: lance.LanceDataset, config: IndexJobConfig) -> st
     dataset needs indexing, unless it is a vector index and the row count is below
     ``config.vector_min_rows`` (intended skip — flat KNN suffices). When the index is present,
     ``dataset.stats.index_stats(name)`` is consulted: if ``num_unindexed_fragments`` is positive
-    or ``num_indices`` exceeds ``config.max_index_deltas``, the dataset needs work. When every
+    or ``num_indices`` exceeds ``config.max_index_deltas``, the dataset needs work. When
+    ``check_vector_artifacts`` is True (the segment-API tier), an existing vector index
+    additionally needs work when its
+    ``lance-etl.vector.{column}`` config entry is absent (a small-tier-built index awaiting the
+    promotion full rebuild) or when the row count grew past ``config.retrain_growth_factor``
+    times the recorded ``rows_at_train`` (a centroid retrain is due even with full coverage).
+    The small tier passes False because its indexes carry a private model with no config entry
+    by design and retrain through tier promotion instead. Both reads come from the
+    already-loaded manifest, so the check stays free of extra object-store I/O. When every
     configured index passes all checks without returning None, a short reason string is returned
     and the caller skips the dataset.
 
     Args:
         dataset: The already-open dataset handle.
         config: Indexing configuration.
+        check_vector_artifacts: Evaluate the vector config-entry and growth-retrain probes,
+            True for the segment-API tier and False for the small in-process tier.
 
     Returns:
         A human-readable skip reason when all indices are current and no work is needed, or
@@ -64,22 +76,22 @@ def index_skip_reason(dataset: lance.LanceDataset, config: IndexJobConfig) -> st
     existing: set[str] = {description.name for description in dataset.describe_indices()}
     rows: int | None = None
 
-    all_names: list[tuple[str, bool]] = []
+    all_names: list[tuple[str, str | None]] = []
     for column in config.vector_columns:
-        all_names.append((vector_index_name(column), True))
+        all_names.append((vector_index_name(column), column))
     for column in config.scalar_columns:
-        all_names.append((scalar_index_name(column), False))
+        all_names.append((scalar_index_name(column), None))
     for column in config.bitmap_columns:
-        all_names.append((bitmap_index_name(column), False))
+        all_names.append((bitmap_index_name(column), None))
     for column in config.text_columns:
-        all_names.append((fts_index_name(column), False))
+        all_names.append((fts_index_name(column), None))
 
     if not all_names:
         return "no indices configured"
 
-    for name, is_vector in all_names:
+    for name, vector_column in all_names:
         if name not in existing:
-            if is_vector:
+            if vector_column is not None:
                 if rows is None:
                     rows = dataset.count_rows()
                 if rows < config.vector_min_rows:
@@ -91,6 +103,18 @@ def index_skip_reason(dataset: lance.LanceDataset, config: IndexJobConfig) -> st
             return None
         if int(stats.get("num_indices") or 0) > config.max_index_deltas:
             return None
+
+        if vector_column is not None and check_vector_artifacts:
+            cfg: dict[str, Any] | None = load_vector_config(dataset, vector_column)
+            if cfg is None:
+                return None
+            rows_at_train: int = int(cfg.get("rows_at_train") or 0)
+            if rows_at_train <= 0:
+                return None
+            if rows is None:
+                rows = dataset.count_rows()
+            if rows > config.retrain_growth_factor * rows_at_train:
+                return None
 
     return "all indices current"
 
@@ -131,8 +155,11 @@ def index_dataset_locally(uri: str, config: IndexJobConfig) -> dict[str, Any]:
     :attr:`IndexJobConfig.vector_columns` follows the same size-aware policy as the distributed
     path and is skipped below the configured row floor. Incremental vector maintenance assigns new
     rows to existing IVF partitions without retraining, so a grown dataset retrains via the large
-    tier's growth trigger once it crosses the fragment threshold, or earlier via a ``rebuild``
-    run. No artifact files or sidecar directories are created by this path.
+    tier once it crosses the fragment threshold (an artifact-less existing index is a full-rebuild
+    trigger there), or earlier via a ``rebuild`` run. No artifact files or sidecar directories are
+    created by this path, and any stored vector config left by an earlier segment-API build is
+    cleared before a plain ``create_index`` build so the large tier never pairs the new index's
+    private model with stale stored artifacts.
 
     Args:
         uri: Dataset URI.
@@ -145,7 +172,7 @@ def index_dataset_locally(uri: str, config: IndexJobConfig) -> dict[str, Any]:
     telemetry: Telemetry = Telemetry.create(config.telemetry)
     dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
 
-    skip: str | None = index_skip_reason(dataset, config)
+    skip: str | None = index_skip_reason(dataset, config, check_vector_artifacts=False)
     if skip is not None:
         telemetry.incr("dataset.skipped_no_work")
         return {"uri": uri, "indexes": [], "tier": "small", "skipped": skip}
@@ -176,6 +203,7 @@ def index_dataset_locally(uri: str, config: IndexJobConfig) -> dict[str, Any]:
             else:
                 planned: int = derive_num_partitions(rows, config.num_partitions, config)
                 partitions: int = degrade_num_partitions(planned, rows, config.train_sample_rate)
+                clear_vector_config(uri, vec_col, config, telemetry)
                 with telemetry.timed("index.build_ms", tags=[f"index:{idx_name}"]):
                     dataset.create_index(
                         vec_col,

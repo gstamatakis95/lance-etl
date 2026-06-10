@@ -84,6 +84,43 @@ def write_vector_config(
     commit_index_with_retries(action, config, telemetry, tags)
 
 
+def clear_vector_config(
+    uri: str,
+    column: str,
+    config: IndexJobConfig,
+    telemetry: Telemetry,
+) -> None:
+    """Remove the stored vector artifact config for a column, if present.
+
+    The small-dataset tier builds vector indices with plain ``create_index``, which mints its own
+    IVF centroids and RaBitQ rotation in process and cannot report them back, so no stored config
+    can describe that index. A config left behind by an earlier segment-API build would pair the
+    new index's centroids with the old build's ``rabitq_model`` on the next large-tier run,
+    producing deltas on mismatched models whose later merge silently corrupts the index. Clearing
+    the key makes the large tier detect the index as artifact-less and retrain with a full
+    rebuild. The delete is a no-op commit-free check when the key is absent.
+
+    Args:
+        uri: Dataset URI.
+        column: The vector column whose config to remove.
+        config: Indexing configuration for the retry budget and backoff.
+        telemetry: Telemetry facade for the current process.
+
+    Raises:
+        OSError | RuntimeError: If commits keep conflicting past the retry budget.
+    """
+    key: str = vector_config_key(column)
+
+    def action() -> None:
+        """Delete the config key at the latest dataset version when it exists."""
+        dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+        if key in dataset.config():
+            dataset.delete_config_keys([key])
+            telemetry.incr("artifacts.config_cleared", tags=[f"column:{column}"])
+
+    commit_index_with_retries(action, config, telemetry, [f"column:{column}"])
+
+
 def optimize_existing_index(
     uri: str,
     index_name: str,
