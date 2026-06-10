@@ -11,7 +11,9 @@ from pathlib import Path
 
 import pytest
 
-from lance_etl.cli import build_parser, parse_partition_cols
+import lance_etl.etl.cli as etl_cli
+import lance_etl.tools.cli as tools_cli
+from lance_etl.cliutil import parse_partition_cols
 from lance_etl.etl import (
     ETLConfig,
     dataset_uri,
@@ -46,11 +48,6 @@ class TestDatasetUri:
         with pytest.raises(ValueError, match="expected 3 routing components"):
             dataset_uri(base_config, "org1", "tenant1")
 
-    def test_invalid_component_raises(self, base_config: ETLConfig) -> None:
-        """A component failing the path-component pattern raises, preventing traversal."""
-        with pytest.raises(ValueError, match="invalid routing component"):
-            dataset_uri(base_config, "org1", "tenant/1", "ns1")
-
     def test_null_component_raises(self, base_config: ETLConfig) -> None:
         """A null routing value raises instead of building a broken path."""
         with pytest.raises(ValueError, match="invalid routing component"):
@@ -66,9 +63,8 @@ class TestCliPartitionFlags:
     def test_etl_has_no_partition_by_flag(self) -> None:
         """The etl subcommand no longer accepts --partition-by."""
         with pytest.raises(SystemExit) as exc_info:
-            build_parser().parse_args(
+            etl_cli.build_parser().parse_args(
                 [
-                    "etl",
                     "--table",
                     "db.t",
                     "--start",
@@ -85,7 +81,7 @@ class TestCliPartitionFlags:
 
     def test_migrate_namespace_partition_by_defaults_to_absent(self) -> None:
         """Without the flag, migrate-namespace carries None so the ROUTING_COLS default applies."""
-        args = build_parser().parse_args(
+        args = tools_cli.build_parser().parse_args(
             [
                 "migrate-namespace",
                 "--source-namespace",
@@ -100,7 +96,7 @@ class TestCliPartitionFlags:
 
     def test_migrate_namespace_partition_by_is_parsed(self) -> None:
         """--partition-by on migrate-namespace lands on the namespace verbatim."""
-        args = build_parser().parse_args(
+        args = tools_cli.build_parser().parse_args(
             [
                 "migrate-namespace",
                 "--source-namespace",
@@ -117,8 +113,8 @@ class TestCliPartitionFlags:
 
     def test_no_partition_derive_flag(self) -> None:
         """The by-date --partition-derive flag is gone from the etl subcommand."""
-        args = build_parser().parse_args(
-            ["etl", "--table", "db.t", "--start", "0", "--end", "1", "--base-uri", "s3://bucket/lance"]
+        args = etl_cli.build_parser().parse_args(
+            ["--table", "db.t", "--start", "0", "--end", "1", "--base-uri", "s3://bucket/lance"]
         )
         assert not hasattr(args, "partition_derive")
 

@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from lance_etl.cli import build_parser, main
+import lance_etl.tools.cli as tools_cli
 from lance_etl.recall import (
     DatadogSpanSource,
     FilterTranslationError,
@@ -311,14 +311,14 @@ class TestRecallCli:
     """The recall subcommand parses and exposes its flags."""
 
     def test_recall_help_exits_zero(self) -> None:
-        """``lance-etl recall --help`` exits with status 0."""
+        """``lance-etl-tools recall --help`` exits with status 0."""
         with pytest.raises(SystemExit) as exc_info:
-            main(["recall", "--help"])
+            tools_cli.main(["recall", "--help"])
         assert exc_info.value.code == 0
 
     def test_recall_args_parse_with_defaults(self) -> None:
         """Required flags parse and optional flags carry the documented defaults."""
-        args = build_parser().parse_args(
+        args = tools_cli.build_parser().parse_args(
             ["recall", "--from", "1700000000000", "--to", "1700000400000", "--base-uri", "s3://bucket/root"]
         )
         assert args.command == "recall"
@@ -334,5 +334,5 @@ class TestRecallCli:
     def test_recall_requires_window_and_base_uri(self) -> None:
         """Missing required flags fail argument parsing."""
         with pytest.raises(SystemExit) as exc_info:
-            build_parser().parse_args(["recall", "--base-uri", "s3://bucket/root"])
+            tools_cli.build_parser().parse_args(["recall", "--base-uri", "s3://bucket/root"])
         assert exc_info.value.code == 2

@@ -16,7 +16,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from lance_etl.cli import build_parser
+import lance_etl.etl.cli as etl_cli
+import lance_etl.indexing.cli as indexing_cli
+import lance_etl.maintenance.cli as maintenance_cli
 from lance_etl.etl import ETLConfig, IcebergToLanceETL
 from lance_etl.telemetry import TelemetryConfig
 
@@ -48,9 +50,9 @@ class TestETLConfigWindowDefaults:
         """window_end is None by default (open upper bound)."""
         assert base_etl_config.window_end is None
 
-    def test_window_column_defaults_to_updated_at(self, base_etl_config: ETLConfig) -> None:
-        """window_column defaults to 'updated_at'."""
-        assert base_etl_config.window_column == "updated_at"
+    def test_window_column_defaults_to_processing_timestamp(self, base_etl_config: ETLConfig) -> None:
+        """window_column defaults to 'processing_timestamp'."""
+        assert base_etl_config.window_column == "processing_timestamp"
 
     def test_window_bounds_can_be_set(self, base_etl_config: ETLConfig) -> None:
         """window_start and window_end can be set to ISO-8601 strings."""
@@ -146,10 +148,8 @@ class TestCLIWindowFlags:
 
     def test_window_flags_have_correct_defaults(self) -> None:
         """Parsing without window flags yields None bounds and no window-column flag."""
-        parser = build_parser()
-        args = parser.parse_args(
+        args = etl_cli.build_parser().parse_args(
             [
-                "etl",
                 "--table",
                 "db.t",
                 "--start",
@@ -166,10 +166,8 @@ class TestCLIWindowFlags:
 
     def test_window_start_is_parsed(self) -> None:
         """--window-start is accepted and stored on the namespace."""
-        parser = build_parser()
-        args = parser.parse_args(
+        args = etl_cli.build_parser().parse_args(
             [
-                "etl",
                 "--table",
                 "db.t",
                 "--start",
@@ -186,10 +184,8 @@ class TestCLIWindowFlags:
 
     def test_window_end_is_parsed(self) -> None:
         """--window-end is accepted and stored on the namespace."""
-        parser = build_parser()
-        args = parser.parse_args(
+        args = etl_cli.build_parser().parse_args(
             [
-                "etl",
                 "--table",
                 "db.t",
                 "--start",
@@ -206,10 +202,8 @@ class TestCLIWindowFlags:
 
     def test_all_window_flags_together(self) -> None:
         """Both window bound flags can be supplied together."""
-        parser = build_parser()
-        args = parser.parse_args(
+        args = etl_cli.build_parser().parse_args(
             [
-                "etl",
                 "--table",
                 "db.t",
                 "--start",
@@ -228,17 +222,15 @@ class TestCLIWindowFlags:
         assert args.window_end == "2024-06-02T00:00:00Z"
 
     def test_window_flags_not_present_on_maintenance(self) -> None:
-        """The maintenance subcommand does not expose window flags."""
-        parser = build_parser()
-        args = parser.parse_args(["maintenance", "--datasets-file", "/tmp/ds.txt"])
+        """The maintenance run subcommand does not expose window flags."""
+        args = maintenance_cli.build_parser().parse_args(["run", "--datasets-file", "/tmp/ds.txt"])
         assert not hasattr(args, "window_start")
         assert not hasattr(args, "window_end")
         assert not hasattr(args, "window_column")
 
     def test_window_flags_not_present_on_index(self) -> None:
-        """The index subcommand does not expose window flags."""
-        parser = build_parser()
-        args = parser.parse_args(["index", "--datasets-file", "/tmp/ds.txt"])
+        """The indexing CLI does not expose window flags."""
+        args = indexing_cli.build_parser().parse_args(["--datasets-file", "/tmp/ds.txt"])
         assert not hasattr(args, "window_start")
         assert not hasattr(args, "window_end")
         assert not hasattr(args, "window_column")

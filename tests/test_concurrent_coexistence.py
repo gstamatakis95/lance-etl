@@ -47,16 +47,11 @@ and the large-tier segment path could never extend coverage. ``replace`` is cons
 bypass and existing deltas are preserved. Fixed in :class:`VectorIndexHandler`, :class:`BTreeIndexHandler`, and
 :class:`BitmapIndexHandler`.
 
-SECOND REAL BUG FOUND AND MITIGATED by this test: on the pinned lance build, compaction's inline eager index
-remap silently corrupts IVF_RQ indexes. Measured here: a clean index with 40/40 exact top-1 recall drops to
-22/40 after one ``Compaction.execute`` rewrote its covered fragments, while ``num_unindexed_fragments`` stays 0
-and ``num_indexed_rows`` stays exact, so no maintenance trigger ever fires. Deferred remap is also broken (vector
-queries fail with a missing fragment-id error, the caveat recorded in ``compaction.py``), and the corruption
-reproduces identically for ``create_index``-built indexes, so it is upstream, not a segment-flow artifact. BTREE
-and FTS remaps measured sound (40/40 after the same rewrite). Mitigation in
-:meth:`VectorIndexHandler.remap_requires_rebuild`: the artifact sidecar records the live fragment ids covered at
-each build, and a later pass finding any of them gone forces a full segment rebuild from the intact row data,
-reusing the trained centroids and rotation.
+SECOND BUG RESOLVED: the IVF_RQ inline-remap corruption described in earlier findings is fixed on the lance
+branch ``fix/ivf-rq-remap-corruption``. The corruption-containment machinery
+(``covered_fragment_ids``, ``remap_requires_rebuild``, ``record_coverage``, ``index_holds_dead_fragments``,
+``drop_stale_index``) has been deleted from the indexing layer. Deploy order: rebuild pylance from the fix
+branch before enabling this code on a production fleet.
 
 Convergence finding (Lance behavior, not a repository bug): the compaction planner never bins fragments whose
 covering index sets differ (``rust/lance/src/dataset/optimize.rs:662-694``) and every index delta carries its own
@@ -85,7 +80,7 @@ import pyarrow as pa
 import pytest
 from lance.optimize import Compaction, CompactionTask
 
-from lance_etl import indexing
+import lance_etl.indexing.segments as indexing_segments
 from lance_etl.etl import ETLConfig, apply_merge, dataset_uri
 from lance_etl.indexing import (
     BTreeIndexHandler,
@@ -336,7 +331,7 @@ def compact_head_with_replan(uri: str, compactor: MaintenanceJob, telemetry: Tel
     while cycles < config.replan_budget:
         cycles += 1
         dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-        plan = Compaction.plan(dataset, options=config.plan_options())
+        plan = Compaction.plan(dataset, options=config.execute_options())
         task_jsons: list[str] = [task.json() for task in plan.tasks]
         if not task_jsons:
             return "noop"
@@ -934,7 +929,7 @@ def racing_compaction_commit(
     Returns:
         A drop-in replacement for :func:`lance_etl.indexing.commit_segments`.
     """
-    real_commit: Callable[..., int] = indexing.commit_segments
+    real_commit: Callable[..., int] = indexing_segments.commit_segments
 
     def commit(*args: object, **kwargs: object) -> int:
         """Compact once, then commit, recording any orphan-fragment error.
@@ -1000,7 +995,9 @@ def test_vector_segment_commit_survives_compaction_orphan(tmp_path: Path, monkey
         commit_backoff_seconds=0.0,
     )
     state: dict[str, bool] = {"compacted": False, "orphan": False}
-    monkeypatch.setattr(indexing, "commit_segments", racing_compaction_commit(uri, compaction_config, telemetry, state))
+    monkeypatch.setattr(
+        indexing_segments, "commit_segments", racing_compaction_commit(uri, compaction_config, telemetry, state)
+    )
     build_segment_index(uri, VectorIndexHandler(rebuild_config, "vector", index_name), rebuild_config, telemetry)
     monkeypatch.undo()
 
@@ -1061,7 +1058,9 @@ def test_scalar_segment_commit_survives_compaction_orphan(tmp_path: Path, monkey
         commit_backoff_seconds=0.0,
     )
     state: dict[str, bool] = {"compacted": False, "orphan": False}
-    monkeypatch.setattr(indexing, "commit_segments", racing_compaction_commit(uri, compaction_config, telemetry, state))
+    monkeypatch.setattr(
+        indexing_segments, "commit_segments", racing_compaction_commit(uri, compaction_config, telemetry, state)
+    )
     build_segment_index(uri, BTreeIndexHandler(rebuild_config, "id", index_name), rebuild_config, telemetry)
     monkeypatch.undo()
 

@@ -56,9 +56,8 @@ async fn ivf_centroids(dataset: &Dataset, index_name: Option<&str>) -> Result<Cl
         .schema()
         .field_path(field_id)
         .map_err(|err| classify_lance_error(&err))?;
-    let uuid = meta.uuid.to_string();
     let index = dataset
-        .open_vector_index(&column, &uuid, &NoOpMetricsCollector)
+        .open_vector_index(&column, &meta.uuid, &NoOpMetricsCollector)
         .await
         .map_err(|err| classify_lance_error(&err))?;
     let ivf = index.ivf_model();

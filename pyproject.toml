@@ -11,7 +11,10 @@ dependencies = [
 ]
 
 [project.scripts]
-lance-etl = "lance_etl.cli:main"
+lance-etl-etl = "lance_etl.etl.cli:main"
+lance-etl-index = "lance_etl.indexing.cli:main"
+lance-etl-maintenance = "lance_etl.maintenance.cli:main"
+lance-etl-tools = "lance_etl.tools.cli:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -89,6 +89,19 @@ pub fn gauge_sub(gauge: &AtomicU64, amount: u64) {
     });
 }
 
+/// Removes one cache directory and decrements both residency gauges by its contents.
+///
+/// Stats the directory first (the size and entry count it holds), removes it, then subtracts both
+/// figures from the gauges with the saturating [`gauge_sub`]. Shared by the index tier's
+/// prefix invalidation and the store tier's per-object invalidation, which previously each
+/// inlined the same stat-remove-decrement sequence.
+pub async fn remove_dir_accounted(dir: &Path, bytes_gauge: &AtomicU64, entries_gauge: &AtomicU64) {
+    let (bytes, entries) = dir_stats(dir);
+    let _ = tokio::fs::remove_dir_all(dir).await;
+    gauge_sub(bytes_gauge, bytes);
+    gauge_sub(entries_gauge, entries);
+}
+
 /// Best-effort mtime refresh so the sweep's LRU-by-mtime approximation tracks disk hits.
 pub fn touch_file(path: &Path) {
     let _ = std::fs::OpenOptions::new()

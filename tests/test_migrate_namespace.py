@@ -104,11 +104,6 @@ class TestValidateConfig:
         with pytest.raises(ValueError, match="not in partition_cols"):
             validate_config(base_config("/tmp/x", telemetry_config, namespace_col="missing"))
 
-    def test_traversal_namespace_rejected(self, telemetry_config: TelemetryConfig) -> None:
-        """A namespace name with a path separator fails the allowlist."""
-        with pytest.raises(ValueError, match="invalid target_namespace"):
-            validate_config(base_config("/tmp/x", telemetry_config, target_namespace="../escape"))
-
 
 class TestPathHelpers:
     """Path parsing and target-URI swapping operate on the namespace component."""

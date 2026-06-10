@@ -10,15 +10,37 @@ before touching any file.
 ```
 lance-etl/
   src/lance_etl/          Python package (production sources)
-    etl.py                IcebergToLanceETL: read, pivot maps to concrete cols, collapse, repartition, merge_insert
-    indexing.py           LanceIndexer + per-type handlers (VectorIndex, BTree, Bitmap, Fts)
-    maintenance.py        MaintenanceJob + MaintenanceConfig: cheap single-org DQ guard (zone-map pushdown count), per-row TTL expiration, two-tier compaction, version cleanup
-    recall.py             RecallAuditJob: replay Datadog spans, score recall@k/nDCG@k/MRR
+    etl/                  ETL job package (python -m lance_etl.etl)
+      __init__.py         Re-exports: IcebergToLanceETL, ETLConfig, ROUTING_COLS, apply_merge, and helpers
+      cli.py              Entry point for lance-etl-etl script and python -m lance_etl.etl
+      __main__.py         Calls cli.main()
+      job.py              IcebergToLanceETL: read, snapshot_id_bounds, apply_merge, dataset_uri
+      pivot.py            ETLConfig, ROUTING_COLS, pivot_map_columns, group_by_routing, apply_fsl_cast, apply_ttl_cast
+    indexing/             Indexing job package (python -m lance_etl.indexing)
+      __init__.py         Re-exports: LanceIndexer, IndexJobConfig, all handlers, segments, optimize helpers
+      cli.py              Entry point for lance-etl-index script and python -m lance_etl.indexing
+      __main__.py         Calls cli.main()
+      config.py           IndexJobConfig, METRIC_TO_DISTANCE, FTS_OPTIONAL_PARAMS, index-name helpers
+      handlers.py         IndexHandler, VectorIndexHandler, BTreeIndexHandler, BitmapIndexHandler, FtsIndexHandler
+      optimize.py         load_vector_config, write_vector_config, config_reusable, drop_existing_index, optimize_existing_index, merge_index_deltas
+      runner.py           LanceIndexer, index_dataset_locally, index_skip_reason (derived-state skip: describe_indices + num_unindexed_fragments)
+      segments.py         build_and_commit_segments, build_vector_segment, build_scalar_segment, commit_segments, split_evenly, stale-fragment guards
+    maintenance/          Maintenance job package (python -m lance_etl.maintenance)
+      __init__.py         Re-exports: MaintenanceJob, MaintenanceConfig, classify_or_compact, fan_out_per_dataset, update_serving_tag, compaction_skip_reason, and helpers
+      cli.py              Entry point for lance-etl-maintenance script and python -m lance_etl.maintenance
+      __main__.py         Calls cli.main()
+      job.py              MaintenanceJob, MaintenanceConfig, classify_or_compact, maintain_one_dataset, compact_small_dataset, cleanup_dataset, delete_expired_rows, run_ttl_on_open_dataset, compaction_skip_reason (derived-state skip: dataset_stats num_fragments)
+      tools.py            update_serving_tag, update_serving_tags, migrate_dataset_manifest_paths, migrate_manifest_paths
+    tools/                Operator tools package (python -m lance_etl.tools)
+      __init__.py         Package marker
+      cli.py              Entry point for lance-etl-tools script and python -m lance_etl.tools
+      __main__.py         Calls cli.main()
+    cliutil.py            Shared CLI helpers: add_common_arguments, add_dataset_arguments, add_index_column_arguments, build_spark, build_telemetry_config, load_dataset_uris, parse_* helpers
+    recall.py             RecallAuditJob, RecallJobConfig, DatadogSpanSource: replay Datadog spans, score recall@k/nDCG@k/MRR
     telemetry.py          Telemetry, TelemetryConfig, LanceRuntimeConfig, commit_with_retries
     cloud_storage.py      resolve_filesystem + discover_datasets for pyarrow filesystem I/O
     arrow_types.py        resolve_arrow_type / resolve_type_map (CLI type specs)
     iceberg_optimize.py   IcebergOptimizer + IcebergOptimizeConfig: source Iceberg table maintenance via CALL procedures (rewrite_data_files, rewrite_manifests, expire_snapshots, opt-in remove_orphan_files)
-    cli.py                Entry point: etl / maintenance / index / recall / tag / migrate-manifests / migrate-namespace / optimize-iceberg
     migrate_namespace.py  NamespaceMigrator + MigrateConfig: one-off namespace copy/optimize utility
   bench/                  Benchmark package (python -m bench)
     cli.py                Subcommand dispatch: download / prepare / ingest / index / compact
@@ -75,10 +97,13 @@ lance-etl/
     src/main.rs           Binary entry point
     Cargo.toml            Workspace root for the crate
   airflow/
-    lance_etl_dag.py      Configurable-schedule Airflow DAG (optimize-iceberg [optional] >> etl >> maintenance >> index)
+    lance_etl_common.py        Shared DAG helpers: default_args, common environment variables, and task-factory utilities
+    lance_etl_etl_dag.py       Airflow DAG for the ETL job (optimize-iceberg [optional] >> etl)
+    lance_etl_maintenance_dag.py  Airflow DAG for maintenance (run, tag, migrate-manifests subcommands)
+    lance_etl_index_dag.py     Airflow DAG for index builds (max_active_runs=1 to serialize index commits)
   tests/                  pytest suite (conftest.py + test_*.py)
   docs/
-    adr/                  23 Architecture Decision Records (0001-0023)
+    adr/                  Architecture Decision Records (0001-0026)
     FINDINGS.md           Narrative companion to the ADRs
   market-research/        Detailed evaluation notes, plans, and evidence underlying the ADRs
   claude/                 Original reference artifacts — IMMUTABLE, never edit

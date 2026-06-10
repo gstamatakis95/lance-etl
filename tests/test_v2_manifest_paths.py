@@ -16,7 +16,8 @@ import lance
 import pyarrow as pa
 import pytest
 
-from lance_etl.cli import build_parser
+import lance_etl.etl.cli as etl_cli
+import lance_etl.maintenance.cli as maintenance_cli
 from lance_etl.etl import ETLConfig, apply_merge
 from lance_etl.maintenance import migrate_dataset_manifest_paths
 from lance_etl.telemetry import TelemetryConfig
@@ -61,16 +62,17 @@ class TestCliWiring:
     """The etl subcommand parses without a V2 flag, and migrate-manifests is wired."""
 
     def test_etl_parses_without_v2_flag(self, tmp_path: Path) -> None:
-        """The opinionated CLI exposes no V2 manifest flag: the ETLConfig default governs the behavior."""
-        args = build_parser().parse_args(
-            ["etl", "--table", "t", "--start", "0", "--end", "1", "--base-uri", str(tmp_path)]
+        """The opinionated ETL CLI exposes no V2 manifest flag: the ETLConfig default governs the behavior."""
+        args = etl_cli.build_parser().parse_args(
+            ["--table", "t", "--start", "0", "--end", "1", "--base-uri", str(tmp_path)]
         )
-        assert args.command == "etl"
         assert not hasattr(args, "enable_v2_manifest_paths")
 
     def test_migrate_subcommand_parses(self, tmp_path: Path) -> None:
         """The migrate-manifests subcommand parses with dataset-selection arguments."""
-        args = build_parser().parse_args(["migrate-manifests", "--dataset-uri", str(tmp_path / "x.lance")])
+        args = maintenance_cli.build_parser().parse_args(
+            ["migrate-manifests", "--dataset-uri", str(tmp_path / "x.lance")]
+        )
         assert args.command == "migrate-manifests"
         assert args.dataset_uri == [str(tmp_path / "x.lance")]
 

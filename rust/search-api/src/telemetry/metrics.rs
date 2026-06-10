@@ -564,6 +564,24 @@ impl Metrics {
             .send();
     }
 
+    /// One completed janitor sweep of one tier: wall-clock duration plus the total entries
+    /// removed (TTL + budget evictions combined).
+    ///
+    /// The duration distribution tracks the cost of the directory walk the sweep performs over the
+    /// tier. On a large fleet a climbing sweep duration is the early signal that a tier's on-disk
+    /// entry count is outgrowing what a periodic full walk can service cheaply. Tagged by `cache`
+    /// only: no per-dataset or per-key dimension.
+    pub fn cache_sweep(&self, cache: CacheName, duration: Duration, removed: u64) {
+        self.client
+            .distribution_with_tags("cache.sweep.duration_ms", millis(duration))
+            .with_tag("cache", cache.as_tag())
+            .send();
+        self.client
+            .distribution_with_tags("cache.sweep.removed", removed)
+            .with_tag("cache", cache.as_tag())
+            .send();
+    }
+
     /// Entries evicted from one tier for one reason.
     pub fn cache_evictions(&self, cache: CacheName, reason: EvictionReason, count: u64) {
         if count == 0 {
@@ -746,6 +764,7 @@ mod tests {
         metrics.rpc(Rpc::VectorSearch, "ok", Duration::from_millis(3));
         metrics.cache_lookup(CacheName::Index, Tier::Disk, true);
         metrics.cache_disk_gauges(CacheName::Store, 10, 2);
+        metrics.cache_sweep(CacheName::Index, Duration::from_millis(7), 4);
         metrics.prewarm(PrewarmStatus::Partial, Duration::from_millis(5));
         metrics.clusters_read(Duration::from_millis(2));
     }
@@ -793,6 +812,7 @@ mod tests {
         metrics.cache_insert_bytes(CacheName::Store, 256);
         metrics.cache_evictions(CacheName::Index, EvictionReason::Ttl, 3);
         metrics.cache_evictions(CacheName::Index, EvictionReason::Size, 0);
+        metrics.cache_sweep(CacheName::Store, Duration::from_millis(11), 5);
         metrics.cache_serialize_error(CacheName::Index);
         metrics.dataset_open(true, Duration::from_millis(40));
         metrics.dataset_handles(7);
@@ -808,6 +828,8 @@ mod tests {
             ),
             ("search_api.cache.insert_bytes:256|c", vec!["cache:store", "tier:disk"]),
             ("search_api.cache.evictions:3|c", vec!["cache:index", "reason:ttl"]),
+            ("search_api.cache.sweep.duration_ms:11|d", vec!["cache:store"]),
+            ("search_api.cache.sweep.removed:5|d", vec!["cache:store"]),
             ("search_api.cache.serialize_errors:1|c", vec!["cache:index"]),
             ("search_api.dataset.open.duration_ms:40|d", vec!["cold:true"]),
             ("search_api.cache.handles.entries:7|g", vec![]),

@@ -24,7 +24,7 @@ use object_store::{
 use serde_json::Value;
 
 use crate::cache::layout::{
-    META_FILE, SweepStats, atomic_write, dir_stats, gauge_sub, hash_hex, sweep_tier, touch_file,
+    META_FILE, SweepStats, atomic_write, dir_stats, hash_hex, remove_dir_accounted, sweep_tier, touch_file,
 };
 use crate::telemetry::{CacheName, EvictionReason, Metrics, Tier};
 
@@ -112,10 +112,7 @@ impl StoreCacheState {
     /// Removes every cached entry of one object, adjusting accounting.
     async fn invalidate_object(&self, store_prefix: &str, location: &ObjectPath) {
         let dir = self.object_dir(store_prefix, location);
-        let (bytes, entries) = dir_stats(&dir);
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        gauge_sub(&self.disk_bytes, bytes);
-        gauge_sub(&self.disk_entries, entries);
+        remove_dir_accounted(&dir, &self.disk_bytes, &self.disk_entries).await;
     }
 }
 
@@ -303,7 +300,11 @@ impl CachedStore {
     ) -> ObjectStoreResult<GetResult> {
         let object_dir = self.state.object_dir(&self.store_prefix, location);
         let entry_path = object_dir.join(entry_file_name(&options.range));
-        if let Ok(buf) = tokio::fs::read(&entry_path).await {
+        let (entry_read, sidecar_read) = tokio::join!(
+            tokio::fs::read(&entry_path),
+            tokio::fs::read_to_string(object_dir.join(META_FILE))
+        );
+        if let Ok(buf) = entry_read {
             if buf.is_empty() {
                 self.state.invalidate_object(&self.store_prefix, location).await;
                 self.state
@@ -314,7 +315,7 @@ impl CachedStore {
                 drop(tokio::task::spawn_blocking(move || touch_file(&touch_path)));
                 self.state.metrics.cache_lookup(CacheName::Store, Tier::Disk, true);
                 tracing::Span::current().record("cache.hit", true);
-                let meta = match tokio::fs::read_to_string(object_dir.join(META_FILE)).await {
+                let meta = match sidecar_read {
                     Ok(raw) => {
                         meta_from_json(&raw, location).unwrap_or_else(|| fallback_meta(location, buf.len() as u64))
                     }

@@ -23,11 +23,14 @@ from lance_etl.indexing import (
     IndexHandler,
     IndexJobConfig,
     VectorIndexHandler,
+    centroids_from_ipc,
     commit_segments,
     index_dataset_locally,
     lance_field_id,
+    load_vector_config,
     serialize_segment,
     split_evenly,
+    vector_config_key,
 )
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
@@ -244,27 +247,43 @@ def test_vector_segment_path_end_to_end(dataset_uri: str, telemetry: Telemetry) 
 
 
 def test_vector_segment_path_reuses_artifacts(dataset_uri: str, telemetry: Telemetry) -> None:
-    """A second prepare adopts the persisted centroids and the identical rotation.
+    """A second prepare reads centroids from the committed index and the rotation from the dataset config.
 
-    Returning the same ``rabitq_model`` string from the sidecar is what keeps independently built segments mergeable
-    across runs, so the shared-rotation invariant is pinned here alongside the centroid bytes.
+    Centroids are recovered via ``get_ivf_model`` and IPC-serialized, so the round-trip is checked by
+    array equality through ``centroids_from_ipc``. The ``rabitq_model`` string must match the first prepare
+    so independently built segments remain mergeable across runs. No ``.artifacts`` directory is created.
     """
     config: IndexJobConfig = index_config()
     handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
     dataset: lance.LanceDataset = lance.dataset(dataset_uri)
     first: object | None = handler.prepare(dataset, dataset_uri, telemetry)
     assert handler.reused_artifacts is False
+
+    version: int = dataset.version
+    documents: list[str] = []
+    for group in split_evenly(fragment_ids_of(dataset_uri), 2):
+        segment: Index = handler.build_segment(lance.dataset(dataset_uri, version=version), group, first)
+        documents.append(serialize_segment(segment))
+    commit_segments(dataset_uri, documents, "vector", "vector_idx", True, config, telemetry)
+
     second_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    second: object | None = second_handler.prepare(dataset, dataset_uri, telemetry)
+    second: object | None = second_handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
     assert second_handler.reused_artifacts is True
-    assert second[0] == first[0]
+
+    first_centroids = centroids_from_ipc(first[0])
+    second_centroids = centroids_from_ipc(second[0])
+    assert first_centroids.equals(second_centroids)
     assert second[1] == first[1]
     assert second[2] == first[2]
     assert second[3] == first[3]
-    manifest_path: Path = Path(f"{dataset_uri}.artifacts") / "vector" / "manifest.json"
-    manifest: dict[str, object] = json.loads(manifest_path.read_text())
-    assert "rabitq_model" in manifest
-    assert manifest["rabitq_model"] == first[1]
+
+    cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
+    assert cfg is not None
+    assert "rabitq_model" in cfg
+    assert cfg["rabitq_model"] == first[1]
+
+    assert vector_config_key("vector") in lance.dataset(dataset_uri).config()
+    assert not Path(f"{dataset_uri}.artifacts").exists()
 
 
 def test_btree_segment_path_end_to_end(dataset_uri: str, telemetry: Telemetry) -> None:

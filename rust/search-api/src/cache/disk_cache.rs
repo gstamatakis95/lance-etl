@@ -14,7 +14,9 @@ use lance_core::Result as LanceResult;
 use lance_core::cache::{CacheBackend, CacheCodec, CacheEntry, InternalCacheKey, MokaCacheBackend};
 use serde_json::Value;
 
-use crate::cache::layout::{SweepStats, atomic_write, dir_stats, gauge_sub, hash_hex, sweep_tier, touch_file};
+use crate::cache::layout::{
+    SweepStats, atomic_write, dir_stats, gauge_sub, hash_hex, remove_dir_accounted, sweep_tier, touch_file,
+};
 use crate::telemetry::{CacheName, EvictionReason, Metrics, Tier};
 
 /// Sidecar file mapping full cache-key prefixes to their hashed directory names, enabling
@@ -323,10 +325,7 @@ impl CacheBackend for DiskIndexCacheBackend {
         };
         for (_, dir_name) in &matching {
             let dir = self.root.join(dir_name.as_str());
-            let (bytes, entries) = dir_stats(&dir);
-            let _ = tokio::fs::remove_dir_all(&dir).await;
-            gauge_sub(&self.disk_bytes, bytes);
-            gauge_sub(&self.disk_entries, entries);
+            remove_dir_accounted(&dir, &self.disk_bytes, &self.disk_entries).await;
         }
         if !matching.is_empty() {
             let snapshot = {

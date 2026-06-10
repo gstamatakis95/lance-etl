@@ -17,13 +17,13 @@ import lance
 import pyarrow as pa
 import pytest
 
-from lance_etl import maintenance
+import lance_etl.maintenance.job as maintenance_job
 from lance_etl.maintenance import (
     MaintenanceConfig,
     MaintenanceJob,
     build_ttl_predicate,
     compute_cutoff,
-    delete_expired_rows,
+    run_ttl_on_open_dataset,
     validate_column_name,
 )
 from lance_etl.telemetry import Telemetry, TelemetryConfig
@@ -164,7 +164,7 @@ class TestMaintenanceConfigDefaults:
 
     def test_ts_column_default(self, telemetry_config: TelemetryConfig) -> None:
         """The default event timestamp column matches ETLConfig.ts_col."""
-        assert MaintenanceConfig(telemetry=telemetry_config).ts_column == "timestamp"
+        assert MaintenanceConfig(telemetry=telemetry_config).ts_column == "event_timestamp"
 
 
 class TestPredicateSafety:
@@ -183,10 +183,10 @@ class TestPredicateSafety:
         assert "2025-03-15T13:00:00.000000" in predicate
 
     def test_validate_rejects_injection(self, tmp_path: Path) -> None:
-        """validate_column_name raises ValueError for names with special characters."""
+        """validate_column_name raises KeyError for names not present in the schema, including injection attempts."""
         uri: str = str(tmp_path / "safe.lance")
         ds: lance.LanceDataset = lance.write_dataset(pa.table({"id": pa.array([1], pa.int64())}), uri)
-        with pytest.raises(ValueError, match="allowlist"):
+        with pytest.raises(KeyError, match="not present"):
             validate_column_name("ts; DROP TABLE", ds.schema)
 
     def test_validate_rejects_unknown(self, tmp_path: Path) -> None:
@@ -207,7 +207,7 @@ class TestPredicateSafety:
 
 
 class TestPerRowTtlDelete:
-    """delete_expired_rows removes only rows whose lifetime has elapsed."""
+    """run_ttl_on_open_dataset removes only rows whose lifetime has elapsed."""
 
     def test_deletes_only_expired_rows(self, ttl_dataset: tuple[str, int, int], telemetry: Telemetry) -> None:
         """Rows whose event timestamp plus per-row lifetime is before now are deleted; the rest survive."""
@@ -215,8 +215,9 @@ class TestPerRowTtlDelete:
         config: MaintenanceConfig = MaintenanceConfig(
             telemetry=TelemetryConfig(), ttl_column=TTL_COLUMN, ts_column=TS_COLUMN, commit_backoff_seconds=0.0
         )
-        result: dict[str, object] = delete_expired_rows(uri, config, compute_cutoff(), telemetry)
-        assert result["rows_deleted"] == expired_count
+        dataset: lance.LanceDataset = lance.dataset(uri)
+        result: dict[str, object] = run_ttl_on_open_dataset(dataset, uri, config, compute_cutoff(), telemetry)
+        assert result["ttl_rows_deleted"] == expired_count
         assert result["skipped"] == ""
         assert lance.dataset(uri).count_rows() == alive_count
 
@@ -225,23 +226,23 @@ class TestPerRowTtlDelete:
         now: datetime = datetime.now(tz=UTC)
         table: pa.Table = make_ttl_table(8, now - timedelta(days=5), timedelta(hours=1), timedelta(days=365))
         uri: str = str(tmp_path / "alive.lance")
-        lance.write_dataset(table, uri)
+        dataset: lance.LanceDataset = lance.write_dataset(table, uri)
         config: MaintenanceConfig = MaintenanceConfig(
             telemetry=TelemetryConfig(), ttl_column=TTL_COLUMN, ts_column=TS_COLUMN, commit_backoff_seconds=0.0
         )
-        result: dict[str, object] = delete_expired_rows(uri, config, compute_cutoff(), telemetry)
-        assert result["rows_deleted"] == 0
+        result: dict[str, object] = run_ttl_on_open_dataset(dataset, uri, config, compute_cutoff(), telemetry)
+        assert result["ttl_rows_deleted"] == 0
         assert lance.dataset(uri).count_rows() == 8
 
     def test_skips_dataset_without_ttl_column(self, tmp_path: Path, telemetry: Telemetry) -> None:
         """A dataset lacking the TTL column is skipped rather than failing."""
         uri: str = str(tmp_path / "no_ttl.lance")
-        lance.write_dataset(pa.table({"id": pa.array([1, 2], pa.int64())}), uri)
+        dataset: lance.LanceDataset = lance.write_dataset(pa.table({"id": pa.array([1, 2], pa.int64())}), uri)
         config: MaintenanceConfig = MaintenanceConfig(
             telemetry=TelemetryConfig(), ttl_column=TTL_COLUMN, ts_column=TS_COLUMN, commit_backoff_seconds=0.0
         )
-        result: dict[str, object] = delete_expired_rows(uri, config, compute_cutoff(), telemetry)
-        assert result["rows_deleted"] == 0
+        result: dict[str, object] = run_ttl_on_open_dataset(dataset, uri, config, compute_cutoff(), telemetry)
+        assert result["ttl_rows_deleted"] == 0
         assert result["skipped"] != ""
 
 
@@ -266,9 +267,9 @@ class TestTtlOffIsNoop:
         def fail_delete(*args: object, **kwargs: object) -> dict[str, object]:
             """Fail if the TTL delete is ever invoked with TTL off."""
             del args, kwargs
-            raise AssertionError("delete_expired_rows must not run when ttl_column is None")
+            raise AssertionError("run_ttl_on_open_dataset must not run when ttl_column is None")
 
-        monkeypatch.setattr(maintenance, "delete_expired_rows", fail_delete)
+        monkeypatch.setattr(maintenance_job, "run_ttl_on_open_dataset", fail_delete)
         config: MaintenanceConfig = MaintenanceConfig(
             telemetry=TelemetryConfig(), target_rows_per_fragment=1000, commit_backoff_seconds=0.0
         )
@@ -297,7 +298,7 @@ class TestRunOrdering:
             processed.append(uri)
             return {"uri": uri, "tier": "small", "tasks": 1, "bytes_removed": 0, "fragments_removed": 0}
 
-        monkeypatch.setattr(maintenance, "maintain_one_dataset", record_maintain)
+        monkeypatch.setattr(maintenance_job, "maintain_one_dataset", record_maintain)
         config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config, ttl_column="ttl")
         MaintenanceJob(config).run(FakeSpark(), ["a.lance", "b.lance"])
         assert processed == ["a.lance", "b.lance"]

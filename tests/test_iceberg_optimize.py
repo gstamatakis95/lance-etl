@@ -27,9 +27,9 @@ from unittest.mock import MagicMock
 import pytest
 from pyspark.sql import Row
 
+import lance_etl.tools.cli as tools_cli
 from bench.config import BenchConfig
 from bench.spark_session import build_spark
-from lance_etl.cli import build_parser
 from lance_etl.iceberg_optimize import (
     DEFAULT_EXPIRE_OLDER_THAN_DAYS,
     DEFAULT_EXPIRE_RETAIN_LAST,
@@ -132,7 +132,7 @@ def test_run_honors_step_toggles(telemetry_config: TelemetryConfig) -> None:
 
 def test_optimize_iceberg_cli_defaults() -> None:
     """The ``optimize-iceberg`` subcommand parses with opinionated step defaults."""
-    args = build_parser().parse_args(["optimize-iceberg", "--table", "cat.db.t"])
+    args = tools_cli.build_parser().parse_args(["optimize-iceberg", "--table", "cat.db.t"])
     assert args.command == "optimize-iceberg"
     assert args.table == "cat.db.t"
     assert args.no_rewrite_data_files is False
@@ -145,7 +145,7 @@ def test_optimize_iceberg_cli_defaults() -> None:
 
 def test_optimize_iceberg_cli_toggles() -> None:
     """The opt-out and opt-in flags flip the step toggles."""
-    args = build_parser().parse_args(
+    args = tools_cli.build_parser().parse_args(
         [
             "optimize-iceberg",
             "--table",

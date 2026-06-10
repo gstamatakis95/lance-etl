@@ -1,11 +1,10 @@
 """Cloud-agnostic object-store helpers shared by the pipeline jobs.
 
 The pipeline can run against AWS S3, Google Cloud Storage, or Azure Blob Storage. pylance reaches the datasets through
-its own Rust object-store layer, driven by each job's ``storage_options``, so it is already portable. This module exists
-for the places that need a filesystem of their own: the IVF_RQ artifact sidecar in the indexing job, which reads and
-writes plain files next to a dataset (the trained centroids, the RaBitQ model, and a manifest), and
-:func:`discover_datasets`, which recursively enumerates ``*.lance`` datasets at any depth under a base URI for the
-compact and index subcommands. That work runs only on the driver.
+its own Rust object-store layer, driven by each job's ``storage_options``, so it is already portable. This module
+provides :func:`resolve_filesystem` for callers that need a pyarrow filesystem handle and :func:`discover_datasets`,
+which recursively enumerates ``*.lance`` datasets at any depth under a base URI for the compact and index subcommands.
+Both run only on the driver.
 
 :func:`resolve_filesystem` builds the right ``pyarrow.fs`` filesystem for any of the three providers from the same
 ``storage_options`` mapping pylance uses. When no explicit credentials are supplied it delegates to
@@ -232,48 +231,3 @@ def discover_datasets(base_uri: str, storage_options: dict[str, Any] | None = No
                 break
     root: str = base_uri.rstrip("/")
     return sorted(f"{root}/{path}" for path in datasets)
-
-
-def write_object(filesystem: Any, path: str, data: bytes) -> None:
-    """Write bytes to a path on a resolved filesystem.
-
-    The parent directory is created first because local filesystems require it. On object stores ``create_dir`` is a
-    harmless no-op since directories are implicit there.
-
-    Args:
-        filesystem: The pyarrow filesystem.
-        path: The destination path.
-        data: The bytes to write.
-    """
-    parent: str = path.rsplit("/", 1)[0] if "/" in path else ""
-    if parent:
-        filesystem.create_dir(parent, recursive=True)
-    with filesystem.open_output_stream(path) as stream:
-        stream.write(data)
-
-
-def read_object(filesystem: Any, path: str) -> bytes:
-    """Read all bytes from a path on a resolved filesystem.
-
-    Args:
-        filesystem: The pyarrow filesystem.
-        path: The source path.
-
-    Returns:
-        The object's bytes.
-    """
-    with filesystem.open_input_stream(path) as stream:
-        return stream.read()
-
-
-def object_exists(filesystem: Any, path: str) -> bool:
-    """Report whether a path is an existing file on a resolved filesystem.
-
-    Args:
-        filesystem: The pyarrow filesystem.
-        path: The path to test.
-
-    Returns:
-        ``True`` if a file exists at the path.
-    """
-    return filesystem.get_file_info(path).type == pa_fs.FileType.File

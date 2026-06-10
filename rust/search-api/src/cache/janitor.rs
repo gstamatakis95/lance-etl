@@ -1,7 +1,7 @@
 //! Background janitor enforcing TTL and disk budgets over both persistent cache tiers.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::cache::disk_cache::DiskIndexCacheBackend;
 use crate::cache::layout::SweepStats;
@@ -43,6 +43,9 @@ impl CacheJanitor {
     }
 
     /// Runs one sweep of both tiers on the blocking thread pool and emits the cache gauges.
+    ///
+    /// Each tier is timed individually so the `cache`-tagged sweep duration reflects the cost of
+    /// that tier's own directory walk.
     pub async fn sweep_once(&self) {
         let index_cache = self.index_cache.clone();
         let store_cache = self.store_cache.clone();
@@ -50,22 +53,27 @@ impl CacheJanitor {
         let index_budget = self.index_budget_bytes;
         let store_budget = self.store_budget_bytes;
         let swept = tokio::task::spawn_blocking(move || {
-            (
-                index_cache.sweep(ttl, index_budget),
-                store_cache.sweep(ttl, store_budget),
-            )
+            let index_started = Instant::now();
+            let index_stats = index_cache.sweep(ttl, index_budget);
+            let index_elapsed = index_started.elapsed();
+            let store_started = Instant::now();
+            let store_stats = store_cache.sweep(ttl, store_budget);
+            let store_elapsed = store_started.elapsed();
+            (index_stats, index_elapsed, store_stats, store_elapsed)
         })
         .await;
-        if let Ok((index_stats, store_stats)) = swept {
-            self.publish(CacheName::Index, index_stats);
-            self.publish(CacheName::Store, store_stats);
+        if let Ok((index_stats, index_elapsed, store_stats, store_elapsed)) = swept {
+            self.publish(CacheName::Index, index_stats, index_elapsed);
+            self.publish(CacheName::Store, store_stats, store_elapsed);
         }
     }
 
-    /// Publishes the post-sweep gauges and eviction counters of one tier.
-    fn publish(&self, cache: CacheName, stats: SweepStats) {
+    /// Publishes the post-sweep gauges, eviction counters, and sweep timing of one tier.
+    fn publish(&self, cache: CacheName, stats: SweepStats, elapsed: Duration) {
         self.metrics
             .cache_disk_gauges(cache, stats.remaining_bytes, stats.remaining_entries);
+        self.metrics
+            .cache_sweep(cache, elapsed, stats.ttl_evicted + stats.size_evicted);
         self.metrics
             .cache_evictions(cache, EvictionReason::Ttl, stats.ttl_evicted);
         self.metrics

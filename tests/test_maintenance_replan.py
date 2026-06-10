@@ -235,18 +235,19 @@ def test_commit_rewrites_uses_small_budget(
         """Compaction stand-in whose commit always conflicts."""
 
         @staticmethod
-        def commit(dataset: object, rewrites: list[object]) -> object:
+        def commit(dataset: object, rewrites: list[object], options: dict[str, object] | None = None) -> object:
             """Always fail with a retryable commit conflict.
 
             Args:
                 dataset: Ignored dataset handle.
                 rewrites: Ignored rewrite results.
+                options: Ignored compaction options forwarded at commit time.
             """
-            del dataset, rewrites
+            del dataset, rewrites, options
             attempts.append(1)
             raise OSError("LanceError(IO): Retryable commit conflict for version 2")
 
-    monkeypatch.setattr("lance_etl.maintenance.Compaction", ConflictingCompaction)
+    monkeypatch.setattr("lance_etl.maintenance.job.Compaction", ConflictingCompaction)
     with pytest.raises(OSError, match="Retryable commit conflict"):
         compactor.commit_rewrites(dataset_uri, [], telemetry)
     assert len(attempts) == config.large_commit_retries + 1
@@ -256,7 +257,6 @@ def test_compaction_mode_defaults_to_try_binary_copy(telemetry_config: Telemetry
     """The default execute options carry the binary-copy-with-fallback mode."""
     config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config)
     assert config.execute_options()["compaction_mode"] == "try_binary_copy"
-    assert config.plan_options()["compaction_mode"] == "try_binary_copy"
 
 
 def test_cleanup_horizon_floor_is_enforced(

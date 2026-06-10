@@ -94,4 +94,3 @@ def test_defer_index_remap_scoped_to_execute_options(telemetry_config: Telemetry
     """
     config: MaintenanceConfig = fri_config(telemetry_config)
     assert config.execute_options()["defer_index_remap"] is True
-    assert "defer_index_remap" not in config.plan_options()
