@@ -74,11 +74,14 @@ def latency_stats(latencies_ms: list[float]) -> dict[str, float]:
 def load_artifacts(config: BenchConfig) -> dict[str, Any]:
     """Load the prepared artifacts the search legs need.
 
+    When ``config.no_text`` is True the vocab file is absent and cluster/vocab fields are omitted
+    because FTS and hybrid legs are skipped.
+
     Args:
         config: Benchmark configuration.
 
     Returns:
-        Queries, per-org ground truth, cluster assignments, and vocabularies.
+        Queries, per-org ground truth, cluster assignments, and vocabularies (empty when no_text).
 
     Raises:
         FileNotFoundError: If the prepare phase has not produced artifacts for this corpus shape.
@@ -87,14 +90,19 @@ def load_artifacts(config: BenchConfig) -> dict[str, Any]:
     if not (prepared / "manifest.json").exists():
         raise FileNotFoundError(f"no prepared artifacts at {prepared}; run 'python -m bench prepare' first")
     ground_truth_file = np.load(prepared / "ground_truth.npz")
-    vocab: dict[str, Any] = read_json(prepared / "vocab.json")
-    return {
+    result: dict[str, Any] = {
         "queries": np.load(prepared / "queries.npy"),
         "ground_truth": {org: ground_truth_file[org] for org in ground_truth_file.files},
         "clusters": np.load(prepared / "clusters.npy"),
-        "cluster_vocab": vocab["clusters"],
-        "common_vocab": vocab["common"],
     }
+    if not config.no_text:
+        vocab: dict[str, Any] = read_json(prepared / "vocab.json")
+        result["cluster_vocab"] = vocab["clusters"]
+        result["common_vocab"] = vocab["common"]
+    else:
+        result["cluster_vocab"] = []
+        result["common_vocab"] = []
+    return result
 
 
 def measure_first_queries(stub: Any, pb2: Any, config: BenchConfig, queries: np.ndarray) -> dict[str, Any]:
@@ -446,20 +454,19 @@ def run_search(config: BenchConfig) -> dict[str, Any]:
         for refine_factor in config.refine_factors:
             logger.info("recall sweep nprobes=%d refine=%s", nprobes, refine_factor)
             sweep.append(sweep_point(stub, pb2, config, queries, artifacts["ground_truth"], nprobes, refine_factor))
-    fts: dict[str, Any] = run_fts_leg(stub, pb2, config, artifacts)
-    hybrid: dict[str, Any] = run_hybrid_leg(stub, pb2, config, artifacts)
     clusters: dict[str, Any] = run_clusters_probe(stub, pb2, config, int(artifacts["queries"].shape[1]))
     load: dict[str, Any] = run_load_leg(config, queries[0])
-    return save_phase(
-        config,
-        "search",
-        {
-            "endpoint": config.endpoint,
-            "first_queries": first_queries,
-            "sweep": sweep,
-            "fts": fts,
-            "hybrid": hybrid,
-            "clusters": clusters,
-            "load": load,
-        },
-    )
+    result: dict[str, Any] = {
+        "endpoint": config.endpoint,
+        "first_queries": first_queries,
+        "sweep": sweep,
+        "clusters": clusters,
+        "load": load,
+    }
+    if config.no_text:
+        result["fts"] = {"skipped": "no_text mode; FTS leg disabled"}
+        result["hybrid"] = {"skipped": "no_text mode; hybrid leg disabled"}
+    else:
+        result["fts"] = run_fts_leg(stub, pb2, config, artifacts)
+        result["hybrid"] = run_hybrid_leg(stub, pb2, config, artifacts)
+    return save_phase(config, "search", result)

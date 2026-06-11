@@ -11,22 +11,22 @@ An optional source-table maintenance task ``optimize-iceberg`` can be enabled vi
 Airflow Variable ``lance_etl_optimize_iceberg_enabled`` (default off). When enabled it
 runs Iceberg's own ``CALL`` maintenance procedures (``rewrite_data_files``,
 ``rewrite_manifests``, ``expire_snapshots``, and optionally ``remove_orphan_files``)
-before the ETL task. This is distinct from Lance dataset maintenance which lives in the
-separate ``lance_etl_maintenance`` DAG.
+before the ETL task. This is distinct from Lance dataset maintenance, compaction, and
+indexing which live in the separate ``lance_etl_pipeline`` DAG.
 
 COEXISTENCE
 -----------
-The three DAGs (``lance_etl_etl``, ``lance_etl_maintenance``, ``lance_etl_index``) run
-independently and share no files. Each derives its dataset list from its own inputs.
-Overlapping runs across jobs are safe by design: concurrent commits are reconciled by
-commit retries, the compaction replan loop, the indexer's stale-segment guards, and the
-lazy frag-reuse remap. The one serialization requirement is ``max_active_runs=1`` on the
-index DAG (same-name index maintenance races). Staggering the three schedules is
-recommended operational practice for cluster contention, not a correctness requirement.
+The two DAGs (``lance_etl_etl``, ``lance_etl_pipeline``) run independently and share no
+files. Each derives its dataset list from its own inputs. Overlapping runs are safe by
+design: concurrent commits are reconciled by commit retries, the compaction replan loop,
+the indexer's stale-segment guards, and the lazy frag-reuse remap. Serialization within
+the pipeline DAG is handled by ``max_active_runs=1`` on ``lance_etl_pipeline``. Staggering
+the two schedules (e.g. ETL at ``:00``, pipeline at ``:15``) is recommended operational
+practice for cluster contention, not a correctness requirement.
 
 Airflow Variables consumed by this DAG:
     lance_etl_etl_schedule
-        Airflow schedule expression for this DAG (default ``@daily``). Update via the
+        Airflow schedule expression for this DAG (default ``@hourly``). Update via the
         Airflow UI or API to change frequency without touching this file.
     lance_etl_iceberg_table
         Fully-qualified Iceberg table name (default ``prod.vectors.events``).
@@ -178,7 +178,7 @@ def build_optimize_iceberg_application_args(params: dict[str, str | int]) -> lis
     return args
 
 
-dag_schedule: str = Variable.get("lance_etl_etl_schedule", default_var="@daily")
+dag_schedule: str = Variable.get("lance_etl_etl_schedule", default_var="@hourly")
 
 with DAG(
     dag_id=DAG_ID,

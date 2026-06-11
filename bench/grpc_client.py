@@ -207,25 +207,44 @@ def timed_call(callable_rpc: Any, request: Any) -> tuple[Any, float]:
     return response, (time.perf_counter() - started) * 1000.0
 
 
-def prewarm_dataset(stub: Any, pb2: ModuleType, org_id: str, fts_with_position: bool = False) -> dict[str, Any]:
+def prewarm_dataset(
+    stub: Any,
+    pb2: ModuleType,
+    org_id: str,
+    fts_with_position: bool = False,
+    tag: str | None = None,
+    version: int | None = None,
+) -> dict[str, Any]:
     """Prewarm one org's dataset through the real ``Prewarm`` rpc.
 
     Warms the dataset metadata and every index, and returns the server-reported timings together with the
-    client-measured rpc latency.
+    client-measured rpc latency. When ``tag`` is supplied the request pins to that serve tag's resolved version.
+    When ``version`` is supplied the request pins to that exact committed version id. Only one of ``tag`` or
+    ``version`` may be set at a time.
 
     Args:
         stub: The connected service stub.
         pb2: The generated proto module.
         org_id: The organization whose dataset is prewarmed.
         fts_with_position: Also pull FTS position data for inverted indexes.
+        tag: Optional serve tag to pin the prewarm to (sets the ``version_ref.tag`` oneof).
+        version: Optional exact committed version to pin to (sets the ``version_ref.version`` oneof).
 
     Returns:
         The prewarm outcome: server-side metadata/total durations, per-index durations and errors, the index cache
-        size after the call, and the client-side rpc latency in milliseconds.
+        size after the call, the resolved version, and the client-side rpc latency in milliseconds.
     """
-    request = pb2.PrewarmRequest(
-        target=dataset_target(pb2, org_id), metadata=True, all_indexes=True, fts_with_position=fts_with_position
-    )
+    kwargs: dict[str, Any] = {
+        "target": dataset_target(pb2, org_id),
+        "metadata": True,
+        "all_indexes": True,
+        "fts_with_position": fts_with_position,
+    }
+    if tag is not None:
+        kwargs["tag"] = tag
+    elif version is not None:
+        kwargs["version"] = version
+    request = pb2.PrewarmRequest(**kwargs)
     response, rpc_ms = timed_call(stub.Prewarm, request)
     return {
         "rpc_ms": round(rpc_ms, 3),
@@ -233,11 +252,51 @@ def prewarm_dataset(stub: Any, pb2: ModuleType, org_id: str, fts_with_position: 
         "metadata_duration_ms": int(response.metadata_duration_ms),
         "total_duration_ms": int(response.total_duration_ms),
         "index_cache_size_bytes": int(response.index_cache_size_bytes),
+        "resolved_version": int(response.resolved_version),
         "indexes": [
             {"name": entry.name, "duration_ms": int(entry.duration_ms), "error": entry.error}
             for entry in response.indexes
         ],
     }
+
+
+def vector_search_at_tag(
+    stub: Any,
+    pb2: ModuleType,
+    org_id: str,
+    query: np.ndarray,
+    k: int,
+    nprobes: int,
+    tag: str | None = None,
+    version: int | None = None,
+) -> tuple[Any, float]:
+    """Run a vector search pinned to a serve tag or exact version.
+
+    Sets the ``version_ref`` oneof on the ``VectorSearchRequest`` message so the server opens
+    exactly the tagged snapshot. When neither ``tag`` nor ``version`` is supplied the request
+    follows the server's default serve policy (latest committed version or configured serve tag).
+
+    Args:
+        stub: The connected service stub.
+        pb2: The generated proto module.
+        org_id: The organization to query.
+        query: The query vector.
+        k: Neighbors to return.
+        nprobes: Probed IVF partitions.
+        tag: Optional serve tag string (sets ``version_ref.tag``).
+        version: Optional exact committed version id (sets ``version_ref.version``).
+
+    Returns:
+        The ``VectorSearchResponse`` and the rpc latency in milliseconds.
+    """
+    vq = vector_query(pb2, query, k, nprobes, None)
+    kwargs: dict[str, Any] = {"target": dataset_target(pb2, org_id), "query": vq}
+    if tag is not None:
+        kwargs["tag"] = tag
+    elif version is not None:
+        kwargs["version"] = version
+    request = pb2.VectorSearchRequest(**kwargs)
+    return timed_call(stub.VectorSearch, request)
 
 
 def fetch_clusters(stub: Any, pb2: ModuleType, org_id: str) -> tuple[Any, float]:

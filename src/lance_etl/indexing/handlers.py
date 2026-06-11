@@ -722,12 +722,17 @@ class BitmapIndexHandler(IndexHandler):
         return "BITMAP"
 
     def merges(self) -> bool:
-        """Report that bitmap segments are merged before commit.
+        """Report that bitmap segments commit unmerged, like BTREE.
+
+        The driver-side bitmap merge materializes every value bitmap on one heap (8-16 GB at
+        a billion rows), so per-shard segments are committed as-is instead. Lance unions the
+        segments in parallel at query time, and the delta-merge maintenance pass consolidates
+        them through the streaming rebuild path on an executor.
 
         Returns:
-            Always ``True``.
+            Always ``False``.
         """
-        return True
+        return False
 
 
 class FtsIndexHandler(IndexHandler):

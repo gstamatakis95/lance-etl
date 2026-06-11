@@ -482,6 +482,12 @@ def build_and_commit_segments(
     exhausted while a writer keeps rewriting, the remaining fragments are left for the next
     scheduled run, which re-covers them once the contention clears.
 
+    Scalar segments (BTREE and BITMAP) are committed unmerged: the driver never merges segment
+    contents, it only publishes them. Lance unions the segments in parallel at query time and the
+    delta-merge pass (triggered by ``max_index_deltas``) consolidates them through
+    ``optimize_indices``, which streams and never materialises all bitmaps at once. Only the
+    vector handler merges on the driver, as IVF_RQ requires one merged segment before commit.
+
     Args:
         uri: Dataset URI.
         handler: The per-type index handler resolving targets.

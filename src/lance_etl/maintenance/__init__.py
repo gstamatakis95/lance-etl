@@ -24,6 +24,8 @@ from lance_etl.maintenance.job import (
 from lance_etl.maintenance.tools import (
     migrate_dataset_manifest_paths,
     migrate_manifest_paths,
+    prune_interval_tags,
+    prune_interval_tags_fleet,
     update_serving_tag,
     update_serving_tags,
 )
@@ -42,6 +44,8 @@ __all__ = [
     "maintain_one_dataset",
     "migrate_dataset_manifest_paths",
     "migrate_manifest_paths",
+    "prune_interval_tags",
+    "prune_interval_tags_fleet",
     "run_ttl_on_open_dataset",
     "update_serving_tag",
     "update_serving_tags",

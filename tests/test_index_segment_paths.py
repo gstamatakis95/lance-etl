@@ -306,15 +306,18 @@ def test_btree_segment_path_end_to_end(dataset_uri: str, telemetry: Telemetry) -
 
 
 def test_bitmap_segment_path_end_to_end(dataset_uri: str, telemetry: Telemetry) -> None:
-    """BITMAP: per-shard uncommitted build, driver merge to one segment, then filter."""
+    """BITMAP: per-shard uncommitted build, unmerged commit like BTREE, then filter."""
     config: IndexJobConfig = index_config()
     handler: BitmapIndexHandler = BitmapIndexHandler(config, "category", "category_bitmap_idx")
-    assert handler.merges() is True
+    assert handler.merges() is False
     run_segment_path(dataset_uri, handler, shards=2, telemetry=telemetry)
     assert "category_bitmap_idx" in listed_index_names(dataset_uri)
     segments: list[object] = index_segments(dataset_uri, "category_bitmap_idx")
-    assert len(segments) == 1
-    assert set(segments[0].fragment_ids) == set(fragment_ids_of(dataset_uri))
+    assert len(segments) == 2
+    covered: set[int] = set()
+    for segment in segments:
+        covered.update(segment.fragment_ids)
+    assert covered == set(fragment_ids_of(dataset_uri))
     dataset: lance.LanceDataset = lance.dataset(dataset_uri)
     assert dataset.to_table(filter="category = 'cat1'").num_rows == ROWS // 4
     plan: str = dataset.scanner(filter="category = 'cat1'").explain_plan(True)

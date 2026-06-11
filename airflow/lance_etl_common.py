@@ -1,8 +1,8 @@
 """Shared helpers for the lance-etl Airflow DAG suite.
 
-This module is imported by the three independent DAG modules (``lance_etl_etl_dag``,
-``lance_etl_maintenance_dag``, ``lance_etl_index_dag``) and provides all reusable
-building blocks so each DAG file stays thin and declarative.
+This module is imported by the two DAG modules (``lance_etl_etl_dag``,
+``lance_etl_pipeline_dag``) and provides all reusable building blocks so each DAG file
+stays thin and declarative.
 
 Shared responsibilities:
 
@@ -32,11 +32,8 @@ PYTHONPATH_LANCE_ETL = "/opt/lance-etl/src"
 APPLICATION_ETL = "/opt/lance-etl/src/lance_etl/etl/__main__.py"
 """Spark application file for the ETL job (``python -m lance_etl.etl``)."""
 
-APPLICATION_INDEXING = "/opt/lance-etl/src/lance_etl/indexing/__main__.py"
-"""Spark application file for the index job (``python -m lance_etl.indexing``)."""
-
-APPLICATION_MAINTENANCE = "/opt/lance-etl/src/lance_etl/maintenance/__main__.py"
-"""Spark application file for the maintenance job (``python -m lance_etl.maintenance``)."""
+APPLICATION_PIPELINE = "/opt/lance-etl/src/lance_etl/pipeline/__main__.py"
+"""Spark application file for the unified pipeline job (``python -m lance_etl.pipeline``)."""
 
 APPLICATION_TOOLS = "/opt/lance-etl/src/lance_etl/tools/__main__.py"
 """Spark application file for the tools job (``python -m lance_etl.tools``)."""
@@ -51,7 +48,7 @@ default_args: dict[str, Any] = {
     "email_on_failure": False,
     "email_on_retry": False,
 }
-"""Airflow task-level defaults shared by all three DAGs."""
+"""Airflow task-level defaults shared by all DAGs."""
 
 etl_dag_params: dict[str, str | int] = {
     "iceberg_table": "prod.vectors.events",
@@ -66,7 +63,7 @@ etl_dag_params: dict[str, str | int] = {
 }
 """Default DAG-run params for the ETL DAG."""
 
-maintenance_dag_params: dict[str, str | int] = {
+pipeline_dag_params: dict[str, str | int] = {
     "datasets_file": "/opt/lance/datasets.txt",
     "dd_service": "lance-pipeline",
     "dd_env": "prod",
@@ -76,19 +73,7 @@ maintenance_dag_params: dict[str, str | int] = {
     "driver_memory": "8g",
     "spark_conf_overrides": "{}",
 }
-"""Default DAG-run params for the maintenance DAG."""
-
-index_dag_params: dict[str, str | int] = {
-    "datasets_file": "/opt/lance/datasets.txt",
-    "dd_service": "lance-pipeline",
-    "dd_env": "prod",
-    "dd_tags": "",
-    "executor_instances": 8,
-    "executor_memory": "8g",
-    "driver_memory": "8g",
-    "spark_conf_overrides": "{}",
-}
-"""Default DAG-run params for the index DAG."""
+"""Default DAG-run params for the unified pipeline DAG."""
 
 
 def resolve_variable(key: str, params: dict[str, str | int], param_key: str | None = None) -> str:

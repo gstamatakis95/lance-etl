@@ -1,8 +1,9 @@
 """Sanity tests for the per-job command-line entry points.
 
-The aggregate ``lance_etl.cli`` dispatcher no longer exists. Tests are mapped to the four
+The aggregate ``lance_etl.cli`` dispatcher no longer exists. Tests are mapped to the five
 per-job CLIs: ``lance_etl.etl.cli``, ``lance_etl.maintenance.cli``, ``lance_etl.indexing.cli``,
-and ``lance_etl.tools.cli``.  Pure helpers (``parse_key_values``) live in ``lance_etl.cliutil``.
+``lance_etl.pipeline.cli``, and ``lance_etl.tools.cli``.  Pure helpers (``parse_key_values``
+and ``parse_window_tag``) live in ``lance_etl.cliutil``.
 """
 
 from __future__ import annotations
@@ -12,8 +13,9 @@ import pytest
 import lance_etl.etl.cli as etl_cli
 import lance_etl.indexing.cli as indexing_cli
 import lance_etl.maintenance.cli as maintenance_cli
+import lance_etl.pipeline.cli as pipeline_cli
 import lance_etl.tools.cli as tools_cli
-from lance_etl.cliutil import parse_key_values
+from lance_etl.cliutil import parse_key_values, parse_window_tag
 
 
 def test_help_exits_zero() -> None:
@@ -202,3 +204,138 @@ def test_migrate_namespace_requires_base_uri() -> None:
             ["migrate-namespace", "--source-namespace", "old", "--target-namespace", "new"]
         )
     assert exc_info.value.code != 0
+
+
+REQUIRED_PIPELINE_RUN_ARGV: list[str] = [
+    "run",
+    "--base-uri",
+    "/tmp/lance",
+]
+
+
+def test_pipeline_parser_builds() -> None:
+    """The pipeline argument parser constructs without error."""
+    parser = pipeline_cli.build_parser()
+    assert parser is not None
+
+
+def test_pipeline_help_exits_zero() -> None:
+    """The pipeline CLI exits with status 0 when passed ``--help``."""
+    with pytest.raises(SystemExit) as exc_info:
+        pipeline_cli.main(["--help"])
+    assert exc_info.value.code == 0
+
+
+def test_pipeline_run_parses_required_args() -> None:
+    """``pipeline run`` subcommand parses dataset selection."""
+    args = pipeline_cli.build_parser().parse_args(REQUIRED_PIPELINE_RUN_ARGV)
+    assert args.command == "run"
+    assert args.base_uri == "/tmp/lance"
+
+
+def test_pipeline_run_defaults() -> None:
+    """``pipeline run`` defaults: tag_keep_last=48, serve_tag=False, tag_stamp=None, rebuild=False."""
+    args = pipeline_cli.build_parser().parse_args(REQUIRED_PIPELINE_RUN_ARGV)
+    assert args.tag_keep_last == 48
+    assert args.serve_tag is False
+    assert args.tag_stamp is None
+    assert args.rebuild is False
+    assert args.ttl_column is None
+    assert args.ts_column == "event_timestamp"
+
+
+def test_pipeline_tag_keep_last_zero_disables() -> None:
+    """``--tag-keep-last 0`` is accepted and later converted to None in run_run."""
+    args = pipeline_cli.build_parser().parse_args([*REQUIRED_PIPELINE_RUN_ARGV, "--tag-keep-last", "0"])
+    assert args.tag_keep_last == 0
+
+
+def test_pipeline_serve_tag_flag() -> None:
+    """``--serve-tag`` is accepted and stored as True."""
+    args = pipeline_cli.build_parser().parse_args([*REQUIRED_PIPELINE_RUN_ARGV, "--serve-tag"])
+    assert args.serve_tag is True
+
+
+def test_pipeline_tag_stamp_converts_via_parse_window_tag() -> None:
+    """``--tag-stamp`` converts the Airflow datetime string through parse_window_tag."""
+    args = pipeline_cli.build_parser().parse_args(
+        [*REQUIRED_PIPELINE_RUN_ARGV, "--tag-stamp", "2026-06-11 12:00:00+00:00"]
+    )
+    assert args.tag_stamp == "20260611T120000Z"
+
+
+def test_pipeline_tag_stamp_t_separator() -> None:
+    """``--tag-stamp`` accepts the T-separated ISO form."""
+    args = pipeline_cli.build_parser().parse_args(
+        [*REQUIRED_PIPELINE_RUN_ARGV, "--tag-stamp", "2026-06-11T12:00:00+00:00"]
+    )
+    assert args.tag_stamp == "20260611T120000Z"
+
+
+def test_pipeline_index_column_flags_present() -> None:
+    """Index column flags are accepted by the pipeline run subcommand."""
+    args = pipeline_cli.build_parser().parse_args(
+        [
+            *REQUIRED_PIPELINE_RUN_ARGV,
+            "--vector-column",
+            "embedding",
+            "--metric",
+            "cosine",
+            "--scalar-column",
+            "updated_at",
+            "--bitmap-column",
+            "category",
+            "--text-column",
+            "body",
+        ]
+    )
+    assert args.vector_column == ["embedding"]
+    assert args.metric == "cosine"
+    assert args.scalar_column == ["updated_at"]
+    assert args.bitmap_column == ["category"]
+    assert args.text_column == ["body"]
+
+
+def test_pipeline_rebuild_flag() -> None:
+    """``--rebuild`` is accepted and stored as True."""
+    args = pipeline_cli.build_parser().parse_args([*REQUIRED_PIPELINE_RUN_ARGV, "--rebuild"])
+    assert args.rebuild is True
+
+
+def test_pipeline_ttl_column_flag() -> None:
+    """``--ttl-column`` and ``--ts-column`` are accepted by the pipeline run subcommand."""
+    args = pipeline_cli.build_parser().parse_args(
+        [*REQUIRED_PIPELINE_RUN_ARGV, "--ttl-column", "ttl", "--ts-column", "event_time"]
+    )
+    assert args.ttl_column == "ttl"
+    assert args.ts_column == "event_time"
+
+
+def test_parse_window_tag_space_separator() -> None:
+    """parse_window_tag handles Airflow-style space-separated datetimes."""
+    result: str = parse_window_tag("2026-06-11 12:00:00+00:00")
+    assert result == "20260611T120000Z"
+
+
+def test_parse_window_tag_t_separator() -> None:
+    """parse_window_tag handles T-separated ISO datetimes."""
+    result: str = parse_window_tag("2026-06-11T12:00:00+00:00")
+    assert result == "20260611T120000Z"
+
+
+def test_parse_window_tag_non_utc_converts_to_utc() -> None:
+    """parse_window_tag converts a non-UTC timezone to UTC before formatting."""
+    result: str = parse_window_tag("2026-06-11T14:00:00+02:00")
+    assert result == "20260611T120000Z"
+
+
+def test_parse_window_tag_naive_treated_as_utc() -> None:
+    """parse_window_tag treats a naive datetime (no timezone) as UTC."""
+    result: str = parse_window_tag("2026-06-11T12:00:00")
+    assert result == "20260611T120000Z"
+
+
+def test_parse_window_tag_garbage_raises() -> None:
+    """parse_window_tag raises ValueError on unparseable input."""
+    with pytest.raises(ValueError, match="cannot parse"):
+        parse_window_tag("not-a-date")

@@ -275,6 +275,7 @@ async fn search_rpcs_return_sensible_results() {
         .vector_search(VectorSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 2)),
         })
@@ -289,6 +290,7 @@ async fn search_rpcs_return_sensible_results() {
         .text_search(TextSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(simple_text_query("lemon", 3)),
         })
@@ -303,6 +305,7 @@ async fn search_rpcs_return_sensible_results() {
         .hybrid_search(HybridSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
             text: Some(simple_text_query("pear", 0)),
@@ -336,6 +339,7 @@ async fn typed_filters_replace_sql_strings() {
         .vector_search(VectorSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(query),
         })
@@ -364,6 +368,7 @@ async fn typed_filters_replace_sql_strings() {
         .vector_search(VectorSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(query),
         })
@@ -380,6 +385,7 @@ async fn typed_filters_replace_sql_strings() {
         .vector_search(VectorSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(query),
         })
@@ -404,6 +410,7 @@ async fn vector_knobs_distance_type_row_id_and_offset() {
         .vector_search(VectorSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(query),
         })
@@ -424,6 +431,7 @@ async fn vector_knobs_distance_type_row_id_and_offset() {
         .vector_search(VectorSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(query),
         })
@@ -456,6 +464,7 @@ async fn fts_phrase_and_boolean_queries() {
         .text_search(TextSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(phrase),
         })
@@ -495,6 +504,7 @@ async fn fts_phrase_and_boolean_queries() {
         .text_search(TextSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(boolean),
         })
@@ -517,6 +527,7 @@ async fn hybrid_fusion_config_is_applied() {
         .hybrid_search(HybridSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
             text: Some(simple_text_query("pear", 0)),
@@ -538,6 +549,7 @@ async fn hybrid_fusion_config_is_applied() {
         .hybrid_search(HybridSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
             text: Some(simple_text_query("pear", 0)),
@@ -581,6 +593,7 @@ async fn prewarm_rpc_warms_metadata_and_indexes() {
         .text_search(TextSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(simple_text_query("lemon", 3)),
         })
@@ -761,6 +774,7 @@ async fn missing_dataset_and_bad_target_return_proper_status_codes() {
         .vector_search(VectorSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("absent"),
             query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 1)),
         })
@@ -773,6 +787,7 @@ async fn missing_dataset_and_bad_target_return_proper_status_codes() {
         .text_search(TextSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("../escape"),
             query: Some(simple_text_query("x", 1)),
         })
@@ -785,6 +800,7 @@ async fn missing_dataset_and_bad_target_return_proper_status_codes() {
         .text_search(TextSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: None,
             query: Some(simple_text_query("x", 1)),
         })
@@ -814,6 +830,7 @@ async fn recall_capture_samples_vector_searches() {
         .vector_search(VectorSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(query),
         })
@@ -859,6 +876,7 @@ async fn recall_capture_samples_vector_searches() {
         .vector_search(VectorSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 1)),
         })
@@ -919,6 +937,7 @@ async fn recall_capture_samples_text_and_hybrid_with_new_attributes() {
         .text_search(TextSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(simple_text_query("lemon", 3)),
         })
@@ -928,6 +947,7 @@ async fn recall_capture_samples_text_and_hybrid_with_new_attributes() {
         .hybrid_search(HybridSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
             text: Some(simple_text_query("pear", 0)),
@@ -1016,6 +1036,7 @@ async fn instrumented_server_emits_rpc_metrics_and_passes_requests_through() {
         .vector_search(VectorSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 2)),
         })
@@ -1028,6 +1049,7 @@ async fn instrumented_server_emits_rpc_metrics_and_passes_requests_through() {
         .text_search(TextSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("absent"),
             query: Some(simple_text_query("x", 1)),
         })
@@ -1136,6 +1158,7 @@ async fn vector_search_string_equality_filter_returns_matching_rows_only() {
         .vector_search(VectorSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(query),
         })
@@ -1159,6 +1182,7 @@ async fn vector_search_string_equality_filter_returns_matching_rows_only() {
         .vector_search(VectorSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(query),
         })
@@ -1182,6 +1206,7 @@ async fn hybrid_request_level_filter_applies_to_both_legs() {
         .hybrid_search(HybridSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
             text: Some(simple_text_query("pear", 0)),
@@ -1208,6 +1233,7 @@ async fn hybrid_request_level_filter_applies_to_both_legs() {
         .hybrid_search(HybridSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
             text: Some(simple_text_query("pear", 0)),
@@ -1228,6 +1254,7 @@ async fn hybrid_request_level_filter_applies_to_both_legs() {
         .hybrid_search(HybridSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             vector: Some({
                 let mut q = vector_query(vec![0.0, 1.0, 0.0, 0.0], 0);
@@ -1300,6 +1327,7 @@ async fn rerank_seam_reorders_only_when_a_spec_is_set() {
         .vector_search(VectorSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 3)),
         })
@@ -1316,6 +1344,7 @@ async fn rerank_seam_reorders_only_when_a_spec_is_set() {
         .vector_search(VectorSearchRequest {
             rerank: identity_rerank(None),
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 3)),
         })
@@ -1348,6 +1377,7 @@ async fn rerank_errors_map_to_a_tonic_status() {
         .text_search(TextSearchRequest {
             rerank: identity_rerank(None),
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(simple_text_query("lemon", 3)),
         })
@@ -1372,6 +1402,7 @@ async fn default_identity_reranker_truncates_to_top_n() {
         .vector_search(VectorSearchRequest {
             rerank: identity_rerank(Some(2)),
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 4)),
         })
@@ -1397,6 +1428,7 @@ async fn weighted_fusion_proto_variant_is_applied() {
         .hybrid_search(HybridSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
             text: Some(simple_text_query("pear", 0)),
@@ -1424,6 +1456,7 @@ async fn weighted_fusion_proto_variant_is_applied() {
         .hybrid_search(HybridSearchRequest {
             rerank: None,
             time_range: None,
+            version_ref: None,
             target: target("org1"),
             vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
             text: Some(simple_text_query("pear", 0)),

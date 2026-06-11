@@ -72,7 +72,7 @@ class FakeRdd:
         """
         return FakeRdd([fn(item) for item in self.items])
 
-    def mapPartitions(self, fn: Callable[[Iterator[object]], Iterator[object]]) -> FakeRdd:  # noqa: N802
+    def mapPartitions(self, fn: Callable[[Iterator[object]], Iterator[object]]) -> FakeRdd:
         """Apply a partition function to the single in-process partition.
 
         Args:
@@ -108,7 +108,7 @@ class FakeSparkContext:
         del slices
         return FakeRdd(items)
 
-    def setLocalProperty(self, key: str, value: str | None) -> None:  # noqa: N802
+    def setLocalProperty(self, key: str, value: str | None) -> None:
         """Accept and ignore scheduler-pool properties.
 
         Args:

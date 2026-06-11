@@ -30,7 +30,12 @@ lance-etl/
       cli.py              Entry point for lance-etl-maintenance script and python -m lance_etl.maintenance
       __main__.py         Calls cli.main()
       job.py              MaintenanceJob, MaintenanceConfig, classify_or_compact, maintain_one_dataset, compact_small_dataset, cleanup_dataset, delete_expired_rows, run_ttl_on_open_dataset, compaction_skip_reason (derived-state skip: dataset_stats num_fragments)
-      tools.py            update_serving_tag, update_serving_tags, migrate_dataset_manifest_paths, migrate_manifest_paths
+      tools.py            update_serving_tag, update_serving_tags, migrate_dataset_manifest_paths, migrate_manifest_paths, prune_interval_tags, prune_interval_tags_fleet
+    pipeline/             Unified pipeline job package (python -m lance_etl.pipeline)
+      __init__.py         Re-exports: PipelineJob, PipelineConfig, prune_interval_tags, prune_interval_tags_fleet, stamp_eligible
+      cli.py              Entry point for lance-etl-pipeline script and python -m lance_etl.pipeline
+      __main__.py         Calls cli.main()
+      job.py              PipelineJob, PipelineConfig: prune -> maintenance -> index -> stamp serialized fleet phases
     tools/                Operator tools package (python -m lance_etl.tools)
       __init__.py         Package marker
       cli.py              Entry point for lance-etl-tools script and python -m lance_etl.tools
@@ -99,11 +104,10 @@ lance-etl/
   airflow/
     lance_etl_common.py        Shared DAG helpers: default_args, common environment variables, and task-factory utilities
     lance_etl_etl_dag.py       Airflow DAG for the ETL job (optimize-iceberg [optional] >> etl)
-    lance_etl_maintenance_dag.py  Airflow DAG for maintenance (run, tag, migrate-manifests subcommands)
-    lance_etl_index_dag.py     Airflow DAG for index builds (max_active_runs=1 to serialize index commits)
+    lance_etl_pipeline_dag.py  Airflow DAG for the unified pipeline (prune >> maintenance >> index >> stamp, max_active_runs=1)
   tests/                  pytest suite (conftest.py + test_*.py)
   docs/
-    adr/                  Architecture Decision Records (0001-0026)
+    adr/                  Architecture Decision Records (0001-0027)
     FINDINGS.md           Narrative companion to the ADRs
   market-research/        Detailed evaluation notes, plans, and evidence underlying the ADRs
   claude/                 Original reference artifacts — IMMUTABLE, never edit
@@ -190,7 +194,9 @@ The only correct distributed index paths are:
 
 **BTREE / BITMAP:**
 Same shard/commit flow but no `index_uuid`. Do not call `create_scalar_index(fragment_ids=)` or
-`merge_index_metadata` for these types — both raise on current lance main.
+`merge_index_metadata` for these types — both raise on current lance main. Scalar segments are
+committed unmerged (no `merge_existing_index_segments` call). Lance unions them at query time and
+the streaming delta-merge pass (`optimize_indices`) consolidates them on an executor later.
 
 **FTS (INVERTED only):**
 1. Driver mints one shared `index_uuid = str(uuid.uuid4())`.

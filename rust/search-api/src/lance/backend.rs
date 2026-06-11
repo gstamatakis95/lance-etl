@@ -15,8 +15,8 @@ use serde_json::{Map, Value};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::domain::{
-    DatasetRef, DatasetTarget, DistanceKind, FilterMode, Hit, HybridQuery, HybridSearchOutcome, SearchBackend,
-    SearchError, TextQuery, TextSearchOutcome, TimeRange, VectorQuery, VectorSearchOutcome,
+    DatasetTarget, DistanceKind, FilterMode, Hit, HybridQuery, HybridSearchOutcome, SearchBackend, SearchError,
+    TextQuery, TextSearchOutcome, TimeRange, VectorQuery, VectorSearchOutcome,
 };
 use crate::lance::error::classify_lance_error;
 use crate::lance::filter::{filter_to_expr, time_range_to_expr};
@@ -218,7 +218,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
         query: VectorQuery,
     ) -> Result<VectorSearchOutcome, SearchError> {
         validate_k(query.k)?;
-        let dataset = self.provider.dataset(target, DatasetRef::Serve).await?;
+        let dataset = self.provider.dataset(target, query.reference.clone()).await?;
         let hits = run_vector_query(&dataset, &query, &self.context(Rpc::VectorSearch)).await?;
         Ok(VectorSearchOutcome {
             hits,
@@ -233,7 +233,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
     )]
     async fn text_search(&self, target: &DatasetTarget, query: TextQuery) -> Result<TextSearchOutcome, SearchError> {
         validate_k(query.k)?;
-        let dataset = self.provider.dataset(target, DatasetRef::Serve).await?;
+        let dataset = self.provider.dataset(target, query.reference.clone()).await?;
         let hits = run_text_query(&dataset, &query, &self.context(Rpc::TextSearch)).await?;
         Ok(TextSearchOutcome {
             hits,
@@ -261,7 +261,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
             text_query.k = query.k;
         }
         let fusion = query.fusion;
-        let dataset = self.provider.dataset(target, DatasetRef::Serve).await?;
+        let dataset = self.provider.dataset(target, query.reference.clone()).await?;
         let context = self.context(Rpc::HybridSearch);
         let (vector_hits, text_hits) = tokio::join!(
             run_vector_query(&dataset, &vector_query, &context),

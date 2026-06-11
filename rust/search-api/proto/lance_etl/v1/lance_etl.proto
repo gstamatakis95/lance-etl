@@ -485,6 +485,15 @@ message VectorSearchRequest {
   // Optional event-time window. When set, restricts results to rows whose event-timestamp column
   // falls in the window, ANDed with any filter on the query. Absent searches all event times.
   TimeRange time_range = 4;
+  // Pins which committed version to search. Additive and optional: when unset the serve policy
+  // is followed (DatasetRef::Serve — the configured serve tag when enabled, otherwise the latest
+  // committed version). Existing clients that never set this field keep their behavior unchanged.
+  oneof version_ref {
+    // Search this exact committed version id.
+    uint64 version = 5;
+    // Search the version this tag currently resolves to.
+    string tag = 6;
+  }
 }
 
 // Response for SearchService.VectorSearch.
@@ -512,6 +521,15 @@ message TextSearchRequest {
   // Optional event-time window. When set, restricts results to rows whose event-timestamp column
   // falls in the window, ANDed with any filter on the query. Absent searches all event times.
   TimeRange time_range = 4;
+  // Pins which committed version to search. Additive and optional: when unset the serve policy
+  // is followed (DatasetRef::Serve — the configured serve tag when enabled, otherwise the latest
+  // committed version). Existing clients that never set this field keep their behavior unchanged.
+  oneof version_ref {
+    // Search this exact committed version id.
+    uint64 version = 5;
+    // Search the version this tag currently resolves to.
+    string tag = 6;
+  }
 }
 
 // Response for SearchService.TextSearch.
@@ -555,6 +573,17 @@ message HybridSearchRequest {
   // Applies only when filter is set. When a leg has its own filter_mode and no request-level
   // filter is present, the leg's own mode is used unchanged.
   FilterMode filter_mode = 9;
+  // Pins which committed version to search on both legs. Additive and optional: when unset the
+  // serve policy is followed (DatasetRef::Serve — the configured serve tag when enabled, otherwise
+  // the latest committed version). Both legs are always opened at the same resolved version so
+  // fusion dedup is consistent. Existing clients that never set this field keep their behavior
+  // unchanged.
+  oneof version_ref {
+    // Search this exact committed version id.
+    uint64 version = 10;
+    // Search the version this tag currently resolves to.
+    string tag = 11;
+  }
 }
 
 // Response for SearchService.HybridSearch.

@@ -45,6 +45,42 @@ pub fn prewarm_ref_from_proto(request: &pb::PrewarmRequest) -> DatasetRef {
     }
 }
 
+/// Maps the `version_ref` oneof of a [`pb::VectorSearchRequest`] onto a [`DatasetRef`].
+///
+/// An unset selector defaults to [`DatasetRef::Serve`] (follow the serve policy), preserving the
+/// behavior of existing clients that never set the field.
+pub fn vector_search_ref_from_proto(version_ref: &Option<pb::vector_search_request::VersionRef>) -> DatasetRef {
+    match version_ref {
+        Some(pb::vector_search_request::VersionRef::Version(v)) => DatasetRef::Version(*v),
+        Some(pb::vector_search_request::VersionRef::Tag(t)) => DatasetRef::Tag(t.clone()),
+        None => DatasetRef::Serve,
+    }
+}
+
+/// Maps the `version_ref` oneof of a [`pb::TextSearchRequest`] onto a [`DatasetRef`].
+///
+/// An unset selector defaults to [`DatasetRef::Serve`] (follow the serve policy), preserving the
+/// behavior of existing clients that never set the field.
+pub fn text_search_ref_from_proto(version_ref: &Option<pb::text_search_request::VersionRef>) -> DatasetRef {
+    match version_ref {
+        Some(pb::text_search_request::VersionRef::Version(v)) => DatasetRef::Version(*v),
+        Some(pb::text_search_request::VersionRef::Tag(t)) => DatasetRef::Tag(t.clone()),
+        None => DatasetRef::Serve,
+    }
+}
+
+/// Maps the `version_ref` oneof of a [`pb::HybridSearchRequest`] onto a [`DatasetRef`].
+///
+/// An unset selector defaults to [`DatasetRef::Serve`] (follow the serve policy), preserving the
+/// behavior of existing clients that never set the field.
+pub fn hybrid_search_ref_from_proto(version_ref: &Option<pb::hybrid_search_request::VersionRef>) -> DatasetRef {
+    match version_ref {
+        Some(pb::hybrid_search_request::VersionRef::Version(v)) => DatasetRef::Version(*v),
+        Some(pb::hybrid_search_request::VersionRef::Tag(t)) => DatasetRef::Tag(t.clone()),
+        None => DatasetRef::Serve,
+    }
+}
+
 /// Converts a proto clusters request into the domain spec (the target travels separately).
 pub fn cluster_spec_from_proto(request: &pb::ClustersRequest) -> ClusterSpec {
     ClusterSpec {
@@ -102,10 +138,12 @@ pub fn time_range_from_proto(range: Option<pb::TimeRange>) -> Option<TimeRange> 
     })
 }
 
-/// Converts an optional proto vector query into the domain query, attaching the request time range.
+/// Converts an optional proto vector query into the domain query, attaching the request time range
+/// and the resolved dataset reference.
 pub fn vector_query_from_proto(
     query: Option<pb::VectorQuery>,
     time_range: Option<TimeRange>,
+    reference: DatasetRef,
 ) -> Result<VectorQuery, SearchError> {
     let query = query.ok_or_else(|| SearchError::invalid_argument("query is required"))?;
     Ok(VectorQuery {
@@ -126,13 +164,16 @@ pub fn vector_query_from_proto(
         projection: query.projection,
         with_row_id: query.with_row_id,
         offset: query.offset.map(|n| n as usize),
+        reference,
     })
 }
 
-/// Converts an optional proto text query into the domain query, attaching the request time range.
+/// Converts an optional proto text query into the domain query, attaching the request time range
+/// and the resolved dataset reference.
 pub fn text_query_from_proto(
     query: Option<pb::TextQuery>,
     time_range: Option<TimeRange>,
+    reference: DatasetRef,
 ) -> Result<TextQuery, SearchError> {
     let query = query.ok_or_else(|| SearchError::invalid_argument("query is required"))?;
     let node = match query.input {
@@ -157,6 +198,7 @@ pub fn text_query_from_proto(
         with_row_id: query.with_row_id,
         offset: query.offset.map(|n| n as usize),
         fast_search: query.fast_search,
+        reference,
     })
 }
 
@@ -167,12 +209,15 @@ pub fn text_query_from_proto(
 /// if a leg already has its own filter the two are combined with [`Filter::And`]; if only one
 /// side is present that side is used alone. The request-level `filter_mode` is applied to both
 /// legs when a request-level filter is present, leaving each leg's own mode unchanged otherwise.
+/// The request-level `version_ref` is resolved once and set on the hybrid query and both legs so
+/// fusion dedup is consistent: both legs always open the same dataset snapshot.
 pub fn hybrid_query_from_proto(request: pb::HybridSearchRequest) -> Result<HybridQuery, SearchError> {
     let time_range = time_range_from_proto(request.time_range);
     let request_filter = request.filter.map(filter_from_proto).transpose()?;
     let request_filter_mode = filter_mode_from_proto(request.filter_mode)?;
-    let mut vector = vector_query_from_proto(request.vector, time_range)?;
-    let mut text = text_query_from_proto(request.text, time_range)?;
+    let reference = hybrid_search_ref_from_proto(&request.version_ref);
+    let mut vector = vector_query_from_proto(request.vector, time_range, reference.clone())?;
+    let mut text = text_query_from_proto(request.text, time_range, reference.clone())?;
     if let Some(req_filter) = request_filter {
         vector.filter = Some(combine_filters(vector.filter, req_filter.clone()));
         vector.filter_mode = request_filter_mode;
@@ -184,6 +229,7 @@ pub fn hybrid_query_from_proto(request: pb::HybridSearchRequest) -> Result<Hybri
         text,
         k: request.k as usize,
         fusion: fusion_from_proto(request.fusion)?,
+        reference,
     })
 }
 
@@ -467,4 +513,121 @@ fn json_value_to_prost(value: Value) -> prost_types::Value {
         Value::Object(map) => Kind::StructValue(json_map_to_struct(map)),
     };
     prost_types::Value { kind: Some(kind) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vector_search_ref_unset_is_serve() {
+        assert_eq!(vector_search_ref_from_proto(&None), DatasetRef::Serve);
+    }
+
+    #[test]
+    fn vector_search_ref_version_maps_through() {
+        let version_ref = Some(pb::vector_search_request::VersionRef::Version(42));
+        assert_eq!(vector_search_ref_from_proto(&version_ref), DatasetRef::Version(42));
+    }
+
+    #[test]
+    fn vector_search_ref_tag_maps_through() {
+        let version_ref = Some(pb::vector_search_request::VersionRef::Tag("green".to_string()));
+        assert_eq!(
+            vector_search_ref_from_proto(&version_ref),
+            DatasetRef::Tag("green".to_string())
+        );
+    }
+
+    #[test]
+    fn text_search_ref_unset_is_serve() {
+        assert_eq!(text_search_ref_from_proto(&None), DatasetRef::Serve);
+    }
+
+    #[test]
+    fn text_search_ref_version_maps_through() {
+        let version_ref = Some(pb::text_search_request::VersionRef::Version(7));
+        assert_eq!(text_search_ref_from_proto(&version_ref), DatasetRef::Version(7));
+    }
+
+    #[test]
+    fn text_search_ref_tag_maps_through() {
+        let version_ref = Some(pb::text_search_request::VersionRef::Tag("stable".to_string()));
+        assert_eq!(
+            text_search_ref_from_proto(&version_ref),
+            DatasetRef::Tag("stable".to_string())
+        );
+    }
+
+    #[test]
+    fn hybrid_search_ref_unset_is_serve() {
+        assert_eq!(hybrid_search_ref_from_proto(&None), DatasetRef::Serve);
+    }
+
+    #[test]
+    fn hybrid_search_ref_version_maps_through() {
+        let version_ref = Some(pb::hybrid_search_request::VersionRef::Version(3));
+        assert_eq!(hybrid_search_ref_from_proto(&version_ref), DatasetRef::Version(3));
+    }
+
+    #[test]
+    fn hybrid_search_ref_tag_maps_through() {
+        let version_ref = Some(pb::hybrid_search_request::VersionRef::Tag("prod".to_string()));
+        assert_eq!(
+            hybrid_search_ref_from_proto(&version_ref),
+            DatasetRef::Tag("prod".to_string())
+        );
+    }
+
+    #[test]
+    fn hybrid_query_reference_fans_out_to_both_legs() {
+        let request = pb::HybridSearchRequest {
+            target: None,
+            vector: Some(pb::VectorQuery {
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+                k: 2,
+                ..Default::default()
+            }),
+            text: Some(pb::TextQuery {
+                input: Some(pb::text_query::Input::Simple("hello".to_string())),
+                k: 2,
+                ..Default::default()
+            }),
+            k: 2,
+            fusion: None,
+            rerank: None,
+            time_range: None,
+            filter: None,
+            filter_mode: 0,
+            version_ref: Some(pb::hybrid_search_request::VersionRef::Tag("v2".to_string())),
+        };
+        let query = hybrid_query_from_proto(request).unwrap();
+        assert_eq!(query.reference, DatasetRef::Tag("v2".to_string()));
+        assert_eq!(query.vector.reference, DatasetRef::Tag("v2".to_string()));
+        assert_eq!(query.text.reference, DatasetRef::Tag("v2".to_string()));
+    }
+
+    #[test]
+    fn vector_query_from_proto_sets_reference() {
+        let proto_query = Some(pb::VectorQuery {
+            vector: vec![1.0, 0.0],
+            k: 1,
+            ..Default::default()
+        });
+        let reference = DatasetRef::Version(5);
+        let query = vector_query_from_proto(proto_query, None, reference.clone()).unwrap();
+        assert_eq!(query.reference, reference);
+    }
+
+    #[test]
+    fn text_query_from_proto_sets_reference() {
+        let proto_query = Some(pb::TextQuery {
+            input: Some(pb::text_query::Input::Simple("cats".to_string())),
+            k: 3,
+            ..Default::default()
+        });
+        let reference = DatasetRef::Tag("latest-prod".to_string());
+        let query = text_query_from_proto(proto_query, None, reference.clone()).unwrap();
+        assert_eq!(query.reference, reference);
+    }
 }

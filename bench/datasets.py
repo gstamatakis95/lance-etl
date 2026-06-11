@@ -12,7 +12,8 @@ per-row document text hook (:meth:`DatasetAdapter.text_for_row`, defaulting to t
 :class:`Sift1mAdapter` carries all SIFT1M specifics that previously lived across the download and prepare phases: the
 IRISA tarball URLs, the per-file HuggingFace mirrors, the published shapes, the checksum manifest handling, and the
 fvecs/ivecs readers. :class:`SyntheticAdapter` generates a deterministic in-memory Gaussian corpus with no download at
-all, which backs the offline tiny-data integration tests.
+all, which backs the offline tiny-data integration tests. :class:`BigannAdapter` serves the billion-scale BIGANN corpus
+downloading only the first ``limit`` vectors via HTTP Range requests with resume support.
 """
 
 from __future__ import annotations
@@ -23,12 +24,19 @@ import shutil
 import tarfile
 import urllib.request
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from bench.bigann_io import (
+    convert_bvecs_gz_to_u8bin,
+    read_ivecs_from_tarball,
+    read_u8bin,
+    read_u8bin_slice,
+    stream_bvecs_to_u8bin,
+)
 from bench.config import (
     SIFT_BASE_COUNT,
     SIFT_DIM,
@@ -600,11 +608,15 @@ def register_adapter(adapter: DatasetAdapter) -> DatasetAdapter:
 def adapter_for(config: BenchConfig) -> DatasetAdapter:
     """Resolve the dataset adapter selected by the configuration.
 
+    For the BIGANN adapter the configured ``--limit`` is bound onto the returned instance,
+    because the prefix size determines the artifact paths, the streamed byte range, and
+    which published ground-truth member applies.
+
     Args:
         config: Benchmark configuration carrying the ``--dataset`` name.
 
     Returns:
-        The registered adapter.
+        The registered adapter, parameterized by the configuration where applicable.
 
     Raises:
         ValueError: If no adapter is registered under the configured name.
@@ -613,8 +625,331 @@ def adapter_for(config: BenchConfig) -> DatasetAdapter:
     if adapter is None:
         known: str = ", ".join(sorted(DATASET_ADAPTERS))
         raise ValueError(f"unknown dataset {config.dataset!r}; registered adapters: {known}")
+    if isinstance(adapter, BigannAdapter):
+        return replace(adapter, limit=config.limit)
     return adapter
+
+
+BIGANN_DIM: int = 128
+BIGANN_TOTAL_VECTORS: int = 1_000_000_000
+BIGANN_QUERY_COUNT: int = 10_000
+BIGANN_GT_DEPTH: int = 1_000
+BIGANN_BASE_PRIMARY_URL: str = "http://corpus-texmex.irisa.fr/bigann_base.bvecs.gz"
+BIGANN_BASE_FALLBACK_URL: str = "https://huggingface.co/datasets/jkhe/bigann/resolve/main/bigann_base.bvecs.gz"
+BIGANN_BASE_FALLBACK_SHA256: str = "f04fa9977f930c811570646ce84649150b72bd707c54ff0dccae7d515e079479"
+BIGANN_QUERY_PRIMARY_URL: str = "http://corpus-texmex.irisa.fr/bigann_query.bvecs.gz"
+BIGANN_QUERY_FALLBACK_URL: str = "https://huggingface.co/datasets/jkhe/bigann/resolve/main/bigann_query.bvecs.gz"
+BIGANN_GND_PRIMARY_URL: str = "http://corpus-texmex.irisa.fr/bigann_gnd.tar.gz"
+BIGANN_GND_FALLBACK_URL: str = "https://huggingface.co/datasets/jkhe/bigann/resolve/main/bigann_gnd.tar.gz"
+BIGANN_GT_MILLION_SIZES: frozenset[int] = frozenset({1, 2, 5, 10, 20, 50, 100, 200, 500, 1_000})
+
+
+def gt_member_name(limit: int) -> str | None:
+    """Return the ivecs member path inside bigann_gnd.tar.gz for a given limit, or None.
+
+    The IRISA ground-truth archive contains members for exactly the 10 prefix sizes:
+    1M, 2M, 5M, 10M, 20M, 50M, 100M, 200M, 500M, and 1000M vectors.
+
+    Args:
+        limit: Number of base vectors (e.g. 100_000_000 for 100M).
+
+    Returns:
+        The tar member path string, or None when limit does not match any published size.
+    """
+    millions: int = limit // 1_000_000
+    if millions not in BIGANN_GT_MILLION_SIZES or millions * 1_000_000 != limit:
+        return None
+    return f"gnd/idx_{millions}M.ivecs"
+
+
+@dataclass
+class BigannAdapter(DatasetAdapter):
+    """The BIGANN billion-scale corpus from the IRISA corpus-texmex distribution.
+
+    Base vectors are streamed from bigann_base.bvecs.gz hosted at corpus-texmex.irisa.fr
+    (primary) with a HuggingFace HTTPS mirror as fallback. The stream is decompressed
+    incrementally and only the first ``limit`` vectors are written to a local u8bin artifact,
+    so a 100M-vector run downloads roughly 10 GB of compressed data instead of 98 GB.
+
+    Resume is supported: compressed bytes are persisted to a .gz.partial sidecar. A
+    subsequent call re-decompresses the local partial from the start (CPU-only) to rebuild
+    the decompressor state and the output artifact, then resumes the HTTP transfer via a
+    Range header from the sidecar's byte size.
+
+    Query vectors come from bigann_query.bvecs.gz (10K queries, ~1 MB). The ground-truth
+    tarball bigann_gnd.tar.gz is downloaded once; individual ivecs members are extracted on
+    demand. Official ground truth exists for exactly 10 prefix sizes (1M, 2M, 5M, 10M, 20M,
+    50M, 100M, 200M, 500M, 1000M vectors). For all other limits the prepare phase computes
+    exact brute-force ground truth.
+
+    Attributes:
+        limit: Number of base vectors to use. Defaults to the BIGANN total (1B).
+    """
+
+    limit: int = BIGANN_TOTAL_VECTORS
+
+    @property
+    def name(self) -> str:
+        """Return the registry name ``bigann``."""
+        return "bigann"
+
+    @property
+    def dimension(self) -> int:
+        """Return the BIGANN descriptor dimension, 128."""
+        return BIGANN_DIM
+
+    @property
+    def base_count(self) -> int:
+        """Return the configured base-vector count."""
+        return self.limit
+
+    @property
+    def metric(self) -> str:
+        """Return the distance metric, L2."""
+        return "L2"
+
+    @property
+    def gt_depth(self) -> int:
+        """Return the published ground-truth depth, 1000 neighbors per query."""
+        return BIGANN_GT_DEPTH
+
+    def corpus_dir(self, workspace: Path) -> Path:
+        """Return the directory holding the BIGANN files.
+
+        Args:
+            workspace: The benchmark workspace directory.
+
+        Returns:
+            The ``bigann`` directory under the workspace.
+        """
+        return workspace / "bigann"
+
+    def base_path(self, workspace: Path) -> Path:
+        """Return the local path of the base u8bin artifact for this limit.
+
+        Args:
+            workspace: The benchmark workspace directory.
+
+        Returns:
+            The base u8bin file path, named by limit for safe co-existence of multiple sizes.
+        """
+        return self.corpus_dir(workspace) / f"base.{self.limit}.u8bin"
+
+    def query_path(self, workspace: Path) -> Path:
+        """Return the local path of the query u8bin artifact.
+
+        Args:
+            workspace: The benchmark workspace directory.
+
+        Returns:
+            The query u8bin file path.
+        """
+        return self.corpus_dir(workspace) / "query.10K.u8bin"
+
+    def gnd_tarball_path(self, workspace: Path) -> Path:
+        """Return the local path of the ground-truth tarball.
+
+        Args:
+            workspace: The benchmark workspace directory.
+
+        Returns:
+            The bigann_gnd.tar.gz path under the corpus directory.
+        """
+        return self.corpus_dir(workspace) / "bigann_gnd.tar.gz"
+
+    def download_query(self, workspace: Path) -> str:
+        """Download and convert the query bvecs.gz to u8bin, idempotently.
+
+        Tries the IRISA primary URL first, then the HuggingFace fallback. The query file is
+        small (~1 MB compressed) so no streaming resume is needed; it is fetched in full and
+        converted in memory.
+
+        Args:
+            workspace: The benchmark workspace directory.
+
+        Returns:
+            The source URL that served the file, or ``"cached"`` if already present.
+        """
+        query: Path = self.query_path(workspace)
+        if query.exists():
+            return "cached"
+        gz_partial: Path = query.with_suffix(".bvecs.gz")
+        for url in (BIGANN_QUERY_PRIMARY_URL, BIGANN_QUERY_FALLBACK_URL):
+            try:
+                logger.info("downloading query bvecs.gz from %s", url)
+                fetch_url(url, gz_partial)
+                convert_bvecs_gz_to_u8bin(gz_partial.read_bytes(), query, BIGANN_QUERY_COUNT)
+                gz_partial.unlink(missing_ok=True)
+                return url
+            except OSError as err:
+                logger.warning("query download from %s failed: %s", url, err)
+        raise RuntimeError("all query sources failed; check network connectivity")
+
+    def download_gnd(self, workspace: Path) -> str:
+        """Download the ground-truth tarball, idempotently.
+
+        Args:
+            workspace: The benchmark workspace directory.
+
+        Returns:
+            The source URL that served the tarball, or ``"cached"`` if already present.
+        """
+        tarball: Path = self.gnd_tarball_path(workspace)
+        if tarball.exists():
+            return "cached"
+        for url in (BIGANN_GND_PRIMARY_URL, BIGANN_GND_FALLBACK_URL):
+            try:
+                logger.info("downloading ground-truth tarball from %s", url)
+                fetch_url(url, tarball)
+                return url
+            except OSError as err:
+                logger.warning("gnd download from %s failed: %s", url, err)
+        raise RuntimeError("all ground-truth sources failed; check network connectivity")
+
+    def download(self, workspace: Path, sha256: str | None = None) -> dict[str, Any]:
+        """Stream and convert the BIGANN corpus prefix, queries, and ground truth.
+
+        The base bvecs.gz is streamed from the IRISA primary URL with the HuggingFace mirror
+        as fallback. Only the first ``limit`` vectors are decompressed and written as u8bin;
+        the HTTP transfer is aborted once the limit is reached. A pinned sha256 is verified
+        against the final base u8bin artifact.
+
+        Args:
+            workspace: The benchmark workspace directory.
+            sha256: Optional pinned digest of the local base u8bin artifact.
+
+        Returns:
+            The download phase payload.
+
+        Raises:
+            ValueError: If the pinned sha256 does not match the downloaded base file.
+        """
+        directory: Path = self.corpus_dir(workspace)
+        directory.mkdir(parents=True, exist_ok=True)
+        base: Path = self.base_path(workspace)
+        query: Path = self.query_path(workspace)
+        checksums_path: Path = directory / f"checksums-{self.limit}.json"
+        if base.exists() and query.exists():
+            recorded: dict[str, Any] = read_json(checksums_path) if checksums_path.exists() else {}
+            return {"skipped": True, "limit": self.limit, "checksums_verified": bool(recorded)}
+        if not base.exists():
+            logger.info("streaming bigann base prefix (%d vectors) from IRISA bvecs.gz", self.limit)
+            stream_bvecs_to_u8bin(
+                BIGANN_BASE_PRIMARY_URL,
+                BIGANN_BASE_FALLBACK_URL,
+                base,
+                self.limit,
+            )
+        base_digest: str = sha256_of(base)
+        if sha256 is not None and base_digest != sha256:
+            raise ValueError(f"bigann base sha256 {base_digest} does not match pinned {sha256}")
+        query_source: str = self.download_query(workspace)
+        query_digest: str = sha256_of(query)
+        member: str | None = gt_member_name(self.limit)
+        gnd_source: str = ""
+        gnd_digest: str = ""
+        if member is not None:
+            gnd_source = self.download_gnd(workspace)
+            gnd_digest = sha256_of(self.gnd_tarball_path(workspace))
+        digests: dict[str, str] = {"base": base_digest, "query": query_digest}
+        if gnd_digest:
+            digests["ground_truth_tarball"] = gnd_digest
+        write_json(checksums_path, digests)
+        return {
+            "skipped": False,
+            "limit": self.limit,
+            "query_source": query_source,
+            "gnd_source": gnd_source,
+            "checksums": digests,
+        }
+
+    def base_vectors(self, workspace: Path, limit: int | None = None) -> np.ndarray:
+        """Read base vectors from the local u8bin artifact, cast to float32.
+
+        Args:
+            workspace: The benchmark workspace directory.
+            limit: Optional cap on rows read from the start.
+
+        Returns:
+            A float32 array of shape (rows, 128).
+        """
+        return read_u8bin(self.base_path(workspace), limit=limit)
+
+    def base_vector_slice(self, workspace: Path, start: int, count: int) -> np.ndarray:
+        """Read one contiguous slice of the base u8bin file, cast to float32.
+
+        Args:
+            workspace: The benchmark workspace directory.
+            start: First global row index of the slice.
+            count: Rows in the slice.
+
+        Returns:
+            A float32 array of shape (count, 128).
+        """
+        return read_u8bin_slice(self.base_path(workspace), start, start + count)
+
+    def query_vectors(self, workspace: Path) -> np.ndarray:
+        """Read the full query matrix from the local query u8bin artifact.
+
+        Args:
+            workspace: The benchmark workspace directory.
+
+        Returns:
+            A float32 array of shape (10000, 128).
+        """
+        return read_u8bin(self.query_path(workspace))
+
+    def ground_truth(self, workspace: Path) -> np.ndarray | None:
+        """Return the published ground truth for this limit, or ``None`` if unavailable.
+
+        Official ground truth is available for exactly 10 prefix sizes: 1M, 2M, 5M, 10M,
+        20M, 50M, 100M, 200M, 500M, and 1000M vectors. For all other limits the prepare
+        phase computes exact brute-force ground truth. The GT tarball must already be present
+        (downloaded during the download phase).
+
+        Args:
+            workspace: The benchmark workspace directory.
+
+        Returns:
+            An int64 array of shape (10000, 1000), or ``None``.
+        """
+        member: str | None = gt_member_name(self.limit)
+        if member is None:
+            return None
+        tarball: Path = self.gnd_tarball_path(workspace)
+        if not tarball.exists():
+            return None
+        return read_ivecs_from_tarball(tarball, member).astype(np.int64)
+
+    def text_for_row(
+        self,
+        cluster_vocab: list[list[str]],
+        common_vocab: list[str],
+        cluster_id: int,
+        global_index: int,
+        seed: int,
+        cluster_terms: int,
+    ) -> str:
+        """Return deterministic synthetic text for rows in text-enabled runs.
+
+        BIGANN is a pure vector corpus and does not carry document text. This method
+        delegates to the default synthetic corpus generator so the adapter remains
+        compatible with text-enabled benchmark modes when ``--no-text`` is not set.
+
+        Args:
+            cluster_vocab: Per-cluster synthetic vocabularies.
+            common_vocab: Shared common-word pool.
+            cluster_id: The row's coarse cluster.
+            global_index: The row's global index.
+            seed: The corpus seed.
+            cluster_terms: Cluster-specific words per document.
+
+        Returns:
+            The synthetic document text.
+        """
+        return row_text(cluster_vocab, common_vocab, cluster_id, global_index, seed, cluster_terms=cluster_terms)
 
 
 register_adapter(Sift1mAdapter())
 register_adapter(SyntheticAdapter())
+register_adapter(BigannAdapter())

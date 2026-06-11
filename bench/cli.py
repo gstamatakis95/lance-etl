@@ -1,8 +1,9 @@
-"""Command-line dispatch for the SIFT1M benchmark phases.
+"""Command-line dispatch for the benchmark phases.
 
 Each subcommand maps to one phase runner imported at module load, per the repository rule that all imports live at the
-top of the file. ``all`` chains the full pipeline. The search phase in the ``all`` chain is skipped with a recorded
-reason when the gRPC server is unreachable. The standalone ``search`` subcommand fails loudly instead.
+top of the file. ``all`` chains the full pipeline. ``e2e`` is the batch-major variant that runs ETL, index, compact,
+and tagging per batch then does historical-tag verification. The search phase in the ``all`` chain is skipped with a
+recorded reason when the gRPC server is unreachable. The standalone ``search`` subcommand fails loudly instead.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import grpc
 from bench.compaction import run_compact
 from bench.config import BenchConfig, build_parser
 from bench.download import run_download
+from bench.e2e import run_e2e
 from bench.indexes import run_index
 from bench.ingest import run_ingest
 from bench.prepare import run_prepare
@@ -36,6 +38,7 @@ PHASE_RUNNERS: dict[str, Callable[[BenchConfig], dict[str, Any]]] = {
     "compact": run_compact,
     "search": run_search,
     "report": run_report,
+    "e2e": run_e2e,
 }
 
 
@@ -119,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if config.command == "all":
             outcome: dict[str, Any] = run_all(config)
+        elif config.command == "e2e":
+            outcome = run_e2e(config)
         else:
             outcome = run_phase(config, config.command)
     except Exception:

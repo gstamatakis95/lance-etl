@@ -62,27 +62,36 @@ SPARK_ROW_DDL: str = (
     "metadata map<string,string>"
 )
 
+SPARK_ROW_DDL_NO_TEXT: str = (
+    "org_id string, tenant_id string, namespace string, vector_id string, op string, updated_at_us long, "
+    "category string, vectors map<string,array<float>>, "
+    "metadata map<string,string>"
+)
 
-def arrow_row_schema() -> pa.Schema:
-    """Return the Arrow schema matching :data:`SPARK_ROW_DDL`.
+
+def arrow_row_schema(no_text: bool = False) -> pa.Schema:
+    """Return the Arrow schema matching :data:`SPARK_ROW_DDL` or :data:`SPARK_ROW_DDL_NO_TEXT`.
+
+    Args:
+        no_text: When True, omit the ``texts`` column from the schema.
 
     Returns:
         The schema of the batches emitted by the generator tasks.
     """
-    return pa.schema(
-        [
-            ("org_id", pa.string()),
-            ("tenant_id", pa.string()),
-            ("namespace", pa.string()),
-            ("vector_id", pa.string()),
-            ("op", pa.string()),
-            ("updated_at_us", pa.int64()),
-            ("category", pa.string()),
-            ("vectors", pa.map_(pa.string(), pa.list_(pa.float32()))),
-            ("texts", pa.map_(pa.string(), pa.string())),
-            ("metadata", pa.map_(pa.string(), pa.string())),
-        ]
-    )
+    fields: list[tuple[str, pa.DataType]] = [
+        ("org_id", pa.string()),
+        ("tenant_id", pa.string()),
+        ("namespace", pa.string()),
+        ("vector_id", pa.string()),
+        ("op", pa.string()),
+        ("updated_at_us", pa.int64()),
+        ("category", pa.string()),
+        ("vectors", pa.map_(pa.string(), pa.list_(pa.float32()))),
+    ]
+    if not no_text:
+        fields.append(("texts", pa.map_(pa.string(), pa.string())))
+    fields.append(("metadata", pa.map_(pa.string(), pa.string())))
+    return pa.schema(fields)
 
 
 def updated_at_micros(global_index: np.ndarray) -> np.ndarray:
@@ -126,11 +135,13 @@ def slice_record_batch(
     tenants: int,
     seed: int,
     words_per_text: int,
+    no_text: bool = False,
 ) -> pa.RecordBatch:
     """Build the Arrow batch for one contiguous slice of base vectors.
 
     Runs inside a Spark executor task: reads its own slice through the pickled dataset adapter, assigns clusters, and
-    generates the deterministic per-row text and routing columns.
+    generates the deterministic per-row text and routing columns. When ``no_text`` is True the ``texts`` column is
+    omitted entirely, keeping the schema consistent with :func:`arrow_row_schema` called with ``no_text=True``.
 
     Args:
         start: First global row index of the slice.
@@ -143,41 +154,44 @@ def slice_record_batch(
         tenants: Round-robin tenant count.
         seed: Corpus seed.
         words_per_text: Cluster-specific words per document.
+        no_text: When True, omit the ``texts`` column from the returned batch.
 
     Returns:
-        One record batch conforming to :func:`arrow_row_schema`.
+        One record batch conforming to :func:`arrow_row_schema` with the same ``no_text`` setting.
     """
     vectors: np.ndarray = adapter.base_vector_slice(workspace, start, count)
     clusters: np.ndarray = assign_clusters(vectors, centroids)
     indices: np.ndarray = np.arange(start, start + count, dtype=np.int64)
     org_ids: list[str] = [f"org{int(i) % tenants}" for i in indices]
-    texts: list[str] = [
-        adapter.text_for_row(cluster_vocab, common_vocab, int(c), int(i), seed, words_per_text)
-        for c, i in zip(clusters, indices, strict=True)
-    ]
     flat_offsets: pa.Array = pa.array(np.arange(count + 1, dtype=np.int32) * vectors.shape[1])
     vector_items: pa.ListArray = pa.ListArray.from_arrays(flat_offsets, pa.array(vectors.ravel(), pa.float32()))
-    return pa.RecordBatch.from_arrays(
-        [
-            pa.array(org_ids, pa.string()),
-            pa.array([TENANT_ID] * count, pa.string()),
-            pa.array([NAMESPACE] * count, pa.string()),
-            pa.array([str(int(i)) for i in indices], pa.string()),
-            pa.array(["insert"] * count, pa.string()),
-            pa.array(updated_at_micros(indices)),
-            pa.array([f"cat{int(c) % CATEGORY_CARDINALITY}" for c in clusters], pa.string()),
-            single_entry_map(["vector"] * count, vector_items),
-            single_entry_map(["text"] * count, pa.array(texts, pa.string())),
-            single_entry_map(["cluster"] * count, pa.array([str(int(c)) for c in clusters], pa.string())),
-        ],
-        schema=arrow_row_schema(),
-    )
+    arrays: list[pa.Array] = [
+        pa.array(org_ids, pa.string()),
+        pa.array([TENANT_ID] * count, pa.string()),
+        pa.array([NAMESPACE] * count, pa.string()),
+        pa.array([str(int(i)) for i in indices], pa.string()),
+        pa.array(["insert"] * count, pa.string()),
+        pa.array(updated_at_micros(indices)),
+        pa.array([f"cat{int(c) % CATEGORY_CARDINALITY}" for c in clusters], pa.string()),
+        single_entry_map(["vector"] * count, vector_items),
+    ]
+    if not no_text:
+        texts: list[str] = [
+            adapter.text_for_row(cluster_vocab, common_vocab, int(c), int(i), seed, words_per_text)
+            for c, i in zip(clusters, indices, strict=True)
+        ]
+        arrays.append(single_entry_map(["text"] * count, pa.array(texts, pa.string())))
+    arrays.append(single_entry_map(["cluster"] * count, pa.array([str(int(c)) for c in clusters], pa.string())))
+    return pa.RecordBatch.from_arrays(arrays, schema=arrow_row_schema(no_text=no_text))
 
 
 def write_iceberg_table(
     config: BenchConfig, adapter: DatasetAdapter, centroids: np.ndarray, vocab: tuple[list[list[str]], list[str]]
 ) -> float:
     """Write the corpus source rows into the local Iceberg table via Spark executors.
+
+    When ``config.no_text`` is True the ``texts`` column is omitted from both the Arrow schema and the
+    Spark DDL string, so the ETL downstream never sees a text map to pivot.
 
     Args:
         config: Benchmark configuration.
@@ -194,6 +208,7 @@ def write_iceberg_table(
     tenants: int = config.tenants
     seed: int = config.seed
     words_per_text: int = config.words_per_text
+    no_text: bool = config.no_text
     slices: list[tuple[int, int]] = [
         (start, min(config.rows_per_slice, config.limit - start))
         for start in range(0, config.limit, config.rows_per_slice)
@@ -223,13 +238,15 @@ def write_iceberg_table(
                     tenants,
                     seed,
                     words_per_text,
+                    no_text,
                 )
 
+    spark_ddl: str = SPARK_ROW_DDL_NO_TEXT if no_text else SPARK_ROW_DDL
     started: float = time.perf_counter()
     try:
         spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {config.catalog}.db")
         specs = spark.createDataFrame(slices, "start long, count long").repartition(len(slices))
-        rows = specs.mapInArrow(generate, schema=SPARK_ROW_DDL)
+        rows = specs.mapInArrow(generate, schema=spark_ddl)
         rows = rows.withColumn("updated_at", F.timestamp_micros(F.col("updated_at_us"))).drop("updated_at_us")
         rows.writeTo(config.table()).using("iceberg").createOrReplace()
         elapsed: float = time.perf_counter() - started
@@ -306,9 +323,11 @@ def run_prepare(config: BenchConfig) -> dict[str, Any]:
     queries: np.ndarray = adapter.query_vectors(config.workspace)
     sample: np.ndarray = adapter.base_vectors(config.workspace, limit=min(config.limit, KMEANS_SAMPLE_ROWS))
     centroids: np.ndarray = train_centroids(sample, config.num_clusters, config.seed)
-    vocab: tuple[list[list[str]], list[str]] = build_vocabulary(
-        len(centroids), config.words_per_cluster, config.common_words, config.seed
-    )
+
+    if config.no_text:
+        vocab: tuple[list[list[str]], list[str]] = ([], [])
+    else:
+        vocab = build_vocabulary(len(centroids), config.words_per_cluster, config.common_words, config.seed)
 
     write_seconds: float = write_iceberg_table(config, adapter, centroids, vocab)
     clusters: np.ndarray = compute_cluster_artifact(config, adapter, centroids)
@@ -318,13 +337,15 @@ def run_prepare(config: BenchConfig) -> dict[str, Any]:
     np.save(prepared / "centroids.npy", centroids)
     np.save(prepared / "clusters.npy", clusters)
     np.savez(prepared / "ground_truth.npz", **ground_truth)
-    (prepared / "vocab.json").write_text(json.dumps({"clusters": vocab[0], "common": vocab[1]}), encoding="utf-8")
+    if not config.no_text:
+        (prepared / "vocab.json").write_text(json.dumps({"clusters": vocab[0], "common": vocab[1]}), encoding="utf-8")
     manifest = {
         "created_at": utc_now(),
         "limit": config.limit,
         "tenants": config.tenants,
         "seed": config.seed,
         "num_clusters": len(centroids),
+        "no_text": config.no_text,
         "table": config.table(),
         "iceberg_write_seconds": round(write_seconds, 3),
         "ground_truth_source": ground_truth_source,

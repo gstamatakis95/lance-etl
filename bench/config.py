@@ -26,7 +26,7 @@ SIFT_GT_DEPTH: int = 100
 TENANT_ID: str = "tenant0"
 NAMESPACE: str = "ns"
 SIFT_FILE_NAMES: tuple[str, str, str] = ("sift_base.fvecs", "sift_query.fvecs", "sift_groundtruth.ivecs")
-SUBCOMMANDS: tuple[str, ...] = ("download", "prepare", "ingest", "index", "compact", "search", "report", "all")
+SUBCOMMANDS: tuple[str, ...] = ("download", "prepare", "ingest", "index", "compact", "search", "report", "all", "e2e")
 PHASE_NAMES: tuple[str, ...] = ("download", "prepare", "ingest", "index", "compact", "search", "report")
 
 
@@ -114,6 +114,13 @@ class BenchConfig:
         sha256: Optional pinned checksum for the downloaded sift archive.
         force: Rebuild prepared artifacts even when a manifest already exists.
         warmup_queries: Queries issued at the maximum nprobes before the timed sweep. Set to 0 to skip warmup.
+        no_text: When True, omit the ``texts`` column and skip FTS/hybrid index and search legs entirely.
+        capture_telemetry: When True, start the local DogStatsD and OTLP capture listeners for the duration of the
+            run and write all telemetry to ``{workspace}/telemetry/``.
+        statsd_port: UDP port for the local DogStatsD capture listener (default 19125, avoids clash with a real agent
+            on 8125).
+        otlp_port: gRPC port for the local OTLP trace capture receiver (default 14317, avoids clash with a real agent
+            on 4317).
     """
 
     command: str
@@ -155,6 +162,10 @@ class BenchConfig:
     sha256: str | None = None
     force: bool = False
     warmup_queries: int = 100
+    no_text: bool = False
+    capture_telemetry: bool = False
+    statsd_port: int = 19125
+    otlp_port: int = 14317
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> BenchConfig:
@@ -167,10 +178,13 @@ class BenchConfig:
             The populated configuration.
         """
         values: dict[str, Any] = {}
+        nullable_fields: frozenset[str] = frozenset(
+            {"ivf_partitions", "compact_target_rows", "max_queries", "sha256", "statsd_port", "otlp_port"}
+        )
         for item in fields(cls):
             if hasattr(args, item.name):
                 value: Any = getattr(args, item.name)
-                if value is not None or item.name in ("ivf_partitions", "compact_target_rows", "max_queries", "sha256"):
+                if value is not None or item.name in nullable_fields:
                     values[item.name] = value
         values["workspace"] = Path(args.workspace).resolve()
         values["results_root"] = Path(args.results_root).resolve()
@@ -204,12 +218,15 @@ class BenchConfig:
         """Return the cache key identifying one prepared corpus shape.
 
         The default ``sift1m`` dataset keeps its historical un-prefixed key. Other datasets are prefixed with their
-        adapter name so prepared artifacts never collide across datasets.
+        adapter name so prepared artifacts never collide across datasets. When ``no_text`` is set the key carries a
+        ``-notext`` suffix so text and no-text artifacts never collide.
 
         Returns:
             A key derived from the dataset and the fields that change the corpus or ground truth.
         """
         shape: str = f"n{self.limit}-t{self.tenants}-s{self.seed}-c{self.num_clusters}"
+        if self.no_text:
+            shape = f"{shape}-notext"
         if self.dataset == "sift1m":
             return shape
         return f"{self.dataset}-{shape}"
@@ -246,6 +263,14 @@ class BenchConfig:
         """
         base: str = str(self.lance_root())
         return [f"{base}/{org}/{TENANT_ID}/{NAMESPACE}.lance" for org in self.org_ids()]
+
+    def telemetry_dir(self) -> Path:
+        """Return the directory under which all telemetry capture files are written.
+
+        Returns:
+            The ``workspace/telemetry`` directory.
+        """
+        return self.workspace / "telemetry"
 
 
 def add_flags(parser: argparse.ArgumentParser) -> None:
@@ -294,6 +319,32 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--sha256", default=None, help="Pinned sha256 of sift.tar.gz")
     parser.add_argument("--force", action="store_true", help="Rebuild prepared artifacts")
     parser.add_argument("--warmup-queries", type=int, default=100, help="Warmup queries before timed sweep; 0 skips")
+    parser.add_argument(
+        "--no-text",
+        dest="no_text",
+        action="store_true",
+        help="Omit text column and skip FTS/hybrid legs; required for pure-vector corpora",
+    )
+    parser.add_argument(
+        "--capture-telemetry",
+        dest="capture_telemetry",
+        action="store_true",
+        help="Start local DogStatsD and OTLP capture listeners for the run duration",
+    )
+    parser.add_argument(
+        "--statsd-port",
+        dest="statsd_port",
+        type=int,
+        default=19125,
+        help="UDP port for the local DogStatsD capture listener (default 19125)",
+    )
+    parser.add_argument(
+        "--otlp-port",
+        dest="otlp_port",
+        type=int,
+        default=14317,
+        help="gRPC port for the local OTLP trace capture receiver (default 14317)",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -314,6 +365,7 @@ def build_parser() -> argparse.ArgumentParser:
         "search": "Run recall, FTS, hybrid, and ghz load modes against the gRPC server",
         "report": "Aggregate run artifacts into summary.md, results.csv, and pareto.png",
         "all": "Run the full chain: download, prepare, ingest, index, compact, search, report",
+        "e2e": "Batch-major e2e: per-batch ETL+index+compact+tag, historical-tag verification, optional gRPC legs",
     }
     for name in SUBCOMMANDS:
         sub: argparse.ArgumentParser = subparsers.add_parser(name, help=help_texts[name])

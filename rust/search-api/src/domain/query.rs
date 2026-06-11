@@ -10,6 +10,7 @@ use serde_json::{Map, Value};
 
 use crate::domain::filter::Filter;
 use crate::domain::fusion::FusionSpec;
+use crate::domain::target::DatasetRef;
 
 /// Distance metric for nearest-neighbor search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +96,11 @@ pub struct VectorQuery {
     pub with_row_id: bool,
     /// Number of leading hits to skip.
     pub offset: Option<usize>,
+    /// Which committed version of the dataset to open for this query. Defaults to
+    /// [`DatasetRef::Serve`], which follows the provider's configured serve policy (the serve tag
+    /// when enabled, otherwise the latest committed version). Setting an explicit version id or tag
+    /// name pins the search to that snapshot without affecting other in-flight requests.
+    pub reference: DatasetRef,
 }
 
 /// How match-query terms combine.
@@ -237,6 +243,11 @@ pub struct TextQuery {
     /// `true` — callers that need read-after-write freshness must set `Some(false)` or leave it
     /// `None` on datasets where the server default is off.
     pub fast_search: Option<bool>,
+    /// Which committed version of the dataset to open for this query. Defaults to
+    /// [`DatasetRef::Serve`], which follows the provider's configured serve policy (the serve tag
+    /// when enabled, otherwise the latest committed version). Setting an explicit version id or tag
+    /// name pins the search to that snapshot without affecting other in-flight requests.
+    pub reference: DatasetRef,
 }
 
 impl TextQuery {
@@ -254,6 +265,7 @@ impl TextQuery {
             with_row_id: false,
             offset: None,
             fast_search: None,
+            reference: DatasetRef::default(),
         }
     }
 
@@ -289,6 +301,12 @@ pub struct HybridQuery {
     pub k: usize,
     /// Fusion strategy for merging the legs.
     pub fusion: FusionSpec,
+    /// Which committed version of the dataset to open for both legs. Defaults to
+    /// [`DatasetRef::Serve`], which follows the provider's configured serve policy (the serve tag
+    /// when enabled, otherwise the latest committed version). Both legs are always opened at the
+    /// same resolved version so fusion dedup is consistent. Setting an explicit version id or tag
+    /// name pins the search to that snapshot without affecting other in-flight requests.
+    pub reference: DatasetRef,
 }
 
 /// The result of one vector search: ranked hits plus dataset provenance for recall capture.

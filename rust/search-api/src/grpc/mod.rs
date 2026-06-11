@@ -34,8 +34,8 @@ use crate::domain::{
 use crate::grpc::convert::{
     cluster_report_to_proto, cluster_spec_from_proto, dataset_target_from_proto, fused_hit_to_proto, fused_to_hit,
     hit_to_fused, hybrid_query_from_proto, prewarm_ref_from_proto, prewarm_report_to_proto, prewarm_spec_from_proto,
-    rerank_from_proto, text_hit_to_proto, text_query_from_proto, time_range_from_proto, vector_hit_to_proto,
-    vector_query_from_proto,
+    rerank_from_proto, text_hit_to_proto, text_query_from_proto, text_search_ref_from_proto, time_range_from_proto,
+    vector_hit_to_proto, vector_query_from_proto, vector_search_ref_from_proto,
 };
 use crate::pb::search_service_server::SearchService;
 use crate::pb::{
@@ -211,8 +211,9 @@ impl<B: SearchBackend + Prewarmer + ClusterReader> SearchService for SearchGrpc<
     ) -> Result<Response<VectorSearchResponse>, Status> {
         let request = request.into_inner();
         self.handle(Rpc::VectorSearch, request.target, async |target| {
+            let reference = vector_search_ref_from_proto(&request.version_ref);
             let time_range = time_range_from_proto(request.time_range);
-            let query = vector_query_from_proto(request.query, time_range).map_err(status_from_error)?;
+            let query = vector_query_from_proto(request.query, time_range, reference).map_err(status_from_error)?;
             let rerank = rerank_from_proto(request.rerank).map_err(status_from_error)?;
             tracing::Span::current().set_attribute("search.k", query.k as i64);
             let k = query.k;
@@ -246,8 +247,9 @@ impl<B: SearchBackend + Prewarmer + ClusterReader> SearchService for SearchGrpc<
     async fn text_search(&self, request: Request<TextSearchRequest>) -> Result<Response<TextSearchResponse>, Status> {
         let request = request.into_inner();
         self.handle(Rpc::TextSearch, request.target, async |target| {
+            let reference = text_search_ref_from_proto(&request.version_ref);
             let time_range = time_range_from_proto(request.time_range);
-            let query = text_query_from_proto(request.query, time_range).map_err(status_from_error)?;
+            let query = text_query_from_proto(request.query, time_range, reference).map_err(status_from_error)?;
             let rerank = rerank_from_proto(request.rerank).map_err(status_from_error)?;
             tracing::Span::current().set_attribute("search.k", query.k as i64);
             let k = query.k;

@@ -1,4 +1,4 @@
-"""Fleet-level manifest-migration and serving-tag helpers for Lance datasets.
+"""Fleet-level manifest-migration, serving-tag, and interval-tag-retention helpers for Lance datasets.
 
 These operations are embarrassingly parallel one-call-per-dataset functions.
 They reuse :func:`fan_out_per_dataset` from :mod:`lance_etl.maintenance.job` to
@@ -12,12 +12,18 @@ cost one object-store request instead of a version-count-proportional LIST.
 to a target version for blue-green promotion. A tagged version is exempt from
 :func:`~lance_etl.maintenance.job.cleanup_dataset` pruning, so the version a serving
 layer reads stays readable until the tag moves to a newer one.
+
+:func:`prune_interval_tags` and :func:`prune_interval_tags_fleet` delete old interval
+tags whose names are classified by :func:`datetime.strptime` against the
+``%Y%m%dT%H%M%SZ`` format, keeping only the newest ``tag_keep_last`` tags.  Tags that
+do not match the format (``HEAD`` and other non-interval tags) are never touched.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
+from datetime import datetime
 from typing import Any
 
 import lance
@@ -209,4 +215,105 @@ def update_serving_tags(
             )
         driver_telemetry.gauge("run.tags_flipped", len(results))
         logger.info("serving-tag flip: tag %r moved on %d datasets", tag, len(results))
+        return results
+
+
+def prune_interval_tags(
+    uri: str,
+    storage_options: dict[str, Any] | None,
+    tag_keep_last: int,
+    telemetry: Telemetry,
+) -> dict[str, Any]:
+    """Delete old interval tags on one dataset, keeping the newest ``tag_keep_last``.
+
+    Interval tags are classified by parsing each tag name with
+    ``datetime.strptime(name, "%Y%m%dT%H%M%SZ")`` inside a ``try/except ValueError``.
+    Tags that do not match the format (``HEAD`` and any other non-interval names) are
+    never considered for deletion.  The matching tags are sorted descending by parsed
+    time, the newest ``tag_keep_last`` are kept, and the rest are deleted via
+    ``dataset.tags.delete(name)``.
+
+    Args:
+        uri: Dataset URI.
+        storage_options: Object-store options forwarded to pylance.
+        tag_keep_last: Number of newest interval tags to retain.
+        telemetry: Telemetry facade for the current process.
+
+    Returns:
+        A statistics dictionary with keys ``uri``, ``tags_pruned``, ``tags_kept``, and
+        optionally ``skipped`` when ``tag_keep_last`` is ``None`` (though callers
+        checking ``None`` should skip calling this function entirely).
+    """
+    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
+    all_tags: list[str] = list(dataset.tags.list())
+
+    interval_tags: list[tuple[datetime, str]] = []
+    for name in all_tags:
+        try:
+            parsed: datetime = datetime.strptime(name, "%Y%m%dT%H%M%SZ")
+            interval_tags.append((parsed, name))
+        except ValueError:
+            pass
+
+    interval_tags.sort(key=lambda pair: pair[0], reverse=True)
+    to_keep: list[str] = [name for _, name in interval_tags[:tag_keep_last]]
+    to_delete: list[str] = [name for _, name in interval_tags[tag_keep_last:]]
+
+    with telemetry.timed("dataset.prune_tags_ms"):
+        for name in to_delete:
+            dataset.tags.delete(name)
+            telemetry.incr("dataset.interval_tag_pruned")
+
+    logger.info(
+        "prune_interval_tags: %s — kept %d, pruned %d interval tags",
+        uri,
+        len(to_keep),
+        len(to_delete),
+    )
+    return {"uri": uri, "tags_pruned": len(to_delete), "tags_kept": len(to_keep)}
+
+
+def prune_interval_tags_fleet(
+    spark: SparkSession,
+    dataset_uris: Iterable[str],
+    telemetry_config: TelemetryConfig,
+    storage_options: dict[str, Any] | None,
+    tag_keep_last: int,
+    partitions: int = 512,
+) -> list[dict[str, Any]]:
+    """Prune old interval tags across a fleet of datasets, one task per executor partition.
+
+    Each dataset's tag pruning is an independent metadata operation, so the work fans
+    out across executors exactly like the manifest migration.  ``tag_keep_last`` is
+    broadcast implicitly through the closure captured by the per-dataset lambda.
+
+    Args:
+        spark: Active Spark session.
+        dataset_uris: Datasets whose old interval tags should be pruned.
+        telemetry_config: Telemetry configuration created per executor process.
+        storage_options: Object-store options forwarded to pylance.
+        tag_keep_last: Number of newest interval tags to retain per dataset.
+        partitions: Maximum Spark partitions for the prune job.
+
+    Returns:
+        One statistics dictionary per dataset.
+    """
+    driver_telemetry: Telemetry = Telemetry.create(telemetry_config)
+    with driver_telemetry.span("lance.interval_tag_prune.run") as run_span:
+        uris: list[str] = list(dataset_uris)
+        run_span.set_tag("dataset_count", len(uris))
+        run_span.set_tag("tag_keep_last", tag_keep_last)
+        if not uris:
+            return []
+        with driver_telemetry.timed("run.prune_tags_ms"):
+            results: list[dict[str, Any]] = fan_out_per_dataset(
+                spark,
+                uris,
+                telemetry_config,
+                lambda uri, telemetry: prune_interval_tags(uri, storage_options, tag_keep_last, telemetry),
+                partitions,
+            )
+        pruned_total: int = sum(int(r.get("tags_pruned", 0)) for r in results)
+        driver_telemetry.gauge("run.interval_tags_pruned", pruned_total)
+        logger.info("interval-tag prune: %d tags pruned across %d datasets", pruned_total, len(results))
         return results

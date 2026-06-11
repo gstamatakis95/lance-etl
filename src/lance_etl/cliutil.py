@@ -236,3 +236,33 @@ def configure_logging_from_args(args: argparse.Namespace) -> None:
 
     level: int = logging.getLevelName(args.log_level.upper())
     configure_logging(build_telemetry_config(args), level=level)
+
+
+def parse_window_tag(value: str) -> str:
+    """Convert an Airflow-rendered datetime string to a colon-free UTC interval tag.
+
+    Accepts ISO 8601 datetime strings in both space-separated form
+    (``"2026-06-11 12:00:00+00:00"``) and T-separated form
+    (``"2026-06-11T12:00:00+00:00"``), with or without timezone info.
+    Naive datetimes are treated as UTC.  The result is always formatted as
+    ``%Y%m%dT%H%M%SZ`` (e.g. ``"20260611T120000Z"``), which is the colon-free
+    stamp used as the interval tag name throughout the pipeline.
+
+    Args:
+        value: An ISO 8601 datetime string, as templated by Airflow's
+            ``{{ data_interval_end | string }}``.
+
+    Returns:
+        The tag name in ``%Y%m%dT%H%M%SZ`` format.
+
+    Raises:
+        ValueError: If ``value`` cannot be parsed by :func:`datetime.fromisoformat`.
+    """
+    try:
+        parsed: datetime = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"cannot parse {value!r} as an ISO 8601 datetime: {exc}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    utc: datetime = parsed.astimezone(UTC)
+    return utc.strftime("%Y%m%dT%H%M%SZ")

@@ -616,6 +616,7 @@ mod tests {
             },
             k: 2,
             fusion: FusionSpec::Weighted { vector_weight: 0.7 },
+            reference: crate::domain::DatasetRef::default(),
         };
         let pending = capture.begin_hybrid(&target, &query).expect("rate 1.0 must sample");
         let mut row = Map::new();

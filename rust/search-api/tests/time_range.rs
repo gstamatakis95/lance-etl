@@ -248,6 +248,7 @@ async fn text_and_hybrid_time_range_restricts_the_window() {
         },
         k: 10,
         fusion: search_api::domain::FusionSpec::default(),
+        reference: search_api::domain::DatasetRef::default(),
     };
     let fused = backend.hybrid_search(&target, hybrid).await.unwrap();
     let mut ids: Vec<i64> = fused.hits.iter().map(|hit| hit_id(&hit.row)).collect();
