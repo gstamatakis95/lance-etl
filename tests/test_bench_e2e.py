@@ -1,9 +1,12 @@
-"""Offline tiny-data end-to-end test of the benchmark chain through a registered fake dataset adapter.
+"""Offline tiny-data end-to-end test of the benchmark chain through the bigann adapter.
 
-Registers a tiny in-memory :class:`bench.datasets.SyntheticAdapter` (2000 base vectors, dimension 16, 50 queries) and
-drives prepare -> ingest -> index -> compact -> report with two tenants and two ETL batches through Spark local mode,
-asserting that the prepared artifacts, the per-tenant Lance datasets, all four index types, the compaction stats, and
-the report files materialize. The search phase is deliberately not exercised: it requires the Rust gRPC server.
+Writes a minimal bigann workspace fixture (2000 base vectors, 128 dims, uint8, seeded rng; 50
+queries) directly into ``{tmp_path}/workspace/bigann/`` using :func:`bench.bigann_io.write_u8bin`,
+with the exact filenames :class:`bench.datasets.BigannAdapter` expects for ``limit=2000``. The
+download phase short-circuits (base and query files already present). ``gt_member_name(2000)``
+returns ``None`` so the prepare phase computes exact brute-force ground truth. The remaining
+flow drives prepare -> ingest -> index -> compact -> report through Spark local mode and asserts
+that all artifacts materialize.
 """
 
 from __future__ import annotations
@@ -15,9 +18,10 @@ import lance
 import numpy as np
 import pytest
 
+from bench.bigann_io import write_u8bin
 from bench.compaction import run_compact
 from bench.config import BenchConfig, build_parser
-from bench.datasets import DATASET_ADAPTERS, SyntheticAdapter, register_adapter
+from bench.datasets import BigannAdapter
 from bench.indexes import run_index
 from bench.ingest import run_ingest
 from bench.prepare import run_prepare
@@ -26,27 +30,49 @@ from bench.results import read_json
 
 pytestmark = pytest.mark.integration
 
-DATASET_NAME: str = "tiny-fake"
 BASE_ROWS: int = 2_000
-DIMENSION: int = 16
+DIMENSION: int = 128
 QUERY_ROWS: int = 50
 TENANTS: int = 2
+GT_DEPTH: int = min(BigannAdapter().gt_depth, BASE_ROWS // TENANTS)
 EXPECTED_INDEX_NAMES: frozenset[str] = frozenset({"vector_idx", "vector_id_idx", "category_bitmap_idx", "text_fts_idx"})
 
 
+def make_bigann_fixture(workspace: Path, seed: int = 11) -> None:
+    """Write a minimal bigann workspace fixture that bypasses network download.
+
+    Creates ``{workspace}/bigann/base.2000.u8bin`` and
+    ``{workspace}/bigann/query.10K.u8bin`` using seeded random uint8 data.
+    The filenames match exactly what :class:`bench.datasets.BigannAdapter` expects
+    for ``limit=2000`` and the default query path.
+
+    Args:
+        workspace: The benchmark workspace directory.
+        seed: RNG seed for reproducible vectors.
+    """
+    bigann_dir: Path = workspace / "bigann"
+    bigann_dir.mkdir(parents=True, exist_ok=True)
+    rng: np.random.Generator = np.random.default_rng(seed)
+    base: np.ndarray = rng.integers(0, 256, size=(BASE_ROWS, DIMENSION), dtype=np.uint8).astype(np.float32)
+    queries: np.ndarray = rng.integers(0, 256, size=(QUERY_ROWS, DIMENSION), dtype=np.uint8).astype(np.float32)
+    adapter: BigannAdapter = BigannAdapter(limit=BASE_ROWS)
+    write_u8bin(adapter.base_path(workspace), base)
+    write_u8bin(adapter.query_path(workspace), queries)
+
+
 def tiny_config(tmp_path: Path) -> BenchConfig:
-    """Build the benchmark configuration of the offline tiny run.
+    """Build the benchmark configuration of the offline tiny bigann run.
 
     Args:
         tmp_path: The temporary workspace root.
 
     Returns:
-        The parsed configuration targeting the registered fake adapter.
+        The parsed configuration targeting the bigann adapter.
     """
     argv: list[str] = [
         "all",
         "--dataset",
-        DATASET_NAME,
+        "bigann",
         "--workspace",
         str(tmp_path / "workspace"),
         "--results-root",
@@ -90,64 +116,60 @@ def assert_prepare_artifacts(config: BenchConfig, outcome: dict[str, Any]) -> No
     """
     assert outcome["skipped"] is False
     prepared: Path = config.prepared_dir()
-    assert prepared.name == f"{DATASET_NAME}-n{BASE_ROWS}-t{TENANTS}-s42-c4"
+    assert prepared.name == f"bigann-n{BASE_ROWS}-t{TENANTS}-s42-c4"
     queries: np.ndarray = np.load(prepared / "queries.npy")
     assert queries.shape == (QUERY_ROWS, DIMENSION)
     ground_truth = np.load(prepared / "ground_truth.npz")
     assert sorted(ground_truth.files) == ["org0", "org1"]
     for org in ground_truth.files:
-        assert ground_truth[org].shape == (QUERY_ROWS, 100)
+        assert ground_truth[org].shape == (QUERY_ROWS, GT_DEPTH)
     manifest: dict[str, Any] = read_json(prepared / "manifest.json")
     assert manifest["ground_truth_source"] == "brute_force"
     assert manifest["limit"] == BASE_ROWS
 
 
 def test_offline_tiny_end_to_end(tmp_path: Path) -> None:
-    """prepare -> ingest -> index -> compact -> report runs offline against the fake adapter."""
-    adapter: SyntheticAdapter = SyntheticAdapter(
-        dataset_name=DATASET_NAME,
-        vector_dimension=DIMENSION,
-        base_rows=BASE_ROWS,
-        query_rows=QUERY_ROWS,
-        seed=11,
-    )
-    register_adapter(adapter)
-    try:
-        config: BenchConfig = tiny_config(tmp_path)
-        assert_prepare_artifacts(config, run_prepare(config))
+    """prepare -> ingest -> index -> compact -> report runs offline against the bigann fixture."""
+    workspace: Path = tmp_path / "workspace"
+    make_bigann_fixture(workspace)
 
-        ingest_outcome: dict[str, Any] = run_ingest(config)
-        assert ingest_outcome["total_rows"] == BASE_ROWS
-        assert len(ingest_outcome["batches"]) == 2
-        uris: list[str] = config.dataset_uris()
-        assert len(uris) == TENANTS
-        for uri in uris:
-            dataset: lance.LanceDataset = lance.dataset(uri)
-            assert dataset.count_rows() == BASE_ROWS // TENANTS
-            field = dataset.schema.field("vector")
-            assert field.type.list_size == DIMENSION
+    config: BenchConfig = tiny_config(tmp_path)
 
-        index_outcome: dict[str, Any] = run_index(config)
-        assert [stage["stage"] for stage in index_outcome["stages"]] == [
-            "vector_ivf_rq",
-            "btree_vector_id",
-            "bitmap_category",
-            "fts_text",
-        ]
-        for uri in uris:
-            names: set[str] = {description.name for description in lance.dataset(uri).describe_indices()}
-            assert names >= EXPECTED_INDEX_NAMES
+    download_outcome: dict[str, Any] = BigannAdapter(limit=BASE_ROWS).download(workspace)
+    assert download_outcome["skipped"] is True, "download must short-circuit when base+query files exist"
 
-        compact_outcome: dict[str, Any] = run_compact(config)
-        for uri in uris:
-            assert compact_outcome["fragments_before"][uri] >= 2
-            assert compact_outcome["fragments_after"][uri] <= compact_outcome["fragments_before"][uri]
+    assert_prepare_artifacts(config, run_prepare(config))
 
-        report_outcome: dict[str, Any] = run_report(config)
-        assert set(report_outcome["files"]) == {"results.csv", "summary.md"}
-        run_dir: Path = config.run_dir()
-        for artifact in ("prepare.json", "ingest.json", "index.json", "compact.json", "report.json"):
-            assert (run_dir / artifact).exists()
-        assert f"# {DATASET_NAME.upper()} benchmark run" in (run_dir / "summary.md").read_text(encoding="utf-8")
-    finally:
-        DATASET_ADAPTERS.pop(DATASET_NAME, None)
+    ingest_outcome: dict[str, Any] = run_ingest(config)
+    assert ingest_outcome["total_rows"] == BASE_ROWS
+    assert len(ingest_outcome["batches"]) == 2
+    uris: list[str] = config.dataset_uris()
+    assert len(uris) == TENANTS
+    for uri in uris:
+        dataset: lance.LanceDataset = lance.dataset(uri)
+        assert dataset.count_rows() == BASE_ROWS // TENANTS
+        field = dataset.schema.field("vector")
+        assert field.type.list_size == DIMENSION
+
+    index_outcome: dict[str, Any] = run_index(config)
+    assert [stage["stage"] for stage in index_outcome["stages"]] == [
+        "vector_ivf_rq",
+        "btree_vector_id",
+        "bitmap_category",
+        "fts_text",
+    ]
+    for uri in uris:
+        names: set[str] = {description.name for description in lance.dataset(uri).describe_indices()}
+        assert names >= EXPECTED_INDEX_NAMES
+
+    compact_outcome: dict[str, Any] = run_compact(config)
+    for uri in uris:
+        assert compact_outcome["fragments_before"][uri] >= 2
+        assert compact_outcome["fragments_after"][uri] <= compact_outcome["fragments_before"][uri]
+
+    report_outcome: dict[str, Any] = run_report(config)
+    assert set(report_outcome["files"]) == {"results.csv", "summary.md"}
+    run_dir: Path = config.run_dir()
+    for artifact in ("prepare.json", "ingest.json", "index.json", "compact.json", "report.json"):
+        assert (run_dir / artifact).exists()
+    assert "# BIGANN benchmark run" in (run_dir / "summary.md").read_text(encoding="utf-8")

@@ -51,7 +51,7 @@ lance-etl/
     cli.py                Subcommand dispatch: download / prepare / ingest / index / compact
                           / search / report / all
     config.py             BenchConfig dataclass + full flag set
-    datasets.py           DatasetAdapter registry: Sift1mAdapter, SyntheticAdapter
+    datasets.py           DatasetAdapter registry: Sift1mAdapter, BigannAdapter
     download.py           Corpus acquisition + checksum verification
     prepare.py            Iceberg table + prepared artifacts (queries, ground truth, vocab)
     ingest.py             Real ETL run via LanceIndexer / IcebergToLanceETL

@@ -6,14 +6,13 @@ with :func:`register_adapter`. The adapter owns acquisition (:meth:`DatasetAdapt
 both the driver and Spark executor tasks (:meth:`DatasetAdapter.base_vectors`,
 :meth:`DatasetAdapter.base_vector_slice`, :meth:`DatasetAdapter.query_vectors`), the optional published ground truth
 (:meth:`DatasetAdapter.ground_truth`, ``None`` means the prepare phase computes exact brute-force truth), and the
-per-row document text hook (:meth:`DatasetAdapter.text_for_row`, defaulting to the synthetic cluster-seeded corpus in
+per-row document text hook (:meth:`DatasetAdapter.text_for_row`, defaulting to the cluster-seeded corpus in
 :mod:`bench.corpus`). Adapters must be picklable because prepare broadcasts them into ``mapInArrow`` closures.
 
 :class:`Sift1mAdapter` carries all SIFT1M specifics that previously lived across the download and prepare phases: the
 IRISA tarball URLs, the per-file HuggingFace mirrors, the published shapes, the checksum manifest handling, and the
-fvecs/ivecs readers. :class:`SyntheticAdapter` generates a deterministic in-memory Gaussian corpus with no download at
-all, which backs the offline tiny-data integration tests. :class:`BigannAdapter` serves the billion-scale BIGANN corpus
-downloading only the first ``limit`` vectors via HTTP Range requests with resume support.
+fvecs/ivecs readers. :class:`BigannAdapter` serves the billion-scale BIGANN corpus downloading only the first
+``limit`` vectors via HTTP Range requests with resume support. The registry keys are ``sift1m`` and ``bigann``.
 """
 
 from __future__ import annotations
@@ -203,12 +202,12 @@ class DatasetAdapter(ABC):
         seed: int,
         cluster_terms: int,
     ) -> str:
-        """Return the document text of one row. Defaults to the synthetic cluster-seeded corpus.
+        """Return the document text of one row. Defaults to the cluster-seeded corpus.
 
-        Datasets with real document text (text corpora) override this and ignore the synthetic vocabularies.
+        Datasets with real document text (text corpora) override this and ignore the cluster vocabularies.
 
         Args:
-            cluster_vocab: Per-cluster synthetic vocabularies.
+            cluster_vocab: Per-cluster vocabularies.
             common_vocab: Shared common-word pool.
             cluster_id: The row's coarse cluster.
             global_index: The row's global index.
@@ -468,125 +467,6 @@ class Sift1mAdapter(DatasetAdapter):
         """
         path: Path = self.corpus_dir(workspace) / "sift_groundtruth.ivecs"
         return read_ivecs(path)[:, : self.gt_depth].astype(np.int64)
-
-
-@dataclass
-class SyntheticAdapter(DatasetAdapter):
-    """A deterministic in-memory Gaussian corpus requiring no download.
-
-    Vectors are regenerated on demand from the seed, so the adapter pickles as a handful of integers and every Spark
-    executor task reproduces exactly the same corpus. There is no published ground truth, so the prepare phase always
-    computes exact brute-force truth. The adapter backs the offline tiny-data integration tests and serves as the
-    template for plugging in future datasets.
-
-    Attributes:
-        dataset_name: The registry name.
-        vector_dimension: The vector dimension. Must be divisible by 8 for the IVF_RQ index build.
-        base_rows: Number of base vectors.
-        query_rows: Number of query vectors.
-        seed: Seed of the deterministic generation.
-    """
-
-    dataset_name: str = "synthetic"
-    vector_dimension: int = 16
-    base_rows: int = 2_000
-    query_rows: int = 50
-    seed: int = 7
-
-    @property
-    def name(self) -> str:
-        """Return the configured registry name."""
-        return self.dataset_name
-
-    @property
-    def dimension(self) -> int:
-        """Return the configured vector dimension."""
-        return self.vector_dimension
-
-    @property
-    def base_count(self) -> int:
-        """Return the configured base-vector count."""
-        return self.base_rows
-
-    @property
-    def gt_depth(self) -> int:
-        """Return the brute-force ground-truth depth, clamped to the corpus size."""
-        return min(SIFT_GT_DEPTH, self.base_rows)
-
-    def base_matrix(self) -> np.ndarray:
-        """Generate the full deterministic base matrix.
-
-        Returns:
-            A float32 ``(base_rows, dimension)`` array.
-        """
-        rng: np.random.Generator = np.random.default_rng([self.seed, 11])
-        return rng.normal(size=(self.base_rows, self.vector_dimension)).astype(np.float32)
-
-    def download(self, workspace: Path, sha256: str | None = None) -> dict[str, Any]:
-        """Report that a synthetic corpus needs no acquisition.
-
-        Args:
-            workspace: The benchmark workspace directory. Unused.
-            sha256: Ignored. Nothing is fetched.
-
-        Returns:
-            A skip payload.
-        """
-        del workspace, sha256
-        return {"skipped": True, "reason": "synthetic dataset; nothing to download"}
-
-    def base_vectors(self, workspace: Path, limit: int | None = None) -> np.ndarray:
-        """Return base vectors from the start of the generated corpus.
-
-        Args:
-            workspace: The benchmark workspace directory. Unused.
-            limit: Optional cap on rows returned.
-
-        Returns:
-            A float32 ``(rows, dimension)`` array.
-        """
-        del workspace
-        matrix: np.ndarray = self.base_matrix()
-        return matrix if limit is None else matrix[:limit]
-
-    def base_vector_slice(self, workspace: Path, start: int, count: int) -> np.ndarray:
-        """Return one contiguous slice of the generated corpus.
-
-        Args:
-            workspace: The benchmark workspace directory. Unused.
-            start: First global row index of the slice.
-            count: Rows in the slice.
-
-        Returns:
-            A float32 ``(count, dimension)`` array.
-        """
-        del workspace
-        return self.base_matrix()[start : start + count]
-
-    def query_vectors(self, workspace: Path) -> np.ndarray:
-        """Return the deterministic query matrix.
-
-        Args:
-            workspace: The benchmark workspace directory. Unused.
-
-        Returns:
-            A float32 ``(query_rows, dimension)`` array.
-        """
-        del workspace
-        rng: np.random.Generator = np.random.default_rng([self.seed, 12])
-        return rng.normal(size=(self.query_rows, self.vector_dimension)).astype(np.float32)
-
-    def ground_truth(self, workspace: Path) -> np.ndarray | None:
-        """Return ``None``: the prepare phase computes exact brute-force ground truth.
-
-        Args:
-            workspace: The benchmark workspace directory. Unused.
-
-        Returns:
-            Always ``None``.
-        """
-        del workspace
-        return None
 
 
 DATASET_ADAPTERS: dict[str, DatasetAdapter] = {}
@@ -930,14 +810,14 @@ class BigannAdapter(DatasetAdapter):
         seed: int,
         cluster_terms: int,
     ) -> str:
-        """Return deterministic synthetic text for rows in text-enabled runs.
+        """Return deterministic cluster-seeded text for rows in text-enabled runs.
 
         BIGANN is a pure vector corpus and does not carry document text. This method
-        delegates to the default synthetic corpus generator so the adapter remains
+        delegates to the default cluster corpus generator so the adapter remains
         compatible with text-enabled benchmark modes when ``--no-text`` is not set.
 
         Args:
-            cluster_vocab: Per-cluster synthetic vocabularies.
+            cluster_vocab: Per-cluster vocabularies.
             common_vocab: Shared common-word pool.
             cluster_id: The row's coarse cluster.
             global_index: The row's global index.
@@ -945,11 +825,10 @@ class BigannAdapter(DatasetAdapter):
             cluster_terms: Cluster-specific words per document.
 
         Returns:
-            The synthetic document text.
+            The cluster-seeded document text.
         """
         return row_text(cluster_vocab, common_vocab, cluster_id, global_index, seed, cluster_terms=cluster_terms)
 
 
 register_adapter(Sift1mAdapter())
-register_adapter(SyntheticAdapter())
 register_adapter(BigannAdapter())

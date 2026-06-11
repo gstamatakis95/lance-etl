@@ -18,25 +18,41 @@ maturin develop --release -m python/Cargo.toml
 
 ---
 
-## Smoke run — 1M vectors (fast, no download required)
-
-Uses the synthetic adapter. No real BIGANN download. Runs in minutes on a laptop.
+The ETL now chunks `merge_insert` sources in bounded row batches (`merge_batch_rows`,
+default 250,000 rows per chunk). This makes `LANCE_MEM_POOL_SIZE` optional headroom rather
+than a hard requirement. For multi-batch runs at 1M scale or larger the env var is still
+recommended to give DataFusion extra spill budget:
 
 ```bash
-python -m bench e2e \
-  --dataset synthetic \
-  --limit 1000000 \
+export LANCE_MEM_POOL_SIZE=4294967296
+```
+
+---
+
+## Smoke run — sift1m (~160 MB download, official ground truth)
+
+The smallest corpus with published ground truth. Downloads the IRISA SIFT1M tarball once
+and caches it under `bench/workspace/sift/`.
+
+```bash
+python -m bench all \
+  --dataset sift1m \
   --batches 2 \
-  --no-text \
-  --rows-per-slice 50000 \
   --etl-partitions 4 \
-  --num-shards 4 \
-  --vector-row-floor 1024 \
-  --num-partitions 64 \
-  --seed 42 \
+  --num-partitions 128 \
+  --endpoint localhost:50051 \
   --workspace bench/workspace \
   --results-root bench/results
 ```
+
+For an offline fixture run without any download, use the pytest integration tests:
+
+```bash
+.venv/bin/pytest tests/test_bench_e2e.py tests/test_bench_e2e_tagged.py -x -q -m integration
+```
+
+The tests write minimal bigann u8bin files directly into a temp workspace so no network
+access is needed. They exercise the full real adapter IO path through Spark local mode.
 
 ---
 
@@ -139,7 +155,7 @@ python -m bench e2e \
 
 ## Phase-major `all` command (for comparison)
 
-The existing `all` subcommand runs phases in order (full ingest, then full index, then compact). Use it for SIFT1M or synthetic baselines:
+The `all` subcommand runs phases in order (full ingest, then full index, then compact). Use it for SIFT1M baselines:
 
 ```bash
 python -m bench all \
@@ -271,10 +287,11 @@ to the bench dependency group first:
 uv pip install --group bench
 ```
 
-Then run with capture enabled:
+Then run with capture enabled (bigann 1M prefix, download once first):
 
 ```bash
-python -m bench e2e --dataset synthetic --limit 1000000 --no-text --capture-telemetry \
+python -m bench download --dataset bigann --limit 1000000 --workspace bench/workspace
+python -m bench e2e --dataset bigann --limit 1000000 --no-text --capture-telemetry \
   --workspace bench/workspace --results-root bench/results
 ```
 

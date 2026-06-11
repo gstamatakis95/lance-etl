@@ -1,4 +1,4 @@
-"""Deterministic synthetic text corpus and tenant routing for the benchmark.
+"""Deterministic cluster-seeded text corpus and tenant routing for the benchmark.
 
 Every base vector is assigned to a coarse k-means cluster (numpy minibatch k-means trained on a sample) and its text is
 drawn from that cluster's private vocabulary plus a small shared common-word pool, so BM25 sees realistic term
@@ -17,7 +17,7 @@ MAX_WORD_LENGTH: int = 9
 
 
 def generate_words(rng: np.random.Generator, count: int, taken: set[str]) -> list[str]:
-    """Generate unique pronounceable-ish synthetic words.
+    """Generate unique pronounceable-ish benchmark vocabulary words.
 
     Args:
         rng: The seeded generator to draw letters from.
@@ -70,7 +70,7 @@ def row_text(
     cluster_terms: int = 8,
     common_terms: int = 2,
 ) -> str:
-    """Build the deterministic synthetic document for one vector.
+    """Build the deterministic cluster-seeded document for one vector.
 
     Args:
         cluster_vocab: Per-cluster vocabularies.

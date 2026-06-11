@@ -70,7 +70,7 @@ and stop after the last recall sweep.
 
 ```bash
 python -m bench e2e \
-  --dataset synthetic \
+  --dataset bigann \
   --limit 1000000 \
   --batches 2 \
   --no-text \

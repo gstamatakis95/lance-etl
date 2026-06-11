@@ -4,7 +4,7 @@ Four legs run against the per-tenant datasets through the real server:
 
 - recall: the SIFT query vectors sweep ``nprobes x refine_factor``. Recall@1/@10/@100 is computed against the prepared
   ground truth and per-config latency statistics are recorded.
-- fts: deterministic synthetic text queries drawn from the cluster vocabularies measure BM25 latency and the
+- fts: deterministic cluster-vocabulary text queries measure BM25 latency and the
   cluster-consistency hit rate (the fraction of hits whose vector belongs to the queried cluster).
 - hybrid: vector + text legs fused with reciprocal-rank fusion. Latency and fused recall@10 are recorded.
 - load: when the external ``ghz`` binary is on PATH, sustained QPS and p50/p95/p99 latency are measured per

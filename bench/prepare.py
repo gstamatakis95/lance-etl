@@ -1,4 +1,4 @@
-"""Build the Iceberg source table, synthetic text corpus, and ground-truth artifacts.
+"""Build the Iceberg source table, cluster-seeded text corpus, and ground-truth artifacts.
 
 The base vectors are written into a local Iceberg table with exactly the schema the project's ETL
 expects: the routing columns (``org_id``, ``tenant_id``, ``namespace``), the merge key
@@ -6,7 +6,7 @@ expects: the routing columns (``org_id``, ``tenant_id``, ``namespace``), the mer
 last-write-wins collapse column and the window-pushdown column), the low-cardinality concrete
 ``category`` column (the bitmap index target, flows through the ETL untouched), and the three map
 columns ``vectors`` / ``texts`` / ``metadata``. The embedding rides in the ``vectors`` map under
-the key ``"vector"`` and the synthetic cluster-seeded document rides in the ``texts`` map under
+the key ``"vector"`` and the cluster-seeded document rides in the ``texts`` map under
 the key ``"text"``. The ETL dynamically pivots every map key into a concrete column per dataset
 group on the executor, so the ``vector`` and ``text`` keys become concrete columns automatically.
 The ``vector`` column type override in the ingest config ensures the inferred FSL dimension is
@@ -15,7 +15,7 @@ into a concrete ``cluster`` string column in the dataset.
 
 Row generation runs inside Spark executors via ``mapInArrow``: each task reads its own row slice straight through the
 dataset adapter, assigns clusters against the driver-trained centroids, and emits Arrow batches. ``updated_at``
-spreads rows deterministically over one synthetic day (minute ``index % 1440``) so the ingest phase can slice the day
+spreads rows deterministically over one base day (minute ``index % 1440``) so the ingest phase can slice the day
 into ``--batches`` windows through the ETL's real ``--window-start`` / ``--window-end`` pushdown flags.
 
 Ground truth: the dataset's published ground truth is used verbatim for the canonical full single-tenant run when the
@@ -97,7 +97,7 @@ def arrow_row_schema(no_text: bool = False) -> pa.Schema:
 def updated_at_micros(global_index: np.ndarray) -> np.ndarray:
     """Return the deterministic ``updated_at`` epoch microseconds per row.
 
-    Rows are spread round-robin over the minutes of one synthetic day, so every batch window selected by the ingest
+    Rows are spread round-robin over the minutes of one base day, so every batch window selected by the ingest
     phase contains rows for every tenant.
 
     Args:

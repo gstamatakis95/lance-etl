@@ -1,10 +1,15 @@
-"""Tests for the dynamic map-column pivot in the ETL.
+"""Tests for the dynamic map-column pivot in the ETL and the collapse last-write-wins guarantee.
 
 Every key of the ``vectors``, ``texts``, and ``metadata`` map columns becomes a concrete column in
 the written Lance dataset. The key is the column name and the value is the column value. The pivot
 runs per-dataset on the executor so each org's dataset contains only the keys that org uses. These
 tests cover the end-to-end Spark pivot and the ``validate_schema`` safety checks (present-but-wrong
 map column type, and a map column that is not a map).
+
+The ``TestCollapseGuarantee`` class verifies that ``IcebergToLanceETL.collapse`` enforces at most one
+row per ``(routing key, vector_id)`` before rows reach ``apply_merge``. This is the invariant that
+makes chunked merge commits order-safe: because collapse runs before partitioning, no key can appear
+in more than one chunk when ``merge_batch_rows`` slices the upsert table.
 """
 
 from __future__ import annotations
@@ -267,3 +272,70 @@ class TestValidateSchema:
             },
         )
         IcebergToLanceETL(config).validate_schema(source)
+
+
+class TestCollapseGuarantee:
+    """collapse() enforces last-write-wins uniqueness per (routing key, vector_id) before apply_merge."""
+
+    def collapse_schema(self) -> StructType:
+        """Return the Spark schema used by collapse uniqueness tests.
+
+        Returns:
+            A schema with routing, key, event and processing timestamps, op, and a texts map.
+        """
+        return StructType(
+            [
+                StructField("vector_id", StringType(), False),
+                StructField("org_id", StringType(), False),
+                StructField("tenant_id", StringType(), False),
+                StructField("namespace", StringType(), False),
+                StructField("event_timestamp", TimestampType(), False),
+                StructField("processing_timestamp", TimestampType(), False),
+                StructField("op", StringType(), False),
+                StructField("texts", MapType(StringType(), StringType()), True),
+            ]
+        )
+
+    def test_duplicate_key_collapses_to_most_recent(
+        self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
+    ) -> None:
+        """Two rows for the same vector_id collapse to the most-recent event_timestamp row.
+
+        This validates the order-safety invariant: because collapse runs before any partitioning,
+        no key can appear in more than one chunk when merge_batch_rows slices the upsert table.
+        The older row is discarded and the newer row's payload is written to the dataset.
+        """
+        ts_old: datetime = datetime(2024, 1, 1, tzinfo=UTC)
+        ts_new: datetime = datetime(2024, 6, 1, tzinfo=UTC)
+        rows: list[tuple] = [
+            ("dup_id", "o1", "t1", "ns1", ts_old, ts_old, "insert", {"txt": "old"}),
+            ("dup_id", "o1", "t1", "ns1", ts_new, ts_new, "insert", {"txt": "new"}),
+            ("unique_id", "o1", "t1", "ns1", ts_new, ts_new, "insert", {"txt": "only"}),
+        ]
+        frame = spark.createDataFrame(rows, self.collapse_schema())
+        config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config, num_partitions=2)
+        IcebergToLanceETL(config).run_on_dataframe(frame)
+
+        table: pa.Table = lance.dataset(dataset_uri(config, "o1", "t1", "ns1")).to_table().sort_by("vector_id")
+        assert table.num_rows == 2, f"expected 2 rows after collapse, got {table.num_rows}"
+        vids: list[str] = table["vector_id"].to_pylist()
+        assert vids == ["dup_id", "unique_id"]
+        txt_values: list[str | None] = table["txt"].to_pylist()
+        txt_by_id: dict[str, str | None] = dict(zip(vids, txt_values, strict=True))
+        assert txt_by_id["dup_id"] == "new", "collapse must keep the most-recent row"
+
+    def test_unique_keys_pass_through_unchanged(
+        self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
+    ) -> None:
+        """When all vector_ids are distinct, collapse does not drop any row.
+
+        A group with N unique vector_ids must produce exactly N rows in the written dataset.
+        """
+        ts: datetime = datetime(2024, 3, 15, tzinfo=UTC)
+        rows: list[tuple] = [(f"v{i}", "o2", "t2", "ns2", ts, ts, "insert", {"txt": f"val{i}"}) for i in range(10)]
+        frame = spark.createDataFrame(rows, self.collapse_schema())
+        config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config, num_partitions=2)
+        IcebergToLanceETL(config).run_on_dataframe(frame)
+
+        dataset = lance.dataset(dataset_uri(config, "o2", "t2", "ns2"))
+        assert dataset.count_rows() == 10

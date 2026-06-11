@@ -1,4 +1,4 @@
-"""Unit tests for the bench synthetic corpus: determinism, vocabulary distinctness, clustering, and tenant routing."""
+"""Unit tests for the bench cluster-seeded corpus: determinism, vocabulary distinctness, clustering, and routing."""
 
 from __future__ import annotations
 

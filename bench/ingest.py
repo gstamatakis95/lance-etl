@@ -13,7 +13,7 @@ the production first-run fallback: a full batch scan pinned to the window's last
 ``snapshot-id`` option. The source table is written once by prepare, so the ``updated_at`` window
 filter is the per-batch slicer.
 
-With ``--batches B`` the synthetic day is split into B consecutive windows and the ETL runs once
+With ``--batches B`` the deterministic base day is split into B consecutive windows and the ETL runs once
 per window, producing B merge commits (and therefore multiple fragments) per dataset for the
 compaction phase to consume.
 """
@@ -38,7 +38,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 def batch_windows(batches: int) -> list[tuple[str, str]]:
-    """Split the synthetic day into consecutive ``updated_at`` window literals.
+    """Split the deterministic base day into consecutive ``updated_at`` window literals.
 
     Args:
         batches: Number of windows.

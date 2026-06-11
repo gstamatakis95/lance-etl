@@ -90,15 +90,95 @@ def dataset_uri(config: ETLConfig, *components: str) -> str:
     return f"{base}/{'/'.join(components)}.lance"
 
 
+def table_chunks(table: pa.Table, batch_rows: int | None) -> list[pa.Table]:
+    """Slice a PyArrow table into zero-copy chunks of at most ``batch_rows`` rows each.
+
+    When ``batch_rows`` is None or the table fits in one batch, returns a single-element list
+    containing the original table so the caller can use the same loop for both cases.
+
+    Args:
+        table: The table to slice.
+        batch_rows: Maximum rows per chunk. None means no chunking.
+
+    Returns:
+        Ordered list of table slices covering all rows.
+    """
+    if batch_rows is None or table.num_rows <= batch_rows:
+        return [table]
+    offsets: list[int] = list(range(0, table.num_rows, batch_rows))
+    return [table.slice(offset, min(batch_rows, table.num_rows - offset)) for offset in offsets]
+
+
+def build_update_condition(ts_col: str) -> str:
+    """Build the SQL condition that guards cross-window out-of-order updates.
+
+    The condition ``source.{ts_col} >= target.{ts_col}`` ensures that a source row only overwrites
+    a target row when the source timestamp is greater than or equal to the target timestamp,
+    enforcing last-write-wins semantics across ETL windows.
+
+    Tie semantics: ties (source.ts == target.ts) apply the update. This preserves idempotency
+    when the same ETL window is replayed — applying the same window twice must converge to the
+    same result, so equal timestamps must not block the update.
+
+    NULL semantics for target: SQL ``x >= NULL`` evaluates to NULL, treated as FALSE by the Lance
+    executor. A target row that carries a NULL ts cannot be updated by any source row. This is an
+    accepted constraint: rows written before the ts column was added to the schema retain NULL and
+    are skipped by the guard. Such rows can only be overwritten by a schema migration or a direct
+    delete-and-reinsert. The alternative (COALESCE with an epoch literal) is not supported in the
+    current lance version because the ``target.`` table-qualifier cannot appear inside function
+    arguments in the DataFusion condition planner.
+
+    NULL semantics for source: ``NULL >= target.ts`` evaluates to NULL (FALSE), so a source row
+    carrying a NULL ts will never overwrite an existing target row. ``collapse`` orders NULL
+    timestamps NULLS LAST within a window, treating them as the oldest event — consistent with the
+    cross-window guard rejecting NULL-ts source rows. Callers must ensure ``ts_col`` is non-NULL in
+    all source rows when the guard is active.
+
+    Delete semantics: ``when_matched_delete`` does not accept a condition parameter in the Lance
+    7.x API, so cross-window stale deletes (delete ts older than stored row ts) cannot be blocked
+    at the Lance level. Within a window, ``collapse`` selects the terminal op per key, which
+    mitigates in-window stale deletes. Cross-window stale deletes remain a known gap pending a
+    future Lance API extension.
+
+    Args:
+        ts_col: Name of the timestamp column in both source and target.
+
+    Returns:
+        An SQL condition string suitable for ``when_matched_update_all(condition=...)``.
+    """
+    return f"source.{ts_col} >= target.{ts_col}"
+
+
 def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], group: pa.Table) -> tuple[int, int]:
     """Pivot, cast, and merge one dataset group via upsert and physical delete.
 
     Pivots map columns, casts TTL, bootstraps a new dataset with V2 manifest paths when absent
     (concurrent-bootstrap race caught with OSError fallback), evolves schema via ``add_columns``
     when new keys appear (idempotent on retry), then runs ``merge_insert`` with
-    ``when_matched_update_all()``. Physical deletes use ``when_matched_delete()`` on a key-only
-    table. Both paths go through :func:`commit_with_retries` with ``on_conflict`` incrementing
-    ``dataset.merge_conflict_retries``.
+    ``when_matched_update_all(condition)``. Physical deletes use ``when_matched_delete()`` on a
+    key-only table. Both paths go through :func:`commit_with_retries` with ``on_conflict``
+    incrementing ``dataset.merge_conflict_retries``.
+
+    Cross-window last-write-wins guard: when ``config.ts_col`` is present in the upsert table, the
+    update condition ``source.{ts_col} >= target.{ts_col}`` prevents a later ETL batch carrying an
+    older timestamp from silently overwriting a newer stored value. Without this guard, ``collapse``
+    enforces last-write-wins only within a single window; across windows, arrival order would
+    determine the winner instead of timestamp order.
+
+    Ties (equal timestamps) still apply the update, preserving idempotency: replaying the same
+    window twice converges to the same result. NULL source or target timestamps are never updated
+    (SQL ``NULL >= x`` and ``x >= NULL`` both evaluate to NULL, treated as FALSE). See
+    :func:`build_update_condition` for the full NULL and delete semantics.
+
+    Delete guard: ``when_matched_delete`` does not accept a condition parameter in the Lance API,
+    so cross-window stale deletes (delete ts older than stored row ts) are not blocked at the Lance
+    level. Within a window, ``collapse`` selects the terminal op per key, which mitigates in-window
+    stale deletes. Cross-window stale deletes remain a known gap.
+
+    When ``config.merge_batch_rows`` is set, the upsert and delete tables are sliced into
+    zero-copy chunks via :func:`table_chunks` and each chunk is committed independently.
+    Chunking is order-safe because :meth:`IcebergToLanceETL.collapse` guarantees at most one row
+    per vector id reaches this function, so no key appears in more than one chunk.
 
     Args:
         config: ETL configuration.
@@ -115,6 +195,9 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
 
     upserts_pre_pivot: pa.Table = group.filter(pc.invert(is_delete)).select(payload_cols)
     upserts_pivoted, pivot_counts = pivot_map_columns(upserts_pre_pivot, config)
+    update_condition: str | None = (
+        build_update_condition(config.ts_col) if config.ts_col in upserts_pivoted.schema.names else None
+    )
     if pivot_counts.get("invalid_map_keys", 0) > 0:
         telemetry.incr("dataset.invalid_map_keys", value=pivot_counts["invalid_map_keys"])
         logger.warning(
@@ -138,87 +221,131 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
     deleted: int = 0
 
     if upserts.num_rows:
+        upsert_chunks: list[pa.Table] = table_chunks(upserts, config.merge_batch_rows)
+        num_chunks: int = len(upsert_chunks)
 
-        def run_merge() -> dict[str, Any]:
-            """Open (or bootstrap) the dataset, evolve schema for new columns, and execute the merge upsert.
+        def make_run_merge(chunk: pa.Table, chunk_index: int) -> Any:
+            """Return a closure that merges one upsert chunk into the dataset.
 
-            Re-opens the dataset on every call so retries see the latest version. ``add_columns``
-            schema evolution is idempotent: a retry that re-enters after evolution finds no missing
-            fields.
+            The closure captures ``chunk`` and ``chunk_index`` so each call operates on a
+            fixed, immutable slice. Re-opens the dataset on every call so retries and sequential
+            chunk commits see the latest version. ``add_columns`` schema evolution is idempotent.
+
+            Args:
+                chunk: The upsert slice to commit.
+                chunk_index: Zero-based position in the chunk sequence, used for logging.
 
             Returns:
-                Merge statistics dictionary with authoritative row counts.
+                A zero-argument callable returning merge statistics.
             """
-            try:
-                dataset_local: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-            except (FileNotFoundError, ValueError):
+
+            def run() -> dict[str, Any]:
+                """Open (or bootstrap) the dataset, evolve schema, and execute the merge upsert."""
+                logger.debug(
+                    "dataset %s: upsert chunk %d/%d (%d rows)",
+                    uri,
+                    chunk_index + 1,
+                    num_chunks,
+                    chunk.num_rows,
+                )
                 try:
-                    dataset_local = lance.write_dataset(
-                        upserts.schema.empty_table(),
-                        uri,
-                        mode="append",
-                        storage_options=config.storage_options,
-                        enable_v2_manifest_paths=True,
-                    )
-                except OSError:
+                    dataset_local: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+                except (FileNotFoundError, ValueError):
+                    try:
+                        dataset_local = lance.write_dataset(
+                            upserts.schema.empty_table(),
+                            uri,
+                            mode="append",
+                            storage_options=config.storage_options,
+                            enable_v2_manifest_paths=True,
+                        )
+                    except OSError:
+                        dataset_local = lance.dataset(uri, storage_options=config.storage_options)
+                missing_fields: list[pa.Field] = [
+                    upserts.schema.field(name)
+                    for name in upserts.schema.names
+                    if name not in dataset_local.schema.names
+                ]
+                if missing_fields:
+                    dataset_local.add_columns(pa.schema(missing_fields))
                     dataset_local = lance.dataset(uri, storage_options=config.storage_options)
-            missing_fields: list[pa.Field] = [
-                upserts.schema.field(name) for name in upserts.schema.names if name not in dataset_local.schema.names
-            ]
-            if missing_fields:
-                dataset_local.add_columns(pa.schema(missing_fields))
-                dataset_local = lance.dataset(uri, storage_options=config.storage_options)
-            builder = dataset_local.merge_insert(on=[config.key_col])
-            builder = builder.when_matched_update_all()
-            return (
-                builder.when_not_matched_insert_all()
-                .conflict_retries(config.conflict_retries)
-                .retry_timeout(config.retry_timeout)
-                .execute(upserts)
-            )
+                builder = dataset_local.merge_insert(on=[config.key_col])
+                builder = builder.when_matched_update_all(condition=update_condition)
+                return (
+                    builder.when_not_matched_insert_all()
+                    .conflict_retries(config.conflict_retries)
+                    .retry_timeout(config.retry_timeout)
+                    .execute(chunk)
+                )
+
+            return run
 
         try:
             with telemetry.timed("dataset.merge_ms"):
-                stats: dict[str, Any] = commit_with_retries(
-                    run_merge,
-                    retries=config.conflict_retries,
-                    backoff_seconds=config.retry_backoff_seconds,
-                    on_conflict=lambda: telemetry.incr("dataset.merge_conflict_retries"),
-                )
-            upserted = stats.get("num_inserted_rows", 0) + stats.get("num_updated_rows", 0)
+                for chunk_idx, upsert_chunk in enumerate(upsert_chunks):
+                    chunk_stats: dict[str, Any] = commit_with_retries(
+                        make_run_merge(upsert_chunk, chunk_idx),
+                        retries=config.conflict_retries,
+                        backoff_seconds=config.retry_backoff_seconds,
+                        on_conflict=lambda: telemetry.incr("dataset.merge_conflict_retries"),
+                    )
+                    upserted += chunk_stats.get("num_inserted_rows", 0) + chunk_stats.get("num_updated_rows", 0)
             telemetry.incr("dataset.merged")
         except Exception:
             telemetry.incr("dataset.merge_error")
             raise
 
     if deletes.num_rows:
+        delete_chunks: list[pa.Table] = table_chunks(deletes, config.merge_batch_rows)
+        num_delete_chunks: int = len(delete_chunks)
 
-        def run_delete() -> dict[str, Any]:
-            """Re-open the dataset and execute ``when_matched_delete`` on the key-only deletes table.
+        def make_run_delete(chunk: pa.Table, chunk_index: int) -> Any:
+            """Return a closure that deletes one chunk of key rows from the dataset.
+
+            The closure captures ``chunk`` and ``chunk_index`` so each call operates on a fixed
+            slice. Re-opens the dataset on every call so retries and sequential chunk commits see
+            the latest version.
+
+            Args:
+                chunk: Key-only delete slice.
+                chunk_index: Zero-based position in the chunk sequence, used for logging.
 
             Returns:
-                Merge statistics dictionary, or an empty dict when the dataset does not exist.
+                A zero-argument callable returning delete statistics.
             """
-            try:
-                delete_dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-            except (FileNotFoundError, ValueError):
-                return {}
-            return (
-                delete_dataset.merge_insert(on=[config.key_col])
-                .when_matched_delete()
-                .conflict_retries(config.conflict_retries)
-                .retry_timeout(config.retry_timeout)
-                .execute(deletes)
-            )
+
+            def run() -> dict[str, Any]:
+                """Re-open the dataset and execute ``when_matched_delete`` on one delete chunk."""
+                logger.debug(
+                    "dataset %s: delete chunk %d/%d (%d rows)",
+                    uri,
+                    chunk_index + 1,
+                    num_delete_chunks,
+                    chunk.num_rows,
+                )
+                try:
+                    delete_dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+                except (FileNotFoundError, ValueError):
+                    return {}
+                return (
+                    delete_dataset.merge_insert(on=[config.key_col])
+                    .when_matched_delete()
+                    .conflict_retries(config.conflict_retries)
+                    .retry_timeout(config.retry_timeout)
+                    .execute(chunk)
+                )
+
+            return run
 
         with telemetry.timed("dataset.delete_ms"):
-            delete_stats: dict[str, Any] = commit_with_retries(
-                run_delete,
-                retries=config.conflict_retries,
-                backoff_seconds=config.retry_backoff_seconds,
-                on_conflict=lambda: telemetry.incr("dataset.merge_conflict_retries"),
-            )
-        deleted = delete_stats.get("num_deleted_rows", 0)
+            for del_chunk_idx, delete_chunk in enumerate(delete_chunks):
+                delete_stats: dict[str, Any] = commit_with_retries(
+                    make_run_delete(delete_chunk, del_chunk_idx),
+                    retries=config.conflict_retries,
+                    backoff_seconds=config.retry_backoff_seconds,
+                    on_conflict=lambda: telemetry.incr("dataset.merge_conflict_retries"),
+                )
+                deleted += delete_stats.get("num_deleted_rows", 0)
 
     telemetry.distribution("dataset.upserted", upserted)
     telemetry.distribution("dataset.deleted", deleted)

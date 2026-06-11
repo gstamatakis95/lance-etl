@@ -31,6 +31,7 @@ bench = ["numpy", "pandas", "matplotlib", "grpcio", "grpcio-tools", "opentelemet
 [tool.ruff]
 line-length = 120
 target-version = "py311"
+exclude = ["bench/workspace/"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "UP", "SIM", "ARG", "PLC0415"]

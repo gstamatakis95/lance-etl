@@ -45,6 +45,8 @@ class ETLConfig:
         window_end: ISO-8601 exclusive upper bound for the window pushdown filter. Open when absent.
         window_column: Column for the timestamp window filter.
         retry_backoff_seconds: Base backoff (seconds) for the commit-conflict retry loop.
+        merge_batch_rows: Row cap per merge_insert commit to bound DataFusion hash-join memory. Slices upsert
+            and delete tables into zero-copy chunks. None disables chunking.
     """
 
     base_uri: str
@@ -63,6 +65,7 @@ class ETLConfig:
     window_end: str | None = None
     window_column: str = "processing_timestamp"
     retry_backoff_seconds: float = 0.5
+    merge_batch_rows: int | None = 250_000
 
 
 def stats_schema() -> pa.Schema:

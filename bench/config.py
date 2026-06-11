@@ -82,7 +82,7 @@ class BenchConfig:
         limit: Number of base vectors to benchmark. The full corpus is 1M.
         tenants: Number of org datasets the vectors are split into round-robin.
         seed: Master seed for k-means sampling, vocabulary, and text generation.
-        num_clusters: Coarse k-means cluster count driving the synthetic text vocabularies.
+        num_clusters: Coarse k-means cluster count driving the cluster-seeded text vocabularies.
         words_per_cluster: Vocabulary size per cluster.
         common_words: Size of the shared common-word pool mixed into every document.
         words_per_text: Cluster-specific words per document.
@@ -105,7 +105,7 @@ class BenchConfig:
         refine_factors: Refine-factor sweep values. ``None`` disables re-ranking.
         search_k: Neighbors requested per query. Must cover the deepest recall cut-off.
         max_queries: Cap on query vectors per sweep point. ``None`` sends all 10k.
-        fts_query_count: Synthetic full-text queries in the FTS leg.
+        fts_query_count: Deterministic full-text queries drawn from cluster vocabularies in the FTS leg.
         hybrid_query_count: Queries in the hybrid (vector + text, RRF) leg.
         concurrency: ghz concurrency levels for the load mode.
         load_duration: ghz test duration per concurrency level.
@@ -358,7 +358,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     help_texts: dict[str, str] = {
         "download": "Fetch and verify the SIFT1M corpus",
-        "prepare": "Write the Iceberg source table, synthetic text, and ground truth",
+        "prepare": "Write the Iceberg source table, cluster-seeded text corpus, and ground truth",
         "ingest": "Run the real Iceberg-to-Lance ETL into per-tenant datasets",
         "index": "Build IVF_RQ, BTREE, BITMAP, and INVERTED indices with LanceIndexer",
         "compact": "Compact the datasets with MaintenanceJob and record fragment counts",

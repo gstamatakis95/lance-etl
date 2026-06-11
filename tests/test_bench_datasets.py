@@ -1,4 +1,4 @@
-"""Unit tests for the bench dataset adapter seam: registry resolution, SIFT specifics, and the synthetic adapter."""
+"""Unit tests for the bench dataset adapter seam: registry resolution, SIFT specifics, and the bigann adapter."""
 
 from __future__ import annotations
 
@@ -7,15 +7,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from bench.bigann_io import write_u8bin
 from bench.config import SIFT_BASE_COUNT, SIFT_DIM, SIFT_FILE_NAMES, BenchConfig, build_parser
 from bench.corpus import build_vocabulary, row_text
 from bench.datasets import (
-    DATASET_ADAPTERS,
+    BigannAdapter,
     DatasetAdapter,
     Sift1mAdapter,
-    SyntheticAdapter,
     adapter_for,
-    register_adapter,
 )
 
 
@@ -40,24 +39,21 @@ class TestRegistry:
         assert isinstance(adapter, Sift1mAdapter)
         assert adapter.name == "sift1m"
 
-    def test_synthetic_is_registered(self) -> None:
-        """The built-in synthetic adapter resolves by name."""
-        adapter: DatasetAdapter = adapter_for(config_for(["prepare", "--dataset", "synthetic"]))
-        assert isinstance(adapter, SyntheticAdapter)
+    def test_bigann_is_registered(self) -> None:
+        """The built-in bigann adapter resolves by name."""
+        adapter: DatasetAdapter = adapter_for(config_for(["prepare", "--dataset", "bigann"]))
+        assert isinstance(adapter, BigannAdapter)
 
     def test_unknown_dataset_raises(self) -> None:
         """An unregistered name raises a ValueError listing what is registered."""
         with pytest.raises(ValueError, match="unknown dataset 'nope'.*sift1m"):
             adapter_for(config_for(["prepare", "--dataset", "nope"]))
 
-    def test_register_and_resolve_fake(self) -> None:
-        """A freshly registered in-memory fake adapter resolves through --dataset."""
-        fake: SyntheticAdapter = SyntheticAdapter(dataset_name="fake-tiny", vector_dimension=8, base_rows=64)
-        register_adapter(fake)
-        try:
-            assert adapter_for(config_for(["prepare", "--dataset", "fake-tiny"])) is fake
-        finally:
-            DATASET_ADAPTERS.pop("fake-tiny", None)
+    def test_bigann_limit_bound_from_config(self) -> None:
+        """adapter_for binds the configured --limit onto the returned BigannAdapter."""
+        resolved: DatasetAdapter = adapter_for(config_for(["prepare", "--dataset", "bigann", "--limit", "50000"]))
+        assert isinstance(resolved, BigannAdapter)
+        assert resolved.limit == 50_000
 
 
 class TestSift1mAdapter:
@@ -73,7 +69,7 @@ class TestSift1mAdapter:
         assert adapter.ground_truth_source == "ivecs"
 
     def test_default_text_hook_delegates_to_corpus(self) -> None:
-        """The default text hook reproduces the synthetic cluster-seeded corpus exactly."""
+        """The default text hook reproduces the cluster-seeded corpus exactly."""
         clusters, common = build_vocabulary(4, 10, 5, seed=7)
         adapter: Sift1mAdapter = Sift1mAdapter()
         assert adapter.text_for_row(clusters, common, 2, 1234, 7, 8) == row_text(
@@ -92,33 +88,52 @@ class TestSift1mAdapter:
         assert adapter.verify_recorded_checksums(tmp_path) is False
 
 
-class TestSyntheticAdapter:
-    """The synthetic adapter is deterministic, consistent across slicing, and download-free."""
+class TestBigannAdapter:
+    """The bigann adapter reads u8bin files and supports limit-scoped IO."""
+
+    def make_fixture(self, workspace: Path, limit: int, dim: int, seed: int) -> BigannAdapter:
+        """Write tiny u8bin files and return a BigannAdapter bound to the limit.
+
+        Args:
+            workspace: The workspace directory.
+            limit: Number of base vectors.
+            dim: Vector dimension.
+            seed: RNG seed.
+
+        Returns:
+            A BigannAdapter with the given limit.
+        """
+        adapter: BigannAdapter = BigannAdapter(limit=limit)
+        rng: np.random.Generator = np.random.default_rng(seed)
+        base: np.ndarray = rng.integers(0, 256, size=(limit, dim), dtype=np.uint8).astype(np.float32)
+        queries: np.ndarray = rng.integers(0, 256, size=(10, dim), dtype=np.uint8).astype(np.float32)
+        write_u8bin(adapter.base_path(workspace), base)
+        write_u8bin(adapter.query_path(workspace), queries)
+        return adapter
 
     def test_slices_match_full_matrix(self, tmp_path: Path) -> None:
-        """Any slice equals the corresponding rows of the full matrix."""
-        adapter: SyntheticAdapter = SyntheticAdapter(vector_dimension=8, base_rows=100, seed=3)
+        """Any slice equals the corresponding rows of the full base matrix."""
+        adapter: BigannAdapter = self.make_fixture(tmp_path, limit=100, dim=128, seed=3)
         full: np.ndarray = adapter.base_vectors(tmp_path)
-        assert full.shape == (100, 8)
+        assert full.shape == (100, 128)
         assert full.dtype == np.float32
         np.testing.assert_array_equal(adapter.base_vector_slice(tmp_path, 40, 25), full[40:65])
         np.testing.assert_array_equal(adapter.base_vectors(tmp_path, limit=10), full[:10])
 
-    def test_deterministic_across_instances(self, tmp_path: Path) -> None:
-        """Two instances with the same seed generate identical corpora."""
-        first: SyntheticAdapter = SyntheticAdapter(vector_dimension=8, base_rows=50, query_rows=5, seed=9)
-        second: SyntheticAdapter = SyntheticAdapter(vector_dimension=8, base_rows=50, query_rows=5, seed=9)
-        np.testing.assert_array_equal(first.base_vectors(tmp_path), second.base_vectors(tmp_path))
-        np.testing.assert_array_equal(first.query_vectors(tmp_path), second.query_vectors(tmp_path))
-
-    def test_no_published_ground_truth_and_no_download(self, tmp_path: Path) -> None:
-        """Ground truth is None (brute force) and download is a recorded no-op."""
-        adapter: SyntheticAdapter = SyntheticAdapter()
-        assert adapter.ground_truth(tmp_path) is None
+    def test_download_short_circuits_when_files_present(self, tmp_path: Path) -> None:
+        """Download returns skipped when both base and query u8bin files already exist."""
+        adapter: BigannAdapter = self.make_fixture(tmp_path, limit=50, dim=128, seed=7)
         payload: dict[str, object] = adapter.download(tmp_path)
         assert payload["skipped"] is True
 
-    def test_gt_depth_clamped_to_corpus(self) -> None:
-        """The brute-force depth never exceeds the corpus size."""
-        assert SyntheticAdapter(base_rows=30).gt_depth == 30
-        assert SyntheticAdapter(base_rows=5_000).gt_depth == 100
+    def test_no_gt_for_non_million_limit(self, tmp_path: Path) -> None:
+        """Ground truth returns None when the limit is not a published million-prefix size."""
+        adapter: BigannAdapter = BigannAdapter(limit=2_000)
+        assert adapter.ground_truth(tmp_path) is None
+
+    def test_text_hook_delegates_to_corpus(self) -> None:
+        """The text hook delegates to the cluster corpus generator."""
+        clusters, common = build_vocabulary(4, 10, 5, seed=7)
+        adapter: BigannAdapter = BigannAdapter()
+        result: str = adapter.text_for_row(clusters, common, 2, 1234, 7, 8)
+        assert result == row_text(clusters, common, 2, 1234, 7, cluster_terms=8)
