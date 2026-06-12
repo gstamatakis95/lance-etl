@@ -90,23 +90,27 @@ def dataset_uri(config: ETLConfig, *components: str) -> str:
     return f"{base}/{'/'.join(components)}.lance"
 
 
-def table_chunks(table: pa.Table, batch_rows: int | None) -> list[pa.Table]:
-    """Slice a PyArrow table into zero-copy chunks of at most ``batch_rows`` rows each.
+def table_chunks(table: pa.Table, batch_bytes: int | None) -> list[pa.Table]:
+    """Slice a PyArrow table into zero-copy chunks whose source byte budget does not exceed ``batch_bytes``.
 
-    When ``batch_rows`` is None or the table fits in one batch, returns a single-element list
-    containing the original table so the caller can use the same loop for both cases.
+    The rows-per-chunk is derived from the table's actual mean row width so that any dtype — uint8,
+    float32, float64 — stays within the budget without requiring manual tuning. When ``batch_bytes``
+    is None or the whole table is already within the budget, returns a single-element list containing
+    the original table so the caller can use the same loop for both cases.
 
     Args:
         table: The table to slice.
-        batch_rows: Maximum rows per chunk. None means no chunking.
+        batch_bytes: Source byte budget per chunk. None means no chunking.
 
     Returns:
         Ordered list of table slices covering all rows.
     """
-    if batch_rows is None or table.num_rows <= batch_rows:
+    if batch_bytes is None or table.nbytes <= batch_bytes:
         return [table]
-    offsets: list[int] = list(range(0, table.num_rows, batch_rows))
-    return [table.slice(offset, min(batch_rows, table.num_rows - offset)) for offset in offsets]
+    bytes_per_row: int = max(1, table.nbytes // table.num_rows)
+    rows_per_chunk: int = max(1, batch_bytes // bytes_per_row)
+    offsets: list[int] = list(range(0, table.num_rows, rows_per_chunk))
+    return [table.slice(offset, min(rows_per_chunk, table.num_rows - offset)) for offset in offsets]
 
 
 def build_update_condition(ts_col: str) -> str:
@@ -175,10 +179,11 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
     level. Within a window, ``collapse`` selects the terminal op per key, which mitigates in-window
     stale deletes. Cross-window stale deletes remain a known gap.
 
-    When ``config.merge_batch_rows`` is set, the upsert and delete tables are sliced into
-    zero-copy chunks via :func:`table_chunks` and each chunk is committed independently.
-    Chunking is order-safe because :meth:`IcebergToLanceETL.collapse` guarantees at most one row
-    per vector id reaches this function, so no key appears in more than one chunk.
+    When ``config.merge_batch_bytes`` is set, the upsert and delete tables are sliced into
+    zero-copy chunks via :func:`table_chunks` using the table's actual mean row width to derive a
+    rows-per-chunk value, and each chunk is committed independently. Chunking is order-safe because
+    :meth:`IcebergToLanceETL.collapse` guarantees at most one row per vector id reaches this
+    function, so no key appears in more than one chunk.
 
     Args:
         config: ETL configuration.
@@ -221,7 +226,7 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
     deleted: int = 0
 
     if upserts.num_rows:
-        upsert_chunks: list[pa.Table] = table_chunks(upserts, config.merge_batch_rows)
+        upsert_chunks: list[pa.Table] = table_chunks(upserts, config.merge_batch_bytes)
         num_chunks: int = len(upsert_chunks)
 
         def make_run_merge(chunk: pa.Table, chunk_index: int) -> Any:
@@ -296,7 +301,7 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
             raise
 
     if deletes.num_rows:
-        delete_chunks: list[pa.Table] = table_chunks(deletes, config.merge_batch_rows)
+        delete_chunks: list[pa.Table] = table_chunks(deletes, config.merge_batch_bytes)
         num_delete_chunks: int = len(delete_chunks)
 
         def make_run_delete(chunk: pa.Table, chunk_index: int) -> Any:

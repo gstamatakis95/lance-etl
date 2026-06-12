@@ -26,5 +26,5 @@ def run_download(config: BenchConfig) -> dict[str, Any]:
     Returns:
         The phase result document.
     """
-    payload: dict[str, Any] = adapter_for(config).download(config.workspace, sha256=config.sha256)
+    payload: dict[str, Any] = adapter_for(config).download(config.corpus_root, sha256=config.sha256)
     return save_phase(config, "download", payload)

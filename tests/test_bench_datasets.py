@@ -91,11 +91,11 @@ class TestSift1mAdapter:
 class TestBigannAdapter:
     """The bigann adapter reads u8bin files and supports limit-scoped IO."""
 
-    def make_fixture(self, workspace: Path, limit: int, dim: int, seed: int) -> BigannAdapter:
+    def make_fixture(self, corpus_root: Path, limit: int, dim: int, seed: int) -> BigannAdapter:
         """Write tiny u8bin files and return a BigannAdapter bound to the limit.
 
         Args:
-            workspace: The workspace directory.
+            corpus_root: The shared corpus cache directory.
             limit: Number of base vectors.
             dim: Vector dimension.
             seed: RNG seed.
@@ -107,29 +107,33 @@ class TestBigannAdapter:
         rng: np.random.Generator = np.random.default_rng(seed)
         base: np.ndarray = rng.integers(0, 256, size=(limit, dim), dtype=np.uint8).astype(np.float32)
         queries: np.ndarray = rng.integers(0, 256, size=(10, dim), dtype=np.uint8).astype(np.float32)
-        write_u8bin(adapter.base_path(workspace), base)
-        write_u8bin(adapter.query_path(workspace), queries)
+        write_u8bin(adapter.base_path(corpus_root), base)
+        write_u8bin(adapter.query_path(corpus_root), queries)
         return adapter
 
     def test_slices_match_full_matrix(self, tmp_path: Path) -> None:
         """Any slice equals the corresponding rows of the full base matrix."""
-        adapter: BigannAdapter = self.make_fixture(tmp_path, limit=100, dim=128, seed=3)
-        full: np.ndarray = adapter.base_vectors(tmp_path)
+        corpus_root: Path = tmp_path / "corpora"
+        corpus_root.mkdir()
+        adapter: BigannAdapter = self.make_fixture(corpus_root, limit=100, dim=128, seed=3)
+        full: np.ndarray = adapter.base_vectors(corpus_root)
         assert full.shape == (100, 128)
         assert full.dtype == np.float32
-        np.testing.assert_array_equal(adapter.base_vector_slice(tmp_path, 40, 25), full[40:65])
-        np.testing.assert_array_equal(adapter.base_vectors(tmp_path, limit=10), full[:10])
+        np.testing.assert_array_equal(adapter.base_vector_slice(corpus_root, 40, 25), full[40:65])
+        np.testing.assert_array_equal(adapter.base_vectors(corpus_root, limit=10), full[:10])
 
     def test_download_short_circuits_when_files_present(self, tmp_path: Path) -> None:
         """Download returns skipped when both base and query u8bin files already exist."""
-        adapter: BigannAdapter = self.make_fixture(tmp_path, limit=50, dim=128, seed=7)
-        payload: dict[str, object] = adapter.download(tmp_path)
+        corpus_root: Path = tmp_path / "corpora"
+        corpus_root.mkdir()
+        adapter: BigannAdapter = self.make_fixture(corpus_root, limit=50, dim=128, seed=7)
+        payload: dict[str, object] = adapter.download(corpus_root)
         assert payload["skipped"] is True
 
     def test_no_gt_for_non_million_limit(self, tmp_path: Path) -> None:
         """Ground truth returns None when the limit is not a published million-prefix size."""
         adapter: BigannAdapter = BigannAdapter(limit=2_000)
-        assert adapter.ground_truth(tmp_path) is None
+        assert adapter.ground_truth(tmp_path / "corpora") is None
 
     def test_text_hook_delegates_to_corpus(self) -> None:
         """The text hook delegates to the cluster corpus generator."""

@@ -43,26 +43,25 @@ BATCHES: int = 2
 EXPECTED_NO_TEXT_INDEX_NAMES: frozenset[str] = frozenset({"vector_idx", "vector_id_idx", "category_bitmap_idx"})
 
 
-def make_bigann_fixture(workspace: Path, seed: int = 7) -> None:
-    """Write a minimal bigann workspace fixture that bypasses network download.
+def make_bigann_fixture(corpus_root: Path, seed: int = 7) -> None:
+    """Write a minimal bigann corpus fixture that bypasses network download.
 
-    Creates ``{workspace}/bigann/base.1200.u8bin`` and
-    ``{workspace}/bigann/query.10K.u8bin`` using seeded random uint8 data.
+    Creates ``{corpus_root}/bigann/base.1200.u8bin`` and
+    ``{corpus_root}/bigann/query.10K.u8bin`` using seeded random uint8 data.
     The filenames match exactly what :class:`bench.datasets.BigannAdapter` expects
     for ``limit=1200`` and the default query path.
 
     Args:
-        workspace: The benchmark workspace directory.
+        corpus_root: The shared corpus cache directory.
         seed: RNG seed for reproducible vectors.
     """
-    bigann_dir: Path = workspace / "bigann"
-    bigann_dir.mkdir(parents=True, exist_ok=True)
+    corpus_root.mkdir(parents=True, exist_ok=True)
     rng: np.random.Generator = np.random.default_rng(seed)
     base: np.ndarray = rng.integers(0, 256, size=(BASE_ROWS, DIMENSION), dtype=np.uint8).astype(np.float32)
     queries: np.ndarray = rng.integers(0, 256, size=(QUERY_ROWS, DIMENSION), dtype=np.uint8).astype(np.float32)
     adapter: BigannAdapter = BigannAdapter(limit=BASE_ROWS)
-    write_u8bin(adapter.base_path(workspace), base)
-    write_u8bin(adapter.query_path(workspace), queries)
+    write_u8bin(adapter.base_path(corpus_root), base)
+    write_u8bin(adapter.query_path(corpus_root), queries)
 
 
 def tagged_config(tmp_path: Path) -> BenchConfig:
@@ -80,6 +79,8 @@ def tagged_config(tmp_path: Path) -> BenchConfig:
         "bigann",
         "--workspace",
         str(tmp_path / "workspace"),
+        "--corpus-root",
+        str(tmp_path / "corpora"),
         "--results-root",
         str(tmp_path / "results"),
         "--run-id",
@@ -115,12 +116,12 @@ def tagged_config(tmp_path: Path) -> BenchConfig:
 
 def test_e2e_tagged_no_text(tmp_path: Path) -> None:
     """run_e2e with 2 batches and --no-text creates per-batch tags and passes historical verification."""
-    workspace: Path = tmp_path / "workspace"
-    make_bigann_fixture(workspace)
+    corpus_root: Path = tmp_path / "corpora"
+    make_bigann_fixture(corpus_root)
 
     config: BenchConfig = tagged_config(tmp_path)
 
-    download_outcome: dict[str, Any] = BigannAdapter(limit=BASE_ROWS).download(workspace)
+    download_outcome: dict[str, Any] = BigannAdapter(limit=BASE_ROWS).download(corpus_root)
     assert download_outcome["skipped"] is True, "download must short-circuit when base+query files exist"
 
     run_prepare(config)

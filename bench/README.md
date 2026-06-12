@@ -18,10 +18,12 @@ maturin develop --release -m python/Cargo.toml
 
 ---
 
-The ETL now chunks `merge_insert` sources in bounded row batches (`merge_batch_rows`,
-default 250,000 rows per chunk). This makes `LANCE_MEM_POOL_SIZE` optional headroom rather
-than a hard requirement. For multi-batch runs at 1M scale or larger the env var is still
-recommended to give DataFusion extra spill budget:
+The ETL chunks `merge_insert` sources by byte budget (`merge_batch_bytes`, default 64 MiB per
+chunk). The rows-per-chunk is derived from the table's actual mean row width, so float32, uint8,
+and other dtypes all stay within the DataFusion default pool (~100 MB) automatically. This makes
+`LANCE_MEM_POOL_SIZE` optional headroom rather than a hard requirement for any corpus dtype. For
+multi-batch runs at 1M scale or larger the env var is still recommended to give DataFusion extra
+spill budget:
 
 ```bash
 export LANCE_MEM_POOL_SIZE=4294967296
@@ -29,10 +31,35 @@ export LANCE_MEM_POOL_SIZE=4294967296
 
 ---
 
+## Corpus cache — download once, reuse across workspaces
+
+Raw corpus files (fvecs, u8bin, tarballs) land in a shared cache directory controlled by
+`--corpus-root` (default `bench/corpora`).  The cache is independent of `--workspace`, so
+switching to a fresh workspace never re-downloads data that is already present.
+
+```bash
+python -m bench download --dataset sift1m
+python -m bench download --dataset sift1m --workspace bench/workspace-new
+```
+
+Both commands read from (and write to) `bench/corpora/sift/` by default.  To share a
+cache across multiple checkout roots, point both runs at the same absolute path:
+
+```bash
+python -m bench download --dataset sift1m --corpus-root /data/bench-corpora
+python -m bench e2e --dataset sift1m --corpus-root /data/bench-corpora --workspace /tmp/run1
+```
+
+Prepared artifacts (queries.npy, ground_truth.npz, manifests) remain workspace-scoped
+under `{workspace}/prepared/` because they depend on `--limit`, `--tenants`, and other
+shape flags that can differ between runs.
+
+---
+
 ## Smoke run — sift1m (~160 MB download, official ground truth)
 
 The smallest corpus with published ground truth. Downloads the IRISA SIFT1M tarball once
-and caches it under `bench/workspace/sift/`.
+and caches it under `bench/corpora/sift/`.
 
 ```bash
 python -m bench all \
@@ -65,11 +92,13 @@ Requires about 10 GB of compressed download traffic, 12.8 GB for the converted b
 ```bash
 python -m bench download \
   --dataset bigann \
-  --limit 100000000 \
-  --workspace bench/workspace
+  --limit 100000000
 ```
 
-The corpus is the original IRISA corpus-texmex distribution (`http://corpus-texmex.irisa.fr/`), with a HuggingFace HTTPS mirror as fallback. The base file `bigann_base.bvecs.gz` is streamed and decompressed on the fly. Only the compressed bytes needed for the first `--limit` vectors are transferred (about 10 GB for 100M, instead of the full 98 GB archive), and the vectors are written locally in u8bin layout. An interrupted transfer resumes from the compressed `.gz.partial` sidecar without refetching. The query file `bigann_query.bvecs.gz` (10K vectors, ~1 MB) is fetched in full. The ground-truth tarball `bigann_gnd.tar.gz` is fetched once when the limit matches a published prefix size. A checksum manifest `checksums-100000000.json` is written under `bench/workspace/bigann/`.
+All files land in `bench/corpora/bigann/` by default.  Pass `--corpus-root` to redirect to
+a different location shared across workspaces.
+
+The corpus is the original IRISA corpus-texmex distribution (`http://corpus-texmex.irisa.fr/`), with a HuggingFace HTTPS mirror as fallback. The base file `bigann_base.bvecs.gz` is streamed and decompressed on the fly. Only the compressed bytes needed for the first `--limit` vectors are transferred (about 10 GB for 100M, instead of the full 98 GB archive), and the vectors are written locally in u8bin layout. An interrupted transfer resumes from the compressed `.gz.partial` sidecar without refetching. The query file `bigann_query.bvecs.gz` (10K vectors, ~1 MB) is fetched in full. The ground-truth tarball `bigann_gnd.tar.gz` is fetched once when the limit matches a published prefix size. A checksum manifest `checksums-100000000.json` is written under `bench/corpora/bigann/`.
 
 Official ground truth ships for exactly ten prefix sizes:
 
@@ -225,7 +254,7 @@ Approximate wall times on a 16-core workstation with NVMe storage:
 
 ## checksums.json semantics
 
-After a successful download, `bench/workspace/bigann/checksums-{limit}.json` records the sha256 digest of:
+After a successful download, `bench/corpora/bigann/checksums-{limit}.json` records the sha256 digest of:
 
 - `base`: the converted local base u8bin file (only the streamed prefix).
 - `query`: the converted query u8bin file.
@@ -290,7 +319,7 @@ uv pip install --group bench
 Then run with capture enabled (bigann 1M prefix, download once first):
 
 ```bash
-python -m bench download --dataset bigann --limit 1000000 --workspace bench/workspace
+python -m bench download --dataset bigann --limit 1000000
 python -m bench e2e --dataset bigann --limit 1000000 --no-text --capture-telemetry \
   --workspace bench/workspace --results-root bench/results
 ```

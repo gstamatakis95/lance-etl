@@ -9,7 +9,7 @@ map column type, and a map column that is not a map).
 The ``TestCollapseGuarantee`` class verifies that ``IcebergToLanceETL.collapse`` enforces at most one
 row per ``(routing key, vector_id)`` before rows reach ``apply_merge``. This is the invariant that
 makes chunked merge commits order-safe: because collapse runs before partitioning, no key can appear
-in more than one chunk when ``merge_batch_rows`` slices the upsert table.
+in more than one chunk when ``merge_batch_bytes`` slices the upsert table.
 """
 
 from __future__ import annotations
@@ -302,7 +302,7 @@ class TestCollapseGuarantee:
         """Two rows for the same vector_id collapse to the most-recent event_timestamp row.
 
         This validates the order-safety invariant: because collapse runs before any partitioning,
-        no key can appear in more than one chunk when merge_batch_rows slices the upsert table.
+        no key can appear in more than one chunk when merge_batch_bytes slices the upsert table.
         The older row is discarded and the newer row's payload is written to the dataset.
         """
         ts_old: datetime = datetime(2024, 1, 1, tzinfo=UTC)

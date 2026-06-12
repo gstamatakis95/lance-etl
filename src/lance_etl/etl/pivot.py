@@ -45,8 +45,12 @@ class ETLConfig:
         window_end: ISO-8601 exclusive upper bound for the window pushdown filter. Open when absent.
         window_column: Column for the timestamp window filter.
         retry_backoff_seconds: Base backoff (seconds) for the commit-conflict retry loop.
-        merge_batch_rows: Row cap per merge_insert commit to bound DataFusion hash-join memory. Slices upsert
-            and delete tables into zero-copy chunks. None disables chunking.
+        merge_batch_bytes: Byte budget per merge_insert commit, derived from the source table's
+            actual row width to keep the DataFusion hash-join build side inside the default ~100 MB
+            pool regardless of vector dtype. At 64 MiB source budget, a 128-dim float32 row (512
+            bytes) yields ~131 K rows/chunk whose hash-join build side peaks around 67 MB — well
+            under the 100 MB default pool that the sift1m repro exhausted at 97.7 MB. None disables
+            chunking.
     """
 
     base_uri: str
@@ -65,7 +69,7 @@ class ETLConfig:
     window_end: str | None = None
     window_column: str = "processing_timestamp"
     retry_backoff_seconds: float = 0.5
-    merge_batch_rows: int | None = 250_000
+    merge_batch_bytes: int | None = 64 * 1024 * 1024
 
 
 def stats_schema() -> pa.Schema:

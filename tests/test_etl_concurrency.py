@@ -2,8 +2,8 @@
 
 These run the executor-task layer directly against local-fs datasets: no Spark is involved. The concurrency test drives
 two upserting threads and one compacting thread against the same dataset and asserts no data is lost.
-The chunking tests verify that ``merge_batch_rows`` slices the upsert and delete tables without changing the final
-dataset state, and that ``merge_batch_rows=None`` preserves the original single-commit behaviour.
+The chunking tests verify that ``merge_batch_bytes`` slices the upsert and delete tables without changing the final
+dataset state, and that ``merge_batch_bytes=None`` preserves the original single-commit behaviour.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import lance
+import numpy as np
 import pyarrow as pa
 import pytest
 
@@ -225,14 +226,17 @@ def make_large_group(keys: list[str], op: str = "insert", value: float = 1.0) ->
 def test_chunked_upsert_matches_unchunked(
     tmp_path: Path, telemetry_config: TelemetryConfig, telemetry: Telemetry
 ) -> None:
-    """Chunked upsert with merge_batch_rows=small produces the same final table as unchunked.
+    """Chunked upsert with merge_batch_bytes=tiny produces the same final table as unchunked.
 
-    Inserts 30 rows in two configs: one with merge_batch_rows=10 (three chunks) and one with
-    merge_batch_rows=None (single commit). Both dataset paths must have identical row counts and
-    identical values on a key sample.
+    Inserts 30 rows in two configs: one with a byte budget small enough to force multiple chunks
+    and one with merge_batch_bytes=None (single commit). Both dataset paths must have identical
+    row counts and identical values on a key sample. The budget is derived from the group table's
+    actual nbytes so the test is not sensitive to column encoding details.
     """
     keys: list[str] = [f"id{i:03d}" for i in range(30)]
     group: pa.Table = make_large_group(keys, value=7.0)
+    bytes_per_row: int = max(1, group.nbytes // group.num_rows)
+    tiny_budget: int = bytes_per_row * 10
 
     chunked_path: Path = tmp_path / "chunked"
     unchunked_path: Path = tmp_path / "unchunked"
@@ -240,12 +244,12 @@ def test_chunked_upsert_matches_unchunked(
     chunked_config: ETLConfig = ETLConfig(
         base_uri=str(chunked_path),
         telemetry=telemetry_config,
-        merge_batch_rows=10,
+        merge_batch_bytes=tiny_budget,
     )
     unchunked_config: ETLConfig = ETLConfig(
         base_uri=str(unchunked_path),
         telemetry=telemetry_config,
-        merge_batch_rows=None,
+        merge_batch_bytes=None,
     )
 
     chunked_upserted, chunked_deleted = apply_merge(chunked_config, telemetry, ROUTING_KEY, group)
@@ -269,8 +273,9 @@ def test_chunked_upsert_counts_aggregate_correctly(
 ) -> None:
     """Upserted counts from chunked merges are summed correctly across chunks.
 
-    Bootstraps with 25 rows then re-upserts 15 of them plus 5 new ones. With merge_batch_rows=5
-    the result must report 20 total (15 updated + 5 inserted), not just the last chunk's count.
+    Bootstraps with 25 rows then re-upserts 15 of them plus 5 new ones. With a byte budget that
+    forces 5-row chunks, the result must report 20 total (15 updated + 5 inserted), not just the
+    last chunk's count. The budget is derived from the group table's actual nbytes.
     """
     all_keys: list[str] = [f"k{i:03d}" for i in range(25)]
     apply_merge(
@@ -281,12 +286,15 @@ def test_chunked_upsert_counts_aggregate_correctly(
     )
 
     update_keys: list[str] = [f"k{i:03d}" for i in range(15)] + [f"new{i}" for i in range(5)]
+    update_group: pa.Table = make_large_group(update_keys, value=2.0)
+    bytes_per_row: int = max(1, update_group.nbytes // update_group.num_rows)
+    five_row_budget: int = bytes_per_row * 5
     chunked_config: ETLConfig = ETLConfig(
         base_uri=str(tmp_path),
         telemetry=telemetry_config,
-        merge_batch_rows=5,
+        merge_batch_bytes=five_row_budget,
     )
-    upserted, deleted = apply_merge(chunked_config, telemetry, ROUTING_KEY, make_large_group(update_keys, value=2.0))
+    upserted, deleted = apply_merge(chunked_config, telemetry, ROUTING_KEY, update_group)
 
     assert upserted == 20
     assert deleted == 0
@@ -296,9 +304,9 @@ def test_chunked_upsert_counts_aggregate_correctly(
 def test_chunked_upsert_none_disables_chunking(
     tmp_path: Path, telemetry_config: TelemetryConfig, telemetry: Telemetry
 ) -> None:
-    """merge_batch_rows=None commits all rows in one call, behaving identically to the legacy path."""
+    """merge_batch_bytes=None commits all rows in one call, behaving identically to the unchunked path."""
     keys: list[str] = [f"r{i}" for i in range(20)]
-    config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config, merge_batch_rows=None)
+    config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config, merge_batch_bytes=None)
     upserted, deleted = apply_merge(config, telemetry, ROUTING_KEY, make_large_group(keys))
     assert upserted == 20
     assert deleted == 0
@@ -306,21 +314,25 @@ def test_chunked_upsert_none_disables_chunking(
 
 
 def test_chunked_delete_path(tmp_path: Path, telemetry_config: TelemetryConfig, telemetry: Telemetry) -> None:
-    """Delete path with merge_batch_rows=small removes exactly the targeted rows.
+    """Delete path with merge_batch_bytes=tiny removes exactly the targeted rows.
 
-    Bootstraps 40 rows, then issues 15 deletes chunked at 5 per commit. Final row count must be 25.
+    Bootstraps 40 rows, then issues 15 deletes with a byte budget that forces ~5-row chunks.
+    Final row count must be 25. The budget is derived from the delete group's actual nbytes.
     """
     all_keys: list[str] = [f"d{i:03d}" for i in range(40)]
     base_config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config)
     apply_merge(base_config, telemetry, ROUTING_KEY, make_large_group(all_keys))
 
     delete_keys: list[str] = [f"d{i:03d}" for i in range(15)]
+    delete_group: pa.Table = make_large_group(delete_keys, op="delete")
+    bytes_per_row: int = max(1, delete_group.nbytes // delete_group.num_rows)
+    five_row_budget: int = bytes_per_row * 5
     chunked_config: ETLConfig = ETLConfig(
         base_uri=str(tmp_path),
         telemetry=telemetry_config,
-        merge_batch_rows=5,
+        merge_batch_bytes=five_row_budget,
     )
-    upserted, deleted = apply_merge(chunked_config, telemetry, ROUTING_KEY, make_large_group(delete_keys, op="delete"))
+    upserted, deleted = apply_merge(chunked_config, telemetry, ROUTING_KEY, delete_group)
     assert upserted == 0
     assert deleted == 15
     assert lance.dataset(dataset_uri(chunked_config, *ROUTING_KEY)).count_rows() == 25
@@ -328,7 +340,6 @@ def test_chunked_delete_path(tmp_path: Path, telemetry_config: TelemetryConfig, 
 
 def test_table_chunks_none_returns_single_element() -> None:
     """table_chunks with None returns a single-element list wrapping the original table."""
-
     table: pa.Table = pa.table({"x": pa.array(list(range(50)), pa.int64())})
     chunks: list[pa.Table] = table_chunks(table, None)
     assert len(chunks) == 1
@@ -336,35 +347,108 @@ def test_table_chunks_none_returns_single_element() -> None:
 
 
 def test_table_chunks_exact_multiple() -> None:
-    """table_chunks slices evenly when row count divides exactly by batch_rows."""
+    """table_chunks slices evenly when the byte budget divides the table into equal-row chunks.
 
+    Uses a byte budget equal to exactly one third of the table's total bytes so that the derived
+    rows-per-chunk is precisely num_rows / 3, producing three equal slices.
+    """
     table: pa.Table = pa.table({"x": pa.array(list(range(30)), pa.int64())})
-    chunks: list[pa.Table] = table_chunks(table, 10)
+    bytes_per_row: int = max(1, table.nbytes // table.num_rows)
+    budget: int = bytes_per_row * 10
+    chunks: list[pa.Table] = table_chunks(table, budget)
     assert len(chunks) == 3
-    for chunk in chunks:
-        assert chunk.num_rows == 10
     assert sum(c.num_rows for c in chunks) == 30
 
 
 def test_table_chunks_remainder() -> None:
-    """table_chunks produces a smaller final chunk when rows do not divide evenly."""
+    """table_chunks produces a smaller final chunk when rows do not divide evenly.
 
+    Uses a byte budget equal to 10 rows worth of bytes on a 25-row table, which yields
+    three chunks: 10, 10, and 5 rows.
+    """
     table: pa.Table = pa.table({"x": pa.array(list(range(25)), pa.int64())})
-    chunks: list[pa.Table] = table_chunks(table, 10)
+    bytes_per_row: int = max(1, table.nbytes // table.num_rows)
+    budget: int = bytes_per_row * 10
+    chunks: list[pa.Table] = table_chunks(table, budget)
     assert len(chunks) == 3
-    assert chunks[0].num_rows == 10
-    assert chunks[1].num_rows == 10
-    assert chunks[2].num_rows == 5
     assert sum(c.num_rows for c in chunks) == 25
+    assert chunks[2].num_rows < chunks[0].num_rows
 
 
-def test_table_chunks_larger_than_table() -> None:
-    """table_chunks returns the original table when batch_rows exceeds num_rows."""
-
+def test_table_chunks_budget_larger_than_table() -> None:
+    """table_chunks returns the original table when the byte budget exceeds the table's total bytes."""
     table: pa.Table = pa.table({"x": pa.array(list(range(5)), pa.int64())})
-    chunks: list[pa.Table] = table_chunks(table, 100)
+    chunks: list[pa.Table] = table_chunks(table, table.nbytes * 10)
     assert len(chunks) == 1
     assert chunks[0] is table
+
+
+def make_wide_float32_group(num_rows: int, dim: int = 128) -> pa.Table:
+    """Build a routing-key group with a fixed-size-list float32 vector column.
+
+    Args:
+        num_rows: Number of rows to generate.
+        dim: Vector dimensionality (number of float32 elements per row).
+
+    Returns:
+        A table with a float32 FSL vector column alongside routing and scalar columns.
+    """
+    vectors: pa.Array = pa.array(
+        [list(np.zeros(dim, dtype="float32"))] * num_rows,
+        pa.list_(pa.float32(), dim),
+    )
+    return pa.table(
+        {
+            "vector_id": pa.array([f"f32_{i}" for i in range(num_rows)], pa.string()),
+            "org_id": pa.array([ROUTING_KEY[0]] * num_rows),
+            "tenant_id": pa.array([ROUTING_KEY[1]] * num_rows),
+            "namespace": pa.array([ROUTING_KEY[2]] * num_rows),
+            "op": pa.array(["insert"] * num_rows),
+            "vec": vectors,
+        }
+    )
+
+
+def test_float32_wide_row_chunks_more_than_uint8_under_same_budget() -> None:
+    """A wide float32-vector table produces more chunks than a narrow uint8 table of equal row count.
+
+    This is the sift1m OOM repro: 128-dim float32 rows are 4x wider than uint8 rows of the same
+    dimension. Under an identical byte budget both tables must chunk, but the float32 table must
+    split into strictly more pieces, confirming that byte-based budgeting adapts to dtype.
+    """
+    num_rows: int = 400_000
+    dim: int = 128
+    budget: int = 64 * 1024 * 1024
+
+    float32_table: pa.Table = make_wide_float32_group(num_rows, dim)
+    uint8_table: pa.Table = pa.table(
+        {
+            "vector_id": pa.array([f"u8_{i}" for i in range(num_rows)], pa.string()),
+            "org_id": pa.array([ROUTING_KEY[0]] * num_rows),
+            "tenant_id": pa.array([ROUTING_KEY[1]] * num_rows),
+            "namespace": pa.array([ROUTING_KEY[2]] * num_rows),
+            "op": pa.array(["insert"] * num_rows),
+            "vec": pa.array(
+                [[0] * dim] * num_rows,
+                pa.list_(pa.uint8(), dim),
+            ),
+        }
+    )
+
+    float32_chunks: list[pa.Table] = table_chunks(float32_table, budget)
+    uint8_chunks: list[pa.Table] = table_chunks(uint8_table, budget)
+
+    assert len(float32_chunks) > 1, "float32 table must be chunked under 64 MiB budget"
+    assert len(uint8_chunks) > 1, "uint8 table must be chunked under 64 MiB budget"
+    assert len(float32_chunks) > len(uint8_chunks), "float32 rows are wider so more chunks are expected"
+    assert sum(c.num_rows for c in float32_chunks) == num_rows
+    assert sum(c.num_rows for c in uint8_chunks) == num_rows
+    float32_bytes_per_row: int = max(1, float32_table.nbytes // float32_table.num_rows)
+    rows_per_chunk: int = max(1, budget // float32_bytes_per_row)
+    for chunk in float32_chunks:
+        assert chunk.num_rows <= rows_per_chunk, (
+            f"chunk has more rows than budget allows: {chunk.num_rows} > {rows_per_chunk}"
+        )
 
 
 TS_TYPE: pa.DataType = pa.timestamp("us", tz=None)

@@ -133,11 +133,11 @@ class DatasetAdapter(ABC):
         return "published"
 
     @abstractmethod
-    def download(self, workspace: Path, sha256: str | None = None) -> dict[str, Any]:
-        """Fetch and verify the corpus into the workspace, idempotently.
+    def download(self, corpus_root: Path, sha256: str | None = None) -> dict[str, Any]:
+        """Fetch and verify the corpus into the shared corpus cache, idempotently.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory, shared across workspaces.
             sha256: Optional pinned digest of the canonical archive.
 
         Returns:
@@ -145,11 +145,11 @@ class DatasetAdapter(ABC):
         """
 
     @abstractmethod
-    def base_vectors(self, workspace: Path, limit: int | None = None) -> np.ndarray:
+    def base_vectors(self, corpus_root: Path, limit: int | None = None) -> np.ndarray:
         """Return base vectors from the start of the corpus.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
             limit: Optional cap on rows returned.
 
         Returns:
@@ -157,11 +157,11 @@ class DatasetAdapter(ABC):
         """
 
     @abstractmethod
-    def base_vector_slice(self, workspace: Path, start: int, count: int) -> np.ndarray:
+    def base_vector_slice(self, corpus_root: Path, start: int, count: int) -> np.ndarray:
         """Return one contiguous base-vector slice, called inside Spark executor tasks.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
             start: First global row index of the slice.
             count: Rows in the slice.
 
@@ -170,24 +170,24 @@ class DatasetAdapter(ABC):
         """
 
     @abstractmethod
-    def query_vectors(self, workspace: Path) -> np.ndarray:
+    def query_vectors(self, corpus_root: Path) -> np.ndarray:
         """Return the full query matrix.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
 
         Returns:
             A float32 ``(num_queries, dimension)`` array.
         """
 
     @abstractmethod
-    def ground_truth(self, workspace: Path) -> np.ndarray | None:
+    def ground_truth(self, corpus_root: Path) -> np.ndarray | None:
         """Return the published full-corpus ground truth, or ``None`` when none exists.
 
         ``None`` instructs the prepare phase to compute exact brute-force ground truth instead.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
 
         Returns:
             An int64 ``(num_queries, gt_depth)`` array of global ids, or ``None``.
@@ -251,16 +251,16 @@ class Sift1mAdapter(DatasetAdapter):
         """Return ``ivecs``, the historical manifest label of the published ground-truth file."""
         return "ivecs"
 
-    def corpus_dir(self, workspace: Path) -> Path:
+    def corpus_dir(self, corpus_root: Path) -> Path:
         """Return the directory holding the extracted SIFT1M files.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
 
         Returns:
-            The ``sift`` directory under the workspace.
+            The ``sift`` directory under the corpus root.
         """
-        return workspace / "sift"
+        return corpus_root / "sift"
 
     def validate_directory(self, directory: Path) -> dict[str, Any]:
         """Validate the structure of every extracted SIFT1M file.
@@ -333,16 +333,16 @@ class Sift1mAdapter(DatasetAdapter):
                     with source, open(directory / base_name, "wb") as sink:
                         shutil.copyfileobj(source, sink)
 
-    def download_tarball(self, workspace: Path) -> tuple[Path | None, str | None]:
+    def download_tarball(self, corpus_root: Path) -> tuple[Path | None, str | None]:
         """Try each tarball URL until one succeeds.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
 
         Returns:
             The archive path and source URL, or ``(None, None)`` when every URL failed.
         """
-        archive: Path = workspace / "sift.tar.gz"
+        archive: Path = corpus_root / "sift.tar.gz"
         if archive.exists():
             return archive, "cached"
         for url in SIFT_TARBALL_URLS:
@@ -376,13 +376,13 @@ class Sift1mAdapter(DatasetAdapter):
                 return template
             except OSError as error:
                 logger.warning("mirror failed for %s: %s", template, error)
-        raise RuntimeError("every download source failed; fetch sift.tar.gz manually into the workspace")
+        raise RuntimeError("every download source failed; fetch sift.tar.gz manually into the corpus root")
 
-    def download(self, workspace: Path, sha256: str | None = None) -> dict[str, Any]:
+    def download(self, corpus_root: Path, sha256: str | None = None) -> dict[str, Any]:
         """Fetch, checksum-verify, and extract the SIFT1M corpus idempotently.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
             sha256: Optional pinned digest of ``sift.tar.gz``.
 
         Returns:
@@ -391,7 +391,7 @@ class Sift1mAdapter(DatasetAdapter):
         Raises:
             ValueError: If the archive digest does not match the pinned digest.
         """
-        directory: Path = self.corpus_dir(workspace)
+        directory: Path = self.corpus_dir(corpus_root)
         directory.mkdir(parents=True, exist_ok=True)
         if all((directory / name).exists() for name in SIFT_FILE_NAMES):
             info: dict[str, Any] = self.validate_directory(directory)
@@ -401,7 +401,7 @@ class Sift1mAdapter(DatasetAdapter):
             return {"skipped": True, "files": info, "checksums_verified": checks_match}
 
         source: str | None
-        archive, source = self.download_tarball(workspace)
+        archive, source = self.download_tarball(corpus_root)
         if archive is not None:
             archive_digest: str = sha256_of(archive)
             if sha256 is not None and archive_digest != sha256:
@@ -420,52 +420,52 @@ class Sift1mAdapter(DatasetAdapter):
             "checksums": digests,
         }
 
-    def base_vectors(self, workspace: Path, limit: int | None = None) -> np.ndarray:
+    def base_vectors(self, corpus_root: Path, limit: int | None = None) -> np.ndarray:
         """Read base vectors from ``sift_base.fvecs``.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
             limit: Optional cap on rows read from the start of the file.
 
         Returns:
             A float32 ``(rows, 128)`` array.
         """
-        return read_fvecs(self.corpus_dir(workspace) / "sift_base.fvecs", limit=limit)
+        return read_fvecs(self.corpus_dir(corpus_root) / "sift_base.fvecs", limit=limit)
 
-    def base_vector_slice(self, workspace: Path, start: int, count: int) -> np.ndarray:
+    def base_vector_slice(self, corpus_root: Path, start: int, count: int) -> np.ndarray:
         """Read one contiguous slice of ``sift_base.fvecs``.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
             start: First global row index of the slice.
             count: Rows in the slice.
 
         Returns:
             A float32 ``(count, 128)`` array.
         """
-        return read_vecs_rows(self.corpus_dir(workspace) / "sift_base.fvecs", start, count, "<f4")
+        return read_vecs_rows(self.corpus_dir(corpus_root) / "sift_base.fvecs", start, count, "<f4")
 
-    def query_vectors(self, workspace: Path) -> np.ndarray:
+    def query_vectors(self, corpus_root: Path) -> np.ndarray:
         """Read the full query matrix from ``sift_query.fvecs``.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
 
         Returns:
             A float32 ``(10000, 128)`` array.
         """
-        return read_fvecs(self.corpus_dir(workspace) / "sift_query.fvecs")
+        return read_fvecs(self.corpus_dir(corpus_root) / "sift_query.fvecs")
 
-    def ground_truth(self, workspace: Path) -> np.ndarray | None:
+    def ground_truth(self, corpus_root: Path) -> np.ndarray | None:
         """Read the published ground truth from ``sift_groundtruth.ivecs``.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
 
         Returns:
             An int64 ``(10000, 100)`` array of global ids.
         """
-        path: Path = self.corpus_dir(workspace) / "sift_groundtruth.ivecs"
+        path: Path = self.corpus_dir(corpus_root) / "sift_groundtruth.ivecs"
         return read_ivecs(path)[:, : self.gt_depth].astype(np.int64)
 
 
@@ -593,51 +593,51 @@ class BigannAdapter(DatasetAdapter):
         """Return the published ground-truth depth, 1000 neighbors per query."""
         return BIGANN_GT_DEPTH
 
-    def corpus_dir(self, workspace: Path) -> Path:
+    def corpus_dir(self, corpus_root: Path) -> Path:
         """Return the directory holding the BIGANN files.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
 
         Returns:
-            The ``bigann`` directory under the workspace.
+            The ``bigann`` directory under the corpus root.
         """
-        return workspace / "bigann"
+        return corpus_root / "bigann"
 
-    def base_path(self, workspace: Path) -> Path:
+    def base_path(self, corpus_root: Path) -> Path:
         """Return the local path of the base u8bin artifact for this limit.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
 
         Returns:
             The base u8bin file path, named by limit for safe co-existence of multiple sizes.
         """
-        return self.corpus_dir(workspace) / f"base.{self.limit}.u8bin"
+        return self.corpus_dir(corpus_root) / f"base.{self.limit}.u8bin"
 
-    def query_path(self, workspace: Path) -> Path:
+    def query_path(self, corpus_root: Path) -> Path:
         """Return the local path of the query u8bin artifact.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
 
         Returns:
             The query u8bin file path.
         """
-        return self.corpus_dir(workspace) / "query.10K.u8bin"
+        return self.corpus_dir(corpus_root) / "query.10K.u8bin"
 
-    def gnd_tarball_path(self, workspace: Path) -> Path:
+    def gnd_tarball_path(self, corpus_root: Path) -> Path:
         """Return the local path of the ground-truth tarball.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
 
         Returns:
             The bigann_gnd.tar.gz path under the corpus directory.
         """
-        return self.corpus_dir(workspace) / "bigann_gnd.tar.gz"
+        return self.corpus_dir(corpus_root) / "bigann_gnd.tar.gz"
 
-    def download_query(self, workspace: Path) -> str:
+    def download_query(self, corpus_root: Path) -> str:
         """Download and convert the query bvecs.gz to u8bin, idempotently.
 
         Tries the IRISA primary URL first, then the HuggingFace fallback. The query file is
@@ -645,12 +645,12 @@ class BigannAdapter(DatasetAdapter):
         converted in memory.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
 
         Returns:
             The source URL that served the file, or ``"cached"`` if already present.
         """
-        query: Path = self.query_path(workspace)
+        query: Path = self.query_path(corpus_root)
         if query.exists():
             return "cached"
         gz_partial: Path = query.with_suffix(".bvecs.gz")
@@ -665,16 +665,16 @@ class BigannAdapter(DatasetAdapter):
                 logger.warning("query download from %s failed: %s", url, err)
         raise RuntimeError("all query sources failed; check network connectivity")
 
-    def download_gnd(self, workspace: Path) -> str:
+    def download_gnd(self, corpus_root: Path) -> str:
         """Download the ground-truth tarball, idempotently.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
 
         Returns:
             The source URL that served the tarball, or ``"cached"`` if already present.
         """
-        tarball: Path = self.gnd_tarball_path(workspace)
+        tarball: Path = self.gnd_tarball_path(corpus_root)
         if tarball.exists():
             return "cached"
         for url in (BIGANN_GND_PRIMARY_URL, BIGANN_GND_FALLBACK_URL):
@@ -686,7 +686,7 @@ class BigannAdapter(DatasetAdapter):
                 logger.warning("gnd download from %s failed: %s", url, err)
         raise RuntimeError("all ground-truth sources failed; check network connectivity")
 
-    def download(self, workspace: Path, sha256: str | None = None) -> dict[str, Any]:
+    def download(self, corpus_root: Path, sha256: str | None = None) -> dict[str, Any]:
         """Stream and convert the BIGANN corpus prefix, queries, and ground truth.
 
         The base bvecs.gz is streamed from the IRISA primary URL with the HuggingFace mirror
@@ -695,7 +695,7 @@ class BigannAdapter(DatasetAdapter):
         against the final base u8bin artifact.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
             sha256: Optional pinned digest of the local base u8bin artifact.
 
         Returns:
@@ -704,10 +704,10 @@ class BigannAdapter(DatasetAdapter):
         Raises:
             ValueError: If the pinned sha256 does not match the downloaded base file.
         """
-        directory: Path = self.corpus_dir(workspace)
+        directory: Path = self.corpus_dir(corpus_root)
         directory.mkdir(parents=True, exist_ok=True)
-        base: Path = self.base_path(workspace)
-        query: Path = self.query_path(workspace)
+        base: Path = self.base_path(corpus_root)
+        query: Path = self.query_path(corpus_root)
         checksums_path: Path = directory / f"checksums-{self.limit}.json"
         if base.exists() and query.exists():
             recorded: dict[str, Any] = read_json(checksums_path) if checksums_path.exists() else {}
@@ -723,14 +723,14 @@ class BigannAdapter(DatasetAdapter):
         base_digest: str = sha256_of(base)
         if sha256 is not None and base_digest != sha256:
             raise ValueError(f"bigann base sha256 {base_digest} does not match pinned {sha256}")
-        query_source: str = self.download_query(workspace)
+        query_source: str = self.download_query(corpus_root)
         query_digest: str = sha256_of(query)
         member: str | None = gt_member_name(self.limit)
         gnd_source: str = ""
         gnd_digest: str = ""
         if member is not None:
-            gnd_source = self.download_gnd(workspace)
-            gnd_digest = sha256_of(self.gnd_tarball_path(workspace))
+            gnd_source = self.download_gnd(corpus_root)
+            gnd_digest = sha256_of(self.gnd_tarball_path(corpus_root))
         digests: dict[str, str] = {"base": base_digest, "query": query_digest}
         if gnd_digest:
             digests["ground_truth_tarball"] = gnd_digest
@@ -743,43 +743,43 @@ class BigannAdapter(DatasetAdapter):
             "checksums": digests,
         }
 
-    def base_vectors(self, workspace: Path, limit: int | None = None) -> np.ndarray:
+    def base_vectors(self, corpus_root: Path, limit: int | None = None) -> np.ndarray:
         """Read base vectors from the local u8bin artifact, cast to float32.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
             limit: Optional cap on rows read from the start.
 
         Returns:
             A float32 array of shape (rows, 128).
         """
-        return read_u8bin(self.base_path(workspace), limit=limit)
+        return read_u8bin(self.base_path(corpus_root), limit=limit)
 
-    def base_vector_slice(self, workspace: Path, start: int, count: int) -> np.ndarray:
+    def base_vector_slice(self, corpus_root: Path, start: int, count: int) -> np.ndarray:
         """Read one contiguous slice of the base u8bin file, cast to float32.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
             start: First global row index of the slice.
             count: Rows in the slice.
 
         Returns:
             A float32 array of shape (count, 128).
         """
-        return read_u8bin_slice(self.base_path(workspace), start, start + count)
+        return read_u8bin_slice(self.base_path(corpus_root), start, start + count)
 
-    def query_vectors(self, workspace: Path) -> np.ndarray:
+    def query_vectors(self, corpus_root: Path) -> np.ndarray:
         """Read the full query matrix from the local query u8bin artifact.
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
 
         Returns:
             A float32 array of shape (10000, 128).
         """
-        return read_u8bin(self.query_path(workspace))
+        return read_u8bin(self.query_path(corpus_root))
 
-    def ground_truth(self, workspace: Path) -> np.ndarray | None:
+    def ground_truth(self, corpus_root: Path) -> np.ndarray | None:
         """Return the published ground truth for this limit, or ``None`` if unavailable.
 
         Official ground truth is available for exactly 10 prefix sizes: 1M, 2M, 5M, 10M,
@@ -788,7 +788,7 @@ class BigannAdapter(DatasetAdapter):
         (downloaded during the download phase).
 
         Args:
-            workspace: The benchmark workspace directory.
+            corpus_root: The shared corpus cache directory.
 
         Returns:
             An int64 array of shape (10000, 1000), or ``None``.
@@ -796,7 +796,7 @@ class BigannAdapter(DatasetAdapter):
         member: str | None = gt_member_name(self.limit)
         if member is None:
             return None
-        tarball: Path = self.gnd_tarball_path(workspace)
+        tarball: Path = self.gnd_tarball_path(corpus_root)
         if not tarball.exists():
             return None
         return read_ivecs_from_tarball(tarball, member).astype(np.int64)

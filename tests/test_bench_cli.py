@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from bench.config import (
+    DEFAULT_CORPUS_ROOT,
     DEFAULT_ICEBERG_PACKAGE,
     SIFT_BASE_COUNT,
     SUBCOMMANDS,
@@ -73,10 +74,18 @@ class TestSubcommandFlags:
     """Phase-relevant flags reach the configuration."""
 
     def test_download_flags(self) -> None:
-        """download accepts a pinned checksum and workspace."""
-        config: BenchConfig = config_for(["download", "--sha256", "abc123", "--workspace", "/tmp/ws"])
+        """download accepts a pinned checksum, workspace, and corpus-root."""
+        config: BenchConfig = config_for(
+            ["download", "--sha256", "abc123", "--workspace", "/tmp/ws", "--corpus-root", "/tmp/corpora"]
+        )
         assert config.sha256 == "abc123"
         assert config.workspace == Path("/tmp/ws").resolve()
+        assert config.corpus_root == Path("/tmp/corpora").resolve()
+
+    def test_corpus_root_default(self) -> None:
+        """corpus_root defaults to bench/corpora relative to the package directory."""
+        config: BenchConfig = config_for(["download"])
+        assert config.corpus_root == DEFAULT_CORPUS_ROOT
 
     def test_prepare_flags(self) -> None:
         """prepare accepts corpus-shape flags."""

@@ -16,6 +16,7 @@ from typing import Any
 PACKAGE_DIR: Path = Path(__file__).resolve().parent
 REPO_ROOT: Path = PACKAGE_DIR.parent
 DEFAULT_WORKSPACE: Path = PACKAGE_DIR / "workspace"
+DEFAULT_CORPUS_ROOT: Path = PACKAGE_DIR / "corpora"
 DEFAULT_RESULTS_ROOT: Path = PACKAGE_DIR / "results"
 DEFAULT_ICEBERG_PACKAGE: str = "org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0"
 PROTO_PATH: Path = REPO_ROOT / "rust" / "search-api" / "proto" / "lance_etl" / "v1" / "lance_etl.proto"
@@ -76,7 +77,8 @@ class BenchConfig:
     Attributes:
         command: The subcommand being executed.
         dataset: Name of the registered dataset adapter driving the run. Defaults to the canonical SIFT1M corpus.
-        workspace: Directory holding downloaded data, prepared artifacts, the Iceberg warehouse, and Lance datasets.
+        workspace: Directory holding prepared artifacts, the Iceberg warehouse, and Lance datasets.
+        corpus_root: Shared corpus cache directory; downloads land here once and are reused across workspaces.
         results_root: Directory under which per-run result directories are created.
         run_id: Identifier of the current run. One run directory aggregates every phase's artifacts.
         limit: Number of base vectors to benchmark. The full corpus is 1M.
@@ -126,6 +128,7 @@ class BenchConfig:
     command: str
     dataset: str = "sift1m"
     workspace: Path = DEFAULT_WORKSPACE
+    corpus_root: Path = DEFAULT_CORPUS_ROOT
     results_root: Path = DEFAULT_RESULTS_ROOT
     run_id: str = field(default_factory=default_run_id)
     limit: int = SIFT_BASE_COUNT
@@ -187,6 +190,7 @@ class BenchConfig:
                 if value is not None or item.name in nullable_fields:
                     values[item.name] = value
         values["workspace"] = Path(args.workspace).resolve()
+        values["corpus_root"] = Path(args.corpus_root).resolve()
         values["results_root"] = Path(args.results_root).resolve()
         return cls(**values)
 
@@ -281,6 +285,13 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
     """
     parser.add_argument("--dataset", default="sift1m", help="Registered dataset adapter name; default sift1m")
     parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
+    parser.add_argument(
+        "--corpus-root",
+        type=Path,
+        default=DEFAULT_CORPUS_ROOT,
+        dest="corpus_root",
+        help="Shared corpus cache; downloads land here once and are reused across workspaces",
+    )
     parser.add_argument("--results-root", type=Path, default=DEFAULT_RESULTS_ROOT)
     parser.add_argument("--run-id", dest="run_id", default=None)
     parser.add_argument("--limit", type=int, default=SIFT_BASE_COUNT, help="Base vectors to benchmark; default 1M")

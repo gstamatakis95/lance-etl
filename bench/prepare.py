@@ -128,7 +128,7 @@ def slice_record_batch(
     start: int,
     count: int,
     adapter: DatasetAdapter,
-    workspace: Path,
+    corpus_root: Path,
     centroids: np.ndarray,
     cluster_vocab: list[list[str]],
     common_vocab: list[str],
@@ -147,7 +147,7 @@ def slice_record_batch(
         start: First global row index of the slice.
         count: Rows in the slice.
         adapter: The dataset adapter, pickled into the task closure.
-        workspace: The benchmark workspace directory, readable from the executor.
+        corpus_root: The shared corpus cache directory, readable from the executor.
         centroids: Broadcast-by-closure k-means centroids.
         cluster_vocab: Per-cluster vocabularies.
         common_vocab: Shared common-word pool.
@@ -159,7 +159,7 @@ def slice_record_batch(
     Returns:
         One record batch conforming to :func:`arrow_row_schema` with the same ``no_text`` setting.
     """
-    vectors: np.ndarray = adapter.base_vector_slice(workspace, start, count)
+    vectors: np.ndarray = adapter.base_vector_slice(corpus_root, start, count)
     clusters: np.ndarray = assign_clusters(vectors, centroids)
     indices: np.ndarray = np.arange(start, start + count, dtype=np.int64)
     org_ids: list[str] = [f"org{int(i) % tenants}" for i in indices]
@@ -203,7 +203,7 @@ def write_iceberg_table(
         The wall time of the write in seconds.
     """
     spark = build_spark(config, "bench-prepare")
-    workspace: Path = config.workspace
+    corpus_root: Path = config.corpus_root
     cluster_vocab, common_vocab = vocab
     tenants: int = config.tenants
     seed: int = config.seed
@@ -231,7 +231,7 @@ def write_iceberg_table(
                     int(start),
                     int(count),
                     adapter,
-                    workspace,
+                    corpus_root,
                     centroids,
                     cluster_vocab,
                     common_vocab,
@@ -272,10 +272,10 @@ def tenant_ground_truth(
         One ``(num_queries, depth)`` int64 array per org id, and the manifest source label.
     """
     if config.limit == adapter.base_count and config.tenants == 1:
-        published: np.ndarray | None = adapter.ground_truth(config.workspace)
+        published: np.ndarray | None = adapter.ground_truth(config.corpus_root)
         if published is not None:
             return {"org0": published}, adapter.ground_truth_source
-    base: np.ndarray = adapter.base_vectors(config.workspace, limit=config.limit)
+    base: np.ndarray = adapter.base_vectors(config.corpus_root, limit=config.limit)
     result: dict[str, np.ndarray] = {}
     for tenant in range(config.tenants):
         ids: np.ndarray = np.arange(tenant, config.limit, config.tenants, dtype=np.int64)
@@ -298,7 +298,7 @@ def compute_cluster_artifact(config: BenchConfig, adapter: DatasetAdapter, centr
     parts: list[np.ndarray] = []
     for start in range(0, config.limit, KMEANS_SAMPLE_ROWS):
         count: int = min(KMEANS_SAMPLE_ROWS, config.limit - start)
-        parts.append(assign_clusters(adapter.base_vector_slice(config.workspace, start, count), centroids))
+        parts.append(assign_clusters(adapter.base_vector_slice(config.corpus_root, start, count), centroids))
     return np.concatenate(parts)
 
 
@@ -320,8 +320,8 @@ def run_prepare(config: BenchConfig) -> dict[str, Any]:
         return save_phase(config, "prepare", {"skipped": True, "manifest": manifest})
 
     adapter: DatasetAdapter = adapter_for(config)
-    queries: np.ndarray = adapter.query_vectors(config.workspace)
-    sample: np.ndarray = adapter.base_vectors(config.workspace, limit=min(config.limit, KMEANS_SAMPLE_ROWS))
+    queries: np.ndarray = adapter.query_vectors(config.corpus_root)
+    sample: np.ndarray = adapter.base_vectors(config.corpus_root, limit=min(config.limit, KMEANS_SAMPLE_ROWS))
     centroids: np.ndarray = train_centroids(sample, config.num_clusters, config.seed)
 
     if config.no_text:
