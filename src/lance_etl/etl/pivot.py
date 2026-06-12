@@ -51,6 +51,15 @@ class ETLConfig:
             bytes) yields ~131 K rows/chunk whose hash-join build side peaks around 67 MB — well
             under the 100 MB default pool that the sift1m repro exhausted at 97.7 MB. None disables
             chunking.
+        spark_batches: Number of sequential Spark-level batches the increment is split into before
+            collapse. Each batch keeps the rows whose ``pmod(xxhash64(key_col), spark_batches)``
+            equals the batch index, so every event for a vector id lands in exactly one batch and
+            per-batch collapse equals global collapse restricted to that batch — last-write-wins
+            is preserved. Each batch runs the full collapse-shuffle-merge flow as its own Spark job
+            over roughly ``1/spark_batches`` of the increment, so executor memory needs scale with
+            the batch size instead of the increment size. Raise this to absorb increments of tens
+            of millions of rows per org without raising executor memory limits. 1 (the default)
+            processes the whole increment in a single pass.
     """
 
     base_uri: str
@@ -70,6 +79,7 @@ class ETLConfig:
     window_column: str = "processing_timestamp"
     retry_backoff_seconds: float = 0.5
     merge_batch_bytes: int | None = 64 * 1024 * 1024
+    spark_batches: int = 1
 
 
 def stats_schema() -> pa.Schema:

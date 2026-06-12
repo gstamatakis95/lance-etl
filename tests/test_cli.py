@@ -74,6 +74,18 @@ def test_etl_has_no_ingested_at_flag() -> None:
     assert not hasattr(args, "ingested_at_col")
 
 
+def test_etl_spark_batches_defaults_to_single_pass() -> None:
+    """Without the flag, ``--spark-batches`` is 1 so the increment is processed in one pass."""
+    args = etl_cli.build_parser().parse_args(REQUIRED_ETL_ARGV)
+    assert args.spark_batches == 1
+
+
+def test_etl_spark_batches_is_parsed_as_int() -> None:
+    """``--spark-batches 8`` parses to the integer batch count."""
+    args = etl_cli.build_parser().parse_args([*REQUIRED_ETL_ARGV, "--spark-batches", "8"])
+    assert args.spark_batches == 8
+
+
 REQUIRED_MAINTENANCE_RUN_ARGV: list[str] = [
     "run",
     "--base-uri",

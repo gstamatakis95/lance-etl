@@ -62,6 +62,17 @@ def build_parser() -> argparse.ArgumentParser:
             "configured window column after the Iceberg read. Absent means the upper bound is open (no filter)."
         ),
     )
+    parser.add_argument(
+        "--spark-batches",
+        type=int,
+        default=1,
+        help=(
+            "Split the increment into this many sequential Spark-level key-hash batches, each processed as its "
+            "own Spark job over a fraction of the rows. Raise this for very large increments (tens of millions "
+            "of rows per org) so executor memory needs scale with the batch size instead of the increment size. "
+            "Default 1 processes the whole increment in a single pass."
+        ),
+    )
     return parser
 
 
@@ -84,6 +95,7 @@ def run(args: argparse.Namespace) -> None:
             iceberg_read_options=parse_key_values(args.iceberg_option),
             window_start=args.window_start,
             window_end=args.window_end,
+            spark_batches=args.spark_batches,
         )
         IcebergToLanceETL(config).run(spark, args.table, parse_epoch_ms(args.start), parse_epoch_ms(args.end))
     except Exception:

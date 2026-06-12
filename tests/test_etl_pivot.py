@@ -339,3 +339,114 @@ class TestCollapseGuarantee:
 
         dataset = lance.dataset(dataset_uri(config, "o2", "t2", "ns2"))
         assert dataset.count_rows() == 10
+
+
+class TestSparkBatches:
+    """spark_batches splits the increment into key-hash batches without changing the merged result."""
+
+    def nullable_routing_schema(self) -> StructType:
+        """Return the pivot source schema with nullable routing columns.
+
+        Returns:
+            The :func:`source_schema` fields with every routing column marked nullable, so a
+            null-routing row can flow in and exercise the Spark-level drop filter.
+        """
+        routing_names: set[str] = {"org_id", "tenant_id", "namespace"}
+        return StructType(
+            [StructField(f.name, f.dataType, f.nullable or f.name in routing_names) for f in source_schema().fields]
+        )
+
+    def make_rows(self) -> list[tuple]:
+        """Build an increment with two orgs, duplicate keys, and one null-routing row.
+
+        Returns:
+            Rows covering 24 unique o1 keys, 8 unique o2 keys, a stale duplicate for one o1 key,
+            and one row with a NULL org_id that must be dropped at the Spark level.
+        """
+        ts_old: datetime = datetime(2023, 1, 1, tzinfo=UTC)
+        rows: list[tuple] = [
+            (
+                f"v{i:02d}",
+                "o1" if i % 4 else "o2",
+                "t1",
+                "n1",
+                TS,
+                TS,
+                "insert",
+                {"vector": [float(i)] * DIMENSION},
+                {"text": f"word{i}"},
+                {"k": str(i)},
+            )
+            for i in range(32)
+        ]
+        rows.append(("v01", "o1", "t1", "n1", ts_old, ts_old, "insert", None, {"text": "stale"}, {"k": "stale"}))
+        rows.append(("vnull", None, "t1", "n1", TS, TS, "insert", None, {"text": "dropped"}, {}))
+        return rows
+
+    def test_batched_run_matches_single_pass(
+        self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
+    ) -> None:
+        """spark_batches=3 produces datasets identical to the single-pass run.
+
+        Covers the order-safety invariant of the split: the duplicate key collapses to its newest
+        row even though the increment is processed as three separate Spark jobs, because the
+        key-hash bucketing puts both duplicate events in the same batch. The null-routing row is
+        dropped by the Spark-level filter in both runs.
+        """
+        frame = spark.createDataFrame(self.make_rows(), self.nullable_routing_schema())
+        batched_config: ETLConfig = ETLConfig(
+            base_uri=str(tmp_path / "batched"),
+            telemetry=telemetry_config,
+            num_partitions=2,
+            spark_batches=3,
+        )
+        single_config: ETLConfig = ETLConfig(
+            base_uri=str(tmp_path / "single"),
+            telemetry=telemetry_config,
+            num_partitions=2,
+            spark_batches=1,
+        )
+        IcebergToLanceETL(batched_config).run_on_dataframe(frame)
+        IcebergToLanceETL(single_config).run_on_dataframe(frame)
+
+        for org, expected_rows in (("o1", 24), ("o2", 8)):
+            batched: pa.Table = (
+                lance.dataset(dataset_uri(batched_config, org, "t1", "n1")).to_table().sort_by("vector_id")
+            )
+            single: pa.Table = (
+                lance.dataset(dataset_uri(single_config, org, "t1", "n1")).to_table().sort_by("vector_id")
+            )
+            assert batched.num_rows == expected_rows
+            assert sorted(batched.schema.names) == sorted(single.schema.names)
+            ordered_names: list[str] = sorted(batched.schema.names)
+            assert batched.select(ordered_names).equals(single.select(ordered_names))
+
+        o1_table: pa.Table = lance.dataset(dataset_uri(batched_config, "o1", "t1", "n1")).to_table()
+        text_by_id: dict[str, str | None] = dict(
+            zip(o1_table["vector_id"].to_pylist(), o1_table["text"].to_pylist(), strict=True)
+        )
+        assert text_by_id["v01"] == "word1", "the stale duplicate must lose to the newer event"
+        assert "vnull" not in text_by_id
+
+    def test_select_batch_partitions_all_rows_exactly_once(
+        self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
+    ) -> None:
+        """The key-hash buckets are disjoint and their union covers every input row.
+
+        Also verifies that batch_count=1 returns the source plan unchanged.
+        """
+        frame = spark.createDataFrame(self.make_rows(), self.nullable_routing_schema())
+        config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config)
+        etl: IcebergToLanceETL = IcebergToLanceETL(config)
+        assert etl.select_batch(frame, 0, 1) is frame
+
+        batch_count: int = 4
+        batch_sizes: list[int] = [etl.select_batch(frame, index, batch_count).count() for index in range(batch_count)]
+        assert sum(batch_sizes) == frame.count()
+
+        duplicated_key_batches: list[int] = [
+            etl.select_batch(frame, index, batch_count).where("vector_id = 'v01'").count()
+            for index in range(batch_count)
+        ]
+        assert sorted(duplicated_key_batches)[-1] == 2, "both events for a duplicated key must share one batch"
+        assert sum(duplicated_key_batches) == 2

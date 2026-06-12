@@ -21,6 +21,14 @@ instead of duplicating. No separate bulk path is needed for backfills.
 
 Heavy work (dataset reads, writes, pivot, merge) runs exclusively in Spark executors.
 The driver only resolves snapshot bounds, short-circuits on empty windows, and collects stats.
+Everything that maps cleanly onto Spark stays in Spark: the key-hash batch split, the
+null-routing-row filter (with an ``Observation``-based dropped-row count), and the
+last-write-wins collapse are all native DataFrame operations. The Arrow closure carries only
+what Spark cannot express — the dynamic per-dataset map pivot and the Lance merge commits.
+
+Large increments are absorbed at the Spark level: ``ETLConfig.spark_batches`` splits the
+increment into sequential key-hash batches, each its own Spark job over a fraction of the rows,
+so a single org increment of 50M+ rows runs without raising executor memory limits.
 """
 
 from __future__ import annotations
@@ -33,7 +41,7 @@ from typing import Any
 import lance
 import pyarrow as pa
 import pyarrow.compute as pc
-from pyspark.sql import Column, DataFrame, SparkSession
+from pyspark.sql import Column, DataFrame, Observation, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
     ArrayType,
@@ -581,11 +589,105 @@ class IcebergToLanceETL:
         """
         self.run_on_dataframe(self.apply_window_filter(self.read_increment(spark, table, start_ms, end_ms)))
 
-    def run_on_dataframe(self, source: DataFrame) -> None:
-        """Validate, collapse, shuffle, and merge a pre-read increment into per-tenant Lance datasets.
+    def select_batch(self, source: DataFrame, batch_index: int, batch_count: int) -> DataFrame:
+        """Filter the increment to one Spark-level key-hash batch.
 
-        Order: validate schema, collapse LWW, repartition by routing key, pivot+cast+merge on
-        executors. Null routing rows are dropped and counted as ``dataset.null_routing_rows``.
+        Buckets rows by ``pmod(xxhash64(key_col), batch_count)`` natively in Spark, so the split
+        is a pushed-down filter rather than driver-side work. Every event for a vector id lands in
+        exactly one batch, so per-batch collapse equals global collapse restricted to that batch
+        and last-write-wins is preserved across the split.
+
+        Args:
+            source: The full incremental source DataFrame.
+            batch_index: Zero-based index of the batch to keep.
+            batch_count: Total number of batches.
+
+        Returns:
+            The batch's rows, or the source unchanged when ``batch_count`` is one.
+        """
+        if batch_count <= 1:
+            return source
+        bucket: Column = F.pmod(F.xxhash64(F.col(self.config.key_col)), F.lit(batch_count))
+        return source.where(bucket == F.lit(batch_index))
+
+    def drop_null_routing_rows(self, source: DataFrame) -> tuple[DataFrame, Observation]:
+        """Drop rows carrying a NULL routing value with a native Spark filter.
+
+        Filtering before the shuffle removes the dead rows from the wire instead of carrying them
+        into the executors' Arrow path. The dropped-row count is captured through a Spark
+        ``Observation`` in the same pass, so no extra job runs for the metric.
+
+        Args:
+            source: The batch DataFrame, before collapse.
+
+        Returns:
+            ``(filtered, observation)`` where ``observation`` exposes ``null_routing_rows`` after
+            an action has run on the filtered plan.
+        """
+        any_null: Column | None = None
+        for routing_col in ROUTING_COLS:
+            is_null: Column = F.col(routing_col).isNull()
+            any_null = is_null if any_null is None else (any_null | is_null)
+        observation: Observation = Observation()
+        observed: DataFrame = source.observe(observation, F.count(F.when(any_null, True)).alias("null_routing_rows"))
+        return observed.where(~any_null), observation
+
+    def merge_dataframe(self, batch: DataFrame) -> list[Any]:
+        """Collapse, shuffle, and merge one batch, returning the collected per-dataset stats rows.
+
+        Only the work that cannot be expressed in native Spark runs inside the ``mapInArrow``
+        closure: the dynamic per-dataset map pivot and the Lance ``merge_insert`` commits. The
+        closure materializes its partition, groups by routing key, and merges each group into its
+        dataset.
+
+        Args:
+            batch: The null-routing-filtered batch DataFrame.
+
+        Returns:
+            The collected stats rows, one per dataset this batch touched.
+        """
+        config: ETLConfig = self.config
+        routing: list[str] = list(ROUTING_COLS)
+        routed: DataFrame = self.collapse(batch).repartition(config.num_partitions, *[F.col(c) for c in routing])
+        partition_stats_schema: pa.Schema = stats_schema()
+
+        def merge_partition(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
+            """Merge all routing-key groups in one Spark partition.
+
+            Args:
+                batches: Arrow batches for this task.
+
+            Yields:
+                One stats record batch when the partition wrote any dataset.
+            """
+            collected: list[pa.RecordBatch] = [b for b in batches if b.num_rows]
+            if not collected:
+                return
+            executor_telemetry: Telemetry = Telemetry.create(config.telemetry)
+            table: pa.Table = pa.Table.from_batches(collected)
+            results: list[tuple[Any, ...]] = []
+            with executor_telemetry.span("lance.etl.partition"):
+                try:
+                    for key, group in group_by_routing(table, routing):
+                        upserted, deleted = apply_merge(config, executor_telemetry, key, group)
+                        results.append((*key, upserted, deleted))
+                except Exception:
+                    executor_telemetry.error("etl partition failed")
+                    raise
+            if results:
+                yield build_stats_batch(results, partition_stats_schema)
+
+        return routed.mapInArrow(merge_partition, schema=stats_spark_ddl()).collect()
+
+    def run_on_dataframe(self, source: DataFrame) -> None:
+        """Validate, batch, collapse, shuffle, and merge a pre-read increment into per-tenant Lance datasets.
+
+        Order: validate schema, split into ``config.spark_batches`` key-hash batches, then per
+        batch: drop null-routing rows with a native Spark filter, collapse LWW, repartition by
+        routing key, pivot+cast+merge on executors. Batches run sequentially as separate Spark
+        jobs, so executor memory needs scale with the batch size instead of the increment size —
+        an org increment of 50M+ rows is absorbed by raising ``spark_batches``, not memory limits.
+        Null routing rows are counted as ``dataset.null_routing_rows``.
 
         Args:
             source: A source DataFrame carrying the operation column.
@@ -594,61 +696,38 @@ class IcebergToLanceETL:
         driver_telemetry: Telemetry = Telemetry.create(config.telemetry)
         with driver_telemetry.span("lance.etl.run") as run_span:
             self.validate_schema(source)
-            collapsed: DataFrame = self.collapse(source)
-            routing: list[str] = list(ROUTING_COLS)
-            routed: DataFrame = collapsed.repartition(config.num_partitions, *[F.col(c) for c in routing])
-            partition_stats_schema: pa.Schema = stats_schema()
-
-            def merge_partition(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
-                """Merge all routing-key groups in one Spark partition.
-
-                Args:
-                    batches: Arrow batches for this task.
-
-                Yields:
-                    One stats record batch when the partition wrote any dataset.
-                """
-                collected: list[pa.RecordBatch] = [b for b in batches if b.num_rows]
-                if not collected:
-                    return
-                executor_telemetry: Telemetry = Telemetry.create(config.telemetry)
-                table: pa.Table = pa.Table.from_batches(collected)
-                valid_mask: pa.Array | None = None
-                for routing_col in routing:
-                    col_valid: pa.Array = pc.is_valid(table[routing_col])
-                    valid_mask = col_valid if valid_mask is None else pc.and_(valid_mask, col_valid)
-                if valid_mask is not None:
-                    null_count: int = int(pc.sum(pc.invert(valid_mask)).as_py() or 0)
-                    if null_count:
-                        executor_telemetry.incr("dataset.null_routing_rows", value=null_count)
-                        logger.warning("dropped %d rows with null routing key(s) in this partition", null_count)
-                        table = table.filter(valid_mask)
-                if not table.num_rows:
-                    return
-                results: list[tuple[Any, ...]] = []
-                with executor_telemetry.span("lance.etl.partition"):
-                    try:
-                        for key, group in group_by_routing(table, routing):
-                            upserted, deleted = apply_merge(config, executor_telemetry, key, group)
-                            results.append((*key, upserted, deleted))
-                    except Exception:
-                        executor_telemetry.error("etl partition failed")
-                        raise
-                if results:
-                    yield build_stats_batch(results, partition_stats_schema)
-
+            batch_count: int = max(1, config.spark_batches)
+            seen_datasets: set[tuple[str, ...]] = set()
+            upserted: int = 0
+            deleted: int = 0
+            null_routing_rows: int = 0
             try:
                 with driver_telemetry.timed("run.execute_ms"):
-                    stats: DataFrame = routed.mapInArrow(merge_partition, schema=stats_spark_ddl())
-                    rows: list[Any] = stats.collect()
+                    for batch_index in range(batch_count):
+                        batch, observation = self.drop_null_routing_rows(
+                            self.select_batch(source, batch_index, batch_count)
+                        )
+                        rows: list[Any] = self.merge_dataframe(batch)
+                        null_routing_rows += int(observation.get["null_routing_rows"] or 0)
+                        for row in rows:
+                            seen_datasets.add(tuple(row[column] for column in ROUTING_COLS))
+                            upserted += int(row["upserted"] or 0)
+                            deleted += int(row["deleted"] or 0)
+                        logger.info(
+                            "spark batch %d/%d merged %d dataset groups",
+                            batch_index + 1,
+                            batch_count,
+                            len(rows),
+                        )
             except Exception:
                 driver_telemetry.error("etl run failed")
                 raise
 
-            datasets: int = len(rows)
-            upserted: int = sum(int(row["upserted"] or 0) for row in rows)
-            deleted: int = sum(int(row["deleted"] or 0) for row in rows)
+            if null_routing_rows:
+                driver_telemetry.incr("dataset.null_routing_rows", value=null_routing_rows)
+                logger.warning("dropped %d rows with null routing key(s)", null_routing_rows)
 
+            datasets: int = len(seen_datasets)
             run_span.set_tag("datasets", datasets)
             driver_telemetry.gauge("run.datasets", datasets)
             driver_telemetry.gauge("run.upserted", upserted)
