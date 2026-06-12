@@ -54,6 +54,13 @@ class IndexJobConfig:
         commit_retries: Retry budget for commit conflicts.
         commit_backoff_seconds: Base backoff between commit retries.
         small_dataset_fragment_threshold: Datasets with fewer fragments are indexed end-to-end on one executor.
+        large_dataset_row_threshold: Row count at or above which a dataset uses the distributed
+            segment fan-out even when its fragment count is below
+            ``small_dataset_fragment_threshold``. The small tier builds the whole index, including
+            IVF training and assignment, in one executor task. A dataset that is large by rows but
+            holds few large fragments would overload that single task, so it is routed to the
+            distributed tier instead. ``None`` disables the row dimension. The row count is read from
+            fragment metadata (no data scan).
         small_tier_slices: Spark partition count for the batched small-dataset and classification jobs.
         driver_concurrency: Concurrent large-dataset submissions from the driver thread pool.
         scheduler_pool: Spark FAIR scheduler pool name for large-dataset jobs.
@@ -94,6 +101,7 @@ class IndexJobConfig:
     commit_retries: int = DEFAULT_COMMIT_RETRIES
     commit_backoff_seconds: float = 0.5
     small_dataset_fragment_threshold: int = 32
+    large_dataset_row_threshold: int | None = 5_000_000
     small_tier_slices: int = 256
     driver_concurrency: int = 8
     scheduler_pool: str = "lance-indexing"

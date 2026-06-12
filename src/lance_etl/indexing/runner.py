@@ -297,10 +297,14 @@ class LanceIndexer:
         return {"uri": uri, "indexes": indexes}
 
     def classify(self, spark: SparkSession, dataset_uris: list[str]) -> tuple[list[str], list[str]]:
-        """Split datasets into the small and large tiers by fragment count.
+        """Split datasets into the small and large tiers by fragment count and row count.
 
-        Fragment counts are gathered with one distributed job so the driver never opens datasets
-        itself.
+        Both the fragment count and the row count are gathered in one distributed job so the driver
+        never opens datasets itself. A dataset goes to the large tier when its fragment count reaches
+        ``small_dataset_fragment_threshold`` or, when ``large_dataset_row_threshold`` is set, when its
+        row count reaches that threshold. The row dimension keeps a dataset that is large by rows but
+        holds few large fragments off the single-task small tier. Both counts come from fragment
+        metadata, so the row probe adds no data scan to the existing pass.
 
         Args:
             spark: Active Spark session.
@@ -312,24 +316,29 @@ class LanceIndexer:
         config: IndexJobConfig = self.config
         storage_options: dict[str, Any] | None = config.storage_options
         threshold: int = config.small_dataset_fragment_threshold
+        row_threshold: int | None = config.large_dataset_row_threshold
 
-        def fragment_count(uri: str) -> tuple[str, int]:
-            """Count one dataset's fragments on an executor.
+        def dataset_sizes(uri: str) -> tuple[str, int, int]:
+            """Read one dataset's fragment count and row count on an executor.
 
             Args:
                 uri: Dataset URI.
 
             Returns:
-                The URI paired with its fragment count.
+                The URI paired with its fragment count and row count.
             """
-            return uri, len(lance.dataset(uri, storage_options=storage_options).get_fragments())
+            dataset: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
+            return uri, len(dataset.get_fragments()), dataset.count_rows()
 
         slices: int = max(1, min(config.small_tier_slices, len(dataset_uris)))
-        counts: list[tuple[str, int]] = (
-            spark.sparkContext.parallelize(dataset_uris, slices).map(fragment_count).collect()
+        sizes: list[tuple[str, int, int]] = (
+            spark.sparkContext.parallelize(dataset_uris, slices).map(dataset_sizes).collect()
         )
-        small: list[str] = [uri for uri, count in counts if count < threshold]
-        large: list[str] = [uri for uri, count in counts if count >= threshold]
+        small: list[str] = []
+        large: list[str] = []
+        for uri, fragments, rows in sizes:
+            is_large: bool = fragments >= threshold or (row_threshold is not None and rows >= row_threshold)
+            (large if is_large else small).append(uri)
         return small, large
 
     def run_small_tier(self, spark: SparkSession, uris: list[str], telemetry: Telemetry) -> list[dict[str, Any]]:

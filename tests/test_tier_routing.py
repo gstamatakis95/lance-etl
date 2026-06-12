@@ -3,7 +3,8 @@
 The per-tenant population is power-law shaped: a tiny dataset must take the cheap in-process path and a huge one must
 take the distributed fan-out. These tests pin that routing decision for both the compactor (no Spark needed: the
 classification and the small-tier compaction both run in process) and the indexer (the classification job that splits
-datasets by fragment count).
+datasets by fragment count). A dataset that is large by row count but holds few large fragments must also take the
+distributed fan-out, so the row-threshold dimension is pinned for both jobs.
 """
 
 from __future__ import annotations
@@ -67,15 +68,75 @@ def test_huge_dataset_defers_to_fan_out_without_compacting(tmp_path: Path, telem
     assert "fragments_removed" not in result
 
 
+def test_row_heavy_dataset_defers_to_fan_out_below_fragment_threshold(tmp_path: Path, telemetry: Telemetry) -> None:
+    """A dataset under the fragment threshold but over the row threshold is deferred to the large tier.
+
+    This is the row-count dimension: a dataset that is large by rows yet holds few large fragments must
+    not be rewritten single-threaded in one in-process executor task.
+    """
+    uri: str = str(tmp_path / "rowheavy.lance")
+    write_fragmented_dataset(uri, make_vector_table(rows=100, dim=8), max_rows_per_file=50)
+    config: MaintenanceConfig = MaintenanceConfig(
+        telemetry=TelemetryConfig(),
+        large_dataset_fragment_threshold=128,
+        large_dataset_row_threshold=100,
+    )
+
+    result: dict[str, object] = classify_or_compact(uri, config, telemetry)
+
+    assert result == {"uri": uri, "tier": "large", "fragments": 2}
+    assert "fragments_removed" not in result
+
+
+def test_row_threshold_none_classifies_on_fragments_alone(tmp_path: Path, telemetry: Telemetry) -> None:
+    """With the row threshold disabled, a row-heavy but few-fragment dataset still takes the small tier."""
+    uri: str = str(tmp_path / "rowheavy_disabled.lance")
+    write_fragmented_dataset(uri, make_vector_table(rows=100, dim=8), max_rows_per_file=50)
+    config: MaintenanceConfig = MaintenanceConfig(
+        telemetry=TelemetryConfig(),
+        large_dataset_fragment_threshold=128,
+        large_dataset_row_threshold=None,
+    )
+
+    result: dict[str, object] = classify_or_compact(uri, config, telemetry)
+
+    assert result["tier"] == "small"
+    assert result["fragments_removed"] == 2
+
+
 def test_indexer_classify_splits_small_and_large(spark: SparkSession, tmp_path: Path) -> None:
     """The indexer routes a tiny dataset to the small tier and a many-fragment one to the large tier."""
     tiny: str = str(tmp_path / "tiny.lance")
     huge: str = str(tmp_path / "huge.lance")
     write_fragmented_dataset(tiny, make_vector_table(rows=20, dim=8), max_rows_per_file=20)
     write_fragmented_dataset(huge, make_vector_table(rows=100, dim=8), max_rows_per_file=20)
-    config: IndexJobConfig = IndexJobConfig(telemetry=TelemetryConfig(), small_dataset_fragment_threshold=3)
+    config: IndexJobConfig = IndexJobConfig(
+        telemetry=TelemetryConfig(), small_dataset_fragment_threshold=3, large_dataset_row_threshold=None
+    )
 
     small, large = LanceIndexer(config).classify(spark, [tiny, huge])
 
     assert small == [tiny]
     assert large == [huge]
+
+
+def test_indexer_classify_routes_row_heavy_dataset_to_large_tier(spark: SparkSession, tmp_path: Path) -> None:
+    """The indexer defers a dataset over the row threshold to the large tier despite few fragments.
+
+    The fragment count alone (2) is below the small-tier threshold, so only the row dimension routes
+    this dataset to the distributed segment fan-out.
+    """
+    tiny: str = str(tmp_path / "tiny.lance")
+    row_heavy: str = str(tmp_path / "rowheavy.lance")
+    write_fragmented_dataset(tiny, make_vector_table(rows=20, dim=8), max_rows_per_file=20)
+    write_fragmented_dataset(row_heavy, make_vector_table(rows=100, dim=8), max_rows_per_file=50)
+    config: IndexJobConfig = IndexJobConfig(
+        telemetry=TelemetryConfig(),
+        small_dataset_fragment_threshold=8,
+        large_dataset_row_threshold=100,
+    )
+
+    small, large = LanceIndexer(config).classify(spark, [tiny, row_heavy])
+
+    assert small == [tiny]
+    assert large == [row_heavy]

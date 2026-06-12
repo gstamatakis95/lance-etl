@@ -63,6 +63,13 @@ class MaintenanceConfig:
         max_tasks: Maximum Spark tasks for one dataset's rewrites.
         large_dataset_fragment_threshold: Fragment count above which a dataset uses the
             distributed plan/execute/commit path instead of in-process ``Compaction.execute``.
+        large_dataset_row_threshold: Row count at or above which a dataset uses the distributed
+            tier even when its fragment count is below ``large_dataset_fragment_threshold``. A
+            dataset that is large by rows but has few (large) fragments would otherwise be rewritten
+            entirely inside one in-process executor task, which streams but runs single-threaded and
+            slow. Routing it to the distributed tier shards the rewrite across executors. ``None``
+            disables the row dimension and classifies on fragment count alone. The row count is read
+            from fragment metadata (no data scan).
         batch_partitions: Maximum Spark partitions for the small-dataset batch job.
         max_concurrent_large: Driver threads running large-dataset compactions concurrently.
         scheduler_pool: Spark FAIR scheduler pool for large-dataset jobs.
@@ -99,6 +106,7 @@ class MaintenanceConfig:
     batch_size: int | None = None
     max_tasks: int = 256
     large_dataset_fragment_threshold: int = 128
+    large_dataset_row_threshold: int | None = 20_000_000
     batch_partitions: int = 512
     max_concurrent_large: int = 4
     scheduler_pool: str = "lance-maintenance"
@@ -441,6 +449,13 @@ def compaction_skip_reason(dataset: lance.LanceDataset) -> str | None:
 def classify_or_compact(uri: str, config: MaintenanceConfig, telemetry: Telemetry) -> dict[str, Any]:
     """Compact a small dataset in process, or flag a large one for tier B.
 
+    A dataset is routed to the distributed tier when its fragment count exceeds
+    ``large_dataset_fragment_threshold`` or, when ``large_dataset_row_threshold`` is set, when its
+    row count reaches that threshold. The row dimension catches datasets that are large by rows but
+    hold few large fragments, which would otherwise be rewritten single-threaded in one in-process
+    executor task. The row count is read from fragment metadata only when the fragment check did not
+    already defer the dataset, so the common small-dataset path adds no extra read.
+
     Args:
         uri: Dataset URI.
         config: Maintenance configuration.
@@ -448,11 +463,17 @@ def classify_or_compact(uri: str, config: MaintenanceConfig, telemetry: Telemetr
 
     Returns:
         Small-tier statistics, or ``{"uri", "tier": "large", "fragments"}`` for
-        datasets whose fragment count exceeds the threshold.
+        datasets that cross either the fragment or the row threshold.
     """
     dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
     fragments: int = int(dataset.stats.dataset_stats()["num_fragments"])
-    if fragments > config.large_dataset_fragment_threshold:
+    large_by_fragments: bool = fragments > config.large_dataset_fragment_threshold
+    large_by_rows: bool = (
+        not large_by_fragments
+        and config.large_dataset_row_threshold is not None
+        and dataset.count_rows() >= config.large_dataset_row_threshold
+    )
+    if large_by_fragments or large_by_rows:
         telemetry.incr("dataset.deferred_to_large_tier")
         return {"uri": uri, "tier": "large", "fragments": fragments}
     return compact_small_dataset(uri, config, telemetry)
