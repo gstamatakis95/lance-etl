@@ -7,9 +7,9 @@ with no Spark involved:
   configuration production uses, mixing fresh inserts, updates of existing keys, and deletes of a known subset.
   The expected terminal state is tracked exactly in memory as ``{key_index: last_upsert_round}``.
 - A COMPACTOR thread sweeps every dataset, compacting whenever the fragment count exceeds a small threshold. The
-  head dataset uses the tier-B plan/execute/commit triad with the production re-plan-on-conflict loop
-  (:meth:`lance_etl.maintenance.MaintenanceJob.commit_rewrites` plus re-plan, mirroring ``compact_one``), and the
-  tail datasets use :func:`lance_etl.maintenance.compact_small_dataset`. Version cleanup runs only at the end,
+  head dataset uses the plan/execute/commit cycle with the production re-plan-on-conflict loop
+  (:func:`lance_etl.maintenance.commit_one_dataset` plus re-plan, mirroring ``MaintenanceJob.run``), and the
+  tail datasets use the in-process ``compact_dataset_inline`` test helper. Version cleanup runs only at the end,
   through :func:`lance_etl.maintenance.cleanup_dataset` with the default retention horizon, so concurrent readers
   pinned to older versions are never broken mid-run.
 - An INDEXER thread loops incremental maintenance. The head dataset uses the real segment-API paths: vector IVF_RQ
@@ -78,6 +78,7 @@ from typing import Any
 import lance
 import pyarrow as pa
 import pytest
+from conftest import compact_dataset_inline
 from lance.optimize import Compaction, CompactionTask
 
 import lance_etl.indexing.segments as indexing_segments
@@ -99,8 +100,8 @@ from lance_etl.indexing import (
     serialize_segment,
     vector_index_name,
 )
-from lance_etl.maintenance import MaintenanceConfig, MaintenanceJob, cleanup_dataset, compact_small_dataset
-from lance_etl.telemetry import Telemetry, TelemetryConfig, is_commit_conflict_error
+from lance_etl.maintenance import MaintenanceConfig, cleanup_dataset, commit_one_dataset
+from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 pytestmark = pytest.mark.integration
 
@@ -309,24 +310,24 @@ def run_ingester(
         time.sleep(pause_seconds)
 
 
-def compact_head_with_replan(uri: str, compactor: MaintenanceJob, telemetry: Telemetry) -> str:
-    """Run one tier-B plan/execute/commit cycle with the production re-plan loop.
+def compact_head_with_replan(uri: str, config: MaintenanceConfig, telemetry: Telemetry) -> str:
+    """Run the production plan/execute/commit cycle in process with the re-plan loop.
 
-    Mirrors :meth:`MaintenanceJob.compact_one` without Spark: the rewrite tasks execute in process and the commit
-    goes through :meth:`MaintenanceJob.commit_rewrites` with its deliberately small manifest-race budget. A
-    semantic commit conflict triggers a re-plan at the latest version instead of a re-commit, up to the configured
-    ``replan_budget``, after which the dataset is skipped for this sweep.
+    Mirrors :meth:`MaintenanceJob.run` for one dataset without Spark: the rewrite tasks execute
+    in process and the commit goes through the production :func:`commit_one_dataset` with its
+    deliberately small manifest-race budget. A semantic commit conflict triggers a re-plan at
+    the latest version instead of a re-commit, up to the configured ``replan_budget``, after
+    which the dataset is skipped for this sweep.
 
     Args:
         uri: Dataset URI.
-        compactor: The compactor carrying the tier-B configuration.
+        config: The compaction configuration.
         telemetry: Telemetry facade shared by the actors.
 
     Returns:
         ``"noop"`` when nothing needed compacting, ``"committed"`` on success, or ``"skipped"`` when every
         re-plan cycle conflicted.
     """
-    config: MaintenanceConfig = compactor.config
     cycles: int = 0
     while cycles < config.replan_budget:
         cycles += 1
@@ -339,13 +340,9 @@ def compact_head_with_replan(uri: str, compactor: MaintenanceJob, telemetry: Tel
         for task_json in task_jsons:
             shard: lance.LanceDataset = lance.dataset(uri, version=plan.read_version)
             rewrites.append(CompactionTask.from_json(task_json).execute(shard).json())
-        try:
-            compactor.commit_rewrites(uri, rewrites, telemetry)
+        outcome: dict[str, object] = commit_one_dataset(uri, rewrites, config, telemetry)
+        if not outcome.get("conflict"):
             return "committed"
-        except (OSError, RuntimeError) as exc:
-            if not is_commit_conflict_error(exc):
-                raise
-            telemetry.incr("dataset.replanned")
     telemetry.incr("dataset.hot_skipped")
     return "skipped"
 
@@ -353,7 +350,7 @@ def compact_head_with_replan(uri: str, compactor: MaintenanceJob, telemetry: Tel
 def run_compactor_loop(
     head_uri: str,
     tail_uris: list[str],
-    head_compactor: MaintenanceJob,
+    head_config: MaintenanceConfig,
     tail_config: MaintenanceConfig,
     telemetry: Telemetry,
     stop: threading.Event,
@@ -364,19 +361,19 @@ def run_compactor_loop(
     committers pinned to older versions keep their transaction files for the whole run.
 
     Args:
-        head_uri: The head dataset URI, compacted through the tier-B triad.
-        tail_uris: Tail dataset URIs, compacted with the small-tier helper.
-        head_compactor: The compactor carrying the tier-B configuration.
-        tail_config: Small-tier compaction configuration with cleanup disabled.
+        head_uri: The head dataset URI, compacted through the plan/execute/commit cycle.
+        tail_uris: Tail dataset URIs, compacted with the in-process helper.
+        head_config: The head dataset's compaction configuration.
+        tail_config: Tail compaction configuration with cleanup disabled.
         telemetry: Telemetry facade shared by the actors.
         stop: Set when ingestion finished and the loop should exit.
     """
     while not stop.is_set():
         if fragment_count(head_uri) > HEAD_COMPACT_FRAGMENT_THRESHOLD:
-            compact_head_with_replan(head_uri, head_compactor, telemetry)
+            compact_head_with_replan(head_uri, head_config, telemetry)
         for uri in tail_uris:
             if fragment_count(uri) > TAIL_COMPACT_FRAGMENT_THRESHOLD:
-                compact_small_dataset(uri, tail_config, telemetry)
+                compact_dataset_inline(uri, tail_config, telemetry)
         time.sleep(COMPACTOR_SWEEP_PAUSE_SECONDS)
 
 
@@ -639,14 +636,12 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
     ]
     tail_uris: list[str] = [dataset_uri(etl_config, *routing) for routing in tail_routings]
 
-    head_compactor: MaintenanceJob = MaintenanceJob(
-        MaintenanceConfig(
-            telemetry=telemetry_config,
-            target_rows_per_fragment=HEAD_TARGET_ROWS_PER_FRAGMENT,
-            commit_backoff_seconds=0.05,
-            large_commit_retries=2,
-            replan_budget=4,
-        )
+    head_compaction_config: MaintenanceConfig = MaintenanceConfig(
+        telemetry=telemetry_config,
+        target_rows_per_fragment=HEAD_TARGET_ROWS_PER_FRAGMENT,
+        commit_backoff_seconds=0.05,
+        large_commit_retries=2,
+        replan_budget=4,
     )
     tail_compaction_config: MaintenanceConfig = MaintenanceConfig(
         telemetry=telemetry_config,
@@ -731,7 +726,7 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
                     run_compactor_loop,
                     head_uri,
                     tail_uris,
-                    head_compactor,
+                    head_compaction_config,
                     tail_compaction_config,
                     telemetry,
                     stop,
@@ -791,10 +786,10 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
     final_cycles: int = 0
     while final_cycles < FINAL_COMPACT_CYCLES:
         final_cycles += 1
-        if compact_head_with_replan(head_uri, head_compactor, telemetry) == "noop":
+        if compact_head_with_replan(head_uri, head_compaction_config, telemetry) == "noop":
             break
     for uri in tail_uris:
-        compact_small_dataset(uri, tail_compaction_config, telemetry)
+        compact_dataset_inline(uri, tail_compaction_config, telemetry)
     maintain_head_indexes(head_uri, vector_handler, btree_handler, fts_handler, index_config, telemetry, events)
     for uri in tail_uris:
         index_dataset_locally(uri, index_config)
@@ -943,7 +938,7 @@ def racing_compaction_commit(
         """
         if not state["compacted"]:
             state["compacted"] = True
-            compact_small_dataset(uri, compaction_config, telemetry)
+            compact_dataset_inline(uri, compaction_config, telemetry)
         try:
             return real_commit(*args, **kwargs)
         except ValueError as exc:

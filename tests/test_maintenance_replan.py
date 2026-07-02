@@ -1,25 +1,29 @@
-"""Tests for tier-B compaction coexistence behavior.
+"""Tests for the unified compaction's replan-on-commit-conflict rounds.
 
-Covers the re-plan-on-commit-conflict loop (a tier-B commit conflict is deterministic on retry because the conflict
-scan is pinned to the plan version, so the productive retry is plan plus re-execute), the hot-dataset skip after the
-re-plan budget, the binary-copy compaction-mode default and its force-mode rejection, and the version-cleanup horizon
-floor. Spark is replaced with a minimal in-process fake since only ``parallelize().map().collect()`` and scheduler-pool
-properties are exercised.
+A commit conflict is deterministic on retry because the conflict scan is pinned to the plan
+version, so the productive retry is a fresh plan plus re-execute. These tests cover the
+fleet-level replan rounds in :meth:`MaintenanceJob.run` (conflicted datasets re-enter the next
+round, exhaustion defers them), the small manifest-race budget inside
+:func:`commit_one_dataset`, the binary-copy compaction-mode default, and the version-cleanup
+horizon floor. Spark is replaced with a minimal in-process fake since only
+``parallelize().map/mapPartitions().collect()`` is exercised.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import lance
 import pyarrow as pa
 import pytest
 
+import lance_etl.maintenance.job as maintenance_job
 from lance_etl.maintenance import (
     MaintenanceConfig,
     MaintenanceJob,
     cleanup_dataset,
+    commit_one_dataset,
 )
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
@@ -49,6 +53,17 @@ class FakeRdd:
         """
         return FakeRdd([fn(item) for item in self.items])
 
+    def mapPartitions(self, fn: Callable[[Iterator[object]], Iterator[object]]) -> FakeRdd:
+        """Apply a partition function to the single in-process partition.
+
+        Args:
+            fn: The partition mapper yielding outputs.
+
+        Returns:
+            A new fake RDD with the collected outputs.
+        """
+        return FakeRdd(list(fn(iter(self.items))))
+
     def collect(self) -> list[object]:
         """Return the items.
 
@@ -73,15 +88,6 @@ class FakeSparkContext:
         """
         del slices
         return FakeRdd(list(items))
-
-    def setLocalProperty(self, key: str, value: str | None) -> None:
-        """Accept and ignore scheduler-pool properties.
-
-        Args:
-            key: The property name.
-            value: The property value.
-        """
-        del key, value
 
 
 class FakeSpark:
@@ -114,7 +120,7 @@ def dataset_uri(tmp_path: Path) -> str:
 
 
 def replan_config(telemetry_config: TelemetryConfig, **overrides: object) -> MaintenanceConfig:
-    """Build the tier-B compaction configuration used by the re-plan tests.
+    """Build the compaction configuration used by the re-plan tests.
 
     Args:
         telemetry_config: The test telemetry configuration.
@@ -134,101 +140,80 @@ def replan_config(telemetry_config: TelemetryConfig, **overrides: object) -> Mai
     return MaintenanceConfig(**base)
 
 
-def test_compact_one_replans_until_budget_then_skips(
-    dataset_uri: str, telemetry_config: TelemetryConfig, telemetry: Telemetry, monkeypatch: pytest.MonkeyPatch
+def test_run_replans_until_budget_then_defers(
+    dataset_uri: str, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Every commit conflict triggers a fresh plan, and exhaustion skips the dataset."""
+    """Every commit conflict re-enters the next round, and exhaustion defers the dataset."""
     config: MaintenanceConfig = replan_config(telemetry_config)
-    compactor: MaintenanceJob = MaintenanceJob(config)
-    plans: list[int] = []
-
-    def fake_execute_plan(
-        self: MaintenanceJob, spark: object, uri: str, plan_version: int, task_jsons: list[str]
-    ) -> list[str]:
-        """Record the cycle instead of executing rewrite tasks."""
-        del self, spark, uri, task_jsons
-        plans.append(plan_version)
-        return []
+    commits: list[str] = []
 
     def conflicting_commit(
-        self: MaintenanceJob, uri: str, rewrite_jsons: list[str], telemetry: Telemetry
-    ) -> dict[str, int]:
-        """Always fail with a retryable commit conflict."""
-        del self, uri, rewrite_jsons, telemetry
-        raise RuntimeError("Retryable commit conflict for version 9: compaction lost the race")
+        uri: str, rewrite_jsons: list[str], cfg: MaintenanceConfig, telemetry: Telemetry
+    ) -> dict[str, object]:
+        """Always report a semantic commit conflict."""
+        del rewrite_jsons, cfg, telemetry
+        commits.append(uri)
+        return {"uri": uri, "conflict": True}
 
-    monkeypatch.setattr(MaintenanceJob, "execute_plan", fake_execute_plan)
-    monkeypatch.setattr(MaintenanceJob, "commit_rewrites", conflicting_commit)
-    result: dict[str, object] = compactor.compact_one(FakeSpark(), dataset_uri, telemetry)
-    assert len(plans) == config.replan_budget
-    assert "skipped" in result
-    assert result["tier"] == "large"
-    assert "fragments_removed" not in result
+    monkeypatch.setattr(maintenance_job, "commit_one_dataset", conflicting_commit)
+    results: list[dict[str, object]] = MaintenanceJob(config).run(FakeSpark(), [dataset_uri])
+    assert len(commits) == config.replan_budget
+    assert len(results) == 1
+    assert "conflicted in all 3" in str(results[0]["skipped"])
+    assert "fragments_removed" not in results[0]
 
 
-def test_compact_one_succeeds_after_one_replan(
-    dataset_uri: str, telemetry_config: TelemetryConfig, telemetry: Telemetry, monkeypatch: pytest.MonkeyPatch
+def test_run_commits_after_one_conflict(
+    dataset_uri: str, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A conflict on the first cycle is resolved by the second plan's commit."""
+    """A conflict in the first round is resolved by the second round's fresh plan and commit."""
     config: MaintenanceConfig = replan_config(telemetry_config)
-    compactor: MaintenanceJob = MaintenanceJob(config)
-    commits: list[int] = []
-
-    def fake_execute_plan(
-        self: MaintenanceJob, spark: object, uri: str, plan_version: int, task_jsons: list[str]
-    ) -> list[str]:
-        """Skip the executor fan-out."""
-        del self, spark, uri, plan_version, task_jsons
-        return []
+    real_commit = maintenance_job.commit_one_dataset
+    commits: list[str] = []
 
     def commit_once_conflicting(
-        self: MaintenanceJob, uri: str, rewrite_jsons: list[str], telemetry: Telemetry
-    ) -> dict[str, int]:
-        """Conflict on the first attempt, then succeed."""
-        del self, uri, rewrite_jsons, telemetry
-        commits.append(1)
+        uri: str, rewrite_jsons: list[str], cfg: MaintenanceConfig, telemetry: Telemetry
+    ) -> dict[str, object]:
+        """Conflict on the first attempt, then delegate to the real commit."""
+        commits.append(uri)
         if len(commits) == 1:
-            raise OSError("LanceError(IO): Retryable commit conflict for version 4")
-        return {"fragments_removed": 8, "fragments_added": 1, "files_removed": 8, "files_added": 1}
+            return {"uri": uri, "conflict": True}
+        return real_commit(uri, rewrite_jsons, cfg, telemetry)
 
-    monkeypatch.setattr(MaintenanceJob, "execute_plan", fake_execute_plan)
-    monkeypatch.setattr(MaintenanceJob, "commit_rewrites", commit_once_conflicting)
-    result: dict[str, object] = compactor.compact_one(FakeSpark(), dataset_uri, telemetry)
+    monkeypatch.setattr(maintenance_job, "commit_one_dataset", commit_once_conflicting)
+    results: list[dict[str, object]] = MaintenanceJob(config).run(FakeSpark(), [dataset_uri])
     assert len(commits) == 2
-    assert result["fragments_removed"] == 8
-    assert "skipped" not in result
+    assert results[0]["fragments_removed"] == ROWS // ROWS_PER_FRAGMENT
+    assert "skipped" not in results[0]
+    assert len(lance.dataset(dataset_uri).get_fragments()) == 1
 
 
-def test_compact_one_propagates_non_conflict_errors(
-    dataset_uri: str, telemetry_config: TelemetryConfig, telemetry: Telemetry, monkeypatch: pytest.MonkeyPatch
+def test_run_propagates_non_conflict_errors(
+    dataset_uri: str, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Errors that are not commit conflicts fail the dataset instead of re-planning."""
-    compactor: MaintenanceJob = MaintenanceJob(replan_config(telemetry_config))
+    """Errors that are not commit conflicts fail the run instead of re-planning."""
 
-    def fake_execute_plan(
-        self: MaintenanceJob, spark: object, uri: str, plan_version: int, task_jsons: list[str]
-    ) -> list[str]:
-        """Skip the executor fan-out."""
-        del self, spark, uri, plan_version, task_jsons
-        return []
-
-    def broken_commit(self: MaintenanceJob, uri: str, rewrite_jsons: list[str], telemetry: Telemetry) -> dict[str, int]:
+    def broken_commit(
+        uri: str, rewrite_jsons: list[str], cfg: MaintenanceConfig, telemetry: Telemetry
+    ) -> dict[str, object]:
         """Fail with a non-conflict error."""
-        del self, uri, rewrite_jsons, telemetry
+        del uri, rewrite_jsons, cfg, telemetry
         raise RuntimeError("schema mismatch: field order differs")
 
-    monkeypatch.setattr(MaintenanceJob, "execute_plan", fake_execute_plan)
-    monkeypatch.setattr(MaintenanceJob, "commit_rewrites", broken_commit)
+    monkeypatch.setattr(maintenance_job, "commit_one_dataset", broken_commit)
     with pytest.raises(RuntimeError, match="schema mismatch"):
-        compactor.compact_one(FakeSpark(), dataset_uri, telemetry)
+        MaintenanceJob(replan_config(telemetry_config)).run(FakeSpark(), [dataset_uri])
 
 
-def test_commit_rewrites_uses_small_budget(
+def test_commit_one_dataset_uses_small_budget(
     dataset_uri: str, telemetry_config: TelemetryConfig, telemetry: Telemetry, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The tier-B commit retries only the small large_commit_retries budget."""
+    """The commit retries only the small large_commit_retries manifest-race budget, then defers.
+
+    Exhaustion surfaces as a ``conflict`` marker rather than an exception, so the fleet run
+    re-plans the dataset instead of failing.
+    """
     config: MaintenanceConfig = replan_config(telemetry_config, large_commit_retries=2)
-    compactor: MaintenanceJob = MaintenanceJob(config)
     attempts: list[int] = []
 
     class ConflictingCompaction:
@@ -248,8 +233,8 @@ def test_commit_rewrites_uses_small_budget(
             raise OSError("LanceError(IO): Retryable commit conflict for version 2")
 
     monkeypatch.setattr("lance_etl.maintenance.job.Compaction", ConflictingCompaction)
-    with pytest.raises(OSError, match="Retryable commit conflict"):
-        compactor.commit_rewrites(dataset_uri, [], telemetry)
+    result: dict[str, object] = commit_one_dataset(dataset_uri, [], config, telemetry)
+    assert result == {"uri": dataset_uri, "conflict": True}
     assert len(attempts) == config.large_commit_retries + 1
 
 

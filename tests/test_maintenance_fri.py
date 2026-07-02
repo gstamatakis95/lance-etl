@@ -11,8 +11,9 @@ from pathlib import Path
 
 import lance
 import pyarrow as pa
+from conftest import compact_dataset_inline
 
-from lance_etl.maintenance import MaintenanceConfig, compact_small_dataset
+from lance_etl.maintenance import MaintenanceConfig
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 ROWS: int = 6000
@@ -66,7 +67,7 @@ def test_small_tier_defer_index_remap_records_frag_reuse_index(
 ) -> None:
     """Deferred remap on the small tier produces a frag-reuse system index."""
     uri: str = write_indexed_dataset(tmp_path)
-    result: dict[str, object] = compact_small_dataset(uri, fri_config(telemetry_config), telemetry)
+    result: dict[str, object] = compact_dataset_inline(uri, fri_config(telemetry_config), telemetry)
     assert result["fragments_removed"] > 0
     names: list[str] = [description.name for description in lance.dataset(uri).describe_indices()]
     assert any(name == "__lance_frag_reuse" for name in names)
@@ -77,7 +78,7 @@ def test_reads_stay_correct_after_deferred_remap(
 ) -> None:
     """Lazy FRI remapping keeps indexed reads correct with no explicit step."""
     uri: str = write_indexed_dataset(tmp_path)
-    compact_small_dataset(uri, fri_config(telemetry_config), telemetry)
+    compact_dataset_inline(uri, fri_config(telemetry_config), telemetry)
     dataset: lance.LanceDataset = lance.dataset(uri)
     result: pa.Table = dataset.to_table(filter="id = 700")
     assert result.num_rows == 1

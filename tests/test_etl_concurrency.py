@@ -17,10 +17,11 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+from conftest import compact_dataset_inline
 
 from lance_etl.etl import ETLConfig, apply_merge, dataset_uri
 from lance_etl.etl.sink import table_chunks
-from lance_etl.maintenance import MaintenanceConfig, compact_small_dataset
+from lance_etl.maintenance import MaintenanceConfig
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 ROUTING_KEY: tuple[str, str, str] = ("org1", "tenant1", "ns1")
@@ -172,7 +173,7 @@ def test_concurrent_merges_and_compaction(
         try:
             thread_telemetry: Telemetry = Telemetry.create(etl_config.telemetry, attach_lance_bridge=False)
             while not stop_compacting.is_set():
-                compactions.append(compact_small_dataset(uri, compaction_config, thread_telemetry))
+                compactions.append(compact_dataset_inline(uri, compaction_config, thread_telemetry))
                 time.sleep(0.02)
         except BaseException as exc:
             failures.append(exc)
@@ -191,7 +192,7 @@ def test_concurrent_merges_and_compaction(
 
     assert failures == []
     assert len(compactions) >= 2
-    assert all(item["tier"] == "small" for item in compactions)
+    assert all(int(item["tasks"]) >= 1 for item in compactions)
     table: pa.Table = lance.dataset(uri).to_table().sort_by("vector_id")
     assert table.num_rows == 400
     assert table["vector_id"].to_pylist() == sorted(keys_one + keys_two)

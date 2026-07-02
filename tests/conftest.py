@@ -18,8 +18,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import lance
 import pyarrow as pa
 import pytest
+from lance.optimize import Compaction
 
-from lance_etl.telemetry import Telemetry, TelemetryConfig
+from lance_etl.maintenance import MaintenanceConfig, cleanup_dataset, compaction_metrics_dict
+from lance_etl.telemetry import Telemetry, TelemetryConfig, commit_with_retries
 
 
 @pytest.fixture
@@ -82,3 +84,34 @@ def write_fragmented_dataset(uri: str, table: pa.Table, max_rows_per_file: int) 
         The written dataset handle.
     """
     return lance.write_dataset(table, uri, max_rows_per_file=max_rows_per_file)
+
+
+def compact_dataset_inline(uri: str, config: MaintenanceConfig, telemetry: Telemetry) -> dict[str, int]:
+    """Compact one dataset fully in-process, a test-only harness for the concurrency suites.
+
+    Production compaction always runs the fleet plan-execute-commit phases on Spark. The
+    concurrency tests need a compaction they can race against merges and index builds from a
+    plain thread without a Spark session, so this helper runs ``Compaction.execute`` (the same
+    plan-execute-commit cycle in one process) with the production conflict-retry wrapper and the
+    production version cleanup.
+
+    Args:
+        uri: Dataset URI.
+        config: Maintenance configuration.
+        telemetry: Telemetry facade for the calling thread.
+
+    Returns:
+        The compaction metrics merged with ``uri``, ``tasks``, and ``bytes_removed``.
+    """
+
+    def action() -> dict[str, int]:
+        """Run the whole compaction against the latest version."""
+        dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+        metrics = Compaction.execute(dataset, config.execute_options())
+        return compaction_metrics_dict(metrics)
+
+    metrics: dict[str, int] = commit_with_retries(action, config.commit_retries, config.commit_backoff_seconds, None)
+    bytes_removed: int = cleanup_dataset(uri, config, telemetry)
+    result: dict[str, int] = {"tasks": 1, "bytes_removed": bytes_removed}
+    result.update(metrics)
+    return result

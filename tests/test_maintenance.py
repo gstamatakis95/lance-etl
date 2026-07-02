@@ -279,26 +279,26 @@ class TestTtlOffIsNoop:
 class TestRunOrdering:
     """A maintenance run uses a consolidated per-dataset pass for DQ, TTL, and compaction."""
 
-    def test_consolidated_pass_runs_all_datasets(
+    def test_plan_fan_out_covers_all_datasets(
         self, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The consolidated fan-out calls maintain_one_dataset for every dataset in the fleet.
+        """The plan fan-out calls plan_one_dataset for every dataset in the fleet.
 
-        With the single fan-out design, maintain_one_dataset handles DQ, TTL, and classify-or-compact
-        in one executor task per dataset. Patching maintain_one_dataset at the module level lets the
-        test observe that every URI is processed exactly once.
+        With the unified design, plan_one_dataset handles TTL, the skip check, and the
+        compaction plan in one executor task per dataset. Patching plan_one_dataset at the
+        module level lets the test observe that every URI is planned exactly once.
         """
         processed: list[str] = []
 
-        def record_maintain(
+        def record_plan(
             uri: str, config: MaintenanceConfig, cutoff: datetime | None, tel: Telemetry
         ) -> dict[str, object]:
-            """Record that maintain_one_dataset was called for this URI."""
+            """Record that plan_one_dataset was called for this URI."""
             del config, cutoff, tel
             processed.append(uri)
-            return {"uri": uri, "tier": "small", "tasks": 1, "bytes_removed": 0, "fragments_removed": 0}
+            return {"uri": uri, "tasks": 0, "bytes_removed": 0, "fragments_removed": 0}
 
-        monkeypatch.setattr(maintenance_job, "maintain_one_dataset", record_maintain)
+        monkeypatch.setattr(maintenance_job, "plan_one_dataset", record_plan)
         config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config, ttl_column="ttl")
         MaintenanceJob(config).run(FakeSpark(), ["a.lance", "b.lance"])
         assert processed == ["a.lance", "b.lance"]

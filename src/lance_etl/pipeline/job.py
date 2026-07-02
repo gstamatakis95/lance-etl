@@ -78,7 +78,6 @@ class PipelineConfig:
         """
         self.maintenance.telemetry = self.telemetry
         self.maintenance.storage_options = self.storage_options
-        self.maintenance.scheduler_pool = self.scheduler_pool
         self.indexing.telemetry = self.telemetry
         self.indexing.storage_options = self.storage_options
         self.indexing.scheduler_pool = self.scheduler_pool

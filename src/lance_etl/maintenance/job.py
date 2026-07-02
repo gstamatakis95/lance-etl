@@ -1,18 +1,26 @@
-"""Per-dataset maintenance job: TTL expiration, two-tier compaction, and version cleanup.
+"""Fleet maintenance job: TTL expiration, unified task-based compaction, and version cleanup.
 
-Owns :class:`MaintenanceConfig`, :class:`MaintenanceJob`, and all the supporting functions
-including :func:`classify_or_compact`, :func:`maintain_one_dataset`, and the new
-:func:`compaction_skip_reason` derived-state check.
+Owns :class:`MaintenanceConfig`, :class:`MaintenanceJob`, and the three phase functions of the
+unified compaction flow. Every dataset, regardless of size, follows the same
+plan-execute-commit path built on the same Lance APIs:
 
-:func:`classify_or_compact` and :func:`maintain_one_dataset` are defined here (same module) so
-existing monkeypatch interception in tests keeps a single defining site.
+- Phase P (:func:`plan_one_dataset`): a per-dataset executor fan-out runs the TTL delete, the
+  derived-state skip check, and ``Compaction.plan``, returning serialized rewrite tasks. A
+  small dataset yields one task and a large one yields many.
+- Phase E (:meth:`MaintenanceJob.execute_fleet_tasks`): every dataset's rewrite tasks run in
+  ONE flat Spark job, so Spark schedules the whole fleet's work instead of driver thread pools.
+- Phase C (:func:`commit_one_dataset`): a per-dataset executor fan-out commits the collected
+  rewrites and prunes old versions. A commit conflict marks the dataset for the next replan
+  round instead of retrying stale rewrites.
+
+:meth:`MaintenanceJob.run` repeats the three phases for conflicted datasets up to
+``replan_budget`` rounds, then defers the survivors to the next scheduled run.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable, Iterator
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -50,40 +58,30 @@ class MaintenanceConfig:
         max_rows_per_group: Maximum rows per group within a fragment.
         max_bytes_per_file: Maximum bytes per compacted file.
         materialize_deletions_threshold: Deletion fraction above which a fragment is rewritten;
-            default ``0.1`` matches lance's own default. An inline index remap on tier B is
-            triggered when covered fragments are rewritten, so budget commit time accordingly for
-            heavily indexed head datasets.
-        defer_index_remap: Defer index remap on both tiers. The distributed tier passes the
-            options to ``Compaction.commit`` and needs a pylance built from the
+            default ``0.1`` matches lance's own default. An inline index remap is triggered when
+            covered fragments are rewritten, so budget commit time accordingly for heavily
+            indexed head datasets.
+        defer_index_remap: Defer index remap at commit time. The options are passed to
+            ``Compaction.commit`` and need a pylance built from the
             ``fix/compaction-commit-options`` lance branch.
         max_source_fragments: Cap on source fragments consumed per run for incremental
             compaction; ``None`` is unbounded, ``0`` is rejected.
         num_threads: Worker threads inside a single rewrite task.
         batch_size: Rows per batch when rewriting.
-        max_tasks: Maximum Spark tasks for one dataset's rewrites.
-        large_dataset_fragment_threshold: Fragment count above which a dataset uses the
-            distributed plan/execute/commit path instead of in-process ``Compaction.execute``.
-        large_dataset_row_threshold: Row count at or above which a dataset uses the distributed
-            tier even when its fragment count is below ``large_dataset_fragment_threshold``. A
-            dataset that is large by rows but has few (large) fragments would otherwise be rewritten
-            entirely inside one in-process executor task, which streams but runs single-threaded and
-            slow. Routing it to the distributed tier shards the rewrite across executors. ``None``
-            disables the row dimension and classifies on fragment count alone. The row count is read
-            from fragment metadata (no data scan).
-        batch_partitions: Maximum Spark partitions for the small-dataset batch job.
-        max_concurrent_large: Driver threads running large-dataset compactions concurrently.
-        scheduler_pool: Spark FAIR scheduler pool for large-dataset jobs.
+        max_tasks: Upper bound on Spark partitions for the flat fleet-wide rewrite job.
+        batch_partitions: Maximum Spark partitions for the per-dataset plan and commit fan-outs.
         cleanup_older_than_seconds: Age threshold for version cleanup; default ``172_800`` (2
             days) with the HEAD-tag exemption keeps rollback headroom while cutting manifest
             storage. ``None`` defers to lance's 14-day default. Values below
             ``min_cleanup_horizon_seconds`` are rejected.
         retain_versions: Number of recent versions to retain regardless of age.
-        commit_retries: Retry budget for small-tier compaction and TTL delete commit conflicts.
+        commit_retries: Retry budget for TTL delete commit conflicts.
         commit_backoff_seconds: Base backoff between commit retries.
-        large_commit_retries: Retry budget around tier-B ``Compaction.commit``; kept small
-            because semantic conflicts re-fail deterministically and only the raw manifest-write
-            race benefits from a retry.
-        replan_budget: Plan/execute/commit cycles per tier-B dataset before skipping as hot.
+        large_commit_retries: Retry budget around ``Compaction.commit``; kept small because
+            semantic conflicts re-fail deterministically and only the raw manifest-write race
+            benefits from a retry.
+        replan_budget: Plan/execute/commit rounds a conflicted dataset participates in before
+            it is skipped as hot and deferred to the next scheduled run.
         compaction_mode: Lance compaction mode for ``Compaction.execute`` and
             ``Compaction.plan``; ``try_binary_copy`` falls back to reencode per task, never
             errors on deletion-bearing fragments unlike ``force_binary_copy``.
@@ -105,11 +103,7 @@ class MaintenanceConfig:
     num_threads: int | None = None
     batch_size: int | None = None
     max_tasks: int = 256
-    large_dataset_fragment_threshold: int = 128
-    large_dataset_row_threshold: int | None = 20_000_000
     batch_partitions: int = 512
-    max_concurrent_large: int = 4
-    scheduler_pool: str = "lance-maintenance"
     cleanup_older_than_seconds: int | None = 172_800
     retain_versions: int | None = None
     commit_retries: int = DEFAULT_COMMIT_RETRIES
@@ -132,10 +126,9 @@ class MaintenanceConfig:
         """Build the compaction options dict shared by ``execute``, ``plan``, and ``commit``.
 
         Deleted rows are always materialized and the mode is taken from
-        :attr:`compaction_mode`. The same dict is passed to single-process
-        ``Compaction.execute``, to the distributed ``Compaction.plan``, and to the distributed
+        :attr:`compaction_mode`. The same dict is passed to ``Compaction.plan`` and to
         ``Compaction.commit`` so commit-time options such as ``defer_index_remap`` take effect
-        on both tiers.
+        uniformly.
 
         Returns:
             Options accepted by the Compaction entry points, omitting unset optional values.
@@ -384,47 +377,6 @@ def cleanup_dataset(uri: str, config: MaintenanceConfig, telemetry: Telemetry) -
     return int(stats.bytes_removed)
 
 
-def compact_small_dataset(uri: str, config: MaintenanceConfig, telemetry: Telemetry) -> dict[str, Any]:
-    """Compact one small dataset entirely inside the current executor task.
-
-    Runs ``Compaction.execute``, which honors every configured option including
-    ``defer_index_remap`` and ``max_source_fragments``, then prunes old versions. Commit conflicts
-    are retried by re-running the whole compaction against the latest version.
-
-    Args:
-        uri: Dataset URI.
-        config: Maintenance configuration.
-        telemetry: Telemetry facade for the current process.
-
-    Returns:
-        A statistics dictionary for the dataset with ``tier`` set to ``"small"``.
-    """
-
-    def action() -> dict[str, int]:
-        """Run the full in-process compaction against the latest version.
-
-        Returns:
-            The compaction metrics for this attempt.
-        """
-        dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-        metrics: CompactionMetrics = Compaction.execute(dataset, config.execute_options())
-        telemetry.incr("dataset.committed")
-        return compaction_metrics_dict(metrics)
-
-    with telemetry.timed("dataset.total_ms"):
-        metrics: dict[str, int] = commit_with_retries(
-            action,
-            config.commit_retries,
-            config.commit_backoff_seconds,
-            lambda: telemetry.incr("dataset.commit_conflict"),
-        )
-        bytes_removed: int = cleanup_dataset(uri, config, telemetry)
-    telemetry.incr("dataset.compacted")
-    result: dict[str, Any] = {"uri": uri, "tier": "small", "tasks": 1, "bytes_removed": bytes_removed}
-    result.update(metrics)
-    return result
-
-
 def compaction_skip_reason(dataset: lance.LanceDataset) -> str | None:
     """Return a reason string when the dataset has one or fewer fragments and needs no compaction.
 
@@ -446,82 +398,41 @@ def compaction_skip_reason(dataset: lance.LanceDataset) -> str | None:
     return None
 
 
-def classify_or_compact(uri: str, config: MaintenanceConfig, telemetry: Telemetry) -> dict[str, Any]:
-    """Compact a small dataset in process, or flag a large one for tier B.
-
-    A dataset is routed to the distributed tier when its fragment count exceeds
-    ``large_dataset_fragment_threshold`` or, when ``large_dataset_row_threshold`` is set, when its
-    row count reaches that threshold. The row dimension catches datasets that are large by rows but
-    hold few large fragments, which would otherwise be rewritten single-threaded in one in-process
-    executor task. The row count is read from fragment metadata only when the fragment check did not
-    already defer the dataset, so the common small-dataset path adds no extra read.
-
-    Args:
-        uri: Dataset URI.
-        config: Maintenance configuration.
-        telemetry: Telemetry facade for the current process.
-
-    Returns:
-        Small-tier statistics, or ``{"uri", "tier": "large", "fragments"}`` for
-        datasets that cross either the fragment or the row threshold.
-    """
-    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-    fragments: int = int(dataset.stats.dataset_stats()["num_fragments"])
-    large_by_fragments: bool = fragments > config.large_dataset_fragment_threshold
-    large_by_rows: bool = (
-        not large_by_fragments
-        and config.large_dataset_row_threshold is not None
-        and dataset.count_rows() >= config.large_dataset_row_threshold
-    )
-    if large_by_fragments or large_by_rows:
-        telemetry.incr("dataset.deferred_to_large_tier")
-        return {"uri": uri, "tier": "large", "fragments": fragments}
-    return compact_small_dataset(uri, config, telemetry)
-
-
-def maintain_one_dataset(
+def plan_one_dataset(
     uri: str,
     config: MaintenanceConfig,
     cutoff: datetime | None,
     telemetry: Telemetry,
 ) -> dict[str, Any]:
-    """Run the full per-dataset maintenance pass in one executor task with one initial dataset open.
+    """Run phase P for one dataset on an executor: TTL delete, skip check, and compaction plan.
 
-    Opens the dataset once and runs the TTL delete and classify-or-compact steps in sequence,
-    sharing the open handle where possible. A single ``try/except`` around the open call provides
-    failure isolation: a missing, corrupt, or unreadable dataset returns a skip dict and never
-    aborts the fleet run.
+    Opens the dataset once, with failure isolation: a missing, corrupt, or unreadable dataset
+    returns a skip dict and never aborts the fleet run. When TTL is active and a cutoff is
+    supplied, expired rows are deleted first because the delete creates compaction work. The
+    derived-state :func:`compaction_skip_reason` check and an empty ``Compaction.plan`` both end
+    the dataset's run early with a cleanup pass. Otherwise the plan's rewrite tasks are
+    serialized for the fleet-wide execute phase.
 
-    Steps executed (each conditional on its guard):
-
-    - TTL delete: when ``config.ttl_active()`` is ``True`` and ``cutoff`` is not ``None``, runs
-      :func:`run_ttl_on_open_dataset` for schema validation then issues the delete via a
-      re-opening retry action.
-    - Compaction skip check: after the TTL step (TTL may create compaction work), or right after
-      open when TTL is off, :func:`compaction_skip_reason` is consulted. When it returns a reason
-      the dataset is skipped: :func:`cleanup_dataset` still runs, the telemetry counter
-      ``dataset.skipped_no_work`` is incremented, and a dict with ``skipped`` is returned.
-    - Classify and compact: reads the fragment count from the open handle's stats to gate the
-      large-tier fast path, then delegates to :func:`classify_or_compact` so that callers patching
-      that module-level function in tests continue to intercept the compaction step.
+    The same function serves every dataset size: a small dataset yields one rewrite task and a
+    large one yields many, so no separate in-process compaction path exists.
 
     Args:
         uri: Dataset URI.
         config: Maintenance configuration.
-        cutoff: TTL cutoff instant precomputed on the driver, or ``None`` when TTL is not active.
+        cutoff: TTL cutoff instant, or ``None`` to skip the TTL step (replan rounds pass None so
+            TTL runs exactly once per fleet run).
         telemetry: Telemetry facade for the current executor process.
 
     Returns:
-        A result dictionary merging TTL and compaction fields. Always contains ``uri``, ``tier``,
-        and ``bytes_removed``. A skipped dataset has ``tier="skipped"`` and ``skipped`` holding
-        the error message. A dataset with TTL active includes ``ttl_rows_deleted``.
+        A terminal result dict (``skipped`` or ``tasks: 0``), or a planned dict carrying
+        ``read_version`` and ``task_jsons`` for the execute phase.
     """
     try:
         dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
     except (FileNotFoundError, OSError, ValueError) as exc:
         logger.warning("maintenance: cannot open dataset %s, skipping: %s", uri, exc)
         telemetry.incr("dataset.maintenance_open_error")
-        return {"uri": uri, "tier": "skipped", "skipped": str(exc), "bytes_removed": 0}
+        return {"uri": uri, "skipped": str(exc), "bytes_removed": 0}
 
     result: dict[str, Any] = {"uri": uri}
 
@@ -534,17 +445,123 @@ def maintain_one_dataset(
     skip: str | None = compaction_skip_reason(dataset)
     if skip is not None:
         telemetry.incr("dataset.skipped_no_work")
-        bytes_removed: int = cleanup_dataset(uri, config, telemetry)
-        result.update({"tier": "small", "skipped": skip, "bytes_removed": bytes_removed})
+        result.update({"skipped": skip, "tasks": 0, "bytes_removed": cleanup_dataset(uri, config, telemetry)})
         return result
 
-    compact_result: dict[str, Any] = classify_or_compact(uri, config, telemetry)
-    result.update(compact_result)
+    plan = Compaction.plan(lance.dataset(uri, storage_options=config.storage_options), options=config.execute_options())
+    task_jsons: list[str] = [task.json() for task in plan.tasks]
+    if not task_jsons:
+        result.update({"tasks": 0, "fragments_removed": 0, "bytes_removed": cleanup_dataset(uri, config, telemetry)})
+        return result
+
+    result.update({"read_version": plan.read_version, "task_jsons": task_jsons})
+    return result
+
+
+def execute_rewrite_task(
+    uri: str,
+    read_version: int,
+    task_json: str,
+    storage_options: dict[str, Any] | None,
+) -> tuple[str, str]:
+    """Execute one serialized rewrite task against its dataset's plan version on an executor.
+
+    Module-level and parameterized by primitives only, so the Spark closure ships a small
+    ``functools.partial`` instead of any job state.
+
+    Args:
+        uri: Dataset URI the task belongs to.
+        read_version: The dataset version the plan was built against.
+        task_json: The serialized compaction task.
+        storage_options: Object-store options forwarded to lance.
+
+    Returns:
+        The dataset URI paired with the serialized rewrite result.
+    """
+    dataset: lance.LanceDataset = lance.dataset(uri, version=read_version, storage_options=storage_options)
+    task: CompactionTask = CompactionTask.from_json(task_json)
+    return uri, task.execute(dataset).json()
+
+
+def commit_one_dataset(
+    uri: str,
+    rewrite_jsons: list[str],
+    config: MaintenanceConfig,
+    telemetry: Telemetry,
+) -> dict[str, Any]:
+    """Run phase C for one dataset on an executor: commit the rewrites and prune old versions.
+
+    The configured compaction options are passed to ``Compaction.commit`` so
+    ``defer_index_remap`` is honored at commit time. The ``options`` parameter exists on pylance
+    builds carrying the ``fix/compaction-commit-options`` lance patch. Older bindings reject the
+    keyword with a ``TypeError``, so the commit falls back to the bare two-argument call, which
+    is behaviorally identical except that ``defer_index_remap`` is silently impossible: the old
+    binding always remaps covering indices inline. The fallback logs a warning and emits
+    ``dataset.commit_options_unsupported`` when ``defer_index_remap`` was requested. Remove the
+    fallback once every deployment runs the patched pylance.
+
+    Retrying the commit cannot resolve a semantic conflict: the conflict scan is pinned to the
+    plan version, so the same conflicting transaction is found on every attempt. The small
+    ``large_commit_retries`` budget only covers the raw manifest-write race. A semantic conflict
+    returns a ``conflict`` marker so :meth:`MaintenanceJob.run` re-plans the dataset in the next
+    round, which is the productive retry. Any non-conflict error propagates and fails the run.
+
+    Args:
+        uri: Dataset URI.
+        rewrite_jsons: Serialized rewrite results collected from the execute phase.
+        config: Maintenance configuration.
+        telemetry: Telemetry facade for the current executor process.
+
+    Returns:
+        A committed result dict with metrics and ``bytes_removed``, or ``{"uri", "conflict":
+        True}`` when the dataset must be re-planned.
+    """
+    rewrites: list[RewriteResult] = [RewriteResult.from_json(document) for document in rewrite_jsons]
+
+    def action() -> dict[str, int]:
+        """Commit the rewrites against the latest version, falling back on old bindings."""
+        dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+        try:
+            metrics: CompactionMetrics = Compaction.commit(dataset, rewrites, options=config.execute_options())
+        except TypeError as exc:
+            if "options" not in str(exc):
+                raise
+            if config.defer_index_remap:
+                telemetry.incr("dataset.commit_options_unsupported")
+                logger.warning(
+                    "installed pylance does not accept Compaction.commit(options=...): "
+                    "defer_index_remap is NOT taking effect for %s. "
+                    "Rebuild pylance from the fix/compaction-commit-options lance branch.",
+                    uri,
+                )
+            metrics = Compaction.commit(dataset, rewrites)
+        telemetry.incr("dataset.committed")
+        return compaction_metrics_dict(metrics)
+
+    try:
+        with telemetry.timed("dataset.commit_ms"):
+            metrics_dict: dict[str, int] = commit_with_retries(
+                action,
+                config.large_commit_retries,
+                config.commit_backoff_seconds,
+                lambda: telemetry.incr("dataset.commit_conflict"),
+            )
+    except (OSError, RuntimeError) as exc:
+        if not is_commit_conflict_error(exc):
+            raise
+        telemetry.incr("dataset.replanned")
+        logger.warning("compaction commit conflicted for %s; re-planning at the latest version", uri)
+        return {"uri": uri, "conflict": True}
+
+    bytes_removed: int = cleanup_dataset(uri, config, telemetry)
+    telemetry.incr("dataset.compacted")
+    result: dict[str, Any] = {"uri": uri, "tasks": len(rewrite_jsons), "bytes_removed": bytes_removed}
+    result.update(metrics_dict)
     return result
 
 
 class MaintenanceJob:
-    """Runs TTL expiration, two-tier compaction, and version cleanup over a Lance fleet."""
+    """Runs TTL expiration, unified task-based compaction, and version cleanup over a Lance fleet."""
 
     def __init__(self, config: MaintenanceConfig) -> None:
         """Initialize the maintenance job.
@@ -554,253 +571,84 @@ class MaintenanceJob:
         """
         self.config: MaintenanceConfig = config
 
-    def commit_rewrites(self, uri: str, rewrite_jsons: list[str], telemetry: Telemetry) -> dict[str, Any]:
-        """Commit serialized rewrites with a deliberately small retry budget.
+    def execute_fleet_tasks(self, spark: SparkSession, tasks: list[tuple[str, int, str]]) -> dict[str, list[str]]:
+        """Run every dataset's rewrite tasks in one flat Spark job (phase E).
 
-        The configured compaction options are passed to ``Compaction.commit`` so
-        ``defer_index_remap`` is honored at commit time. The ``options`` parameter exists on
-        pylance builds carrying the ``fix/compaction-commit-options`` lance patch. Older bindings
-        reject the keyword with a ``TypeError``, so the commit falls back to the bare two-argument
-        call, which is behaviorally identical except that ``defer_index_remap`` is silently
-        impossible: the old binding always remaps covering indices inline. The fallback therefore
-        logs a warning and emits ``dataset.commit_options_unsupported`` when ``defer_index_remap``
-        was requested, so an operator can see the setting is not taking effect. Remove the
-        fallback once every deployment runs the patched pylance.
-
-        Retrying the commit cannot resolve a semantic conflict: the conflict scan is pinned to the
-        plan version, so the same conflicting transaction is found on every attempt. The small
-        ``large_commit_retries`` budget only covers the raw manifest-write race. Semantic
-        conflicts escape to :meth:`compact_one`, whose re-plan loop is the productive retry.
-
-        Args:
-            uri: Dataset URI.
-            rewrite_jsons: Serialized rewrite results from the executors.
-            telemetry: Telemetry facade.
-
-        Returns:
-            A metrics dictionary for the committed compaction.
-
-        Raises:
-            OSError | RuntimeError: If commits keep conflicting past the retry budget.
-        """
-        config: MaintenanceConfig = self.config
-        rewrites: list[RewriteResult] = [RewriteResult.from_json(j) for j in rewrite_jsons]
-
-        def action() -> dict[str, int]:
-            """Commit the rewrites against the latest version, falling back on old bindings.
-
-            A ``TypeError`` naming the ``options`` keyword means the installed pylance predates
-            the ``fix/compaction-commit-options`` patch. Any other ``TypeError`` propagates.
-
-            Returns:
-                The compaction metrics for this commit.
-            """
-            dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-            try:
-                metrics: CompactionMetrics = Compaction.commit(dataset, rewrites, options=config.execute_options())
-            except TypeError as exc:
-                if "options" not in str(exc):
-                    raise
-                if config.defer_index_remap:
-                    telemetry.incr("dataset.commit_options_unsupported")
-                    logger.warning(
-                        "installed pylance does not accept Compaction.commit(options=...): "
-                        "defer_index_remap is NOT taking effect on the distributed tier for %s. "
-                        "Rebuild pylance from the fix/compaction-commit-options lance branch.",
-                        uri,
-                    )
-                metrics = Compaction.commit(dataset, rewrites)
-            telemetry.incr("dataset.committed")
-            return compaction_metrics_dict(metrics)
-
-        return commit_with_retries(
-            action,
-            config.large_commit_retries,
-            config.commit_backoff_seconds,
-            lambda: telemetry.incr("dataset.commit_conflict"),
-        )
-
-    def execute_plan(self, spark: SparkSession, uri: str, plan_version: int, task_jsons: list[str]) -> list[str]:
-        """Fan one compaction plan's rewrite tasks out across executors.
+        All datasets' tasks share one job, so Spark schedules the fleet's rewrite work across
+        the cluster: a large dataset contributes many tasks and a small one contributes one,
+        with no per-dataset job submission or driver thread pool.
 
         Args:
             spark: Active Spark session.
-            uri: Dataset URI.
-            plan_version: The dataset version the plan was built against.
-            task_jsons: Serialized compaction tasks from the plan.
+            tasks: ``(uri, read_version, task_json)`` triples flattened across the fleet.
 
         Returns:
-            The serialized rewrite results, one per task.
+            The serialized rewrite results grouped by dataset URI.
         """
         config: MaintenanceConfig = self.config
         storage_options: dict[str, Any] | None = config.storage_options
 
-        def execute_task(task_json: str) -> str:
-            """Execute one rewrite task on an executor and return its JSON.
+        def run_one(item: tuple[str, int, str]) -> tuple[str, str]:
+            """Execute one rewrite task on an executor.
 
             Args:
-                task_json: The serialized compaction task.
+                item: The ``(uri, read_version, task_json)`` triple.
 
             Returns:
-                The serialized rewrite result.
+                The URI paired with the serialized rewrite result.
             """
-            shard_dataset: lance.LanceDataset = lance.dataset(
-                uri, version=plan_version, storage_options=storage_options
-            )
-            task: CompactionTask = CompactionTask.from_json(task_json)
-            return task.execute(shard_dataset).json()
+            return execute_rewrite_task(item[0], item[1], item[2], storage_options)
 
-        return (
-            spark.sparkContext.parallelize(task_jsons, min(len(task_jsons), config.max_tasks))
-            .map(execute_task)
-            .collect()
-        )
+        slices: int = max(1, min(config.max_tasks, len(tasks)))
+        pairs: list[tuple[str, str]] = spark.sparkContext.parallelize(tasks, slices).map(run_one).collect()
+        grouped: dict[str, list[str]] = {}
+        for uri, rewrite_json in pairs:
+            grouped.setdefault(uri, []).append(rewrite_json)
+        return grouped
 
-    def compact_one(self, spark: SparkSession, uri: str, telemetry: Telemetry) -> dict[str, Any]:
-        """Plan, execute across executors, and commit one large dataset's compaction.
-
-        The driver only plans and commits. Rewrite I/O runs on executors. With
-        ``defer_index_remap`` off, index remap happens inline during the driver commit, so commit
-        duration grows with the number and size of indices covering rewritten fragments. With it
-        on, the commit records a frag-reuse index instead and stays cheap. With
-        ``max_source_fragments`` set, each run consumes a bounded slice of the oldest fragments
-        for incremental compaction. Spark jobs submitted from the calling thread are pinned to the
-        configured FAIR scheduler pool.
-
-        A commit conflict means the rewrite results are stale, so the loop re-plans and
-        re-executes against the latest version instead of re-committing, which would re-fail
-        deterministically. After ``replan_budget`` conflicting cycles the dataset is skipped for
-        this run with a hot-dataset metric and deferred to the next cycle.
+    def commit_fleet(self, spark: SparkSession, pending: list[tuple[str, list[str]]]) -> list[dict[str, Any]]:
+        """Commit every planned dataset's rewrites in a per-dataset executor fan-out (phase C).
 
         Args:
             spark: Active Spark session.
-            uri: Dataset URI.
-            telemetry: Driver telemetry facade.
+            pending: ``(uri, rewrite_jsons)`` pairs, one per dataset with executed rewrites.
 
         Returns:
-            A statistics dictionary for the dataset with ``tier`` set to ``"large"``. Skipped hot
-            datasets carry a ``"skipped"`` reason instead of commit metrics.
+            One outcome dict per dataset, committed or conflict-marked.
         """
         config: MaintenanceConfig = self.config
-        try:
-            spark.sparkContext.setLocalProperty("spark.scheduler.pool", config.scheduler_pool)
-            tasks_attempted: int = 0
-            for cycle in range(1, config.replan_budget + 1):
-                dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-                plan = Compaction.plan(dataset, options=config.execute_options())
-                task_jsons: list[str] = [task.json() for task in plan.tasks]
-                if not task_jsons:
-                    bytes_removed: int = cleanup_dataset(uri, config, telemetry)
-                    return {
-                        "uri": uri,
-                        "tier": "large",
-                        "tasks": 0,
-                        "fragments_removed": 0,
-                        "bytes_removed": bytes_removed,
-                    }
 
-                tasks_attempted = len(task_jsons)
-                with telemetry.timed("dataset.rewrite_ms"):
-                    rewrite_jsons: list[str] = self.execute_plan(spark, uri, plan.read_version, task_jsons)
-                try:
-                    with telemetry.timed("dataset.commit_ms"):
-                        metrics: dict[str, Any] = self.commit_rewrites(uri, rewrite_jsons, telemetry)
-                except (OSError, RuntimeError) as exc:
-                    if not is_commit_conflict_error(exc):
-                        raise
-                    telemetry.incr("dataset.replanned")
-                    logger.warning(
-                        "compaction commit conflicted for %s (cycle %d/%d); re-planning at the latest version",
-                        uri,
-                        cycle,
-                        config.replan_budget,
-                    )
-                    continue
+        def partition(items: Iterable[tuple[str, list[str]]]) -> Iterator[dict[str, Any]]:
+            """Commit the datasets assigned to this executor task.
 
-                bytes_removed = cleanup_dataset(uri, config, telemetry)
-                telemetry.incr("dataset.compacted")
-                result: dict[str, Any] = {
-                    "uri": uri,
-                    "tier": "large",
-                    "tasks": tasks_attempted,
-                    "bytes_removed": bytes_removed,
-                }
-                result.update(metrics)
-                return result
+            Args:
+                items: ``(uri, rewrite_jsons)`` pairs for this partition.
 
-            telemetry.incr("dataset.hot_skipped")
-            logger.warning(
-                "skipping compaction of hot dataset %s: commit conflicted on all %d plan/execute/commit cycles",
-                uri,
-                config.replan_budget,
-            )
-            return {
-                "uri": uri,
-                "tier": "large",
-                "tasks": tasks_attempted,
-                "bytes_removed": 0,
-                "skipped": f"commit conflicted on all {config.replan_budget} re-plan cycles; deferred to the next run",
-            }
-        finally:
-            spark.sparkContext.setLocalProperty("spark.scheduler.pool", None)
+            Yields:
+                One outcome dict per dataset.
+            """
+            executor_telemetry: Telemetry = Telemetry.create(config.telemetry)
+            for uri, rewrite_jsons in items:
+                yield commit_one_dataset(uri, rewrite_jsons, config, executor_telemetry)
 
-    def compact_large_tier(self, spark: SparkSession, uris: list[str], telemetry: Telemetry) -> list[dict[str, Any]]:
-        """Compact large datasets concurrently from a driver thread pool.
-
-        Each worker thread runs one dataset's plan/execute/commit cycle and pins its Spark jobs to
-        the FAIR scheduler pool, so several large datasets share the cluster instead of queueing
-        FIFO. All datasets are attempted. The first failure is re-raised after the pool drains.
-
-        Args:
-            spark: Active Spark session.
-            uris: Large-dataset URIs from the classification pass.
-            telemetry: Driver telemetry facade.
-
-        Returns:
-            One statistics dictionary per dataset.
-
-        Raises:
-            Exception: The first per-dataset failure, after all datasets finish.
-        """
-        config: MaintenanceConfig = self.config
-        results: list[dict[str, Any]] = []
-        failures: list[BaseException] = []
-        with ThreadPoolExecutor(max_workers=config.max_concurrent_large) as pool:
-            futures: dict[Future[dict[str, Any]], str] = {
-                pool.submit(self.compact_one, spark, uri, telemetry): uri for uri in uris
-            }
-            for future in as_completed(futures):
-                uri: str = futures[future]
-                try:
-                    results.append(future.result())
-                except Exception as exc:
-                    telemetry.error(f"compaction failed for {uri}")
-                    failures.append(exc)
-        if failures:
-            raise failures[0]
-        return results
+        slices: int = max(1, min(config.batch_partitions, len(pending)))
+        return spark.sparkContext.parallelize(pending, slices).mapPartitions(partition).collect()
 
     def run(self, spark: SparkSession, dataset_uris: Iterable[str]) -> list[dict[str, Any]]:
-        """Maintain every dataset in one consolidated fan-out pass, then compact large datasets from the driver.
+        """Maintain every dataset through the unified plan-execute-commit rounds.
 
-        The run is ordered: TTL expiration (when configured) runs first inside the per-dataset
-        executor task, followed by two-tier compaction, followed by version cleanup. A single
-        :func:`maintain_one_dataset` executor function opens each dataset once and runs the TTL
-        delete and classify-or-compact steps in sequence, sharing the open handle. The TTL cutoff
-        is computed once on the driver before the fan-out and shared across all executors so every
-        dataset decides expiry against the same clock. Large-tier datasets returned by the fan-out
-        are then compacted with the distributed plan/execute/commit triad, several at a time from
-        a driver thread pool on the FAIR scheduler pool.
-
-        Run-level aggregates extracted from the outcome dicts include TTL rows deleted and datasets
-        expired, bytes and fragments reclaimed, and the standard dataset/tier counts.
+        Round structure: phase P fans out per dataset (TTL runs only in the first round),
+        phase E runs the whole fleet's rewrite tasks in one flat Spark job, and phase C fans the
+        commits out per dataset. Datasets whose commit hit a semantic conflict re-enter the next
+        round to be re-planned against the latest version, up to ``replan_budget`` rounds, after
+        which they are deferred to the next scheduled run with a ``dataset.hot_skipped`` metric.
 
         Args:
             spark: Active Spark session.
             dataset_uris: Datasets to maintain, typically those changed recently.
 
         Returns:
-            One statistics dictionary per dataset.
+            One statistics dictionary per dataset, in input order.
         """
         config: MaintenanceConfig = self.config
         driver_telemetry: Telemetry = Telemetry.create(config.telemetry)
@@ -812,37 +660,94 @@ class MaintenanceJob:
                 return []
 
             cutoff: datetime | None = compute_cutoff() if config.ttl_active() else None
+            results_by_uri: dict[str, dict[str, Any]] = {}
+            base_by_uri: dict[str, dict[str, Any]] = {}
+            pending_uris: list[str] = uris
 
             with driver_telemetry.timed("run.maintain_ms"):
-                outcomes: list[dict[str, Any]] = fan_out_per_dataset(
-                    spark,
-                    uris,
-                    config.telemetry,
-                    lambda uri, telemetry: maintain_one_dataset(uri, config, cutoff, telemetry),
-                    config.batch_partitions,
+                for round_index in range(config.replan_budget):
+                    round_cutoff: datetime | None = cutoff if round_index == 0 else None
+                    plans: list[dict[str, Any]] = fan_out_per_dataset(
+                        spark,
+                        pending_uris,
+                        config.telemetry,
+                        lambda uri, telemetry, cutoff_value=round_cutoff: plan_one_dataset(
+                            uri, config, cutoff_value, telemetry
+                        ),
+                        config.batch_partitions,
+                    )
+                    planned: list[dict[str, Any]] = []
+                    for plan in plans:
+                        uri = plan["uri"]
+                        if round_index == 0:
+                            base_by_uri[uri] = {
+                                field: plan[field] for field in ("ttl_rows_deleted", "ttl_skipped") if field in plan
+                            }
+                        if plan.get("task_jsons"):
+                            planned.append(plan)
+                        else:
+                            results_by_uri[uri] = {**base_by_uri.get(uri, {}), **plan}
+                    if not planned:
+                        pending_uris = []
+                        break
+
+                    flat_tasks: list[tuple[str, int, str]] = [
+                        (plan["uri"], plan["read_version"], task_json)
+                        for plan in planned
+                        for task_json in plan["task_jsons"]
+                    ]
+                    logger.info(
+                        "compaction round %d/%d: %d datasets, %d rewrite tasks",
+                        round_index + 1,
+                        config.replan_budget,
+                        len(planned),
+                        len(flat_tasks),
+                    )
+                    with driver_telemetry.timed("run.rewrite_ms"):
+                        rewrites_by_uri: dict[str, list[str]] = self.execute_fleet_tasks(spark, flat_tasks)
+
+                    commit_pairs: list[tuple[str, list[str]]] = [
+                        (plan["uri"], rewrites_by_uri.get(plan["uri"], [])) for plan in planned
+                    ]
+                    outcomes: list[dict[str, Any]] = self.commit_fleet(spark, commit_pairs)
+                    conflicted: list[str] = []
+                    for outcome in outcomes:
+                        uri = outcome["uri"]
+                        if outcome.get("conflict"):
+                            conflicted.append(uri)
+                        else:
+                            results_by_uri[uri] = {**base_by_uri.get(uri, {}), **outcome}
+                    pending_uris = conflicted
+                    if not pending_uris:
+                        break
+
+            for uri in pending_uris:
+                driver_telemetry.incr("dataset.hot_skipped")
+                logger.warning(
+                    "skipping compaction of hot dataset %s: commit conflicted in all %d rounds",
+                    uri,
+                    config.replan_budget,
                 )
+                results_by_uri[uri] = {
+                    **base_by_uri.get(uri, {}),
+                    "uri": uri,
+                    "bytes_removed": 0,
+                    "skipped": f"commit conflicted in all {config.replan_budget} re-plan rounds",
+                }
+
+            results: list[dict[str, Any]] = [results_by_uri[uri] for uri in uris]
 
             if config.ttl_active():
-                rows_deleted: int = sum(int(item.get("ttl_rows_deleted", 0)) for item in outcomes)
-                datasets_expired: int = sum(1 for item in outcomes if int(item.get("ttl_rows_deleted", 0)) > 0)
+                rows_deleted: int = sum(int(item.get("ttl_rows_deleted", 0)) for item in results)
+                datasets_expired: int = sum(1 for item in results if int(item.get("ttl_rows_deleted", 0)) > 0)
                 run_span.set_tag("ttl_rows_deleted", rows_deleted)
                 driver_telemetry.gauge("run.ttl_rows_deleted", rows_deleted)
                 driver_telemetry.gauge("run.ttl_datasets_expired", datasets_expired)
                 logger.info("ttl: %d datasets expired, %d rows deleted", datasets_expired, rows_deleted)
 
-            results: list[dict[str, Any]] = [item for item in outcomes if item.get("tier") == "small"]
-            large_uris: list[str] = [item["uri"] for item in outcomes if item.get("tier") == "large"]
-            run_span.set_tag("small_datasets", len(results))
-            run_span.set_tag("large_datasets", len(large_uris))
-            logger.info("small tier compacted %d datasets; %d deferred to large tier", len(results), len(large_uris))
-
-            if large_uris:
-                with driver_telemetry.timed("run.large_tier_ms"):
-                    results.extend(self.compact_large_tier(spark, large_uris, driver_telemetry))
-
             bytes_removed: int = sum(int(item.get("bytes_removed", 0)) for item in results)
             fragments_removed: int = sum(int(item.get("fragments_removed", 0)) for item in results)
-            skipped: int = sum(1 for item in outcomes if item.get("skipped"))
+            skipped: int = sum(1 for item in results if item.get("skipped"))
             run_span.set_tag("skipped_datasets", skipped)
             driver_telemetry.gauge("run.datasets", len(results))
             driver_telemetry.gauge("run.datasets_skipped", skipped)

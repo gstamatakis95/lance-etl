@@ -514,7 +514,6 @@ class TestPipelineConfigPropagation:
             indexing=indexing,
             scheduler_pool="my-pool",
         )
-        assert config.maintenance.scheduler_pool == "my-pool"
         assert config.indexing.scheduler_pool == "my-pool"
 
     def test_telemetry_propagated(self, telemetry_config: TelemetryConfig) -> None:
@@ -547,7 +546,6 @@ class TestPipelineConfigPropagation:
         """The default scheduler_pool is 'lance-pipeline'."""
         config = make_config(telemetry_config)
         assert config.scheduler_pool == "lance-pipeline"
-        assert config.maintenance.scheduler_pool == "lance-pipeline"
         assert config.indexing.scheduler_pool == "lance-pipeline"
 
 
