@@ -198,7 +198,6 @@ class VectorIndexHandler(IndexHandler):
         self.reused_artifacts: bool = False
         self.num_partitions_used: int | None = None
         self.cached_artifacts: tuple | None = None
-        self.full_rebuild: bool = False
 
     def index_type(self) -> str:
         """Return the vector index type.
@@ -271,53 +270,47 @@ class VectorIndexHandler(IndexHandler):
             return True
         return rows > self.config.retrain_growth_factor * int(rows_at_train)
 
-    def target_fragments(self, dataset: lance.LanceDataset) -> list[int]:
-        """Return fragments to index, expanding to all of them when a retrain is needed.
+    def needs_bootstrap(self, dataset: lance.LanceDataset) -> bool:
+        """Decide whether this index must be rebuilt through a streaming bootstrap.
 
         Retrained centroids and rotation cannot merge with segments built from the old artifacts,
-        so when the growth trigger fires every fragment is rebuilt, exactly as on a ``rebuild``
-        run. A non-reusable config (changed dimension or metric) is also treated as a
-        full-rebuild trigger so the index self-heals rather than remaining broken. An existing
-        index with no stored config at all gets the same treatment: it was built by the
-        small-dataset tier's plain ``create_index`` under its own private model, so appending
-        segments built from freshly trained artifacts would create deltas whose IVF centroids and
-        RaBitQ rotation disagree, and a later delta merge would silently corrupt the index by
-        copying quantized codes across mismatched models. Once any trigger fires the decision is
-        sticky for this handler instance (one build call), so a stale-fragment replan keeps
-        rebuilding everything even after ``prepare`` has refreshed the stored config.
+        so any artifact trigger routes the whole index back to the committed streaming
+        ``create_index`` bootstrap (ADR 0030). Three triggers fire it. A non-reusable config
+        (changed dimension, metric, or num_bits) means the index must self-heal rather than
+        remain broken. Growth past ``retrain_growth_factor`` times the recorded ``rows_at_train``
+        means the centroids are stale. An existing index with no stored config at all gets the
+        same treatment: it was built by a plain ``create_index`` under its own private model, so
+        appending segments built from freshly trained artifacts would create deltas whose IVF
+        centroids and RaBitQ rotation disagree, and a later delta merge would silently corrupt
+        the index by copying quantized codes across mismatched models.
 
         Args:
             dataset: The dataset to inspect.
 
         Returns:
-            Every fragment when retraining, rebuilding, or recovering from missing or mismatched
-            artifacts, otherwise only uncovered fragments.
+            ``True`` when the index must be retrained from scratch, ``False`` when its stored
+            artifacts are reusable for incremental segment builds.
         """
-        config: IndexJobConfig = self.config
-        if not config.rebuild and not self.full_rebuild:
-            cfg: dict[str, Any] | None = load_vector_config(dataset, self.column)
-            if cfg is None:
-                if self.covered_fragments(dataset):
-                    logger.warning(
-                        "index %s on %s exists without stored vector artifacts (small-tier build); "
-                        "it will be retrained and fully rebuilt to keep all deltas on one model",
-                        self.index_name,
-                        dataset.uri,
-                    )
-                    self.full_rebuild = True
-            elif not config_reusable(cfg, self.dimension(dataset), config.metric, config.ivf_rq_num_bits):
+        cfg: dict[str, Any] | None = load_vector_config(dataset, self.column)
+        if cfg is None:
+            if self.covered_fragments(dataset):
                 logger.warning(
-                    "stored vector config for %s on %s no longer matches the current configuration; "
-                    "the index will be retrained and fully rebuilt",
+                    "index %s on %s exists without stored vector artifacts (plain create_index build); "
+                    "it will be retrained and fully rebuilt to keep all deltas on one model",
                     self.index_name,
                     dataset.uri,
                 )
-                self.full_rebuild = True
-            elif self.growth_requires_retrain(cfg, dataset.count_rows()):
-                self.full_rebuild = True
-        if self.full_rebuild:
-            return all_fragment_ids(dataset)
-        return super().target_fragments(dataset)
+                return True
+            return False
+        if not config_reusable(cfg, self.dimension(dataset), self.config.metric, self.config.ivf_rq_num_bits):
+            logger.warning(
+                "stored vector config for %s on %s no longer matches the current configuration; "
+                "the index will be retrained and fully rebuilt",
+                self.index_name,
+                dataset.uri,
+            )
+            return True
+        return self.growth_requires_retrain(cfg, dataset.count_rows())
 
     def prepare(self, dataset: lance.LanceDataset, uri: str, telemetry: Telemetry) -> tuple:
         """Load the reusable IVF_RQ artifacts for this dataset's vector column.

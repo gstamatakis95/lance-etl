@@ -43,6 +43,7 @@ lance-etl/
       __main__.py         Calls cli.main()
     cliutil.py            Shared CLI helpers: add_common_arguments, add_dataset_arguments, add_index_column_arguments, build_spark (memory-safe SQL defaults), build_telemetry_config, load_dataset_uris, parse_* helpers
     column_roles.py       Column-role metadata (lance-etl.columns): load_column_roles, merge_column_roles
+    fanout.py             Shared per-dataset Spark fan-out (fan_out_per_dataset) used by the maintenance, indexing, and operator-tool fleet phases
     recall.py             RecallAuditJob, RecallJobConfig, DatadogSpanSource: replay Datadog spans, score recall@k/nDCG@k/MRR
     telemetry.py          Telemetry, TelemetryConfig, LanceRuntimeConfig, commit_with_retries
     cloud_storage.py      resolve_filesystem + discover_datasets for pyarrow filesystem I/O

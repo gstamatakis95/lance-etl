@@ -6,15 +6,17 @@ APIs, and a small dataset is simply the one-shard case:
 - Plan (:func:`plan_dataset_indexes`): a per-dataset executor fan-out resolves which indexes to
   build (explicit config columns, or the ``lance-etl.columns`` role metadata written by the ETL
   sink), runs the derived-state skip check, and shards each index's target fragments into
-  build tasks sized by ``fragments_per_index_task``.
-- Artifacts (:meth:`LanceIndexer.resolve_fleet_artifacts`): one flat Spark job resolves the
-  IVF_RQ artifacts for every vector index in the fleet. Reuse reads centroids back from the
-  committed index on the executor, and training runs in-process ON that executor under the
-  train semaphore, so the driver never holds a training sample.
+  build tasks sized by ``fragments_per_index_task``. A vector index whose artifacts are absent,
+  mismatched, or growth-stale plans one ``bootstrap`` task instead of shards (ADR 0030).
+- Artifacts (:meth:`LanceIndexer.resolve_fleet_artifacts`): one flat Spark job reads the IVF_RQ
+  artifacts back for every ``segments``-mode vector index in the fleet: centroids from the
+  committed index via ``get_ivf_model`` and the RaBitQ rotation from the stored config. This
+  phase is reuse-only, so no training sample ever exists here.
 - Build (:meth:`LanceIndexer.build_fleet_segments`): ONE flat Spark job over every dataset's
-  shard tasks. Vector and scalar shards build uncommitted segments, FTS rebuild shards build
-  per-fragment inverted indices under their dataset's shared index id, and FTS maintain runs
-  as a single task per dataset.
+  shard tasks. Vector and scalar shards build uncommitted segments, a vector bootstrap task
+  runs a committed ``create_index`` whose internal streaming k-means trains the centroids, FTS
+  rebuild shards build per-fragment inverted indices under their dataset's shared index id,
+  and FTS maintain runs as a single task per dataset.
 - Commit (:func:`commit_one_index`): a per-(dataset, index) executor fan-out merges vector
   segments and publishes through the production commit paths, keeping the heavy merge off the
   driver. A stale-fragment commit (a concurrent compaction rewrote planned fragments) marks the
@@ -38,6 +40,7 @@ from lance.lance import indices as native_indices
 from pyspark.sql import SparkSession
 
 from lance_etl.column_roles import SCALAR_ROLE, TEXT_ROLE, VECTOR_ROLE, load_column_roles
+from lance_etl.fanout import fan_out_per_dataset
 from lance_etl.indexing.config import (
     IndexJobConfig,
     bitmap_index_name,
@@ -70,7 +73,6 @@ from lance_etl.indexing.segments import (
     serialize_segment,
     split_evenly,
 )
-from lance_etl.maintenance.job import fan_out_per_dataset
 from lance_etl.telemetry import Telemetry
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -304,12 +306,9 @@ def plan_dataset_indexes(
             )
             continue
 
-        target_ids: list[int] = handler.target_fragments(dataset)
         if kind == VECTOR_KIND:
-            needs_bootstrap: bool = (
-                config.rebuild or index_name not in existing_names or bool(getattr(handler, "full_rebuild", False))
-            )
-            if needs_bootstrap:
+            vector_handler: VectorIndexHandler = handler
+            if config.rebuild or index_name not in existing_names or vector_handler.needs_bootstrap(dataset):
                 specs.append(
                     {
                         "kind": kind,
@@ -321,6 +320,7 @@ def plan_dataset_indexes(
                     }
                 )
                 continue
+        target_ids: list[int] = handler.target_fragments(dataset)
         if not target_ids:
             done.append({"column": column, "index": index_name, "segments": 0, "fragments": 0})
             continue
@@ -595,6 +595,35 @@ def commit_one_index(
         return {"column": column, "index": index_name, "segments": 0, "fragments": 0, "stale": True}
 
 
+def flatten_shard_tasks(
+    specs_by_uri: dict[str, list[dict[str, Any]]], version_by_uri: dict[str, int]
+) -> list[dict[str, Any]]:
+    """Expand every dataset's index specs into the flat build-task list for one Spark job.
+
+    Each shard becomes one task carrying its spec fields plus ``uri``, ``version``, and
+    ``shard``. Specs without shards (vector bootstraps and FTS maintains) become a single task
+    with an empty shard.
+
+    Args:
+        specs_by_uri: The plan phase's index specs, keyed by dataset URI.
+        version_by_uri: The plan-time dataset version, keyed by dataset URI.
+
+    Returns:
+        The flattened task specs across the fleet.
+    """
+    shard_tasks: list[dict[str, Any]] = []
+    for uri, specs in specs_by_uri.items():
+        version: int = version_by_uri[uri]
+        for spec in specs:
+            base: dict[str, Any] = {**spec, "uri": uri, "version": version}
+            if not spec["shards"]:
+                shard_tasks.append({**base, "shard": []})
+                continue
+            for shard in spec["shards"]:
+                shard_tasks.append({**base, "shard": list(shard)})
+    return shard_tasks
+
+
 def merge_deltas_if_needed(uri: str, index_name: str, config: IndexJobConfig, telemetry: Telemetry) -> bool:
     """Merge one index's accumulated deltas on an executor when over the configured cap.
 
@@ -770,6 +799,103 @@ class LanceIndexer:
         )
         return {(uri, index_name): flag for uri, index_name, flag in merged}
 
+    def run_round(
+        self,
+        spark: SparkSession,
+        round_index: int,
+        pending_uris: list[str],
+        stats_by_uri: dict[str, dict[str, Any]],
+        kind_by_index: dict[tuple[str, str], str],
+        driver_telemetry: Telemetry,
+    ) -> list[str]:
+        """Run one plan-artifacts-build-commit round over the pending datasets.
+
+        The plan fan-out resolves each dataset's index specs, one flat Spark job resolves the
+        fleet's vector artifacts, one flat Spark job builds every shard task, and the commit
+        fan-out publishes per index. Finished index stats accumulate into ``stats_by_uri`` and
+        every spec's kind is recorded in ``kind_by_index`` for the final delta bound.
+
+        Args:
+            spark: Active Spark session.
+            round_index: Zero-based round number, for logging.
+            pending_uris: Datasets to plan and build this round.
+            stats_by_uri: Per-dataset result records, mutated in place.
+            kind_by_index: Index kinds keyed by ``(uri, index_name)``, mutated in place.
+            driver_telemetry: The driver's telemetry facade.
+
+        Returns:
+            The datasets whose commits hit stale fragments, sorted, for the next round.
+        """
+        config: IndexJobConfig = self.config
+        plans: list[dict[str, Any]] = fan_out_per_dataset(
+            spark,
+            pending_uris,
+            config.telemetry,
+            lambda uri, telemetry: plan_dataset_indexes(uri, config, telemetry),
+            config.batch_partitions,
+        )
+
+        specs_by_uri: dict[str, list[dict[str, Any]]] = {}
+        for plan in plans:
+            uri: str = plan["uri"]
+            if "skipped" in plan:
+                stats_by_uri[uri]["skipped"] = plan["skipped"]
+                continue
+            stats_by_uri[uri]["indexes"].extend(plan.get("done", []))
+            if plan["specs"]:
+                specs_by_uri[uri] = plan["specs"]
+                for spec in plan["specs"]:
+                    kind_by_index[(uri, spec["index_name"])] = spec["kind"]
+                stats_by_uri[uri]["version"] = plan["version"]
+        if not specs_by_uri:
+            return []
+
+        vector_specs: list[tuple[str, dict[str, Any]]] = [
+            (uri, spec)
+            for uri, specs in specs_by_uri.items()
+            for spec in specs
+            if spec["kind"] == VECTOR_KIND and spec["mode"] == "segments"
+        ]
+        with driver_telemetry.timed("run.artifacts_ms"):
+            artifacts, artifact_extras = self.resolve_fleet_artifacts(spark, vector_specs)
+
+        version_by_uri: dict[str, int] = {uri: stats_by_uri[uri]["version"] for uri in specs_by_uri}
+        shard_tasks: list[dict[str, Any]] = flatten_shard_tasks(specs_by_uri, version_by_uri)
+        logger.info(
+            "indexing round %d/%d: %d datasets, %d build tasks",
+            round_index + 1,
+            config.max_stale_replans,
+            len(specs_by_uri),
+            len(shard_tasks),
+        )
+        with driver_telemetry.timed("run.build_ms"):
+            built: list[tuple[str, str, dict[str, Any]]] = self.build_fleet_segments(spark, shard_tasks, artifacts)
+
+        payloads_by_index: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for uri, index_name, payload in built:
+            if "stats" in payload:
+                stats_by_uri[uri]["indexes"].append(payload["stats"])
+                continue
+            payloads_by_index.setdefault((uri, index_name), []).append(payload)
+
+        commit_entries: list[tuple[str, dict[str, Any], list[dict[str, Any]]]] = []
+        for uri, specs in specs_by_uri.items():
+            for spec in specs:
+                key: tuple[str, str] = (uri, spec["index_name"])
+                if key in payloads_by_index:
+                    commit_entries.append((uri, spec, payloads_by_index[key]))
+        with driver_telemetry.timed("run.commit_ms"):
+            outcomes: list[tuple[str, dict[str, Any]]] = self.commit_fleet(spark, commit_entries)
+
+        stale_uris: set[str] = set()
+        for uri, stats in outcomes:
+            if stats.pop("stale", False):
+                stale_uris.add(uri)
+                continue
+            extra: dict[str, Any] = artifact_extras.get((uri, stats["column"]), {})
+            stats_by_uri[uri]["indexes"].append({**stats, **extra})
+        return sorted(stale_uris)
+
     def run(self, spark: SparkSession, dataset_uris: list[str]) -> list[dict[str, Any]]:
         """Index every dataset through the unified plan-artifacts-build-commit rounds.
 
@@ -792,85 +918,9 @@ class LanceIndexer:
             kind_by_index: dict[tuple[str, str], str] = {}
 
             for round_index in range(config.max_stale_replans):
-                plans: list[dict[str, Any]] = fan_out_per_dataset(
-                    spark,
-                    pending_uris,
-                    config.telemetry,
-                    lambda uri, telemetry: plan_dataset_indexes(uri, config, telemetry),
-                    config.batch_partitions,
+                pending_uris = self.run_round(
+                    spark, round_index, pending_uris, stats_by_uri, kind_by_index, driver_telemetry
                 )
-
-                specs_by_uri: dict[str, list[dict[str, Any]]] = {}
-                for plan in plans:
-                    uri = plan["uri"]
-                    if "skipped" in plan:
-                        stats_by_uri[uri]["skipped"] = plan["skipped"]
-                        continue
-                    stats_by_uri[uri]["indexes"].extend(plan.get("done", []))
-                    if plan["specs"]:
-                        specs_by_uri[uri] = plan["specs"]
-                        for spec in plan["specs"]:
-                            kind_by_index[(uri, spec["index_name"])] = spec["kind"]
-                        stats_by_uri[uri]["version"] = plan["version"]
-                if not specs_by_uri:
-                    pending_uris = []
-                    break
-
-                vector_specs: list[tuple[str, dict[str, Any]]] = [
-                    (uri, spec)
-                    for uri, specs in specs_by_uri.items()
-                    for spec in specs
-                    if spec["kind"] == VECTOR_KIND and spec["mode"] == "segments"
-                ]
-                with driver_telemetry.timed("run.artifacts_ms"):
-                    artifacts, artifact_extras = self.resolve_fleet_artifacts(spark, vector_specs)
-
-                shard_tasks: list[dict[str, Any]] = []
-                for uri, specs in specs_by_uri.items():
-                    version: int = stats_by_uri[uri]["version"]
-                    for spec in specs:
-                        base: dict[str, Any] = {**spec, "uri": uri, "version": version}
-                        if not spec["shards"]:
-                            shard_tasks.append({**base, "shard": []})
-                            continue
-                        for shard in spec["shards"]:
-                            shard_tasks.append({**base, "shard": list(shard)})
-                logger.info(
-                    "indexing round %d/%d: %d datasets, %d build tasks",
-                    round_index + 1,
-                    config.max_stale_replans,
-                    len(specs_by_uri),
-                    len(shard_tasks),
-                )
-                with driver_telemetry.timed("run.build_ms"):
-                    built: list[tuple[str, str, dict[str, Any]]] = self.build_fleet_segments(
-                        spark, shard_tasks, artifacts
-                    )
-
-                payloads_by_index: dict[tuple[str, str], list[dict[str, Any]]] = {}
-                for uri, index_name, payload in built:
-                    if "stats" in payload:
-                        stats_by_uri[uri]["indexes"].append(payload["stats"])
-                        continue
-                    payloads_by_index.setdefault((uri, index_name), []).append(payload)
-
-                commit_entries: list[tuple[str, dict[str, Any], list[dict[str, Any]]]] = []
-                for uri, specs in specs_by_uri.items():
-                    for spec in specs:
-                        key: tuple[str, str] = (uri, spec["index_name"])
-                        if key in payloads_by_index:
-                            commit_entries.append((uri, spec, payloads_by_index[key]))
-                with driver_telemetry.timed("run.commit_ms"):
-                    outcomes: list[tuple[str, dict[str, Any]]] = self.commit_fleet(spark, commit_entries)
-
-                stale_uris: set[str] = set()
-                for uri, stats in outcomes:
-                    if stats.pop("stale", False):
-                        stale_uris.add(uri)
-                        continue
-                    extra: dict[str, Any] = artifact_extras.get((uri, stats["column"]), {})
-                    stats_by_uri[uri]["indexes"].append({**stats, **extra})
-                pending_uris = sorted(stale_uris)
                 if not pending_uris:
                     break
 

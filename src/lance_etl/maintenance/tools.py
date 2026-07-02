@@ -1,7 +1,7 @@
 """Fleet-level manifest-migration, serving-tag, and interval-tag-retention helpers for Lance datasets.
 
 These operations are embarrassingly parallel one-call-per-dataset functions.
-They reuse :func:`fan_out_per_dataset` from :mod:`lance_etl.maintenance.job` to
+They reuse :func:`fan_out_per_dataset` from :mod:`lance_etl.fanout` to
 spread work across Spark executors without any additional orchestration.
 
 :func:`migrate_dataset_manifest_paths` and :func:`migrate_manifest_paths` upgrade
@@ -29,7 +29,7 @@ from typing import Any
 import lance
 from pyspark.sql import SparkSession
 
-from lance_etl.maintenance.job import fan_out_per_dataset
+from lance_etl.fanout import fan_out_per_dataset
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 logger: logging.Logger = logging.getLogger(__name__)

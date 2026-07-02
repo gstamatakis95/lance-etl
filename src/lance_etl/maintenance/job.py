@@ -20,7 +20,7 @@ plan-execute-commit path built on the same Lance APIs:
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -29,6 +29,7 @@ import lance
 from lance.optimize import Compaction, CompactionMetrics, CompactionTask, RewriteResult
 from pyspark.sql import SparkSession
 
+from lance_etl.fanout import fan_out_per_dataset
 from lance_etl.telemetry import (
     DEFAULT_COMMIT_RETRIES,
     DEFAULT_LARGE_COMMIT_RETRIES,
@@ -282,52 +283,6 @@ def compaction_metrics_dict(metrics: CompactionMetrics) -> dict[str, int]:
         "files_removed": metrics.files_removed,
         "files_added": metrics.files_added,
     }
-
-
-def fan_out_per_dataset(
-    spark: SparkSession,
-    uris: list[str],
-    telemetry_config: TelemetryConfig,
-    per_dataset: Callable[[str, Telemetry], dict[str, Any]],
-    partitions: int,
-) -> list[dict[str, Any]]:
-    """Run an independent per-dataset operation across executors, one task per partition.
-
-    Each executor task creates its own telemetry facade and applies ``per_dataset`` to every URI
-    in its partition. Used by the consolidated maintenance pass, the manifest migration, and the
-    serving-tag flip, all of which are embarrassingly parallel one-call-per-dataset operations
-    that differ only in the per-dataset callable.
-
-    An empty ``uris`` list is returned immediately without submitting a Spark job, because
-    ``sparkContext.parallelize`` with zero slices raises a Java exception.
-
-    Args:
-        spark: Active Spark session.
-        uris: Dataset URIs to process.
-        telemetry_config: Telemetry configuration created per executor process.
-        per_dataset: The operation to apply to one URI with an executor-local telemetry facade.
-        partitions: Upper bound on Spark partitions, capped at the URI count.
-
-    Returns:
-        One outcome dictionary per dataset.
-    """
-    if not uris:
-        return []
-
-    def partition(part: Iterable[str]) -> Iterator[dict[str, Any]]:
-        """Apply the operation to one partition of dataset URIs on an executor.
-
-        Args:
-            part: Dataset URIs assigned to this executor task.
-
-        Yields:
-            One outcome dictionary per dataset.
-        """
-        executor_telemetry: Telemetry = Telemetry.create(telemetry_config)
-        for uri in part:
-            yield per_dataset(uri, executor_telemetry)
-
-    return spark.sparkContext.parallelize(uris, min(len(uris), partitions)).mapPartitions(partition).collect()
 
 
 def cleanup_dataset(uri: str, config: MaintenanceConfig, telemetry: Telemetry) -> int:
@@ -614,6 +569,84 @@ class MaintenanceJob:
         slices: int = max(1, min(config.batch_partitions, len(pending)))
         return spark.sparkContext.parallelize(pending, slices).mapPartitions(partition).collect()
 
+    def run_round(
+        self,
+        spark: SparkSession,
+        round_index: int,
+        pending_uris: list[str],
+        cutoff: datetime | None,
+        base_by_uri: dict[str, dict[str, Any]],
+        results_by_uri: dict[str, dict[str, Any]],
+        driver_telemetry: Telemetry,
+    ) -> list[str]:
+        """Run one plan-execute-commit round over the pending datasets.
+
+        Phase P fans out per dataset (TTL runs only in the first round, so ``cutoff`` is dropped
+        after it), phase E runs the round's rewrite tasks in one flat Spark job, and phase C fans
+        the commits out per dataset. Terminal outcomes land in ``results_by_uri`` and the first
+        round's TTL fields are kept in ``base_by_uri`` so later rounds merge onto them.
+
+        Args:
+            spark: Active Spark session.
+            round_index: Zero-based round number, for logging and the TTL first-round gate.
+            pending_uris: Datasets to plan and compact this round.
+            cutoff: The TTL cutoff, applied only when ``round_index`` is zero.
+            base_by_uri: First-round TTL fields per dataset, populated in round zero.
+            results_by_uri: Per-dataset terminal outcomes, mutated in place.
+            driver_telemetry: The driver's telemetry facade.
+
+        Returns:
+            The datasets whose commit hit a semantic conflict, for the next round's re-plan.
+        """
+        config: MaintenanceConfig = self.config
+        round_cutoff: datetime | None = cutoff if round_index == 0 else None
+        plans: list[dict[str, Any]] = fan_out_per_dataset(
+            spark,
+            pending_uris,
+            config.telemetry,
+            lambda uri, telemetry, cutoff_value=round_cutoff: plan_one_dataset(uri, config, cutoff_value, telemetry),
+            config.batch_partitions,
+        )
+        planned: list[dict[str, Any]] = []
+        for plan in plans:
+            uri: str = plan["uri"]
+            if round_index == 0:
+                base_by_uri[uri] = {
+                    field: plan[field] for field in ("ttl_rows_deleted", "ttl_skipped") if field in plan
+                }
+            if plan.get("task_jsons"):
+                planned.append(plan)
+            else:
+                results_by_uri[uri] = {**base_by_uri.get(uri, {}), **plan}
+        if not planned:
+            return []
+
+        flat_tasks: list[tuple[str, int, str]] = [
+            (plan["uri"], plan["read_version"], task_json) for plan in planned for task_json in plan["task_jsons"]
+        ]
+        logger.info(
+            "compaction round %d/%d: %d datasets, %d rewrite tasks",
+            round_index + 1,
+            config.replan_budget,
+            len(planned),
+            len(flat_tasks),
+        )
+        with driver_telemetry.timed("run.rewrite_ms"):
+            rewrites_by_uri: dict[str, list[str]] = self.execute_fleet_tasks(spark, flat_tasks)
+
+        commit_pairs: list[tuple[str, list[str]]] = [
+            (plan["uri"], rewrites_by_uri.get(plan["uri"], [])) for plan in planned
+        ]
+        outcomes: list[dict[str, Any]] = self.commit_fleet(spark, commit_pairs)
+        conflicted: list[str] = []
+        for outcome in outcomes:
+            uri = outcome["uri"]
+            if outcome.get("conflict"):
+                conflicted.append(uri)
+            else:
+                results_by_uri[uri] = {**base_by_uri.get(uri, {}), **outcome}
+        return conflicted
+
     def run(self, spark: SparkSession, dataset_uris: Iterable[str]) -> list[dict[str, Any]]:
         """Maintain every dataset through the unified plan-execute-commit rounds.
 
@@ -646,58 +679,9 @@ class MaintenanceJob:
 
             with driver_telemetry.timed("run.maintain_ms"):
                 for round_index in range(config.replan_budget):
-                    round_cutoff: datetime | None = cutoff if round_index == 0 else None
-                    plans: list[dict[str, Any]] = fan_out_per_dataset(
-                        spark,
-                        pending_uris,
-                        config.telemetry,
-                        lambda uri, telemetry, cutoff_value=round_cutoff: plan_one_dataset(
-                            uri, config, cutoff_value, telemetry
-                        ),
-                        config.batch_partitions,
+                    pending_uris = self.run_round(
+                        spark, round_index, pending_uris, cutoff, base_by_uri, results_by_uri, driver_telemetry
                     )
-                    planned: list[dict[str, Any]] = []
-                    for plan in plans:
-                        uri = plan["uri"]
-                        if round_index == 0:
-                            base_by_uri[uri] = {
-                                field: plan[field] for field in ("ttl_rows_deleted", "ttl_skipped") if field in plan
-                            }
-                        if plan.get("task_jsons"):
-                            planned.append(plan)
-                        else:
-                            results_by_uri[uri] = {**base_by_uri.get(uri, {}), **plan}
-                    if not planned:
-                        pending_uris = []
-                        break
-
-                    flat_tasks: list[tuple[str, int, str]] = [
-                        (plan["uri"], plan["read_version"], task_json)
-                        for plan in planned
-                        for task_json in plan["task_jsons"]
-                    ]
-                    logger.info(
-                        "compaction round %d/%d: %d datasets, %d rewrite tasks",
-                        round_index + 1,
-                        config.replan_budget,
-                        len(planned),
-                        len(flat_tasks),
-                    )
-                    with driver_telemetry.timed("run.rewrite_ms"):
-                        rewrites_by_uri: dict[str, list[str]] = self.execute_fleet_tasks(spark, flat_tasks)
-
-                    commit_pairs: list[tuple[str, list[str]]] = [
-                        (plan["uri"], rewrites_by_uri.get(plan["uri"], [])) for plan in planned
-                    ]
-                    outcomes: list[dict[str, Any]] = self.commit_fleet(spark, commit_pairs)
-                    conflicted: list[str] = []
-                    for outcome in outcomes:
-                        uri = outcome["uri"]
-                        if outcome.get("conflict"):
-                            conflicted.append(uri)
-                        else:
-                            results_by_uri[uri] = {**base_by_uri.get(uri, {}), **outcome}
-                    pending_uris = conflicted
                     if not pending_uris:
                         break
 

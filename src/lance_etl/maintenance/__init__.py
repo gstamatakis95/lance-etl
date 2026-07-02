@@ -6,6 +6,7 @@ Re-exports the public API from the sub-modules so callers can write
 
 from __future__ import annotations
 
+from lance_etl.fanout import fan_out_per_dataset
 from lance_etl.maintenance.job import (
     MaintenanceConfig,
     MaintenanceJob,
@@ -16,7 +17,6 @@ from lance_etl.maintenance.job import (
     compaction_skip_reason,
     compute_cutoff,
     execute_rewrite_task,
-    fan_out_per_dataset,
     plan_one_dataset,
     run_ttl_on_open_dataset,
     validate_column_name,

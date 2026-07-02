@@ -109,6 +109,102 @@ class PipelineJob:
         """
         self.config: PipelineConfig = config
 
+    def prune_phase(
+        self, spark: SparkSession, uris: list[str], run_span: Any, driver_telemetry: Telemetry
+    ) -> list[dict[str, Any]]:
+        """Run the interval-tag prune phase, or skip it when ``tag_keep_last`` is ``None``.
+
+        Args:
+            spark: Active Spark session.
+            uris: Dataset URIs to prune.
+            run_span: The pipeline run span, tagged with the pruned-tag count.
+            driver_telemetry: The driver's telemetry facade.
+
+        Returns:
+            The raw per-dataset prune results, empty when pruning is disabled.
+        """
+        config: PipelineConfig = self.config
+        if config.tag_keep_last is None:
+            return []
+        logger.info("pipeline: pruning interval tags (keep_last=%d)", config.tag_keep_last)
+        with driver_telemetry.timed("run.prune_ms"):
+            prune_results: list[dict[str, Any]] = prune_interval_tags_fleet(
+                spark,
+                uris,
+                config.telemetry,
+                config.storage_options,
+                config.tag_keep_last,
+                partitions=config.tag_partitions,
+            )
+        pruned_tags_total: int = sum(int(r.get("tags_pruned", 0)) for r in prune_results)
+        run_span.set_tag("pruned_tags", pruned_tags_total)
+        driver_telemetry.gauge("run.pruned_tags", pruned_tags_total)
+        logger.info("pipeline: pruned %d interval tags across %d datasets", pruned_tags_total, len(prune_results))
+        return prune_results
+
+    def stamp_phase(
+        self,
+        spark: SparkSession,
+        uris: list[str],
+        index_results: list[dict[str, Any]],
+        run_span: Any,
+        driver_telemetry: Telemetry,
+    ) -> list[dict[str, Any]]:
+        """Run the interval-tag stamp phase, or skip it when ``tag_stamp`` is ``None``.
+
+        Stamps the configured interval tag on every dataset whose index stats pass
+        :func:`stamp_eligible`, then optionally advances the ``HEAD`` tag on the same datasets
+        when ``serve_tag`` is set.
+
+        Args:
+            spark: Active Spark session.
+            uris: Dataset URIs processed by the run, in input order.
+            index_results: The indexing phase's per-dataset stats, gating eligibility.
+            run_span: The pipeline run span, tagged with the stamped-dataset count.
+            driver_telemetry: The driver's telemetry facade.
+
+        Returns:
+            The raw tag-update results (interval stamps plus any HEAD flips), empty when
+            stamping is disabled.
+        """
+        config: PipelineConfig = self.config
+        if config.tag_stamp is None:
+            return []
+        index_by_uri: dict[str, dict[str, Any]] = {r["uri"]: r for r in index_results}
+        eligible_uris: list[str] = [u for u in uris if stamp_eligible(index_by_uri.get(u, {}))]
+        logger.info(
+            "pipeline: stamping tag %r on %d/%d eligible datasets",
+            config.tag_stamp,
+            len(eligible_uris),
+            len(uris),
+        )
+        with driver_telemetry.timed("run.stamp_ms"):
+            stamp_results: list[dict[str, Any]] = update_serving_tags(
+                spark,
+                eligible_uris,
+                config.telemetry,
+                config.storage_options,
+                tag=config.tag_stamp,
+                partitions=config.tag_partitions,
+            )
+        run_span.set_tag("stamped", len(stamp_results))
+        driver_telemetry.gauge("run.stamped_datasets", len(stamp_results))
+
+        if config.serve_tag:
+            logger.info("pipeline: advancing HEAD tag on %d datasets", len(eligible_uris))
+            with driver_telemetry.timed("run.head_tag_ms"):
+                head_results: list[dict[str, Any]] = update_serving_tags(
+                    spark,
+                    eligible_uris,
+                    config.telemetry,
+                    config.storage_options,
+                    tag="HEAD",
+                    partitions=config.tag_partitions,
+                )
+            stamp_results = stamp_results + head_results
+            driver_telemetry.gauge("run.head_tags_flipped", len(head_results))
+        return stamp_results
+
     def run(self, spark: SparkSession, uris: list[str]) -> dict[str, Any]:
         """Execute all four pipeline phases in order over the supplied dataset URIs.
 
@@ -143,25 +239,8 @@ class PipelineJob:
             run_span.set_tag("tag_stamp", config.tag_stamp or "")
             run_span.set_tag("tag_keep_last", config.tag_keep_last if config.tag_keep_last is not None else -1)
 
-            prune_results: list[dict[str, Any]] = []
-            if config.tag_keep_last is not None:
-                logger.info("pipeline: pruning interval tags (keep_last=%d)", config.tag_keep_last)
-                with driver_telemetry.timed("run.prune_ms"):
-                    prune_results = prune_interval_tags_fleet(
-                        spark,
-                        uris,
-                        config.telemetry,
-                        config.storage_options,
-                        config.tag_keep_last,
-                        partitions=config.tag_partitions,
-                    )
+            prune_results: list[dict[str, Any]] = self.prune_phase(spark, uris, run_span, driver_telemetry)
             pruned_tags_total: int = sum(int(r.get("tags_pruned", 0)) for r in prune_results)
-            if config.tag_keep_last is not None:
-                run_span.set_tag("pruned_tags", pruned_tags_total)
-                driver_telemetry.gauge("run.pruned_tags", pruned_tags_total)
-                logger.info(
-                    "pipeline: pruned %d interval tags across %d datasets", pruned_tags_total, len(prune_results)
-                )
 
             logger.info("pipeline: starting maintenance phase")
             with driver_telemetry.timed("run.maintenance_ms"):
@@ -171,41 +250,9 @@ class PipelineJob:
             with driver_telemetry.timed("run.index_ms"):
                 index_results: list[dict[str, Any]] = LanceIndexer(config.indexing).run(spark, uris)
 
-            stamp_results: list[dict[str, Any]] = []
-            if config.tag_stamp is not None:
-                index_by_uri: dict[str, dict[str, Any]] = {r["uri"]: r for r in index_results}
-                eligible_uris: list[str] = [u for u in uris if stamp_eligible(index_by_uri.get(u, {}))]
-                logger.info(
-                    "pipeline: stamping tag %r on %d/%d eligible datasets",
-                    config.tag_stamp,
-                    len(eligible_uris),
-                    len(uris),
-                )
-                with driver_telemetry.timed("run.stamp_ms"):
-                    stamp_results = update_serving_tags(
-                        spark,
-                        eligible_uris,
-                        config.telemetry,
-                        config.storage_options,
-                        tag=config.tag_stamp,
-                        partitions=config.tag_partitions,
-                    )
-                run_span.set_tag("stamped", len(stamp_results))
-                driver_telemetry.gauge("run.stamped_datasets", len(stamp_results))
-
-                if config.serve_tag:
-                    logger.info("pipeline: advancing HEAD tag on %d datasets", len(eligible_uris))
-                    with driver_telemetry.timed("run.head_tag_ms"):
-                        head_results: list[dict[str, Any]] = update_serving_tags(
-                            spark,
-                            eligible_uris,
-                            config.telemetry,
-                            config.storage_options,
-                            tag="HEAD",
-                            partitions=config.tag_partitions,
-                        )
-                    stamp_results = stamp_results + head_results
-                    driver_telemetry.gauge("run.head_tags_flipped", len(head_results))
+            stamp_results: list[dict[str, Any]] = self.stamp_phase(
+                spark, uris, index_results, run_span, driver_telemetry
+            )
 
             maint_by_uri: dict[str, dict[str, Any]] = {r["uri"]: r for r in maintenance_results}
             idx_by_uri: dict[str, dict[str, Any]] = {r["uri"]: r for r in index_results}

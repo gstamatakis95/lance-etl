@@ -86,6 +86,7 @@ prewarm every replica against the green version explicitly (use the `version` or
 | `maintenance/` | `MaintenanceConfig`, `MaintenanceJob` | Per-row TTL expiration (opt-in), unified plan-execute-commit compaction, and version cleanup |
 | `pipeline/` | `PipelineConfig`, `PipelineJob` | Serialized fleet phases: prune tags, maintenance, index, stamp |
 | `column_roles.py` | `load_column_roles`, `merge_column_roles` | Per-column role metadata (`lance-etl.columns`) driving automatic index target discovery |
+| `fanout.py` | `fan_out_per_dataset` | Shared per-dataset Spark fan-out backing the maintenance, indexing, and operator-tool fleet phases |
 | `recall.py` | `RecallAuditJob`, `RecallJobConfig` | Offline recall@k / nDCG@k / MRR audit from Datadog spans |
 | `telemetry.py` | `Telemetry`, `TelemetryConfig` | ddtrace spans, DogStatsD, Lance event bridge |
 | `cloud_storage.py` | `resolve_filesystem`, `discover_datasets` | pyarrow filesystem + recursive dataset discovery |
