@@ -14,22 +14,23 @@ lance-etl/
       __init__.py         Re-exports: IcebergToLanceETL, ETLConfig, ROUTING_COLS, apply_merge, and helpers
       cli.py              Entry point for lance-etl-etl script and python -m lance_etl.etl
       __main__.py         Calls cli.main()
-      job.py              IcebergToLanceETL: read, snapshot_id_bounds, apply_merge, dataset_uri
-      pivot.py            ETLConfig, ROUTING_COLS, pivot_map_columns, group_by_routing, apply_fsl_cast, apply_ttl_cast
+      job.py              IcebergToLanceETL: read_increment, collapse, spark_batches split, merge fan-out
+      pivot.py            ETLConfig, ROUTING_COLS, pivot_map_columns (returns column roles), group_by_routing, apply_fsl_cast, apply_ttl_cast
+      sink.py             The Lance sink seam: apply_merge, table_chunks, build_update_condition, dataset_uri (format 2.1 bootstrap, role writes)
     indexing/             Indexing job package (python -m lance_etl.indexing)
       __init__.py         Re-exports: LanceIndexer, IndexJobConfig, all handlers, segments, optimize helpers
       cli.py              Entry point for lance-etl-index script and python -m lance_etl.indexing
       __main__.py         Calls cli.main()
       config.py           IndexJobConfig, METRIC_TO_DISTANCE, FTS_OPTIONAL_PARAMS, index-name helpers
-      handlers.py         IndexHandler, VectorIndexHandler, BTreeIndexHandler, BitmapIndexHandler, FtsIndexHandler
-      optimize.py         load_vector_config, write_vector_config, config_reusable, drop_existing_index, optimize_existing_index, merge_index_deltas
-      runner.py           LanceIndexer, index_dataset_locally, index_skip_reason (derived-state skip: describe_indices + num_unindexed_fragments)
-      segments.py         build_and_commit_segments, build_vector_segment, build_scalar_segment, commit_segments, split_evenly, stale-fragment guards
+      handlers.py         IndexHandler, VectorIndexHandler, BTreeIndexHandler, BitmapIndexHandler, FtsIndexHandler, commit_fts_index, publish_fts_index
+      optimize.py         load_vector_config, write_vector_config, drop_existing_index, optimize_existing_index, merge_index_deltas, maintain_index_locally
+      runner.py           LanceIndexer fleet phases: plan_dataset_indexes, resolve_vector_artifacts, build_one_shard, commit_one_index, merge_deltas_if_needed, index_skip_reason, role-based target discovery
+      segments.py         build_vector_segment, build_scalar_segment, commit_segments, split_evenly, stale-fragment guards
     maintenance/          Maintenance job package (python -m lance_etl.maintenance)
-      __init__.py         Re-exports: MaintenanceJob, MaintenanceConfig, classify_or_compact, fan_out_per_dataset, update_serving_tag, compaction_skip_reason, and helpers
+      __init__.py         Re-exports: MaintenanceJob, MaintenanceConfig, plan_one_dataset, commit_one_dataset, fan_out_per_dataset, update_serving_tag, compaction_skip_reason, and helpers
       cli.py              Entry point for lance-etl-maintenance script and python -m lance_etl.maintenance
       __main__.py         Calls cli.main()
-      job.py              MaintenanceJob, MaintenanceConfig, classify_or_compact, maintain_one_dataset, compact_small_dataset, cleanup_dataset, delete_expired_rows, run_ttl_on_open_dataset, compaction_skip_reason (derived-state skip: dataset_stats num_fragments)
+      job.py              MaintenanceJob fleet phases: plan_one_dataset, execute_rewrite_task, commit_one_dataset, cleanup_dataset, run_ttl_on_open_dataset, compaction_skip_reason (derived-state skip: dataset_stats num_fragments)
       tools.py            update_serving_tag, update_serving_tags, migrate_dataset_manifest_paths, migrate_manifest_paths, prune_interval_tags, prune_interval_tags_fleet
     pipeline/             Unified pipeline job package (python -m lance_etl.pipeline)
       __init__.py         Re-exports: PipelineJob, PipelineConfig, prune_interval_tags, prune_interval_tags_fleet, stamp_eligible
@@ -40,7 +41,8 @@ lance-etl/
       __init__.py         Package marker
       cli.py              Entry point for lance-etl-tools script and python -m lance_etl.tools
       __main__.py         Calls cli.main()
-    cliutil.py            Shared CLI helpers: add_common_arguments, add_dataset_arguments, add_index_column_arguments, build_spark, build_telemetry_config, load_dataset_uris, parse_* helpers
+    cliutil.py            Shared CLI helpers: add_common_arguments, add_dataset_arguments, add_index_column_arguments, build_spark (memory-safe SQL defaults), build_telemetry_config, load_dataset_uris, parse_* helpers
+    column_roles.py       Column-role metadata (lance-etl.columns): load_column_roles, merge_column_roles
     recall.py             RecallAuditJob, RecallJobConfig, DatadogSpanSource: replay Datadog spans, score recall@k/nDCG@k/MRR
     telemetry.py          Telemetry, TelemetryConfig, LanceRuntimeConfig, commit_with_retries
     cloud_storage.py      resolve_filesystem + discover_datasets for pyarrow filesystem I/O
@@ -281,9 +283,10 @@ Key facts to internalize:
   `ValueError`. The same string must reach every executor shard.
 - `CommitConflictError` is not reliably importable from `lance` directly. Use the fallback chain
   in `telemetry.py`. Conflicts surface as `OSError` or `RuntimeError` from lance internals.
-- `defer_index_remap=True` on the small-dataset tier builds a `__lance_frag_reuse` system index.
-  The large-dataset tier ignores `defer_index_remap` entirely because the Python `Compaction.commit`
-  binding hard-codes default options and always remaps inline.
+- `defer_index_remap=True` builds a `__lance_frag_reuse` system index at commit time. The
+  options-carrying `Compaction.commit(options=...)` binding requires a pylance built from the
+  `fix/compaction-commit-options` lance branch. Older bindings fall back to the bare call and
+  always remap inline (a warning plus `dataset.commit_options_unsupported` is emitted).
 - The FTS path requires a Lance field id (not a pyarrow schema index) for `Index(fields=[...])`.
   Resolve it with `dataset._ds.lance_schema.field_case_insensitive(col).id()`.
 - Iceberg 1.10 rejects `start-timestamp` / `end-timestamp` outside changelog scans. Use
@@ -318,5 +321,5 @@ Key facts to internalize:
 All commits (ETL merge_insert, index commit, compaction commit) must go through
 `commit_with_retries` from `telemetry.py`. Retry budgets are defined as named constants in
 `telemetry.py`: `DEFAULT_CONFLICT_RETRIES` (10) for ETL, `DEFAULT_COMMIT_RETRIES` (20) for index
-and compaction, and `DEFAULT_LARGE_COMMIT_RETRIES` (2) for the tier-B compaction commit. The retry
+and compaction, and `DEFAULT_LARGE_COMMIT_RETRIES` (2) for the compaction `Compaction.commit`. The retry
 loop re-reads the dataset before each attempt so it operates against the latest version.

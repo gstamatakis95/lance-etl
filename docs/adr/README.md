@@ -10,7 +10,7 @@ The companion narrative, with the live-verified numbers and the stale-branch cor
 | ADR | Title | Status |
 |---|---|---|
 | [0001](0001-distributed-indexing-segment-api.md) | Distributed indexing via the Lance segment API | Accepted |
-| [0002](0002-two-tier-compaction-orchestration.md) | Two-tier compaction orchestration (30k-org power law) | Accepted |
+| [0002](0002-two-tier-compaction-orchestration.md) | Two-tier compaction orchestration (30k-org power law) | Superseded by [0028](0028-unified-task-fleet-orchestration.md) |
 | [0003](0003-read-increment-snapshot-bounds.md) | Incremental Iceberg reads via snapshot-id bounds | Accepted |
 | [0004](0004-dynamic-partition-targets.md) | Dynamic write-partition targets and duplicate semantics | Accepted |
 | [0005](0005-rust-grpc-layering-typed-filter.md) | Rust gRPC service layering and the typed filter AST | Accepted |
@@ -33,3 +33,7 @@ The companion narrative, with the live-verified numbers and the stale-branch cor
 | [0022](0022-object-store-request-tracing.md) | Object-store request counts and IO info on per-RPC search spans | Accepted |
 | [0023](0023-iceberg-table-optimization-job.md) | Iceberg source-table optimization job | Accepted |
 | [0024](0024-dynamic-map-pivot.md) | Dynamic per-dataset map pivot: every key becomes a column | Accepted |
+| [0025](0025-sidecar-free-vector-artifacts.md) | Sidecar-free vector artifacts in the dataset config KV | Accepted |
+| [0026](0026-three-job-isolation.md) | Three-job isolation | Accepted |
+| [0027](0027-unified-pipeline.md) | Unified pipeline job | Accepted |
+| [0028](0028-unified-task-fleet-orchestration.md) | Unified task-based fleet orchestration, format 2.1, column roles | Accepted |
