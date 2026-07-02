@@ -109,6 +109,8 @@ class MigrateConfig:
         scheduler_pool: Spark FAIR scheduler pool name set for large-dataset copies.
         max_rows_per_file: Row cap per written fragment file, or ``None`` for the Lance default. Recompaction
             re-fragments afterwards, so this only shapes the intermediate copy.
+        data_storage_version: Lance file format version for the copied target datasets. The
+            default ``"2.1"`` adopts the latest stable format with structural encodings.
         commit_retries: Retry budget for copy commits.
         commit_backoff_seconds: Base backoff between copy-commit retries.
     """
@@ -132,6 +134,7 @@ class MigrateConfig:
     max_tasks: int = 256
     scheduler_pool: str = "lance-migrate"
     max_rows_per_file: int | None = None
+    data_storage_version: str = "2.1"
     commit_retries: int = DEFAULT_COMMIT_RETRIES
     commit_backoff_seconds: float = 0.5
 
@@ -333,6 +336,7 @@ def copy_small_dataset(source_uri: str, target_uri: str, config: MigrateConfig, 
         "mode": mode,
         "storage_options": config.storage_options,
         "enable_v2_manifest_paths": True,
+        "data_storage_version": config.data_storage_version,
     }
     if config.max_rows_per_file is not None:
         write_kwargs["max_rows_per_file"] = config.max_rows_per_file
@@ -383,7 +387,12 @@ def write_fragment_shard(
     source: lance.LanceDataset = lance.dataset(source_uri, version=version, storage_options=config.storage_options)
     wanted: set[int] = set(shard)
     fragments: list[Any] = [f for f in source.get_fragments() if f.fragment_id in wanted]
-    write_kwargs: dict[str, Any] = {"schema": schema, "mode": "create", "storage_options": config.storage_options}
+    write_kwargs: dict[str, Any] = {
+        "schema": schema,
+        "mode": "create",
+        "storage_options": config.storage_options,
+        "data_storage_version": config.data_storage_version,
+    }
     if config.max_rows_per_file is not None:
         write_kwargs["max_rows_per_file"] = config.max_rows_per_file
     with telemetry.timed("migrate.shard_write_ms"):

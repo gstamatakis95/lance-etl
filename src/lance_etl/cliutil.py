@@ -19,6 +19,19 @@ from lance_etl.telemetry import TelemetryConfig, configure_logging
 APP_NAME: str = "lance-pipeline"
 """Opinionated Spark application name shared by every subcommand."""
 
+SPARK_CONF_DEFAULTS: dict[str, str] = {
+    "spark.sql.adaptive.enabled": "true",
+    "spark.sql.adaptive.advisoryPartitionSizeInBytes": "64m",
+    "spark.sql.execution.arrow.maxRecordsPerBatch": "4096",
+}
+"""Runtime Spark SQL defaults applied by :func:`build_spark` when the operator did not set them.
+
+Adaptive query execution right-sizes shuffle partitions from actual data volumes instead of the
+static partition count. The Arrow batch cap bounds the per-slice memory of every ``mapInArrow``
+stage for wide vector rows (a 4096-row batch of 512-byte rows stays around 2 MiB), which is the
+first line of defense against executor OOM on large increments.
+"""
+
 
 def parse_epoch_ms(value: str) -> int:
     """Parse an ISO 8601 timestamp or epoch milliseconds into epoch ms.
@@ -216,7 +229,12 @@ def add_index_column_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def build_spark(app_name: str | None = None) -> SparkSession:
-    """Build and return a Spark session for a lance-etl job.
+    """Build and return a Spark session for a lance-etl job with memory-safe SQL defaults.
+
+    Each entry of :data:`SPARK_CONF_DEFAULTS` is applied only when the key was not set
+    explicitly through spark-submit, spark-defaults, or the session builder, so operator
+    configuration always wins. Explicitly-set keys are detected through the SparkContext's
+    ``SparkConf``, which carries only explicit settings and not Spark's built-in defaults.
 
     Args:
         app_name: Spark application name. Defaults to :data:`APP_NAME`.
@@ -224,7 +242,12 @@ def build_spark(app_name: str | None = None) -> SparkSession:
     Returns:
         An active SparkSession.
     """
-    return SparkSession.builder.appName(app_name or APP_NAME).getOrCreate()
+    session: SparkSession = SparkSession.builder.appName(app_name or APP_NAME).getOrCreate()
+    explicit = session.sparkContext.getConf()
+    for conf_key, conf_value in SPARK_CONF_DEFAULTS.items():
+        if not explicit.contains(conf_key):
+            session.conf.set(conf_key, conf_value)
+    return session
 
 
 def configure_logging_from_args(args: argparse.Namespace) -> None:

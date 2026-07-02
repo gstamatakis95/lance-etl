@@ -8,8 +8,6 @@ from __future__ import annotations
 
 from lance_etl.etl.job import (
     IcebergToLanceETL,
-    apply_merge,
-    dataset_uri,
     snapshot_id_bounds,
 )
 from lance_etl.etl.pivot import (
@@ -23,14 +21,22 @@ from lance_etl.etl.pivot import (
     stats_schema,
     stats_spark_ddl,
 )
+from lance_etl.etl.sink import (
+    apply_merge,
+    build_update_condition,
+    dataset_uri,
+    table_chunks,
+)
 
 __all__ = [
     "ROUTING_COLS",
     "ETLConfig",
     "IcebergToLanceETL",
     "apply_merge",
+    "build_update_condition",
     "dataset_uri",
     "snapshot_id_bounds",
+    "table_chunks",
     "apply_fsl_cast",
     "apply_ttl_cast",
     "build_stats_batch",

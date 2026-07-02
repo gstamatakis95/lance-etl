@@ -21,7 +21,7 @@ import pyarrow as pa
 import pytest
 from pyspark.sql import SparkSession
 
-import lance_etl.etl.job as etl_module
+import lance_etl.etl.sink as etl_module
 from lance_etl.etl import (
     ROUTING_COLS,
     ETLConfig,

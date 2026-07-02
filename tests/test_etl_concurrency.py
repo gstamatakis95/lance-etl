@@ -19,7 +19,7 @@ import pyarrow as pa
 import pytest
 
 from lance_etl.etl import ETLConfig, apply_merge, dataset_uri
-from lance_etl.etl.job import table_chunks
+from lance_etl.etl.sink import table_chunks
 from lance_etl.maintenance import MaintenanceConfig, compact_small_dataset
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 

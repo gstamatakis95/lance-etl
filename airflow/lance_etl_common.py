@@ -100,6 +100,13 @@ def build_base_spark_conf(params: dict[str, str | int]) -> dict[str, str]:
     Executor instance count and memory are taken from Variables / params first, then any
     ``spark_conf_overrides`` JSON is merged on top (overrides win).
 
+    ``spark.executor.memoryOverheadFactor`` defaults to ``0.3`` because lance-etl executors run
+    substantial native and Python-worker memory outside the JVM heap: Lance dataset reads and
+    writes happen in native code, and the pivot plus merge closures live in PySpark workers. The
+    Spark default of 0.1 under-provisions that off-heap footprint and shows up as executors
+    killed by the resource manager rather than JVM OOMs. Override through
+    ``spark_conf_overrides`` when a workload needs a different split.
+
     Args:
         params: DAG-run ``params`` dict.
 
@@ -110,6 +117,7 @@ def build_base_spark_conf(params: dict[str, str | int]) -> dict[str, str]:
         "spark.executor.instances": str(resolve_variable("executor_instances", params)),
         "spark.executor.memory": resolve_variable("executor_memory", params),
         "spark.driver.memory": resolve_variable("driver_memory", params),
+        "spark.executor.memoryOverheadFactor": "0.3",
     }
     raw_overrides = resolve_variable("spark_conf_overrides", params)
     try:

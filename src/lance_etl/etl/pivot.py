@@ -18,6 +18,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from lance_etl.column_roles import SCALAR_ROLE, TEXT_ROLE, VECTOR_ROLE
 from lance_etl.telemetry import DEFAULT_CONFLICT_RETRIES, DEFAULT_RETRY_TIMEOUT, TelemetryConfig
 
 ROUTING_COLS: tuple[str, str, str] = ("org_id", "tenant_id", "namespace")
@@ -51,6 +52,9 @@ class ETLConfig:
             bytes) yields ~131 K rows/chunk whose hash-join build side peaks around 67 MB — well
             under the 100 MB default pool that the sift1m repro exhausted at 97.7 MB. None disables
             chunking.
+        data_storage_version: Lance file format version for newly created datasets. The default
+            ``"2.1"`` adopts the latest stable format with structural encodings. Existing
+            datasets keep the format they were created with, and lance reads both transparently.
         spark_batches: Number of sequential Spark-level batches the increment is split into before
             collapse. Each batch keeps the rows whose ``pmod(xxhash64(key_col), spark_batches)``
             equals the batch index, so every event for a vector id lands in exactly one batch and
@@ -79,6 +83,7 @@ class ETLConfig:
     window_column: str = "processing_timestamp"
     retry_backoff_seconds: float = 0.5
     merge_batch_bytes: int | None = 64 * 1024 * 1024
+    data_storage_version: str = "2.1"
     spark_batches: int = 1
 
 
@@ -136,7 +141,7 @@ def apply_fsl_cast(
     return table.set_column(col_idx, col_name, column.cast(pa.list_(pa.float32(), dim)))
 
 
-def pivot_map_columns(table: pa.Table, config: ETLConfig) -> tuple[pa.Table, dict[str, int]]:
+def pivot_map_columns(table: pa.Table, config: ETLConfig) -> tuple[pa.Table, dict[str, int], dict[str, str]]:
     """Expand every map column into concrete per-key columns for this dataset group.
 
     Processes ``vectors``, ``texts``, and ``metadata`` in order. For each map column, all distinct
@@ -144,13 +149,19 @@ def pivot_map_columns(table: pa.Table, config: ETLConfig) -> tuple[pa.Table, dic
     an existing or reserved column are skipped. Vector columns are passed through
     :func:`apply_fsl_cast`. The map column is dropped after its keys are extracted.
 
+    Each created column's role is its source map: keys from ``vectors`` are ``"vector"`` columns,
+    keys from ``texts`` are ``"text"`` columns, and keys from ``metadata`` are ``"scalar"``
+    columns. The sink persists these roles into the dataset's config KV so the indexer can later
+    choose which index each column gets.
+
     Args:
         table: The upsert table for one dataset group, after Spark serialisation.
         config: ETL configuration providing the set of reserved column names.
 
     Returns:
-        ``(result_table, counts)`` where ``counts`` carries ``"invalid_map_keys"`` and
-        ``"invalid_vector_rows"`` when non-zero.
+        ``(result_table, counts, roles)`` where ``counts`` carries ``"invalid_map_keys"`` and
+        ``"invalid_vector_rows"`` when non-zero, and ``roles`` maps each created column to its
+        role string.
     """
     routing_reserved: set[str] = {
         config.key_col,
@@ -162,11 +173,12 @@ def pivot_map_columns(table: pa.Table, config: ETLConfig) -> tuple[pa.Table, dic
     result: pa.Table = table
     collision_key_count: int = 0
     fsl_invalid_counts: dict[str, int] = {}
+    roles: dict[str, str] = {}
 
-    for map_col, is_vectors in (
-        ("vectors", True),
-        ("texts", False),
-        ("metadata", False),
+    for map_col, role in (
+        ("vectors", VECTOR_ROLE),
+        ("texts", TEXT_ROLE),
+        ("metadata", SCALAR_ROLE),
     ):
         if map_col not in result.schema.names:
             continue
@@ -190,8 +202,9 @@ def pivot_map_columns(table: pa.Table, config: ETLConfig) -> tuple[pa.Table, dic
             extracted: pa.ChunkedArray = pc.map_lookup(map_column, query_key=key, occurrence="last")
             result = result.append_column(key, extracted)
             seen_names.add(key)
+            roles[key] = role
 
-            if is_vectors:
+            if role == VECTOR_ROLE:
                 result = apply_fsl_cast(result, key, fsl_invalid_counts)
 
         col_idx: int = result.schema.get_field_index(map_col)
@@ -203,7 +216,7 @@ def pivot_map_columns(table: pa.Table, config: ETLConfig) -> tuple[pa.Table, dic
     invalid_rows: int = sum(fsl_invalid_counts.values())
     if invalid_rows:
         counts["invalid_vector_rows"] = invalid_rows
-    return result, counts
+    return result, counts, roles
 
 
 def group_by_routing(table: pa.Table, routing_cols: list[str]) -> Iterator[tuple[tuple[Any, ...], pa.Table]]:
