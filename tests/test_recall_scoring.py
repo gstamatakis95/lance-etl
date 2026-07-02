@@ -7,7 +7,6 @@ Spark is replaced with the minimal in-process fake used elsewhere in the suite s
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +14,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+from conftest import FakeSpark
 
 from lance_etl.recall import (
     AggregateRow,
@@ -37,62 +37,6 @@ from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 DIM: int = 8
 ROWS: int = 100
-
-
-class FakeRdd:
-    """Minimal stand-in for a Spark RDD running map eagerly in process."""
-
-    def __init__(self, items: list[object]) -> None:
-        """Initialize the fake RDD.
-
-        Args:
-            items: The partitioned items.
-        """
-        self.items: list[object] = items
-
-    def map(self, fn: Callable[[object], object]) -> FakeRdd:
-        """Apply a function to every item eagerly.
-
-        Args:
-            fn: The mapper.
-
-        Returns:
-            A new fake RDD with the mapped items.
-        """
-        return FakeRdd([fn(item) for item in self.items])
-
-    def collect(self) -> list[object]:
-        """Return the items.
-
-        Returns:
-            The current items.
-        """
-        return list(self.items)
-
-
-class FakeSparkContext:
-    """Minimal stand-in for a SparkContext."""
-
-    def parallelize(self, items: list[object], slices: int) -> FakeRdd:
-        """Wrap items into a fake RDD.
-
-        Args:
-            items: The items to distribute.
-            slices: Ignored partition count.
-
-        Returns:
-            The fake RDD.
-        """
-        del slices
-        return FakeRdd(list(items))
-
-
-class FakeSpark:
-    """Minimal stand-in for a SparkSession."""
-
-    def __init__(self) -> None:
-        """Initialize the fake session with its fake context."""
-        self.sparkContext: FakeSparkContext = FakeSparkContext()
 
 
 def make_vectors(rows: int, dim: int, seed: int) -> np.ndarray:

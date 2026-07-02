@@ -283,10 +283,8 @@ Key facts to internalize:
   `ValueError`. The same string must reach every executor shard.
 - `CommitConflictError` is not reliably importable from `lance` directly. Use the fallback chain
   in `telemetry.py`. Conflicts surface as `OSError` or `RuntimeError` from lance internals.
-- `defer_index_remap=True` builds a `__lance_frag_reuse` system index at commit time. The
-  options-carrying `Compaction.commit(options=...)` binding requires a pylance built from the
-  `fix/compaction-commit-options` lance branch. Older bindings fall back to the bare call and
-  always remap inline (a warning plus `dataset.commit_options_unsupported` is emitted).
+- `defer_index_remap=True` builds a `__lance_frag_reuse` system index at commit time through
+  the options passed to `Compaction.commit`. pylance 8.0.0 carries the `options` parameter.
 - The FTS path requires a Lance field id (not a pyarrow schema index) for `Index(fields=[...])`.
   Resolve it with `dataset._ds.lance_schema.field_case_insensitive(col).id()`.
 - Iceberg 1.10 rejects `start-timestamp` / `end-timestamp` outside changelog scans. Use

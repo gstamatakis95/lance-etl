@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import random
 import sys
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
 os.environ.setdefault("DD_TRACE_ENABLED", "false")
@@ -115,3 +116,93 @@ def compact_dataset_inline(uri: str, config: MaintenanceConfig, telemetry: Telem
     result: dict[str, int] = {"tasks": 1, "bytes_removed": bytes_removed}
     result.update(metrics)
     return result
+
+
+class FakeBroadcast:
+    """Minimal stand-in for a Spark broadcast variable."""
+
+    def __init__(self, value: object) -> None:
+        """Wrap the broadcast value.
+
+        Args:
+            value: The value to expose.
+        """
+        self.value: object = value
+
+
+class FakeRdd:
+    """Minimal stand-in for a Spark RDD running everything eagerly in process."""
+
+    def __init__(self, items: list[object]) -> None:
+        """Initialize the fake RDD.
+
+        Args:
+            items: The partitioned items.
+        """
+        self.items: list[object] = items
+
+    def map(self, fn: Callable[[object], object]) -> FakeRdd:
+        """Apply a function to every item eagerly.
+
+        Args:
+            fn: The mapper.
+
+        Returns:
+            A new fake RDD with the mapped items.
+        """
+        return FakeRdd([fn(item) for item in self.items])
+
+    def mapPartitions(self, fn: Callable[[Iterator[object]], Iterator[object]]) -> FakeRdd:
+        """Apply a partition function to the single in-process partition.
+
+        Args:
+            fn: The partition mapper yielding outputs.
+
+        Returns:
+            A new fake RDD with the collected outputs.
+        """
+        return FakeRdd(list(fn(iter(self.items))))
+
+    def collect(self) -> list[object]:
+        """Return the items.
+
+        Returns:
+            The current items.
+        """
+        return list(self.items)
+
+
+class FakeSparkContext:
+    """Minimal stand-in for a SparkContext with broadcast support."""
+
+    def parallelize(self, items: Iterable[object], slices: int) -> FakeRdd:
+        """Wrap items into a fake RDD.
+
+        Args:
+            items: The items to distribute.
+            slices: Ignored partition count.
+
+        Returns:
+            The fake RDD.
+        """
+        del slices
+        return FakeRdd(list(items))
+
+    def broadcast(self, value: object) -> FakeBroadcast:
+        """Wrap a value into a fake broadcast.
+
+        Args:
+            value: The value to broadcast.
+
+        Returns:
+            The fake broadcast handle.
+        """
+        return FakeBroadcast(value)
+
+
+class FakeSpark:
+    """Minimal stand-in for a SparkSession driving fan-outs in the driver process."""
+
+    def __init__(self) -> None:
+        """Initialize the fake session with its fake context."""
+        self.sparkContext: FakeSparkContext = FakeSparkContext()

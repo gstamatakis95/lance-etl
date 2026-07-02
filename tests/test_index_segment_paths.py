@@ -7,13 +7,12 @@ driver-side merge, then commit, asserting the index is listed and queryable afte
 from __future__ import annotations
 
 import json
-import pickle
 import uuid
 from pathlib import Path
 
 import lance
 import pytest
-from conftest import make_vector_table, write_fragmented_dataset
+from conftest import FakeSpark, make_vector_table, write_fragmented_dataset
 from lance.dataset import Index
 
 from lance_etl.indexing import (
@@ -71,27 +70,6 @@ def index_config() -> IndexJobConfig:
         commit_retries=5,
         commit_backoff_seconds=0.0,
     )
-
-
-def test_handler_segment_builder_is_picklable() -> None:
-    """The ``segment_builder`` callable pickles cleanly and stays small for Spark closures.
-
-    It is a :func:`functools.partial` over a module-level function bound to primitive values only, so it must
-    round-trip through pickle without dragging the handler instance (and its ``config`` with ``storage_options``
-    and ``telemetry``) onto every task.
-    """
-    config: IndexJobConfig = index_config()
-    handlers: list[IndexHandler] = [
-        VectorIndexHandler(config, "vector", "vector_idx"),
-        BTreeIndexHandler(config, "id", "id_idx"),
-        BitmapIndexHandler(config, "category", "category_idx"),
-    ]
-    for handler in handlers:
-        builder: object = handler.segment_builder()
-        payload: bytes = pickle.dumps(builder)
-        restored: object = pickle.loads(payload)
-        assert callable(restored)
-        assert len(payload) < len(pickle.dumps(handler))
 
 
 def fragment_ids_of(uri: str) -> list[int]:
@@ -355,96 +333,6 @@ def test_scalar_fragment_sharding_requires_segment_api(dataset_uri: str) -> None
             fragment_ids=[first_fragment],
             index_uuid=str(uuid.uuid4()),
         )
-
-
-class FakeBroadcast:
-    """Minimal stand-in for a Spark broadcast variable."""
-
-    def __init__(self, value: object) -> None:
-        """Wrap the broadcast value.
-
-        Args:
-            value: The value to expose.
-        """
-        self.value: object = value
-
-
-class FakeRdd:
-    """Minimal stand-in for a Spark RDD running everything eagerly in process."""
-
-    def __init__(self, items: list[object]) -> None:
-        """Initialize the fake RDD.
-
-        Args:
-            items: The partitioned items.
-        """
-        self.items: list[object] = items
-
-    def map(self, fn: object) -> FakeRdd:
-        """Apply a function to every item eagerly.
-
-        Args:
-            fn: The mapper.
-
-        Returns:
-            A new fake RDD with the mapped items.
-        """
-        return FakeRdd([fn(item) for item in self.items])
-
-    def mapPartitions(self, fn: object) -> FakeRdd:
-        """Apply a partition function to the single in-process partition.
-
-        Args:
-            fn: The partition mapper yielding outputs.
-
-        Returns:
-            A new fake RDD with the collected outputs.
-        """
-        return FakeRdd(list(fn(iter(self.items))))
-
-    def collect(self) -> list[object]:
-        """Return the items.
-
-        Returns:
-            The current items.
-        """
-        return list(self.items)
-
-
-class FakeSparkContext:
-    """Minimal stand-in for a SparkContext with broadcast support."""
-
-    def parallelize(self, items: list[object], slices: int) -> FakeRdd:
-        """Wrap items into a fake RDD.
-
-        Args:
-            items: The items to distribute.
-            slices: Ignored partition count.
-
-        Returns:
-            The fake RDD.
-        """
-        del slices
-        return FakeRdd(list(items))
-
-    def broadcast(self, value: object) -> FakeBroadcast:
-        """Wrap a value into a fake broadcast.
-
-        Args:
-            value: The value to broadcast.
-
-        Returns:
-            The fake broadcast handle.
-        """
-        return FakeBroadcast(value)
-
-
-class FakeSpark:
-    """Minimal stand-in for a SparkSession."""
-
-    def __init__(self) -> None:
-        """Initialize the fake session with its fake context."""
-        self.sparkContext: FakeSparkContext = FakeSparkContext()
 
 
 def test_unified_run_builds_fts_end_to_end(dataset_uri: str) -> None:

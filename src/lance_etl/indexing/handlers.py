@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import functools
 import logging
-from collections.abc import Callable
 from typing import Any
 
 import lance
@@ -169,7 +168,7 @@ class IndexHandler:
         This base implementation covers the artifact-free scalar types (BTREE and BITMAP). It
         delegates to the module-level :func:`~lance_etl.indexing.segments.build_scalar_segment` so
         the same logic backs both direct calls and the closure-friendly builder returned by
-        :meth:`segment_builder`. Handlers that need broadcast artifacts override this method.
+        the runner's build tasks. Handlers that need broadcast artifacts override this method.
 
         Args:
             dataset: A dataset handle pinned to the build version.
@@ -183,26 +182,6 @@ class IndexHandler:
             dataset,
             fragment_ids,
             artifacts,
-            column=self.column,
-            index_name=self.index_name,
-            index_type=self.index_type(),
-        )
-
-    def segment_builder(self) -> Callable[[lance.LanceDataset, list[int], object | None], Index]:
-        """Return a picklable per-shard segment builder that does not capture the handler instance.
-
-        The Spark closure in :meth:`build` ships this callable to executors. Returning a
-        :func:`functools.partial` over the module-level
-        :func:`~lance_etl.indexing.segments.build_scalar_segment` with only primitive values keeps
-        the serialized task small. Capturing the bound ``self.build_segment`` instead would pickle
-        the whole handler, including its ``config`` with ``storage_options`` and ``telemetry``,
-        onto every task.
-
-        Returns:
-            A callable taking the shard dataset, fragment ids, and broadcast artifacts.
-        """
-        return functools.partial(
-            build_scalar_segment,
             column=self.column,
             index_name=self.index_name,
             index_type=self.index_type(),
@@ -504,7 +483,7 @@ class VectorIndexHandler(IndexHandler):
 
         Delegates to the module-level
         :func:`~lance_etl.indexing.segments.build_vector_segment` so the same logic backs both
-        direct calls and the closure-friendly builder returned by :meth:`segment_builder`.
+        direct calls and the runner's build tasks.
 
         Args:
             dataset: A dataset handle pinned to the build version.
@@ -523,24 +502,6 @@ class VectorIndexHandler(IndexHandler):
             dataset,
             fragment_ids,
             artifacts,
-            column=self.column,
-            index_name=self.index_name,
-            metric=self.config.metric,
-        )
-
-    def segment_builder(self) -> Callable[[lance.LanceDataset, list[int], object | None], Index]:
-        """Return a picklable IVF_RQ segment builder that does not capture the handler instance.
-
-        Mirrors :meth:`IndexHandler.segment_builder` but binds the vector-specific
-        :func:`~lance_etl.indexing.segments.build_vector_segment` with the metric. The centroids
-        and RaBitQ model are not bound here. They reach executors through the separate artifact
-        broadcast and arrive as the ``artifacts`` argument at call time.
-
-        Returns:
-            A callable taking the shard dataset, fragment ids, and broadcast artifacts.
-        """
-        return functools.partial(
-            build_vector_segment,
             column=self.column,
             index_name=self.index_name,
             metric=self.config.metric,

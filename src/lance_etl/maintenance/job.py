@@ -61,9 +61,8 @@ class MaintenanceConfig:
             default ``0.1`` matches lance's own default. An inline index remap is triggered when
             covered fragments are rewritten, so budget commit time accordingly for heavily
             indexed head datasets.
-        defer_index_remap: Defer index remap at commit time. The options are passed to
-            ``Compaction.commit`` and need a pylance built from the
-            ``fix/compaction-commit-options`` lance branch.
+        defer_index_remap: Defer index remap at commit time through the options passed to
+            ``Compaction.commit``.
         max_source_fragments: Cap on source fragments consumed per run for incremental
             compaction; ``None`` is unbounded, ``0`` is rejected.
         num_threads: Worker threads inside a single rewrite task.
@@ -491,14 +490,8 @@ def commit_one_dataset(
 ) -> dict[str, Any]:
     """Run phase C for one dataset on an executor: commit the rewrites and prune old versions.
 
-    The configured compaction options are passed to ``Compaction.commit`` so
-    ``defer_index_remap`` is honored at commit time. The ``options`` parameter exists on pylance
-    builds carrying the ``fix/compaction-commit-options`` lance patch. Older bindings reject the
-    keyword with a ``TypeError``, so the commit falls back to the bare two-argument call, which
-    is behaviorally identical except that ``defer_index_remap`` is silently impossible: the old
-    binding always remaps covering indices inline. The fallback logs a warning and emits
-    ``dataset.commit_options_unsupported`` when ``defer_index_remap`` was requested. Remove the
-    fallback once every deployment runs the patched pylance.
+    The configured compaction options are passed to ``Compaction.commit`` so commit-time options
+    such as ``defer_index_remap`` take effect (pylance 8.0.0 carries the ``options`` parameter).
 
     Retrying the commit cannot resolve a semantic conflict: the conflict scan is pinned to the
     plan version, so the same conflicting transaction is found on every attempt. The small
@@ -519,22 +512,9 @@ def commit_one_dataset(
     rewrites: list[RewriteResult] = [RewriteResult.from_json(document) for document in rewrite_jsons]
 
     def action() -> dict[str, int]:
-        """Commit the rewrites against the latest version, falling back on old bindings."""
+        """Commit the rewrites against the latest version."""
         dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-        try:
-            metrics: CompactionMetrics = Compaction.commit(dataset, rewrites, options=config.execute_options())
-        except TypeError as exc:
-            if "options" not in str(exc):
-                raise
-            if config.defer_index_remap:
-                telemetry.incr("dataset.commit_options_unsupported")
-                logger.warning(
-                    "installed pylance does not accept Compaction.commit(options=...): "
-                    "defer_index_remap is NOT taking effect for %s. "
-                    "Rebuild pylance from the fix/compaction-commit-options lance branch.",
-                    uri,
-                )
-            metrics = Compaction.commit(dataset, rewrites)
+        metrics: CompactionMetrics = Compaction.commit(dataset, rewrites, options=config.execute_options())
         telemetry.incr("dataset.committed")
         return compaction_metrics_dict(metrics)
 

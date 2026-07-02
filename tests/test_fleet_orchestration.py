@@ -9,89 +9,16 @@ with nothing to do.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import lance
 import pyarrow as pa
 import pytest
+from conftest import FakeSpark
 
 import lance_etl.maintenance.job as maintenance_job
 from lance_etl.maintenance import MaintenanceConfig, MaintenanceJob, plan_one_dataset
 from lance_etl.telemetry import Telemetry, TelemetryConfig
-
-
-class FakeRdd:
-    """Minimal stand-in for a Spark RDD running map eagerly in process."""
-
-    def __init__(self, items: list[object]) -> None:
-        """Initialize the fake RDD.
-
-        Args:
-            items: The partitioned items.
-        """
-        self.items: list[object] = items
-
-    def map(self, fn: Callable[[object], object]) -> FakeRdd:
-        """Apply a function to every item eagerly.
-
-        Args:
-            fn: The mapper.
-
-        Returns:
-            A new fake RDD with the mapped items.
-        """
-        return FakeRdd([fn(item) for item in self.items])
-
-    def mapPartitions(self, fn: Callable[[Iterator[object]], Iterator[object]]) -> FakeRdd:
-        """Apply a partition function to the single in-process partition.
-
-        Args:
-            fn: The partition mapper yielding outputs.
-
-        Returns:
-            A new fake RDD with the collected outputs.
-        """
-        return FakeRdd(list(fn(iter(self.items))))
-
-    def collect(self) -> list[object]:
-        """Return the items.
-
-        Returns:
-            The current items.
-        """
-        return list(self.items)
-
-
-class FakeSparkContext:
-    """Minimal stand-in for a SparkContext recording flat-job sizes."""
-
-    def __init__(self) -> None:
-        """Initialize with an empty record of parallelize calls."""
-        self.parallelize_sizes: list[int] = []
-
-    def parallelize(self, items: list[object], slices: int) -> FakeRdd:
-        """Wrap items into a fake RDD, recording the item count.
-
-        Args:
-            items: The items to distribute.
-            slices: Ignored partition count.
-
-        Returns:
-            The fake RDD.
-        """
-        del slices
-        materialized: list[object] = list(items)
-        self.parallelize_sizes.append(len(materialized))
-        return FakeRdd(materialized)
-
-
-class FakeSpark:
-    """Minimal stand-in for a SparkSession."""
-
-    def __init__(self) -> None:
-        """Initialize the fake session with its fake context."""
-        self.sparkContext: FakeSparkContext = FakeSparkContext()
 
 
 def write_rows(uri: str, rows: int, rows_per_file: int) -> None:

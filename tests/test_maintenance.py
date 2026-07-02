@@ -9,13 +9,13 @@ fan-out callables run in the driver process and can be observed.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import lance
 import pyarrow as pa
 import pytest
+from conftest import FakeSpark
 
 import lance_etl.maintenance.job as maintenance_job
 from lance_etl.maintenance import (
@@ -48,82 +48,6 @@ def make_ttl_table(rows: int, ts_base: datetime, step: timedelta, lifetime: time
     timestamps: pa.Array = pa.array([ts_base + step * i for i in range(rows)], pa.timestamp("us", tz="UTC"))
     lifetimes: pa.Array = pa.array([lifetime for _ in range(rows)], pa.duration("us"))
     return pa.table({"id": ids, TS_COLUMN: timestamps, TTL_COLUMN: lifetimes})
-
-
-class FakeRdd:
-    """Minimal in-process stand-in for a Spark RDD."""
-
-    def __init__(self, items: Iterable[object]) -> None:
-        """Initialize the fake RDD.
-
-        Args:
-            items: The partitioned items.
-        """
-        self.items: list[object] = list(items)
-
-    def map(self, fn: Callable[[object], object]) -> FakeRdd:
-        """Apply a function to every item eagerly.
-
-        Args:
-            fn: The mapper.
-
-        Returns:
-            A new fake RDD with the mapped items.
-        """
-        return FakeRdd([fn(item) for item in self.items])
-
-    def mapPartitions(self, fn: Callable[[Iterator[object]], Iterator[object]]) -> FakeRdd:
-        """Apply a partition function to the single in-process partition.
-
-        Args:
-            fn: The partition mapper yielding outputs.
-
-        Returns:
-            A new fake RDD with the collected outputs.
-        """
-        return FakeRdd(list(fn(iter(self.items))))
-
-    def collect(self) -> list[object]:
-        """Return the items.
-
-        Returns:
-            The current items.
-        """
-        return list(self.items)
-
-
-class FakeSparkContext:
-    """Minimal stand-in for a SparkContext running everything in process."""
-
-    def parallelize(self, items: Iterable[object], slices: int) -> FakeRdd:
-        """Wrap items into a fake RDD.
-
-        Args:
-            items: The items to distribute.
-            slices: Ignored partition count.
-
-        Returns:
-            The fake RDD.
-        """
-        del slices
-        return FakeRdd(items)
-
-    def setLocalProperty(self, key: str, value: str | None) -> None:
-        """Accept and ignore scheduler-pool properties.
-
-        Args:
-            key: The property name.
-            value: The property value.
-        """
-        del key, value
-
-
-class FakeSpark:
-    """Minimal stand-in for a SparkSession driving fan-out in the driver process."""
-
-    def __init__(self) -> None:
-        """Initialize the fake session with its fake context."""
-        self.sparkContext: FakeSparkContext = FakeSparkContext()
 
 
 @pytest.fixture
