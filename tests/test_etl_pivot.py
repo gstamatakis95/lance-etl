@@ -118,6 +118,11 @@ class TestPivotEndToEnd:
         Vector keys land as fixed-size-list columns, text keys as string columns, and metadata
         keys as string columns. The map columns themselves are not written to Lance. A key absent
         from a row yields NULL for that column in that row.
+
+        Args:
+            spark: The module-scoped local Spark session.
+            tmp_path: Pytest-provided temporary directory.
+            telemetry_config: The test telemetry configuration.
         """
         config: ETLConfig = pivot_config(tmp_path, telemetry_config)
         vector_a: list[float] = [float(i) for i in range(DIMENSION)]
@@ -164,6 +169,11 @@ class TestPivotEndToEnd:
 
         These are exactly the column types the IVF_RQ and INVERTED index handlers require, so a
         tiny FTS index can be built directly over the pivoted text column.
+
+        Args:
+            spark: The module-scoped local Spark session.
+            tmp_path: Pytest-provided temporary directory.
+            telemetry_config: The test telemetry configuration.
         """
         config: ETLConfig = pivot_config(tmp_path, telemetry_config)
         rows: list[tuple] = [
@@ -304,6 +314,11 @@ class TestCollapseGuarantee:
         This validates the order-safety invariant: because collapse runs before any partitioning,
         no key can appear in more than one chunk when merge_batch_bytes slices the upsert table.
         The older row is discarded and the newer row's payload is written to the dataset.
+
+        Args:
+            spark: The module-scoped local Spark session.
+            tmp_path: Pytest-provided temporary directory.
+            telemetry_config: The test telemetry configuration.
         """
         ts_old: datetime = datetime(2024, 1, 1, tzinfo=UTC)
         ts_new: datetime = datetime(2024, 6, 1, tzinfo=UTC)
@@ -330,6 +345,11 @@ class TestCollapseGuarantee:
         """When all vector_ids are distinct, collapse does not drop any row.
 
         A group with N unique vector_ids must produce exactly N rows in the written dataset.
+
+        Args:
+            spark: The module-scoped local Spark session.
+            tmp_path: Pytest-provided temporary directory.
+            telemetry_config: The test telemetry configuration.
         """
         ts: datetime = datetime(2024, 3, 15, tzinfo=UTC)
         rows: list[tuple] = [(f"v{i}", "o2", "t2", "ns2", ts, ts, "insert", {"txt": f"val{i}"}) for i in range(10)]
@@ -392,6 +412,11 @@ class TestSparkBatches:
         row even though the increment is processed as three separate Spark jobs, because the
         key-hash bucketing puts both duplicate events in the same batch. The null-routing row is
         dropped by the Spark-level filter in both runs.
+
+        Args:
+            spark: The module-scoped local Spark session.
+            tmp_path: Pytest-provided temporary directory.
+            telemetry_config: The test telemetry configuration.
         """
         frame = spark.createDataFrame(self.make_rows(), self.nullable_routing_schema())
         batched_config: ETLConfig = ETLConfig(
@@ -434,6 +459,11 @@ class TestSparkBatches:
         """The key-hash buckets are disjoint and their union covers every input row.
 
         Also verifies that batch_count=1 returns the source plan unchanged.
+
+        Args:
+            spark: The module-scoped local Spark session.
+            tmp_path: Pytest-provided temporary directory.
+            telemetry_config: The test telemetry configuration.
         """
         frame = spark.createDataFrame(self.make_rows(), self.nullable_routing_schema())
         config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config)

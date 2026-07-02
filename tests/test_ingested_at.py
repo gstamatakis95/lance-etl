@@ -83,6 +83,11 @@ class TestNoIngestedAtColumn:
         """A fresh ingest does not produce an ``_ingested_at`` column in the written dataset.
 
         This is the primary regression guard for ADR 0016: the column must not reappear.
+
+        Args:
+            spark: The module-scoped local Spark session.
+            tmp_path: Pytest-provided temporary directory.
+            telemetry_config: The test telemetry configuration.
         """
         config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config, num_partitions=4)
         frame = spark.createDataFrame(sample_rows(), SOURCE_DDL)
@@ -97,6 +102,11 @@ class TestNoIngestedAtColumn:
         """The event timestamp column (``ts_col``) is present in the written dataset.
 
         The event timestamp is the single canonical clock after ADR 0016.
+
+        Args:
+            spark: The module-scoped local Spark session.
+            tmp_path: Pytest-provided temporary directory.
+            telemetry_config: The test telemetry configuration.
         """
         config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config, num_partitions=4)
         frame = spark.createDataFrame(sample_rows(), SOURCE_DDL)

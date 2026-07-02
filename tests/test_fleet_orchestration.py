@@ -96,6 +96,11 @@ def test_fleet_run_compacts_mixed_sizes_in_one_flat_job(
 
     The flat job's size must equal the sum of both datasets' task counts, proving the fleet's
     rewrite work is scheduled together rather than per dataset.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        telemetry_config: The test telemetry configuration.
+        monkeypatch: Pytest monkeypatch fixture.
     """
     small_uri: str = str(tmp_path / "small.lance")
     big_uri: str = str(tmp_path / "big.lance")

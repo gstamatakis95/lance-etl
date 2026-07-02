@@ -145,6 +145,12 @@ def test_commit_one_dataset_uses_small_budget(
 
     Exhaustion surfaces as a ``conflict`` marker rather than an exception, so the fleet run
     re-plans the dataset instead of failing.
+
+    Args:
+        dataset_uri: URI of the pre-built test dataset.
+        telemetry_config: The test telemetry configuration.
+        telemetry: The telemetry facade fixture.
+        monkeypatch: Pytest monkeypatch fixture.
     """
     config: MaintenanceConfig = replan_config(telemetry_config, large_commit_retries=2)
     attempts: list[int] = []

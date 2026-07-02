@@ -233,6 +233,11 @@ def test_chunked_upsert_matches_unchunked(
     and one with merge_batch_bytes=None (single commit). Both dataset paths must have identical
     row counts and identical values on a key sample. The budget is derived from the group table's
     actual nbytes so the test is not sensitive to column encoding details.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        telemetry_config: The test telemetry configuration.
+        telemetry: The telemetry facade fixture.
     """
     keys: list[str] = [f"id{i:03d}" for i in range(30)]
     group: pa.Table = make_large_group(keys, value=7.0)
@@ -277,6 +282,11 @@ def test_chunked_upsert_counts_aggregate_correctly(
     Bootstraps with 25 rows then re-upserts 15 of them plus 5 new ones. With a byte budget that
     forces 5-row chunks, the result must report 20 total (15 updated + 5 inserted), not just the
     last chunk's count. The budget is derived from the group table's actual nbytes.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        telemetry_config: The test telemetry configuration.
+        telemetry: The telemetry facade fixture.
     """
     all_keys: list[str] = [f"k{i:03d}" for i in range(25)]
     apply_merge(
@@ -319,6 +329,11 @@ def test_chunked_delete_path(tmp_path: Path, telemetry_config: TelemetryConfig, 
 
     Bootstraps 40 rows, then issues 15 deletes with a byte budget that forces ~5-row chunks.
     Final row count must be 25. The budget is derived from the delete group's actual nbytes.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        telemetry_config: The test telemetry configuration.
+        telemetry: The telemetry facade fixture.
     """
     all_keys: list[str] = [f"d{i:03d}" for i in range(40)]
     base_config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config)
@@ -506,6 +521,10 @@ def test_out_of_order_update_does_not_overwrite(ts_config: ETLConfig, telemetry:
 
     This is the primary cross-window last-write-wins guard: arrival order after ``collapse`` must
     not matter when the source carries an older timestamp than the already-stored row.
+
+    Args:
+        ts_config: The timestamp-guarded ETL configuration fixture.
+        telemetry: The telemetry facade fixture.
     """
     apply_merge(ts_config, telemetry, ROUTING_KEY, make_ts_group(["k1"], ts_values=[100], value=99.0))
     apply_merge(ts_config, telemetry, ROUTING_KEY, make_ts_group(["k1"], ts_values=[50], value=0.0))
@@ -520,6 +539,10 @@ def test_equal_ts_replay_is_idempotent(ts_config: ETLConfig, telemetry: Telemetr
 
     Ties (source.ts == target.ts) must apply the update so that re-running the same ETL window
     produces the same dataset state (idempotent replay).
+
+    Args:
+        ts_config: The timestamp-guarded ETL configuration fixture.
+        telemetry: The telemetry facade fixture.
     """
     apply_merge(ts_config, telemetry, ROUTING_KEY, make_ts_group(["k1"], ts_values=[100], value=7.0))
     apply_merge(ts_config, telemetry, ROUTING_KEY, make_ts_group(["k1"], ts_values=[100], value=7.0))
@@ -533,6 +556,10 @@ def test_newer_update_overwrites_older_stored_row(ts_config: ETLConfig, telemetr
     """A source row with a higher timestamp must overwrite the stored row (forward progress).
 
     Confirms the guard does not block legitimate updates from a later ETL window.
+
+    Args:
+        ts_config: The timestamp-guarded ETL configuration fixture.
+        telemetry: The telemetry facade fixture.
     """
     apply_merge(ts_config, telemetry, ROUTING_KEY, make_ts_group(["k1"], ts_values=[100], value=1.0))
     apply_merge(ts_config, telemetry, ROUTING_KEY, make_ts_group(["k1"], ts_values=[200], value=2.0))
@@ -553,6 +580,10 @@ def test_null_target_ts_is_not_overwritten(ts_config: ETLConfig, telemetry: Tele
     The COALESCE-based alternative (treat NULL target ts as epoch) is not supported in the current
     lance version because the ``target.`` table-qualifier cannot appear inside function arguments
     in the DataFusion condition planner.
+
+    Args:
+        ts_config: The timestamp-guarded ETL configuration fixture.
+        telemetry: The telemetry facade fixture.
     """
     null_ts_group: pa.Table = pa.table(
         {

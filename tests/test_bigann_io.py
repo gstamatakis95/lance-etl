@@ -246,6 +246,9 @@ def test_convert_bvecs_gz_to_u8bin_roundtrip(tmp_path: Path) -> None:
 
     Verifies that every payload byte survives the gzip-bvecs -> u8bin round-trip without
     corruption, and that the output header matches the requested limit.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
     """
     nvecs: int = 20
     limit: int = 15
@@ -275,6 +278,9 @@ def test_stream_bvecs_to_u8bin_oneshot(tmp_path: Path) -> None:
 
     Uses a mock _open_range_response that returns the complete gzip-compressed bvecs bytes
     wrapped in a BytesIO context manager, so no network access occurs.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
     """
     nvecs: int = 30
     limit: int = 20
@@ -303,6 +309,9 @@ def test_stream_bvecs_to_u8bin_resume(tmp_path: Path) -> None:
     state behind. A second call to stream_bvecs_to_u8bin must rebuild the decompressor and
     the u8bin partial from the sidecar alone, fetch only the remaining compressed bytes via
     the Range offset, and produce the same u8bin as a clean one-shot run.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
     """
     nvecs: int = 30
     limit: int = 20
@@ -370,6 +379,9 @@ def test_rebuild_stream_state_continues_decoding(tmp_path: Path) -> None:
     Feeds the first half of a gzip stream into the partial file, rebuilds the stream state,
     then verifies the rebuilt u8bin partial plus the continued decode of the second half
     reproduces every vector payload of the full corpus.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
     """
     vectors: np.ndarray = make_bvecs128_corpus(10, seed=6)
     limit: int = 10

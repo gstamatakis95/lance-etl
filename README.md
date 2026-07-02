@@ -81,15 +81,17 @@ prewarm every replica against the green version explicitly (use the `version` or
 
 | Module | Key types | Purpose |
 |---|---|---|
-| `etl.py` | `ETLConfig`, `IcebergToLanceETL` | Iceberg read, collapse, repartition, merge_insert |
-| `indexing.py` | `LanceIndexer`, `*IndexHandler` | Distributed index builds via the segment API |
-| `maintenance.py` | `MaintenanceConfig`, `MaintenanceJob` | Per-row TTL expiration (opt-in), two-tier compaction (small/large), and version cleanup — run in that order per dataset |
+| `etl/` | `ETLConfig`, `IcebergToLanceETL`, `sink.py` | Iceberg source read, LWW collapse, Spark-level key-hash batching, and the content-routed Lance sink (format 2.1 bootstrap, column-role metadata) |
+| `indexing/` | `LanceIndexer`, `*IndexHandler` | Unified fleet index builds: plan fan-out, streaming k-means vector bootstrap, flat segment-build job, commit fan-out, delta bounding |
+| `maintenance/` | `MaintenanceConfig`, `MaintenanceJob` | Per-row TTL expiration (opt-in), unified plan-execute-commit compaction, and version cleanup |
+| `pipeline/` | `PipelineConfig`, `PipelineJob` | Serialized fleet phases: prune tags, maintenance, index, stamp |
+| `column_roles.py` | `load_column_roles`, `merge_column_roles` | Per-column role metadata (`lance-etl.columns`) driving automatic index target discovery |
 | `recall.py` | `RecallAuditJob`, `RecallJobConfig` | Offline recall@k / nDCG@k / MRR audit from Datadog spans |
 | `telemetry.py` | `Telemetry`, `TelemetryConfig` | ddtrace spans, DogStatsD, Lance event bridge |
 | `cloud_storage.py` | `resolve_filesystem`, `discover_datasets` | pyarrow filesystem + recursive dataset discovery |
 | `arrow_types.py` | `resolve_arrow_type`, `resolve_type_map` | Arrow type specs (`fixed_size_list<float32,768>`) |
 | `iceberg_optimize.py` | `IcebergOptimizer`, `IcebergOptimizeConfig`, `IcebergOptimizeReport` | Source Iceberg table maintenance via `CALL` procedures (`rewrite_data_files`, `rewrite_manifests`, `expire_snapshots`, opt-in `remove_orphan_files`). Distinct from the Lance maintenance job. |
-| `cli.py` | `main`, `build_parser` | Eight subcommands: `etl`, `maintenance`, `index`, `recall`, `tag`, `migrate-manifests`, `migrate-namespace`, `optimize-iceberg` |
+| `*/cli.py` | `main`, `build_parser` | Per-job entry points: `lance-etl-etl`, `lance-etl-index`, `lance-etl-maintenance`, `lance-etl-pipeline`, `lance-etl-tools` |
 | `migrate_namespace.py` | `NamespaceMigrator`, `MigrateConfig` | One-off operator utility to copy a whole namespace to a new namespace name |
 
 ### Rust (`rust/search-api/src/`)
@@ -123,17 +125,16 @@ prewarm every replica against the green version explicitly (use the `version` or
 | `telemetry/recall.rs` | Deterministic sampled-query capture into `recall.*` span attributes |
 | `config.rs` | `Config` from environment variables |
 
-### Airflow (`airflow/lance_etl_dag.py`)
+### Airflow (`airflow/`)
 
-DAG `lance_etl_pipeline` running `etl -> maintenance -> index` as `SparkSubmitOperator` tasks with
-`max_active_runs=1`. An optional `optimize-iceberg` task, gated by the `lance_etl_optimize_iceberg_enabled`
-Variable (default off), runs before `etl` to maintain the upstream Iceberg source table. Maintenance runs
-before indexing so fresh uncovered fragments are merged into large fragments before the index covers them,
-avoiding inline remap cost on every index commit.
-Schedule is driven by the Airflow Variable `lance_etl_schedule` (default `@daily`).
-Data-interval windowing and `dag_run.conf` overrides are described in the module docstring. The
-`migrate-namespace` subcommand is a one-off operator tool run manually via the CLI and is not
-scheduled here.
+Two DAGs built on the shared task factory in `lance_etl_common.py`. `lance_etl_etl_dag.py` runs
+the ingestion job (with an optional `optimize-iceberg` task, gated by the
+`lance_etl_optimize_iceberg_enabled` Variable, maintaining the upstream Iceberg source first).
+`lance_etl_pipeline_dag.py` runs the unified pipeline (`prune -> maintenance -> index -> stamp`)
+as `SparkSubmitOperator` tasks with `max_active_runs=1`. Maintenance runs before indexing so
+fresh fragments are compacted before the index covers them. Schedules are driven by Airflow
+Variables (`lance_etl_schedule`, default `@daily`). Data-interval windowing and `dag_run.conf`
+overrides are described in each module docstring.
 
 ### Benchmark package (`bench/`)
 
@@ -149,13 +150,13 @@ can drive the entire `all` chain.
 
 ### Documentation (`docs/`)
 
-- `docs/adr/` — 23 Architecture Decision Records (0001 through 0023) covering distributed indexing,
-  two-tier compaction, snapshot-id bounds, dynamic partition routing, gRPC layering, disk cache and
-  prewarm, observability and recall audit, compaction/index coexistence, stable-row-id rejection,
-  ingested-at column, V2 manifest paths, blue-green serving, by-date partitioning removal,
-  CLI and config knob reduction, event-time canonical clock, Rust intake service, TTL expiration,
-  namespace migrate utility, map pivot to concrete columns, gRPC event-time range search,
-  object-store request tracing, and Iceberg source-table optimization.
+- `docs/adr/` — 30 Architecture Decision Records (0001 through 0030) covering distributed
+  indexing, snapshot-id bounds, gRPC layering, disk cache and prewarm, observability and recall
+  audit, compaction/index coexistence, stable-row-id rejection, V2 manifest paths, blue-green
+  serving, event-time canonical clock, TTL expiration, dynamic map pivot, sidecar-free vector
+  artifacts, the unified task-based fleet orchestration with format 2.1 and column roles
+  (0028), all-distributed segment builds with scalar auto-indexing (0029), and the streaming
+  k-means vector bootstrap (0030).
 - `docs/FINDINGS.md` — narrative companion to the ADRs: verified APIs, production patterns,
   scale design, coexistence results, and open items.
 - `docs/datadog-dashboard-guide.md` — guide to the Datadog dashboards shipped with the pipeline.
@@ -174,14 +175,9 @@ uv pip install -e ".[dev]"
 uv pip install --group bench
 ```
 
-The project requires `pylance>=8.0.0b6`, which must currently be built from the lance checkout:
-
-```bash
-cd /Users/gstamatakis/IdeaProjects/lance
-maturin develop --release -m python/Cargo.toml
-```
-
-Once `pylance>=8.0.0b6` is published to PyPI, a plain `uv pip install -e ".[dev]"` will suffice.
+The project requires `pylance>=8.0.0`, which installs from PyPI, so a plain
+`uv pip install -e ".[dev]"` suffices. The Rust service sources the lance crates from crates.io
+at the same version.
 
 ### CLI overview
 
@@ -189,8 +185,8 @@ The CLI is deliberately small and opinionated. It exposes only the arguments tha
 per-deployment: the data and identity contract (which table, which window, where datasets live,
 Datadog service) and what to build (partition routing, which index types, the distance metric, and
 the FTS base tokenizer and language). Every tuning knob — the schema column names, shuffle
-partitions, retry budgets, compaction fragment sizing, IVF training parameters, fine-grained FTS
-tokenizer toggles, and two-tier thresholds — is set to an opinionated default in the configuration
+partitions, retry budgets, compaction fragment sizing, streaming k-means parameters,
+fine-grained FTS tokenizer toggles, and task sizing — is set to an opinionated default in the configuration
 dataclasses (`ETLConfig`, `IndexJobConfig`, `MaintenanceConfig`) and stays tunable in
 code, not from the command line.
 
@@ -265,8 +261,9 @@ lance-etl maintenance \
   --dd-service lance-pipeline --dd-env prod
 ```
 
-Runs four ordered steps per dataset: a cheap single-org data-quality guard (when `--base-uri` is set),
-per-row TTL expiration (when `--ttl-column` is set), two-tier distributed compaction, and version cleanup.
+Runs the ordered per-dataset steps: per-row TTL expiration (when `--ttl-column` is set), the
+unified plan-execute-commit compaction (one flat Spark job over every dataset's rewrite tasks),
+and version cleanup.
 The DQ guard calls `dataset.count_rows(filter=predicate)` over only the partition columns to confirm each
 dataset contains rows for only its own routing key. TTL deletes expired rows before compaction so the
 compaction reclaims that storage.
@@ -559,9 +556,10 @@ where a cross-encoder or LLM reranker slots in without changing the request shap
 
 ### Airflow DAG deployment
 
-Deploy `airflow/lance_etl_dag.py` to your Airflow DAGs folder. Set the Airflow Connection
-`spark_default` to point at your Spark cluster. Pipeline order is `etl >> maintenance >> index` with
-`max_active_runs=1`.
+Deploy `airflow/lance_etl_common.py`, `airflow/lance_etl_etl_dag.py`, and
+`airflow/lance_etl_pipeline_dag.py` to your Airflow DAGs folder. Set the Airflow Connection
+`spark_default` to point at your Spark cluster. The pipeline DAG runs
+`prune >> maintenance >> index >> stamp` with `max_active_runs=1`.
 
 Configure via Airflow Variables:
 
@@ -593,7 +591,7 @@ Manual triggers can supply `{"start": "<ISO-8601>", "end": "<ISO-8601>"}` in `da
 override the window bounds. Backfill with `airflow dags backfill lance_etl_pipeline`.
 
 The `lance-etl` wheel must be installed on every executor. Either bake it into the cluster image
-or ship it via `spark.submit.pyFiles` (see the module docstring in `airflow/lance_etl_dag.py`).
+or ship it via `spark.submit.pyFiles` (see the module docstring in `airflow/lance_etl_common.py`).
 
 ### Benchmark (`bench/`)
 

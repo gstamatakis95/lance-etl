@@ -24,7 +24,7 @@ lance-etl/
       config.py           IndexJobConfig, METRIC_TO_DISTANCE, FTS_OPTIONAL_PARAMS, index-name helpers
       handlers.py         IndexHandler, VectorIndexHandler, BTreeIndexHandler, BitmapIndexHandler, FtsIndexHandler, commit_fts_index, publish_fts_index
       optimize.py         load_vector_config, write_vector_config, drop_existing_index, optimize_existing_index, merge_index_deltas, maintain_index_locally
-      runner.py           LanceIndexer fleet phases: plan_dataset_indexes, resolve_vector_artifacts, build_one_shard, commit_one_index, merge_deltas_if_needed, index_skip_reason, role-based target discovery
+      runner.py           LanceIndexer fleet phases: plan_dataset_indexes, bootstrap_vector_index (streaming k-means), resolve_vector_artifacts, build_one_shard, commit_one_index, merge_deltas_if_needed, role-based target discovery
       segments.py         build_vector_segment, build_scalar_segment, commit_segments, split_evenly, stale-fragment guards
     maintenance/          Maintenance job package (python -m lance_etl.maintenance)
       __init__.py         Re-exports: MaintenanceJob, MaintenanceConfig, plan_one_dataset, commit_one_dataset, fan_out_per_dataset, update_serving_tag, compaction_skip_reason, and helpers

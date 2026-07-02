@@ -10,7 +10,9 @@ The four rules most likely to cause a review failure if missed:
    was removed from `src/lance_etl/__init__.py` for exactly this reason.
 2. Lance indexes are built exclusively via the segment API (`create_index_uncommitted` /
    `merge_existing_index_segments` / `commit_existing_index_segments` for vector/scalar, and the
-   `index_uuid` + `merge_index_metadata` path for FTS/INVERTED only). Never use
+   `index_uuid` + `merge_index_metadata` path for FTS/INVERTED only), with ONE sanctioned
+   exception: fresh vector builds bootstrap through a committed `create_index` with streaming
+   k-means and an explicit stored `rabitq_model` (ADR 0030). Never use
    `create_scalar_index(fragment_ids=)` for BTREE or BITMAP — it raises on current lance main.
 3. No raw SQL strings in the gRPC filter API — use the typed `Filter` AST in `domain/filter.rs`.
    All column names are validated and literals are typed DataFusion `lit` expressions.

@@ -247,6 +247,10 @@ def test_vector_segment_path_reuses_artifacts(dataset_uri: str, telemetry: Telem
     array equality through ``centroids_from_ipc``. The ``rabitq_model`` string must match the streaming
     bootstrap's stored rotation so segments stay mergeable across runs. No ``.artifacts`` directory is
     created.
+
+    Args:
+        dataset_uri: URI of the pre-built test dataset.
+        telemetry: The telemetry facade fixture.
     """
     config: IndexJobConfig = index_config()
     bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
@@ -328,6 +332,9 @@ def test_scalar_fragment_sharding_requires_segment_api(dataset_uri: str) -> None
     Pins updated-main behavior so a regression back to per-shard ``create_scalar_index(index_uuid=, fragment_ids=)`` for
     BTREE or BITMAP is caught immediately: those types must go through ``create_index_uncommitted`` without a
     caller-supplied ``index_uuid``.
+
+    Args:
+        dataset_uri: URI of the pre-built test dataset.
     """
     dataset: lance.LanceDataset = lance.dataset(dataset_uri)
     first_fragment: int = dataset.get_fragments()[0].fragment_id
@@ -349,6 +356,9 @@ def test_unified_run_builds_fts_end_to_end(dataset_uri: str) -> None:
     Exercises plan (shard specs), the flat build job (per-fragment INVERTED builds under one
     shared index id), the commit fan-out (metadata merge plus publish), and the delta bound,
     all through the production phase functions driven by the in-process Spark fake.
+
+    Args:
+        dataset_uri: URI of the pre-built test dataset.
     """
     config: IndexJobConfig = IndexJobConfig(
         telemetry=TelemetryConfig(),
@@ -370,6 +380,9 @@ def test_unified_run_discovers_columns_from_roles(dataset_uri: str) -> None:
 
     Every ``scalar`` role column gets a BTREE index and every ``text`` role column gets a BM25
     INVERTED index (ADR 0029), both built through the distributed segment paths.
+
+    Args:
+        dataset_uri: URI of the pre-built test dataset.
     """
     lance.dataset(dataset_uri).update_config({"lance-etl.columns": '{"text": "text", "id": "scalar"}'})
     config: IndexJobConfig = IndexJobConfig(

@@ -170,6 +170,10 @@ def test_plan_skips_when_all_indices_current(dataset_uri: str, telemetry: Teleme
     The ``index_skip_reason`` pre-flight guard returns ``"all indices current"`` when every index
     exists and has zero unindexed fragments, so the plan exits early with no build specs rather
     than issuing redundant maintenance work. The dataset remains fully queryable.
+
+    Args:
+        dataset_uri: URI of the pre-built test dataset.
+        telemetry: The telemetry facade fixture.
     """
     config: IndexJobConfig = IndexJobConfig(
         telemetry=TelemetryConfig(), scalar_columns=["id"], text_columns=["text"], commit_backoff_seconds=0.0
@@ -387,6 +391,10 @@ def test_artifact_less_index_plans_bootstrap(dataset_uri: str, telemetry: Teleme
     A plain ``create_index`` (as pre-unification deployments produced) mints its own model and
     writes no config KV. Appending segments built from fresh artifacts would put deltas on
     mismatched models, so the plan phase replaces the whole index with a bootstrap instead.
+
+    Args:
+        dataset_uri: URI of the pre-built test dataset.
+        telemetry: The telemetry facade fixture.
     """
     config: IndexJobConfig = maintenance_config()
     lance.dataset(dataset_uri).create_index(

@@ -92,6 +92,9 @@ def test_defer_index_remap_scoped_to_execute_options(telemetry_config: Telemetry
 
     The distributed commit binding compacts with default options, so the flag is only honored where
     ``Compaction.execute`` parses the full option set.
+
+    Args:
+        telemetry_config: The test telemetry configuration.
     """
     config: MaintenanceConfig = fri_config(telemetry_config)
     assert config.execute_options()["defer_index_remap"] is True

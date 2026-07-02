@@ -211,6 +211,10 @@ class TestRunOrdering:
         With the unified design, plan_one_dataset handles TTL, the skip check, and the
         compaction plan in one executor task per dataset. Patching plan_one_dataset at the
         module level lets the test observe that every URI is planned exactly once.
+
+        Args:
+            telemetry_config: The test telemetry configuration.
+            monkeypatch: Pytest monkeypatch fixture.
         """
         processed: list[str] = []
 

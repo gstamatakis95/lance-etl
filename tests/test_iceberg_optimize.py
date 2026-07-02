@@ -219,6 +219,9 @@ def test_optimizer_compacts_data_files(tmp_path: Path) -> None:
     runtime disagree on the ``DataSourceV2Relation.create`` signature that ``rewrite_manifests`` and
     ``expire_snapshots`` route through, so those two raise ``NoSuchMethodError`` on this pair. Their statement shape
     parsing are covered by the unit tests above. The module docstring documents this environmental constraint in full.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
     """
     if jvm_gateway_already_launched():
         pytest.skip("Iceberg catalog jars resolve only at JVM launch. Run this file in its own pytest process.")

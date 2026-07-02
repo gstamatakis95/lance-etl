@@ -11,9 +11,7 @@ This runbook covers the reproducible commands for running the benchmark at 1M (s
 uv pip install -e ".[dev]"
 uv pip install --group bench
 
-# Build pylance from the local checkout (required until >=8.0.0b6 ships on PyPI)
-cd /Users/gstamatakis/IdeaProjects/lance
-maturin develop --release -m python/Cargo.toml
+# pylance >=8.0.0 installs from PyPI with the dev extras above
 ```
 
 ---
@@ -217,12 +215,10 @@ frag-reuse index instead. Both the `--num-shards 32` 1B run and any compaction p
 1B dataset require at least 32 GB of available driver RAM, with `defer_index_remap=True`
 strongly recommended.
 
-**IVF training sample (executor heap):** The `train_sample_memory_budget_bytes` field in
-`IndexJobConfig` (default 8 GB) caps the IVF centroid training sample that lands on a single
-executor. At 16384 partitions and 256 samples per partition over 128-dimensional float32
-vectors, the sample is `16384 * 256 * 128 * 4 bytes` = 2.1 GB. This is within the default
-budget for the 1B run at `--num-partitions 16384`. Each Spark executor needs at least 4 GB
-heap to cover the training sample plus framework overhead.
+**IVF training (executor memory):** Vector bootstrap builds train centroids with lance's
+streaming k-means (ADR 0030), which loads at most `num_partitions * streaming_sample_rate`
+vectors per step instead of one giant sample, so training memory stays bounded regardless of
+the partition count. No training memory budget needs tuning.
 
 ---
 

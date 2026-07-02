@@ -307,6 +307,10 @@ class TestPruneIntervalTags:
         non-matching names used here are restricted to those characters.  The
         format %Y%m%dT%H%M%SZ contains the literal 'T' and 'Z' characters, which
         differ from hyphenated date strings like '2026-06-01'.
+
+        Args:
+            tmp_path: Pytest-provided temporary directory.
+            telemetry: The telemetry facade fixture.
         """
         uri: str = self.make_tagged_dataset(
             tmp_path,
