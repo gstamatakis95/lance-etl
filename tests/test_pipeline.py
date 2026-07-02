@@ -502,19 +502,7 @@ class TestStampGating:
 
 
 class TestPipelineConfigPropagation:
-    """PipelineConfig.__post_init__ pushes scheduler_pool and telemetry into both sub-configs."""
-
-    def test_scheduler_pool_propagated(self, telemetry_config: TelemetryConfig) -> None:
-        """The configured scheduler_pool is present on both sub-configs after construction."""
-        maintenance = MaintenanceConfig(telemetry=telemetry_config)
-        indexing = IndexJobConfig(telemetry=telemetry_config)
-        config = PipelineConfig(
-            telemetry=telemetry_config,
-            maintenance=maintenance,
-            indexing=indexing,
-            scheduler_pool="my-pool",
-        )
-        assert config.indexing.scheduler_pool == "my-pool"
+    """PipelineConfig.__post_init__ pushes telemetry and storage options into both sub-configs."""
 
     def test_telemetry_propagated(self, telemetry_config: TelemetryConfig) -> None:
         """The top-level telemetry config is set on both sub-configs after construction."""
@@ -541,16 +529,6 @@ class TestPipelineConfigPropagation:
         )
         assert config.maintenance.storage_options is opts
         assert config.indexing.storage_options is opts
-
-    def test_default_scheduler_pool(self, telemetry_config: TelemetryConfig) -> None:
-        """The default scheduler_pool is 'lance-pipeline'."""
-        config = make_config(telemetry_config)
-        assert config.scheduler_pool == "lance-pipeline"
-        assert config.indexing.scheduler_pool == "lance-pipeline"
-
-
-class TestReturnShape:
-    """PipelineJob.run returns the expected result dictionary shape."""
 
     def test_result_keys_present(
         self,

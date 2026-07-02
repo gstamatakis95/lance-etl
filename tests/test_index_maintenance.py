@@ -23,11 +23,12 @@ from lance_etl.indexing import (
     IndexJobConfig,
     VectorIndexHandler,
     commit_segments,
-    index_dataset_locally,
     index_delta_count,
     load_vector_config,
     merge_index_deltas,
     optimize_existing_index,
+    plan_dataset_indexes,
+    publish_fts_index,
     serialize_segment,
     split_evenly,
     vector_config_key,
@@ -141,30 +142,43 @@ def build_btree_segments(uri: str, config: IndexJobConfig, telemetry: Telemetry,
     commit_segments(uri, documents, "id", "id_idx", False, config, telemetry)
 
 
-def test_index_dataset_locally_second_run_skips_when_current(dataset_uri: str) -> None:
-    """A second small-tier run is a no-op when all indices are fully covered.
+def test_plan_skips_when_all_indices_current(dataset_uri: str, telemetry: Telemetry) -> None:
+    """The plan phase is a no-op when every targeted index exists with full coverage.
 
-    The new ``index_skip_reason`` pre-flight guard returns ``"all indices current"`` when every index
-    exists and has zero unindexed fragments, so the second run exits early with an empty index list
-    rather than issuing redundant maintenance calls. The dataset remains fully queryable.
+    The ``index_skip_reason`` pre-flight guard returns ``"all indices current"`` when every index
+    exists and has zero unindexed fragments, so the plan exits early with no build specs rather
+    than issuing redundant maintenance work. The dataset remains fully queryable.
     """
-    config: IndexJobConfig = maintenance_config()
-    first: dict[str, object] = index_dataset_locally(dataset_uri, config)
-    assert all("maintained" not in entry for entry in first["indexes"])
-    second: dict[str, object] = index_dataset_locally(dataset_uri, config)
-    assert second.get("skipped") == "all indices current"
-    assert second["indexes"] == []
+    config: IndexJobConfig = IndexJobConfig(
+        telemetry=TelemetryConfig(), scalar_columns=["id"], text_columns=["text"], commit_backoff_seconds=0.0
+    )
     dataset: lance.LanceDataset = lance.dataset(dataset_uri)
-    assert dataset.to_table(nearest={"column": "vector", "q": [0.5] * DIM, "k": 3}).num_rows == 3
-    assert dataset.to_table(filter="id = 7").num_rows == 1
+    dataset.create_scalar_index("id", "BTREE", name="id_idx")
+    lance.dataset(dataset_uri).create_scalar_index("text", "INVERTED", name="text_fts_idx")
+
+    plan: dict[str, object] = plan_dataset_indexes(dataset_uri, config, set(), telemetry)
+    assert plan.get("skipped") == "all indices current"
+    refreshed: lance.LanceDataset = lance.dataset(dataset_uri)
+    assert refreshed.to_table(filter="id = 7").num_rows == 1
 
 
-def test_index_dataset_locally_rebuild_flag_forces_rebuild(dataset_uri: str) -> None:
-    """The rebuild flag keeps the create path even when indices exist."""
-    config: IndexJobConfig = maintenance_config()
-    index_dataset_locally(dataset_uri, config)
-    rebuilt: dict[str, object] = index_dataset_locally(dataset_uri, maintenance_config(rebuild=True))
-    assert all("maintained" not in entry for entry in rebuilt["indexes"])
+def test_plan_rebuild_flag_forces_specs(dataset_uri: str, telemetry: Telemetry) -> None:
+    """The rebuild flag plans fresh build specs even when every index exists and is current."""
+    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
+    dataset.create_scalar_index("id", "BTREE", name="id_idx")
+    lance.dataset(dataset_uri).create_scalar_index("text", "INVERTED", name="text_fts_idx")
+
+    rebuild_config: IndexJobConfig = IndexJobConfig(
+        telemetry=TelemetryConfig(),
+        scalar_columns=["id"],
+        text_columns=["text"],
+        rebuild=True,
+        commit_backoff_seconds=0.0,
+    )
+    plan: dict[str, object] = plan_dataset_indexes(dataset_uri, rebuild_config, set(), telemetry)
+    assert "skipped" not in plan
+    assert {spec["index_name"] for spec in plan["specs"]} == {"id_idx", "text_fts_idx"}
+    assert all(spec["shards"] for spec in plan["specs"])
 
 
 def test_optimize_existing_index_covers_new_fragments(dataset_uri: str, telemetry: Telemetry) -> None:
@@ -351,23 +365,25 @@ def test_commit_segments_keeps_fresh_segments(dataset_uri: str, telemetry: Telem
 def test_fts_commit_index_raises_on_missing_fragments(dataset_uri: str, telemetry: Telemetry) -> None:
     """The inverted-index publish refuses coverage of fragments that no longer exist."""
     config: IndexJobConfig = maintenance_config()
-    handler: FtsIndexHandler = FtsIndexHandler(config, "text", "text_fts_idx")
-    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
     stale_ids: list[int] = [*fragment_ids_of(dataset_uri), 9999]
     with pytest.raises(ValueError, match="no longer exist"):
-        handler.commit_index(dataset_uri, dataset, "00000000-0000-0000-0000-000000000000", stale_ids, telemetry)
+        publish_fts_index(
+            dataset_uri, "text", "text_fts_idx", "00000000-0000-0000-0000-000000000000", stale_ids, config, telemetry
+        )
 
 
 def test_promoted_small_tier_index_triggers_full_rebuild(dataset_uri: str, telemetry: Telemetry) -> None:
-    """An index built by the small tier (no stored config) is fully rebuilt on the segment path.
+    """An index built outside the segment path (no stored config) is fully rebuilt on it.
 
-    The small tier's plain ``create_index`` mints its own IVF centroids and RaBitQ rotation and
-    writes no config KV. When the dataset crosses the fragment threshold, the segment path must
-    target every fragment so the retrained model replaces the old delta instead of appending a
-    delta on a different model, whose later merge would silently corrupt the index.
+    A plain ``create_index`` build (as pre-unification small-tier deployments produced) mints its
+    own IVF centroids and RaBitQ rotation and writes no config KV. The segment path must target
+    every fragment so the retrained model replaces the old delta instead of appending a delta on
+    a different model, whose later merge would silently corrupt the index.
     """
     config: IndexJobConfig = maintenance_config()
-    index_dataset_locally(dataset_uri, config)
+    lance.dataset(dataset_uri).create_index(
+        "vector", "IVF_RQ", name="vector_idx", replace=True, num_partitions=4, num_bits=1
+    )
     assert load_vector_config(lance.dataset(dataset_uri), "vector") is None
 
     append_fragment(dataset_uri, rows=ROWS_PER_FRAGMENT, start_id=ROWS)
@@ -419,23 +435,6 @@ def test_full_rebuild_is_sticky_across_replans(dataset_uri: str, telemetry: Tele
     assert refreshed_cfg is not None
     assert refreshed_cfg["rows_at_train"] == ROWS
     assert retrain_handler.target_fragments(lance.dataset(dataset_uri)) == fragment_ids_of(dataset_uri)
-
-
-def test_small_tier_rebuild_clears_stale_vector_config(dataset_uri: str, telemetry: Telemetry) -> None:
-    """A small-tier ``create_index`` build removes a stored config left by an earlier segment build."""
-    config: IndexJobConfig = maintenance_config()
-    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
-    artifacts: object | None = handler.prepare(dataset, dataset_uri, telemetry)
-    documents: list[str] = []
-    for group in split_evenly(fragment_ids_of(dataset_uri), 2):
-        segment: Index = handler.build_segment(lance.dataset(dataset_uri, version=dataset.version), group, artifacts)
-        documents.append(serialize_segment(segment))
-    commit_segments(dataset_uri, documents, "vector", "vector_idx", True, config, telemetry)
-    assert load_vector_config(lance.dataset(dataset_uri), "vector") is not None
-
-    index_dataset_locally(dataset_uri, maintenance_config(rebuild=True))
-    assert load_vector_config(lance.dataset(dataset_uri), "vector") is None
 
 
 def test_prepare_trains_when_config_present_but_index_absent(dataset_uri: str, telemetry: Telemetry) -> None:

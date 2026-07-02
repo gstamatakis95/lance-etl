@@ -2,9 +2,9 @@
 
 Provides all the primitives needed by the distributed index build: serialise/deserialise
 uncommitted segment metadata, IPC-encode/decode IVF centroids, shard fragment lists, validate
-live fragments, commit collected segments with conflict retries, the picklable
-:func:`train_vector_artifacts` used to offload IVF centroid training to a Spark executor, and the
-outer build-and-commit-segments loop that handles stale-fragment replans.
+live fragments, commit collected segments with conflict retries, and the picklable
+:func:`train_vector_artifacts` executed on a Spark executor for IVF centroid training. The
+stale-fragment replan loop lives in :mod:`lance_etl.indexing.runner` as fleet-level rounds.
 """
 
 from __future__ import annotations
@@ -454,93 +454,3 @@ def commit_segments(
         return len(fresh)
 
     return commit_index_with_retries(action, config, telemetry, tags)
-
-
-def build_and_commit_segments(
-    uri: str,
-    handler: Any,
-    config: IndexJobConfig,
-    telemetry: Telemetry,
-    build_documents: Callable[[list[list[int]], int, object | None], list[str]],
-    spark: Any | None = None,
-) -> dict[str, int]:
-    """Build per-shard segments and commit them, rebuilding when a concurrent compaction makes the plan stale.
-
-    The segment build plans over a fragment set resolved at one version. A concurrent compaction
-    can rewrite some of those fragments and remap an existing wider index segment over them between
-    the build and the commit, so publishing the freshly built segments would either orphan fragments
-    the existing segment still holds (:func:`commit_segments` re-raises the ``"would orphan
-    fragments"`` ``ValueError``) or cover fragments that no longer exist (:func:`commit_segments`
-    drops them). Both mean the fragment set is stale. This mirrors the compactor's
-    re-plan-on-conflict loop: it re-reads the dataset at the latest version, re-resolves the target
-    fragments (dropping fragments that no longer exist), rebuilds the affected segments, and
-    re-commits, bounded by ``config.commit_retries``. Every live target therefore ends up covered
-    rather than silently skipped. The full-rebuild replan loop is bounded by
-    ``config.max_stale_replans`` (not by ``config.commit_retries``): each replan rebuilds every
-    remaining target fragment from scratch which can be terabytes of I/O for a whale org, so it is
-    bounded tightly and independently from the cheap commit-conflict budget. If the budget is
-    exhausted while a writer keeps rewriting, the remaining fragments are left for the next
-    scheduled run, which re-covers them once the contention clears.
-
-    Scalar segments (BTREE and BITMAP) are committed unmerged: the driver never merges segment
-    contents, it only publishes them. Lance unions the segments in parallel at query time and the
-    delta-merge pass (triggered by ``max_index_deltas``) consolidates them through
-    ``optimize_indices``, which streams and never materialises all bitmaps at once. Only the
-    vector handler merges on the driver, as IVF_RQ requires one merged segment before commit.
-
-    Args:
-        uri: Dataset URI.
-        handler: The per-type index handler resolving targets.
-        config: Indexing configuration.
-        telemetry: Telemetry facade for the current process.
-        build_documents: Builds one serialized segment per shard for the given fragment groups,
-            pinned to the given dataset version, using the broadcast artifacts. Supplied by the
-            distributed and in-process callers so the rebuild loop is shared.
-        spark: Active Spark session forwarded to ``handler.prepare`` for executor-offloaded IVF
-            training. When ``None`` the handler trains in-process (test or no-cluster fallback).
-
-    Returns:
-        A mapping with the total ``segments`` committed and the ``fragments`` targeted on the first
-        attempt.
-    """
-    tags: list[str] = [f"index:{handler.index_name}"]
-    total_segments: int = 0
-    first_targets: int = 0
-    for attempt in range(config.max_stale_replans):
-        dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-        targets: list[int] = handler.target_fragments(dataset)
-        if attempt == 0:
-            first_targets = len(targets)
-        if not targets:
-            return {"segments": total_segments, "fragments": first_targets}
-        artifacts: object | None = handler.prepare(dataset, uri, telemetry, spark=spark)
-        version: int = dataset.version
-        groups: list[list[int]] = split_evenly(targets, config.num_shards)
-        documents: list[str] = build_documents(groups, version, artifacts)
-        try:
-            committed: int = commit_segments(
-                uri, documents, handler.column, handler.index_name, handler.merges(), config, telemetry
-            )
-        except ValueError as exc:
-            if not is_stale_fragment_error(exc):
-                raise
-            telemetry.incr("index.stale_fragment_replan", tags=tags)
-            logger.warning(
-                "rebuilding %s on %s: a concurrent compaction orphaned the planned fragment set (%s)",
-                handler.index_name,
-                uri,
-                exc,
-            )
-            continue
-        if committed:
-            total_segments += committed
-        if committed == len(documents):
-            return {"segments": total_segments, "fragments": first_targets}
-        telemetry.incr("index.stale_fragment_replan", tags=tags)
-    logger.warning(
-        "index %s on %s still has uncovered fragments after %d stale-replan attempts; next scheduled run re-covers",
-        handler.index_name,
-        uri,
-        config.max_stale_replans,
-    )
-    return {"segments": total_segments, "fragments": first_targets}

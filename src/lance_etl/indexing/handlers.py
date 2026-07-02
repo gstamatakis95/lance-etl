@@ -9,8 +9,7 @@ from __future__ import annotations
 
 import functools
 import logging
-import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from typing import Any
 
 import lance
@@ -28,24 +27,18 @@ from lance_etl.indexing.config import (
 )
 from lance_etl.indexing.optimize import (
     drop_existing_index,
-    index_delta_count,
     load_vector_config,
-    maintain_index_locally,
-    merge_index_deltas,
     write_vector_config,
 )
 from lance_etl.indexing.segments import (
     TRAIN_SEMAPHORE,
     all_fragment_ids,
-    build_and_commit_segments,
     build_scalar_segment,
     build_vector_segment,
     centroids_to_ipc,
     commit_index_with_retries,
     lance_field_id,
     live_fragment_ids,
-    serialize_segment,
-    split_evenly,
     train_vector_artifacts,
 )
 from lance_etl.telemetry import Telemetry
@@ -114,14 +107,6 @@ class IndexHandler:
         """
         del dataset
         return None
-
-    def extra_stats(self) -> dict[str, Any]:
-        """Return handler-specific fields to merge into the result.
-
-        Returns:
-            Additional statistics, empty by default.
-        """
-        return {}
 
     def covered_fragments(self, dataset: lance.LanceDataset) -> set[int]:
         """Return fragments already covered by this index.
@@ -223,119 +208,6 @@ class IndexHandler:
             index_type=self.index_type(),
         )
 
-    def merge_deltas(self, spark: SparkSession, uri: str, telemetry: Telemetry) -> bool:
-        """Merge this index's accumulated deltas on one executor when over the cap.
-
-        The driver only reads the index statistics. The merge itself, which can approach a rebuild
-        for sort-merge scalar types, runs in a single-task Spark job so heavy work stays off the
-        driver.
-
-        Args:
-            spark: Active Spark session.
-            uri: Dataset URI.
-            telemetry: Driver telemetry facade.
-
-        Returns:
-            ``True`` if a merge ran.
-        """
-        config: IndexJobConfig = self.config
-        dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-        if self.index_name not in {description.name for description in dataset.describe_indices()}:
-            return False
-        if index_delta_count(dataset, self.index_name) <= config.max_index_deltas:
-            return False
-        index_name: str = self.index_name
-
-        def merge_one(target: str) -> bool:
-            """Merge the index deltas inside an executor task.
-
-            Args:
-                target: Dataset URI.
-
-            Returns:
-                ``True`` if a merge ran.
-            """
-            return merge_index_deltas(target, index_name, config, Telemetry.create(config.telemetry))
-
-        with telemetry.timed("index.delta_merge_ms", tags=[f"index:{index_name}"]):
-            merged: list[bool] = spark.sparkContext.parallelize([uri], 1).map(merge_one).collect()
-        return bool(merged and merged[0])
-
-    def build(self, spark: SparkSession, uri: str, telemetry: Telemetry) -> dict[str, Any]:
-        """Build and commit this index across executors, then bound its deltas.
-
-        Args:
-            spark: Active Spark session.
-            uri: Dataset URI.
-            telemetry: Driver telemetry facade.
-
-        Returns:
-            A statistics dictionary for the index.
-        """
-        config: IndexJobConfig = self.config
-        dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-        reason: str | None = self.skip_reason(dataset)
-        if reason is not None:
-            telemetry.incr("index.skipped", tags=[f"index:{self.index_name}"])
-            return {"column": self.column, "index": self.index_name, "segments": 0, "fragments": 0, "skipped": reason}
-        self.validate(dataset)
-
-        spark_context = spark.sparkContext
-        build_segment: Callable[[lance.LanceDataset, list[int], object | None], Index] = self.segment_builder()
-        storage_options: dict[str, Any] | None = config.storage_options
-        index_type: str = self.index_type()
-
-        def build_documents(groups: list[list[int]], version: int, artifacts: object | None) -> list[str]:
-            """Build one serialized segment per shard across executors at the pinned version.
-
-            Args:
-                groups: Fragment-id shards to build.
-                version: Dataset version to pin every shard build to.
-                artifacts: Broadcast artifacts for the segment builder, if any.
-
-            Returns:
-                The serialized segments collected from the executors.
-            """
-            broadcast_artifacts = spark_context.broadcast(artifacts) if artifacts is not None else None
-
-            def build_partition(group_iterator: Iterator[list[int]]) -> Iterator[str]:
-                """Build one segment per shard on an executor.
-
-                Args:
-                    group_iterator: Fragment-id shards assigned to this task.
-
-                Yields:
-                    The serialized segment for each shard.
-                """
-                telemetry_local: Telemetry = Telemetry.create(config.telemetry)
-                local_artifacts: object | None = broadcast_artifacts.value if broadcast_artifacts is not None else None
-                tags: list[str] = [f"index_type:{index_type}"]
-                with telemetry_local.span("lance.indexing.build_segment"):
-                    for group in group_iterator:
-                        shard_dataset: lance.LanceDataset = lance.dataset(
-                            uri, version=version, storage_options=storage_options
-                        )
-                        with telemetry_local.timed("segment.build_ms", tags=tags):
-                            segment = build_segment(shard_dataset, list(group), local_artifacts)
-                        telemetry_local.incr("segment.built", tags=tags)
-                        yield serialize_segment(segment)
-
-            return spark_context.parallelize(groups, len(groups)).mapPartitions(build_partition).collect()
-
-        with telemetry.timed("index.build_ms", tags=[f"index:{self.index_name}"]):
-            stats: dict[str, int] = build_and_commit_segments(
-                uri, self, config, telemetry, build_documents, spark=spark
-            )
-        result: dict[str, Any] = {
-            "column": self.column,
-            "index": self.index_name,
-            "segments": stats["segments"],
-            "fragments": stats["fragments"],
-            "deltas_merged": self.merge_deltas(spark, uri, telemetry),
-        }
-        result.update(self.extra_stats())
-        return result
-
 
 class VectorIndexHandler(IndexHandler):
     """Builds an IVF_RQ vector index, storing artifacts in the dataset's own config KV.
@@ -379,17 +251,6 @@ class VectorIndexHandler(IndexHandler):
             Always ``True``.
         """
         return True
-
-    def extra_stats(self) -> dict[str, Any]:
-        """Return artifact reuse and the partition count actually used.
-
-        When ``reused_artifacts`` is true, the centroids were read back from the committed index
-        and no training or external writes were performed.
-
-        Returns:
-            A mapping with the artifact reuse flag and IVF partition count.
-        """
-        return {"reused_artifacts": self.reused_artifacts, "num_partitions": self.num_partitions_used}
 
     def skip_reason(self, dataset: lance.LanceDataset) -> str | None:
         """Skip the vector index when the dataset is below the row floor.
@@ -771,192 +632,103 @@ class FtsIndexHandler(IndexHandler):
         stats: dict[str, Any] = dataset.stats.index_stats(self.index_name)
         return int(stats.get("num_unindexed_fragments") or 0) <= self.config.fts_max_unindexed_fragments
 
-    def maintain(self, spark: SparkSession, uri: str, telemetry: Telemetry) -> dict[str, Any]:
-        """Maintain the existing inverted index incrementally on one executor.
 
-        Runs ``optimize_indices`` for this index in a single-task Spark job, then bounds the delta
-        count.
+def commit_fts_index(
+    uri: str,
+    column: str,
+    index_name: str,
+    index_uuid: str,
+    fragment_ids: list[int],
+    has_existing: bool,
+    config: IndexJobConfig,
+    telemetry: Telemetry,
+) -> None:
+    """Publish a rebuilt inverted index on an executor: drop the old one, merge metadata, commit.
 
-        Args:
-            spark: Active Spark session.
-            uri: Dataset URI.
-            telemetry: Driver telemetry facade.
+    An existing same-name index is dropped only now, AFTER the per-fragment executor builds
+    completed, so the old index stayed live and searchable for the whole (potentially
+    hours-long) build phase and is absent only for the short merge-plus-commit window. Each
+    commit attempt validates that every covered fragment still exists at the latest version: a
+    concurrent compaction can rewrite covered fragments between build and commit, and a blind
+    retry at the new head would publish an index whose row addresses point at compacted-away
+    fragments.
 
-        Returns:
-            A statistics dictionary for the index with ``maintained`` set.
-        """
-        config: IndexJobConfig = self.config
-        index_name: str = self.index_name
+    Args:
+        uri: Dataset URI.
+        column: The indexed text column.
+        index_name: The index name to publish under.
+        index_uuid: The shared index id the fragment builds used.
+        fragment_ids: The fragments the index covers.
+        has_existing: Whether a same-name index existed before the rebuild.
+        config: Indexing configuration.
+        telemetry: Telemetry facade for the current process.
 
-        def maintain_one(target: str) -> bool:
-            """Optimize and delta-bound the index inside an executor task.
+    Raises:
+        ValueError: If covered fragments no longer exist because a compaction rewrote them.
+        OSError | RuntimeError: If commits keep conflicting past the retry budget.
+    """
+    if has_existing:
+        drop_existing_index(uri, index_name, config, telemetry)
+    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+    with telemetry.timed("index.merge_ms", tags=[f"index:{index_name}"]):
+        dataset.merge_index_metadata(index_uuid, index_type="INVERTED")
+    publish_fts_index(uri, column, index_name, index_uuid, fragment_ids, config, telemetry)
 
-            Args:
-                target: Dataset URI.
 
-            Returns:
-                ``True`` if a delta merge ran.
-            """
-            return maintain_index_locally(target, index_name, config, Telemetry.create(config.telemetry))
+def publish_fts_index(
+    uri: str,
+    column: str,
+    index_name: str,
+    index_uuid: str,
+    fragment_ids: list[int],
+    config: IndexJobConfig,
+    telemetry: Telemetry,
+) -> None:
+    """Publish an already-merged inverted index, retrying conflicts and refusing stale coverage.
 
-        with telemetry.timed("index.build_ms", tags=[f"index:{index_name}"]):
-            merged: list[bool] = spark.sparkContext.parallelize([uri], 1).map(maintain_one).collect()
-        return {
-            "column": self.column,
-            "index": index_name,
-            "segments": 0,
-            "fragments": 0,
-            "maintained": True,
-            "deltas_merged": bool(merged and merged[0]),
-        }
+    Each attempt validates that every covered fragment still exists at the latest version before
+    committing the ``CreateIndex`` operation.
 
-    def commit_index(
-        self,
-        uri: str,
-        dataset: lance.LanceDataset,
-        index_uuid: str,
-        fragment_ids: list[int],
-        telemetry: Telemetry,
-    ) -> None:
-        """Publish the merged inverted index, retrying conflicts.
+    Args:
+        uri: Dataset URI.
+        column: The indexed text column.
+        index_name: The index name to publish under.
+        index_uuid: The shared index id the fragment builds used.
+        fragment_ids: The fragments the index covers.
+        config: Indexing configuration.
+        telemetry: Telemetry facade for the current process.
 
-        Each attempt validates that every covered fragment still exists at the latest version. A
-        concurrent compaction can rewrite covered fragments between the executor build and this
-        commit, and a blind retry at the new head version would then publish an index whose row
-        addresses point at compacted-away fragments.
+    Raises:
+        ValueError: If covered fragments no longer exist because a compaction rewrote them.
+        OSError | RuntimeError: If commits keep conflicting past the retry budget.
+    """
+    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+    field_id: int = lance_field_id(dataset, column)
+    fragments: set[int] = set(fragment_ids)
+    storage_options: dict[str, Any] | None = config.storage_options
+    tags: list[str] = ["index_type:INVERTED"]
 
-        Args:
-            uri: Dataset URI.
-            dataset: A dataset handle refreshed to the latest version after the executor build.
-            index_uuid: The shared index id the shards built under.
-            fragment_ids: The fragments the index covers.
-            telemetry: Driver telemetry facade.
-
-        Raises:
-            ValueError: If covered fragments no longer exist because a compaction rewrote them.
-            OSError | RuntimeError: If commits keep conflicting past the retry budget.
-        """
-        config: IndexJobConfig = self.config
-        field_id: int = lance_field_id(dataset, self.column)
-        index_name: str = self.index_name
-        fragments: set[int] = set(fragment_ids)
-        storage_options: dict[str, Any] | None = config.storage_options
-        tags: list[str] = ["index_type:INVERTED"]
-
-        def action() -> None:
-            """Publish the merged inverted index at the latest version."""
-            current: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
-            live: set[int] = live_fragment_ids(current)
-            missing: set[int] = fragments - live
-            if missing:
-                raise ValueError(
-                    f"inverted index {index_name} on {uri} covers fragments {sorted(missing)} that no longer exist; "
-                    "a compaction rewrote them between build and commit, so this build must be redone"
-                )
-            index: Index = Index(
-                uuid=index_uuid,
-                name=index_name,
-                fields=[field_id],
-                dataset_version=current.version,
-                fragment_ids=fragments,
-                index_version=0,
+    def action() -> None:
+        """Publish the merged inverted index at the latest version."""
+        current: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
+        live: set[int] = live_fragment_ids(current)
+        missing: set[int] = fragments - live
+        if missing:
+            raise ValueError(
+                f"inverted index {index_name} on {uri} covers fragments {sorted(missing)} that no longer exist; "
+                "a compaction rewrote them between build and commit, so this build must be redone"
             )
-            operation = lance.LanceOperation.CreateIndex(new_indices=[index], removed_indices=[])
-            lance.LanceDataset.commit(uri, operation, read_version=current.version, storage_options=storage_options)
-            telemetry.incr("index.committed", tags=tags)
+        index: Index = Index(
+            uuid=index_uuid,
+            name=index_name,
+            fields=[field_id],
+            dataset_version=current.version,
+            fragment_ids=fragments,
+            index_version=0,
+        )
+        operation = lance.LanceOperation.CreateIndex(new_indices=[index], removed_indices=[])
+        lance.LanceDataset.commit(uri, operation, read_version=current.version, storage_options=storage_options)
+        telemetry.incr("index.committed", tags=tags)
 
+    with telemetry.timed("index.commit_ms", tags=[f"index:{index_name}"]):
         commit_index_with_retries(action, config, telemetry, tags)
-
-    def build(self, spark: SparkSession, uri: str, telemetry: Telemetry) -> dict[str, Any]:
-        """Maintain the inverted index incrementally, or rebuild it across executors.
-
-        An existing index with a small unindexed backlog is maintained with ``optimize_indices``
-        on one executor. Otherwise the full distributed rebuild runs: the dataset handle is
-        refreshed after the executor build so the metadata merge and the publish commit both
-        operate against the latest committed version rather than the snapshot captured before the
-        Spark job ran.
-
-        On the distributed rebuild path an existing same-name index is dropped AFTER the executor
-        builds complete, just before the metadata merge and the publish commit. This shrinks the
-        availability gap compared to dropping before the Spark job: the old index stays live for
-        the entire (potentially hours-long) executor build phase and is absent only for the short
-        merge-plus-commit window.
-
-        Args:
-            spark: Active Spark session.
-            uri: Dataset URI.
-            telemetry: Driver telemetry facade.
-
-        Returns:
-            A statistics dictionary for the index.
-        """
-        config: IndexJobConfig = self.config
-        dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-        if self.maintainable(dataset):
-            return self.maintain(spark, uri, telemetry)
-        has_existing: bool = bool(self.covered_fragments(dataset))
-
-        fragment_ids: list[int] = all_fragment_ids(dataset)
-        if not fragment_ids:
-            return {"column": self.column, "index": self.index_name, "segments": 0, "fragments": 0}
-
-        version: int = dataset.version
-        index_uuid: str = str(uuid.uuid4())
-        params: dict[str, Any] = config.fts_params()
-        groups: list[list[int]] = split_evenly(fragment_ids, config.num_shards)
-        column: str = self.column
-        index_name: str = self.index_name
-        storage_options: dict[str, Any] | None = config.storage_options
-
-        def build_partition(group_iterator: Iterator[list[int]]) -> Iterator[int]:
-            """Build per-fragment inverted indices under the shared id.
-
-            Uses ``replace=True`` to bypass the same-name existence guard on the uncommitted
-            per-fragment path so the old committed index remains live and searchable while the
-            executor builds run.
-
-            Args:
-                group_iterator: Fragment-id shards assigned to this task.
-
-            Yields:
-                The count of fragments this task built.
-            """
-            telemetry_local: Telemetry = Telemetry.create(config.telemetry)
-            built: int = 0
-            with telemetry_local.span("lance.indexing.build_fts_segment"):
-                for group in group_iterator:
-                    shard_dataset: lance.LanceDataset = lance.dataset(
-                        uri, version=version, storage_options=storage_options
-                    )
-                    for fragment_id in group:
-                        with telemetry_local.timed("segment.build_ms", tags=["index_type:INVERTED"]):
-                            shard_dataset.create_scalar_index(
-                                column=column,
-                                index_type="INVERTED",
-                                name=index_name,
-                                replace=True,
-                                index_uuid=index_uuid,
-                                fragment_ids=[fragment_id],
-                                **params,
-                            )
-                        built += 1
-                        telemetry_local.incr("segment.built", tags=["index_type:INVERTED"])
-            yield built
-
-        with telemetry.timed("index.build_ms", tags=[f"index:{index_name}"]):
-            counts: list[int] = (
-                spark.sparkContext.parallelize(groups, len(groups)).mapPartitions(build_partition).collect()
-            )
-        if has_existing:
-            drop_existing_index(uri, self.index_name, config, telemetry)
-        dataset = lance.dataset(uri, storage_options=config.storage_options)
-        with telemetry.timed("index.merge_ms", tags=[f"index:{index_name}"]):
-            dataset.merge_index_metadata(index_uuid, index_type="INVERTED")
-        with telemetry.timed("index.commit_ms", tags=[f"index:{index_name}"]):
-            self.commit_index(uri, dataset, index_uuid, fragment_ids, telemetry)
-        return {
-            "column": self.column,
-            "index": index_name,
-            "segments": sum(counts),
-            "fragments": len(fragment_ids),
-        }

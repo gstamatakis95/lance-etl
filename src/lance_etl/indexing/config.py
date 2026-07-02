@@ -47,23 +47,19 @@ class IndexJobConfig:
         fts_stem: Apply FTS stemming when set.
         fts_remove_stop_words: Remove FTS stop words when set.
         fts_ascii_folding: Apply FTS ASCII folding when set.
-        num_shards: Parallel segment builders per dataset.
-        rebuild: Reindex every fragment; forces the small tier and FTS handler to rebuild instead of maintaining.
+        fragments_per_index_task: Target fragments covered by one segment-build task. The shard
+            count per index is ``ceil(target_fragments / fragments_per_index_task)``, so a small
+            dataset builds in exactly one task and a big one fans out across many, through the
+            same segment API.
+        rebuild: Reindex every fragment; forces every handler to rebuild instead of maintaining.
         max_index_deltas: Merge accumulated index deltas into one when the count exceeds this cap.
         fts_max_unindexed_fragments: Maintain an inverted index incrementally only within this unindexed backlog.
         commit_retries: Retry budget for commit conflicts.
         commit_backoff_seconds: Base backoff between commit retries.
-        small_dataset_fragment_threshold: Datasets with fewer fragments are indexed end-to-end on one executor.
-        large_dataset_row_threshold: Row count at or above which a dataset uses the distributed
-            segment fan-out even when its fragment count is below
-            ``small_dataset_fragment_threshold``. The small tier builds the whole index, including
-            IVF training and assignment, in one executor task. A dataset that is large by rows but
-            holds few large fragments would overload that single task, so it is routed to the
-            distributed tier instead. ``None`` disables the row dimension. The row count is read from
-            fragment metadata (no data scan).
-        small_tier_slices: Spark partition count for the batched small-dataset and classification jobs.
-        driver_concurrency: Concurrent large-dataset submissions from the driver thread pool.
-        scheduler_pool: Spark FAIR scheduler pool name for large-dataset jobs.
+        batch_partitions: Maximum Spark partitions for the per-dataset plan, commit, and
+            delta-bound fan-outs.
+        max_build_tasks: Upper bound on Spark partitions for the flat fleet-wide artifact and
+            segment-build jobs.
         min_ivf_partitions: Floor on the derived IVF partition count.
         max_ivf_partitions: Cap on the derived IVF partition count; operators needing more set ``num_partitions``.
         target_rows_per_ivf_partition: Target rows per partition for the size-aware policy.
@@ -74,7 +70,7 @@ class IndexJobConfig:
         train_sample_memory_budget_bytes: Executor RAM cap for the IVF training sample; caps partition count.
             The sample lands in executor heap, so this budget should track executor sizing (the default 8g
             executor covers the 8 GiB default).
-        max_stale_replans: Rebuild-everything cycles in ``build_and_commit_segments`` before giving up.
+        max_stale_replans: Fleet-level plan-build-commit rounds for stale indexes before giving up.
     """
 
     telemetry: TelemetryConfig
@@ -94,17 +90,14 @@ class IndexJobConfig:
     fts_stem: bool | None = None
     fts_remove_stop_words: bool | None = None
     fts_ascii_folding: bool | None = None
-    num_shards: int = 64
+    fragments_per_index_task: int = 8
     rebuild: bool = False
     max_index_deltas: int = 4
     fts_max_unindexed_fragments: int = 32
     commit_retries: int = DEFAULT_COMMIT_RETRIES
     commit_backoff_seconds: float = 0.5
-    small_dataset_fragment_threshold: int = 32
-    large_dataset_row_threshold: int | None = 5_000_000
-    small_tier_slices: int = 256
-    driver_concurrency: int = 8
-    scheduler_pool: str = "lance-indexing"
+    batch_partitions: int = 512
+    max_build_tasks: int = 1024
     min_ivf_partitions: int = 16
     max_ivf_partitions: int = 32768
     target_rows_per_ivf_partition: int = 8192

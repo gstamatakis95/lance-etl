@@ -92,7 +92,7 @@ class BenchConfig:
         batches: Sequential ETL merge batches during ingest. Values above 1 create extra fragments for compaction.
         etl_partitions: Shuffle partition count handed to the ETL job.
         ivf_partitions: Explicit IVF partition count. ``None`` uses the indexer's size-aware policy.
-        num_shards: Parallel segment builders per dataset during indexing.
+        num_shards: Fragments covered by one segment-build task during indexing.
         vector_row_floor: Row floor below which the vector index is skipped. Lowered from the production default so
             small ``--limit`` runs still build an index.
         fts_with_position: Store token positions in the inverted index.

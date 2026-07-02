@@ -44,7 +44,7 @@ def union_index_config(config: BenchConfig) -> IndexJobConfig:
     Returns:
         An ``IndexJobConfig`` with vector, scalar, bitmap, and (optionally) text columns set.
     """
-    shared: dict[str, Any] = {"telemetry": bench_telemetry_config(), "num_shards": config.num_shards}
+    shared: dict[str, Any] = {"telemetry": bench_telemetry_config(), "fragments_per_index_task": config.num_shards}
     kwargs: dict[str, Any] = {
         "vector_columns": ["vector"],
         "num_partitions": config.ivf_partitions,
@@ -72,7 +72,7 @@ def index_stages(config: BenchConfig) -> list[tuple[str, IndexJobConfig]]:
     Returns:
         ``(stage_name, job_config)`` pairs in build order.
     """
-    shared: dict[str, Any] = {"telemetry": bench_telemetry_config(), "num_shards": config.num_shards}
+    shared: dict[str, Any] = {"telemetry": bench_telemetry_config(), "fragments_per_index_task": config.num_shards}
     stages: list[tuple[str, IndexJobConfig]] = [
         (
             "vector_ivf_rq",

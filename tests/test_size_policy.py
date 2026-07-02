@@ -12,9 +12,9 @@ from lance_etl.indexing import (
     VectorIndexHandler,
     degrade_num_partitions,
     derive_num_partitions,
-    index_dataset_locally,
+    plan_dataset_indexes,
 )
-from lance_etl.telemetry import TelemetryConfig
+from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 
 def make_default_config() -> IndexJobConfig:
@@ -94,9 +94,9 @@ def test_vector_skip_reason_at_or_above_floor(tmp_path: Path) -> None:
     assert handler.skip_reason(lance.dataset(uri)) is None
 
 
-def test_index_dataset_locally_skips_vector_below_floor(tmp_path: Path) -> None:
-    """The tier-A executor task records the skip and builds no vector index."""
-    uri: str = str(tmp_path / "tier_a.lance")
+def test_plan_skips_vector_below_floor(tmp_path: Path, telemetry: Telemetry) -> None:
+    """The plan phase records the skip for a below-floor vector index and builds no shards for it."""
+    uri: str = str(tmp_path / "floor.lance")
     write_fragmented_dataset(uri, make_vector_table(rows=200, dim=8), max_rows_per_file=100)
     config: IndexJobConfig = IndexJobConfig(
         telemetry=TelemetryConfig(),
@@ -104,11 +104,8 @@ def test_index_dataset_locally_skips_vector_below_floor(tmp_path: Path) -> None:
         vector_min_rows=50_000,
         scalar_columns=["id"],
     )
-    result: dict[str, object] = index_dataset_locally(uri, config)
-    assert result["tier"] == "small"
-    by_index: dict[str, dict[str, object]] = {item["index"]: item for item in result["indexes"]}
+    plan: dict[str, object] = plan_dataset_indexes(uri, config, set(), telemetry)
+    by_index: dict[str, dict[str, object]] = {item["index"]: item for item in plan["done"]}
     assert "skipped" in by_index["vector_idx"]
-    dataset: lance.LanceDataset = lance.dataset(uri)
-    names: list[str] = [item["name"] for item in dataset.list_indices()]
-    assert "vector_idx" not in names
-    assert "id_idx" in names
+    assert all(spec["index_name"] != "vector_idx" for spec in plan["specs"])
+    assert any(spec["index_name"] == "id_idx" for spec in plan["specs"])

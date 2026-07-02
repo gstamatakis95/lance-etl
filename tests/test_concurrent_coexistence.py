@@ -16,8 +16,8 @@ with no Spark involved:
   and BTREE increments through ``create_index_uncommitted`` plus :func:`lance_etl.indexing.commit_segments` (which
   drops stale segments after a concurrent rewrite), the inverted index through the shared-uuid metadata-merge path
   published by :meth:`lance_etl.indexing.FtsIndexHandler.commit_index`, and delta bounding through
-  :func:`lance_etl.indexing.merge_index_deltas`. Tail datasets run the production small-tier
-  :func:`lance_etl.indexing.index_dataset_locally` build-then-maintain path. Every commit goes through
+  :func:`lance_etl.indexing.merge_index_deltas`. Tail datasets run the production unified
+  plan-build-commit functions fully in process. Every commit goes through
   :func:`lance_etl.telemetry.commit_with_retries`.
 
 The fleet is the 30,000-org shape in miniature: one head-org-sized dataset (about 200k keys, dim 16) plus a
@@ -89,15 +89,21 @@ from lance_etl.indexing import (
     IndexHandler,
     IndexJobConfig,
     VectorIndexHandler,
-    build_and_commit_segments,
+    build_one_shard,
+    commit_one_index,
+    commit_segments,
     fts_index_name,
-    index_dataset_locally,
     index_delta_count,
     is_stale_fragment_error,
     merge_index_deltas,
     optimize_existing_index,
+    plan_dataset_indexes,
+    publish_fts_index,
+    resolve_vector_artifacts,
     scalar_index_name,
     serialize_segment,
+    shard_count,
+    split_evenly,
     vector_index_name,
 )
 from lance_etl.maintenance import MaintenanceConfig, cleanup_dataset, commit_one_dataset
@@ -381,7 +387,7 @@ def build_segment_index(uri: str, handler: IndexHandler, config: IndexJobConfig,
     """Build one index increment through the production segment API in process.
 
     Mirrors :meth:`IndexHandler.build` without Spark by delegating to the production
-    :func:`build_and_commit_segments` rebuild loop with an in-process segment builder: it resolves the target
+    the production replan loop shape with an in-process segment builder: it resolves the target
     fragments, builds one uncommitted segment per shard against a version-pinned handle, and publishes through
     :func:`lance_etl.indexing.commit_segments`, which drops stale segments after a concurrent rewrite. When the
     commit would orphan fragments held by a wider existing segment that a compaction remapped, the loop re-resolves
@@ -416,18 +422,71 @@ def build_segment_index(uri: str, handler: IndexHandler, config: IndexJobConfig,
             documents.append(serialize_segment(handler.build_segment(shard, list(group), artifacts)))
         return documents
 
-    build_and_commit_segments(uri, handler, config, telemetry, build_documents)
+    for attempt in range(config.max_stale_replans):
+        del attempt
+        current: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+        targets: list[int] = handler.target_fragments(current)
+        if not targets:
+            break
+        artifacts: object | None = handler.prepare(current, uri, telemetry)
+        groups: list[list[int]] = split_evenly(targets, shard_count(len(targets), config))
+        documents: list[str] = build_documents(groups, current.version, artifacts)
+        try:
+            committed: int = commit_segments(
+                uri, documents, handler.column, handler.index_name, handler.merges(), config, telemetry
+            )
+        except ValueError as exc:
+            if not is_stale_fragment_error(exc):
+                raise
+            continue
+        if committed == len(documents):
+            break
     refreshed: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
     if handler.index_name in {description.name for description in refreshed.describe_indices()}:
         merge_index_deltas(uri, handler.index_name, config, telemetry)
+
+
+def index_tail_dataset(uri: str, config: IndexJobConfig, telemetry: Telemetry) -> None:
+    """Index one tail dataset through the unified plan-build-commit functions, fully in process.
+
+    Mirrors :meth:`LanceIndexer.run` for a single dataset without Spark: the plan phase resolves
+    targets and shards, vector artifacts resolve through the production reuse-or-train path, each
+    shard builds through :func:`lance_etl.indexing.build_one_shard`, and every index publishes
+    through :func:`lance_etl.indexing.commit_one_index`.
+
+    Args:
+        uri: Dataset URI.
+        config: Indexing configuration.
+        telemetry: Telemetry facade shared by the actors.
+    """
+    plan: dict[str, object] = plan_dataset_indexes(uri, config, set(), telemetry)
+    if "skipped" in plan:
+        return
+    artifacts: dict[tuple[str, str], tuple] = {}
+    for spec in plan["specs"]:
+        if spec["kind"] == "vector":
+            _, _, artifact, _, _ = resolve_vector_artifacts(
+                uri, spec["column"], spec["index_name"], bool(spec.get("full_rebuild")), config
+            )
+            artifacts[(uri, spec["column"])] = artifact
+    for spec in plan["specs"]:
+        base: dict[str, object] = {**spec, "uri": uri, "version": plan["version"]}
+        if spec["kind"] == "fts" and spec["mode"] == "maintain":
+            build_one_shard({**base, "shard": []}, artifacts, config, telemetry)
+            continue
+        payloads: list[dict[str, object]] = []
+        for shard in spec["shards"]:
+            _, _, payload = build_one_shard({**base, "shard": list(shard)}, artifacts, config, telemetry)
+            payloads.append(payload)
+        commit_one_index(uri, spec, payloads, config, telemetry)
 
 
 def fts_first_build(uri: str, handler: FtsIndexHandler, config: IndexJobConfig, telemetry: Telemetry) -> None:
     """Build the inverted index through the production shared-uuid metadata-merge path.
 
     Each fragment is built under one shared index id against a version-pinned handle, the per-fragment metadata is
-    merged, and the index is published with :meth:`FtsIndexHandler.commit_index`, whose stale-publish guard raises
-    ``ValueError`` when a concurrent compaction rewrote covered fragments between build and commit.
+    merged, and the index is published with :func:`lance_etl.indexing.publish_fts_index`, whose stale-publish guard
+    raises ``ValueError`` when a concurrent compaction rewrote covered fragments between build and commit.
 
     Args:
         uri: Dataset URI.
@@ -457,7 +516,7 @@ def fts_first_build(uri: str, handler: FtsIndexHandler, config: IndexJobConfig, 
         )
     refreshed: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
     refreshed.merge_index_metadata(shared_uuid, index_type="INVERTED")
-    handler.commit_index(uri, refreshed, shared_uuid, fragment_ids, telemetry)
+    publish_fts_index(uri, handler.column, handler.index_name, shared_uuid, fragment_ids, config, telemetry)
 
 
 def maintain_head_indexes(
@@ -528,7 +587,7 @@ def run_indexer_loop(
             maintain_head_indexes(head_uri, vector_handler, btree_handler, fts_handler, config, telemetry, events)
         for uri in tail_uris:
             if open_or_none(uri) is not None:
-                index_dataset_locally(uri, config)
+                index_tail_dataset(uri, config, telemetry)
         time.sleep(INDEXER_SWEEP_PAUSE_SECONDS)
 
 
@@ -779,7 +838,7 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
 
     maintain_head_indexes(head_uri, vector_handler, btree_handler, fts_handler, index_config, telemetry, events)
     for uri in tail_uris:
-        index_dataset_locally(uri, index_config)
+        index_tail_dataset(uri, index_config, telemetry)
     collapse_index_deltas(head_uri, head_required, index_config, telemetry)
     for uri in tail_uris:
         collapse_index_deltas(uri, tail_required, index_config, telemetry)
@@ -792,7 +851,7 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
         compact_dataset_inline(uri, tail_compaction_config, telemetry)
     maintain_head_indexes(head_uri, vector_handler, btree_handler, fts_handler, index_config, telemetry, events)
     for uri in tail_uris:
-        index_dataset_locally(uri, index_config)
+        index_tail_dataset(uri, index_config, telemetry)
 
     cleanup_config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config)
     bytes_removed: int = 0

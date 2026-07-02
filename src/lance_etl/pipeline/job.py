@@ -7,8 +7,8 @@ serializes the four fleet-level phases in dependency order so compaction always 
 The phase sequence is:
 
 1. **Prune**: delete old interval tags (skipped when ``tag_keep_last`` is ``None``).
-2. **Maintenance**: per-row TTL expiration, two-tier compaction, and version cleanup.
-3. **Index**: two-tier index builds with derived-state skip.
+2. **Maintenance**: per-row TTL expiration, unified task-based compaction, and version cleanup.
+3. **Index**: unified task-based index builds with derived-state skip.
 4. **Stamp**: write an interval tag and optionally advance the HEAD tag (skipped when
    ``tag_stamp`` is ``None``).
 
@@ -39,8 +39,8 @@ class PipelineConfig:
 
     Composes a :class:`~lance_etl.maintenance.job.MaintenanceConfig` and an
     :class:`~lance_etl.indexing.config.IndexJobConfig` and applies cross-cutting
-    settings (``scheduler_pool``, ``telemetry``, ``storage_options``) into both at
-    post-init time so callers do not have to set them twice.
+    settings (``telemetry``, ``storage_options``) into both at post-init time so callers
+    do not have to set them twice.
 
     Attributes:
         telemetry: Telemetry configuration shared across both sub-jobs.
@@ -53,8 +53,6 @@ class PipelineConfig:
             disables the stamp phase.
         serve_tag: When ``True`` and ``tag_stamp`` is set, advance the ``HEAD`` tag to the
             dataset's latest version after stamping the interval tag.
-        scheduler_pool: Spark FAIR scheduler pool injected into both sub-configurations
-            at post-init.
         tag_partitions: Maximum Spark partitions for the prune and stamp fan-outs.
     """
 
@@ -65,22 +63,20 @@ class PipelineConfig:
     tag_keep_last: int | None = 48
     tag_stamp: str | None = None
     serve_tag: bool = False
-    scheduler_pool: str = "lance-pipeline"
     tag_partitions: int = 512
 
     def __post_init__(self) -> None:
         """Push cross-cutting settings into the composed sub-configurations.
 
-        Copies ``telemetry``, ``storage_options``, and ``scheduler_pool`` from this config
-        into both ``maintenance`` and ``indexing`` so every phase shares the same identity
-        and object-store credentials without requiring callers to set them on each
-        sub-config individually.
+        Copies ``telemetry`` and ``storage_options`` from this config into both
+        ``maintenance`` and ``indexing`` so every phase shares the same identity and
+        object-store credentials without requiring callers to set them on each sub-config
+        individually.
         """
         self.maintenance.telemetry = self.telemetry
         self.maintenance.storage_options = self.storage_options
         self.indexing.telemetry = self.telemetry
         self.indexing.storage_options = self.storage_options
-        self.indexing.scheduler_pool = self.scheduler_pool
 
 
 def stamp_eligible(index_stats: dict[str, Any]) -> bool:

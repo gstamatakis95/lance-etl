@@ -22,10 +22,10 @@ from lance_etl.indexing import (
     FtsIndexHandler,
     IndexHandler,
     IndexJobConfig,
+    LanceIndexer,
     VectorIndexHandler,
     centroids_from_ipc,
     commit_segments,
-    index_dataset_locally,
     lance_field_id,
     load_vector_config,
     serialize_segment,
@@ -74,12 +74,11 @@ def index_config() -> IndexJobConfig:
 
 
 def test_handler_segment_builder_is_picklable() -> None:
-    """The ``segment_builder`` callable captured by the Spark closure pickles cleanly and stays small.
+    """The ``segment_builder`` callable pickles cleanly and stays small for Spark closures.
 
-    ``IndexHandler.build`` ships ``segment_builder()`` to executors inside the closure. It is a
-    :func:`functools.partial` over a module-level function bound to primitive values only, so it must round-trip
-    through pickle without dragging the handler instance (and its ``config`` with ``storage_options`` and
-    ``telemetry``) onto every task.
+    It is a :func:`functools.partial` over a module-level function bound to primitive values only, so it must
+    round-trip through pickle without dragging the handler instance (and its ``config`` with ``storage_options``
+    and ``telemetry``) onto every task.
     """
     config: IndexJobConfig = index_config()
     handlers: list[IndexHandler] = [
@@ -358,13 +357,139 @@ def test_scalar_fragment_sharding_requires_segment_api(dataset_uri: str) -> None
         )
 
 
-def test_index_dataset_locally_builds_all_types(dataset_uri: str) -> None:
-    """The tier-A executor task builds every configured index in one process."""
+class FakeBroadcast:
+    """Minimal stand-in for a Spark broadcast variable."""
+
+    def __init__(self, value: object) -> None:
+        """Wrap the broadcast value.
+
+        Args:
+            value: The value to expose.
+        """
+        self.value: object = value
+
+
+class FakeRdd:
+    """Minimal stand-in for a Spark RDD running everything eagerly in process."""
+
+    def __init__(self, items: list[object]) -> None:
+        """Initialize the fake RDD.
+
+        Args:
+            items: The partitioned items.
+        """
+        self.items: list[object] = items
+
+    def map(self, fn: object) -> FakeRdd:
+        """Apply a function to every item eagerly.
+
+        Args:
+            fn: The mapper.
+
+        Returns:
+            A new fake RDD with the mapped items.
+        """
+        return FakeRdd([fn(item) for item in self.items])
+
+    def mapPartitions(self, fn: object) -> FakeRdd:
+        """Apply a partition function to the single in-process partition.
+
+        Args:
+            fn: The partition mapper yielding outputs.
+
+        Returns:
+            A new fake RDD with the collected outputs.
+        """
+        return FakeRdd(list(fn(iter(self.items))))
+
+    def collect(self) -> list[object]:
+        """Return the items.
+
+        Returns:
+            The current items.
+        """
+        return list(self.items)
+
+
+class FakeSparkContext:
+    """Minimal stand-in for a SparkContext with broadcast support."""
+
+    def parallelize(self, items: list[object], slices: int) -> FakeRdd:
+        """Wrap items into a fake RDD.
+
+        Args:
+            items: The items to distribute.
+            slices: Ignored partition count.
+
+        Returns:
+            The fake RDD.
+        """
+        del slices
+        return FakeRdd(list(items))
+
+    def broadcast(self, value: object) -> FakeBroadcast:
+        """Wrap a value into a fake broadcast.
+
+        Args:
+            value: The value to broadcast.
+
+        Returns:
+            The fake broadcast handle.
+        """
+        return FakeBroadcast(value)
+
+
+class FakeSpark:
+    """Minimal stand-in for a SparkSession."""
+
+    def __init__(self) -> None:
+        """Initialize the fake session with its fake context."""
+        self.sparkContext: FakeSparkContext = FakeSparkContext()
+
+
+def test_unified_run_builds_fts_end_to_end(dataset_uri: str) -> None:
+    """The unified fleet run builds a BM25 inverted index end-to-end through all phases.
+
+    Exercises plan (shard specs), the flat build job (per-fragment INVERTED builds under one
+    shared index id), the commit fan-out (metadata merge plus publish), and the delta bound,
+    all through the production phase functions driven by the in-process Spark fake.
+    """
+    config: IndexJobConfig = IndexJobConfig(
+        telemetry=TelemetryConfig(),
+        text_columns=["text"],
+        fragments_per_index_task=1,
+        commit_retries=5,
+        commit_backoff_seconds=0.0,
+    )
+    results: list[dict[str, object]] = LanceIndexer(config).run(FakeSpark(), [dataset_uri])
+    assert "text_fts_idx" in listed_index_names(dataset_uri)
+    by_index: dict[str, dict[str, object]] = {item["index"]: item for item in results[0]["indexes"]}
+    assert by_index["text_fts_idx"]["segments"] == len(fragment_ids_of(dataset_uri))
+    expected: int = sum(1 for i in range(ROWS) if i % 10 == 2)
+    assert lance.dataset(dataset_uri).to_table(full_text_query="word2").num_rows == expected
+
+
+def test_unified_run_discovers_columns_from_roles(dataset_uri: str) -> None:
+    """With no explicit columns configured, the run derives FTS targets from role metadata."""
+    lance.dataset(dataset_uri).update_config({"lance-etl.columns": '{"text": "text"}'})
+    config: IndexJobConfig = IndexJobConfig(
+        telemetry=TelemetryConfig(),
+        fragments_per_index_task=2,
+        commit_retries=5,
+        commit_backoff_seconds=0.0,
+    )
+    results: list[dict[str, object]] = LanceIndexer(config).run(FakeSpark(), [dataset_uri])
+    assert "text_fts_idx" in listed_index_names(dataset_uri)
+    assert results[0]["indexes"][0]["index"] == "text_fts_idx"
+
+
+def test_unified_run_builds_all_types(dataset_uri: str) -> None:
+    """One unified fleet run builds every configured index through the segment APIs."""
     config: IndexJobConfig = index_config()
-    result: dict[str, object] = index_dataset_locally(dataset_uri, config)
+    results: list[dict[str, object]] = LanceIndexer(config).run(FakeSpark(), [dataset_uri])
     names: list[str] = listed_index_names(dataset_uri)
     assert {"vector_idx", "id_idx", "category_bitmap_idx", "text_fts_idx"} <= set(names)
-    by_index: dict[str, dict[str, object]] = {item["index"]: item for item in result["indexes"]}
+    by_index: dict[str, dict[str, object]] = {item["index"]: item for item in results[0]["indexes"]}
     assert by_index["vector_idx"]["num_partitions"] == 4
     dataset: lance.LanceDataset = lance.dataset(dataset_uri)
     assert dataset.to_table(nearest={"column": "vector", "q": [0.5] * DIM, "k": 3}).num_rows == 3

@@ -1,24 +1,45 @@
-"""LanceIndexer orchestrator and small-dataset in-process path.
+"""LanceIndexer: unified fleet orchestration for index builds.
 
-Provides :class:`LanceIndexer` (two-tier orchestration), :func:`index_dataset_locally` (the
-small-tier in-process build), and the new derived-state :func:`index_skip_reason` check that lets
-a dataset skip indexing when all configured indices are current.
+Every dataset, regardless of size, follows the same phases built on the same Lance segment
+APIs, and a small dataset is simply the one-shard case:
+
+- Plan (:func:`plan_dataset_indexes`): a per-dataset executor fan-out resolves which indexes to
+  build (explicit config columns, or the ``lance-etl.columns`` role metadata written by the ETL
+  sink), runs the derived-state skip check, and shards each index's target fragments into
+  build tasks sized by ``fragments_per_index_task``.
+- Artifacts (:meth:`LanceIndexer.resolve_fleet_artifacts`): one flat Spark job resolves the
+  IVF_RQ artifacts for every vector index in the fleet. Reuse reads centroids back from the
+  committed index on the executor, and training runs in-process ON that executor under the
+  train semaphore, so the driver never holds a training sample.
+- Build (:meth:`LanceIndexer.build_fleet_segments`): ONE flat Spark job over every dataset's
+  shard tasks. Vector and scalar shards build uncommitted segments, FTS rebuild shards build
+  per-fragment inverted indices under their dataset's shared index id, and FTS maintain runs
+  as a single task per dataset.
+- Commit (:func:`commit_one_index`): a per-(dataset, index) executor fan-out merges vector
+  segments and publishes through the production commit paths, keeping the heavy merge off the
+  driver. A stale-fragment commit (a concurrent compaction rewrote planned fragments) marks the
+  index for the next replan round instead of failing the run.
+- Delta bound (:func:`merge_deltas_if_needed`): a final per-(dataset, index) fan-out merges
+  accumulated index deltas once they exceed ``max_index_deltas``.
+
+:meth:`LanceIndexer.run` repeats plan-artifacts-build-commit for stale indexes up to
+``max_stale_replans`` rounds, then defers the survivors to the next scheduled run.
 """
 
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import math
+import uuid
 from typing import Any
 
 import lance
 from pyspark.sql import SparkSession
 
+from lance_etl.column_roles import TEXT_ROLE, VECTOR_ROLE, load_column_roles
 from lance_etl.indexing.config import (
     IndexJobConfig,
     bitmap_index_name,
-    degrade_num_partitions,
-    derive_num_partitions,
     fts_index_name,
     scalar_index_name,
     vector_index_name,
@@ -29,69 +50,135 @@ from lance_etl.indexing.handlers import (
     FtsIndexHandler,
     IndexHandler,
     VectorIndexHandler,
+    commit_fts_index,
 )
-from lance_etl.indexing.optimize import clear_vector_config, load_vector_config, maintain_index_locally
+from lance_etl.indexing.optimize import index_delta_count, load_vector_config, maintain_index_locally
+from lance_etl.indexing.optimize import merge_index_deltas as merge_index_deltas_now
+from lance_etl.indexing.segments import (
+    build_scalar_segment,
+    build_vector_segment,
+    commit_segments,
+    is_stale_fragment_error,
+    serialize_segment,
+    split_evenly,
+)
+from lance_etl.maintenance.job import fan_out_per_dataset
 from lance_etl.telemetry import Telemetry
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+VECTOR_KIND: str = "vector"
+"""Index kind for IVF_RQ vector indexes."""
+
+BTREE_KIND: str = "btree"
+"""Index kind for BTREE scalar indexes."""
+
+BITMAP_KIND: str = "bitmap"
+"""Index kind for BITMAP scalar indexes."""
+
+FTS_KIND: str = "fts"
+"""Index kind for BM25 INVERTED full-text indexes."""
+
+KIND_TO_HANDLER: dict[str, type[IndexHandler]] = {
+    VECTOR_KIND: VectorIndexHandler,
+    BTREE_KIND: BTreeIndexHandler,
+    BITMAP_KIND: BitmapIndexHandler,
+    FTS_KIND: FtsIndexHandler,
+}
+"""Maps an index kind to the handler class owning its type-specific logic."""
+
+
+def make_handler(kind: str, column: str, index_name: str, config: IndexJobConfig) -> IndexHandler:
+    """Instantiate the handler for one index kind.
+
+    Args:
+        kind: One of the ``*_KIND`` constants.
+        column: The column to index.
+        index_name: The index name to publish under.
+        config: Indexing configuration.
+
+    Returns:
+        The handler instance.
+    """
+    return KIND_TO_HANDLER[kind](config, column, index_name)
+
+
+def resolve_index_targets(dataset: lance.LanceDataset, config: IndexJobConfig) -> list[tuple[str, str, str]]:
+    """Resolve which indexes a dataset should carry, from explicit config or role metadata.
+
+    When any column list is set on the config, the explicit lists win unchanged. Otherwise the
+    dataset's own ``lance-etl.columns`` role metadata (written by the ETL sink) drives the
+    decision per dataset: every ``vector`` role column gets an IVF_RQ index and every ``text``
+    role column gets a BM25 INVERTED index. Scalar roles build nothing unless explicitly
+    configured. This lets one fleet run serve heterogeneous per-tenant schemas without
+    per-dataset CLI flags.
+
+    Args:
+        dataset: The open dataset.
+        config: Indexing configuration.
+
+    Returns:
+        ``(kind, column, index_name)`` triples in vector, btree, bitmap, text order.
+    """
+    explicit: bool = bool(
+        config.vector_columns or config.scalar_columns or config.bitmap_columns or config.text_columns
+    )
+    if explicit:
+        targets: list[tuple[str, str, str]] = []
+        targets.extend((VECTOR_KIND, column, vector_index_name(column)) for column in config.vector_columns)
+        targets.extend((BTREE_KIND, column, scalar_index_name(column)) for column in config.scalar_columns)
+        targets.extend((BITMAP_KIND, column, bitmap_index_name(column)) for column in config.bitmap_columns)
+        targets.extend((FTS_KIND, column, fts_index_name(column)) for column in config.text_columns)
+        return targets
+
+    roles: dict[str, str] = load_column_roles(dataset)
+    columns: set[str] = set(dataset.schema.names)
+    discovered: list[tuple[str, str, str]] = []
+    for column in sorted(name for name, role in roles.items() if role == VECTOR_ROLE and name in columns):
+        discovered.append((VECTOR_KIND, column, vector_index_name(column)))
+    for column in sorted(name for name, role in roles.items() if role == TEXT_ROLE and name in columns):
+        discovered.append((FTS_KIND, column, fts_index_name(column)))
+    return discovered
+
 
 def index_skip_reason(
-    dataset: lance.LanceDataset, config: IndexJobConfig, check_vector_artifacts: bool = True
+    dataset: lance.LanceDataset, config: IndexJobConfig, targets: list[tuple[str, str, str]]
 ) -> str | None:
-    """Return a reason string when all configured indices are current, or None to proceed.
+    """Return a reason string when all targeted indices are current, or None to proceed.
 
     Evaluates derived dataset state from the already-open handle so no extra object-store I/O is
     needed. The check is bypassed when ``config.rebuild`` is True.
 
-    For each configured index name the check proceeds as follows. When the index is absent the
-    dataset needs indexing, unless it is a vector index and the row count is below
+    For each targeted index the check proceeds as follows. When the index is absent the dataset
+    needs indexing, unless it is a vector index and the row count is below
     ``config.vector_min_rows`` (intended skip — flat KNN suffices). When the index is present,
     ``dataset.stats.index_stats(name)`` is consulted: if ``num_unindexed_fragments`` is positive
-    or ``num_indices`` exceeds ``config.max_index_deltas``, the dataset needs work. When
-    ``check_vector_artifacts`` is True (the segment-API tier), an existing vector index
-    additionally needs work when its
-    ``lance-etl.vector.{column}`` config entry is absent (a small-tier-built index awaiting the
-    promotion full rebuild) or when the row count grew past ``config.retrain_growth_factor``
-    times the recorded ``rows_at_train`` (a centroid retrain is due even with full coverage).
-    The small tier passes False because its indexes carry a private model with no config entry
-    by design and retrain through tier promotion instead. Both reads come from the
-    already-loaded manifest, so the check stays free of extra object-store I/O. When every
-    configured index passes all checks without returning None, a short reason string is returned
-    and the caller skips the dataset.
+    or ``num_indices`` exceeds ``config.max_index_deltas``, the dataset needs work. An existing
+    vector index additionally needs work when its ``lance-etl.vector.{column}`` config entry is
+    absent (an index built outside the segment path awaiting a full rebuild) or when the row
+    count grew past ``config.retrain_growth_factor`` times the recorded ``rows_at_train``. Both
+    reads come from the already-loaded manifest.
 
     Args:
         dataset: The already-open dataset handle.
         config: Indexing configuration.
-        check_vector_artifacts: Evaluate the vector config-entry and growth-retrain probes,
-            True for the segment-API tier and False for the small in-process tier.
+        targets: The resolved ``(kind, column, index_name)`` triples for this dataset.
 
     Returns:
-        A human-readable skip reason when all indices are current and no work is needed, or
-        ``None`` when at least one index requires attention.
+        A human-readable skip reason when all indices are current, or ``None`` when at least one
+        index requires attention.
     """
     if config.rebuild:
         return None
+    if not targets:
+        return "no indices configured"
 
     existing: set[str] = {description.name for description in dataset.describe_indices()}
     rows: int | None = None
 
-    all_names: list[tuple[str, str | None]] = []
-    for column in config.vector_columns:
-        all_names.append((vector_index_name(column), column))
-    for column in config.scalar_columns:
-        all_names.append((scalar_index_name(column), None))
-    for column in config.bitmap_columns:
-        all_names.append((bitmap_index_name(column), None))
-    for column in config.text_columns:
-        all_names.append((fts_index_name(column), None))
-
-    if not all_names:
-        return "no indices configured"
-
-    for name, vector_column in all_names:
+    for kind, column, name in targets:
         if name not in existing:
-            if vector_column is not None:
+            if kind == VECTOR_KIND:
                 if rows is None:
                     rows = dataset.count_rows()
                 if rows < config.vector_min_rows:
@@ -104,8 +191,8 @@ def index_skip_reason(
         if int(stats.get("num_indices") or 0) > config.max_index_deltas:
             return None
 
-        if vector_column is not None and check_vector_artifacts:
-            cfg: dict[str, Any] | None = load_vector_config(dataset, vector_column)
+        if kind == VECTOR_KIND:
+            cfg: dict[str, Any] | None = load_vector_config(dataset, column)
             if cfg is None:
                 return None
             rows_at_train: int = int(cfg.get("rows_at_train") or 0)
@@ -119,131 +206,318 @@ def index_skip_reason(
     return "all indices current"
 
 
-def maintained_stats(column: str, index_name: str, fragments: int, deltas_merged: bool) -> dict[str, Any]:
-    """Build the statistics dictionary for an incrementally maintained index.
+def shard_count(target_fragments: int, config: IndexJobConfig) -> int:
+    """Derive the build-task count for one index from its target fragment count.
 
     Args:
-        column: The indexed column.
-        index_name: The maintained index name.
-        fragments: The dataset's fragment count.
-        deltas_merged: Whether a delta merge ran after the maintenance pass.
+        target_fragments: Number of fragments the index build must cover.
+        config: Indexing configuration supplying ``fragments_per_index_task``.
 
     Returns:
-        A statistics dictionary matching the large-tier shape with ``maintained`` set.
+        The shard count: one task per ``fragments_per_index_task`` fragments, at least one.
     """
-    return {
-        "column": column,
-        "index": index_name,
-        "segments": 0,
-        "fragments": fragments,
-        "maintained": True,
-        "deltas_merged": deltas_merged,
-    }
+    return max(1, math.ceil(target_fragments / config.fragments_per_index_task))
 
 
-def index_dataset_locally(uri: str, config: IndexJobConfig) -> dict[str, Any]:
-    """Build or maintain every configured index for one small dataset on one executor.
+def plan_dataset_indexes(
+    uri: str,
+    config: IndexJobConfig,
+    forced_full_rebuild: set[str],
+    telemetry: Telemetry,
+) -> dict[str, Any]:
+    """Run the plan phase for one dataset on an executor.
 
-    This is the small-dataset tier: no segment fan-out. An index that already exists is maintained
-    incrementally with ``optimize_indices``, which appends only unindexed fragments and no-ops
-    cheaply when the index is fully covered, so sweeping the unchanged power-law tail costs near
-    zero. Missing indices, or every index on a ``rebuild`` run (the path for parameter changes),
-    are built with plain ``create_index`` / ``create_scalar_index`` calls that build and commit
-    end-to-end. After each maintenance pass the index's deltas are merged once they exceed
-    ``max_index_deltas``. Single-process ``create_index`` needs no shared RaBitQ model — a lone
-    non-merged segment may use its own random rotation. Each vector column listed in
-    :attr:`IndexJobConfig.vector_columns` follows the same size-aware policy as the distributed
-    path and is skipped below the configured row floor. Incremental vector maintenance assigns new
-    rows to existing IVF partitions without retraining, so a grown dataset retrains via the large
-    tier once it crosses the fragment threshold (an artifact-less existing index is a full-rebuild
-    trigger there), or earlier via a ``rebuild`` run. No artifact files or sidecar directories are
-    created by this path, and any stored vector config left by an earlier segment-API build is
-    cleared before a plain ``create_index`` build so the large tier never pairs the new index's
-    private model with stale stored artifacts.
+    Opens the dataset once (failure isolation: an unreadable dataset returns a skip record),
+    resolves the index targets, applies the fleet-level and per-index skip checks, and shards
+    each index's target fragments into build tasks. Vector indexes carry their full-rebuild
+    decision so a stale replan keeps rebuilding everything even after the stored config was
+    refreshed (the ``forced_full_rebuild`` names re-force it in later rounds).
 
     Args:
         uri: Dataset URI.
         config: Indexing configuration.
+        forced_full_rebuild: Index names whose earlier round decided a full rebuild.
+        telemetry: Telemetry facade for the current executor process.
 
     Returns:
-        A statistics dictionary matching the large-tier shape. Maintained indices carry
-        ``maintained: True``.
+        A dict with ``uri`` and either ``skipped`` or ``version`` plus per-index ``specs``.
+        Each spec carries ``kind``, ``column``, ``index_name``, ``mode``, ``shards``, and the
+        FTS extras (``index_uuid``, ``has_existing``) or the vector ``full_rebuild`` flag.
+        Indexes with nothing to do land in ``done`` as finished stats.
     """
-    telemetry: Telemetry = Telemetry.create(config.telemetry)
-    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+    try:
+        dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        logger.warning("indexing: cannot open dataset %s, skipping: %s", uri, exc)
+        telemetry.incr("dataset.index_open_error")
+        return {"uri": uri, "indexes": [], "skipped": str(exc)}
 
-    skip: str | None = index_skip_reason(dataset, config, check_vector_artifacts=False)
+    targets: list[tuple[str, str, str]] = resolve_index_targets(dataset, config)
+    skip: str | None = index_skip_reason(dataset, config, targets)
     if skip is not None:
         telemetry.incr("dataset.skipped_no_work")
-        return {"uri": uri, "indexes": [], "tier": "small", "skipped": skip}
+        return {"uri": uri, "indexes": [], "skipped": skip}
 
-    fragments: int = len(dataset.get_fragments())
-    existing: set[str] = {description.name for description in dataset.describe_indices()}
-    indexes: list[dict[str, Any]] = []
-    with telemetry.span("lance.indexing.local_dataset"):
-        rows: int = dataset.count_rows()
-        for vec_col in config.vector_columns:
-            idx_name: str = vector_index_name(vec_col)
-            if rows < config.vector_min_rows:
-                telemetry.incr("index.skipped", tags=[f"index:{idx_name}"])
-                reason: str = f"{rows} rows below vector_min_rows={config.vector_min_rows}; flat KNN suffices"
-                indexes.append(
-                    {
-                        "column": vec_col,
-                        "index": idx_name,
-                        "segments": 0,
-                        "fragments": 0,
-                        "skipped": reason,
-                    }
+    specs: list[dict[str, Any]] = []
+    done: list[dict[str, Any]] = []
+    for kind, column, index_name in targets:
+        handler: IndexHandler = make_handler(kind, column, index_name, config)
+        reason: str | None = handler.skip_reason(dataset)
+        if reason is not None:
+            telemetry.incr("index.skipped", tags=[f"index:{index_name}"])
+            done.append({"column": column, "index": index_name, "segments": 0, "fragments": 0, "skipped": reason})
+            continue
+        handler.validate(dataset)
+
+        if kind == FTS_KIND:
+            fts_handler: FtsIndexHandler = handler
+            if fts_handler.maintainable(dataset):
+                specs.append(
+                    {"kind": kind, "column": column, "index_name": index_name, "mode": "maintain", "shards": []}
                 )
-            elif idx_name in existing and not config.rebuild:
-                with telemetry.timed("index.build_ms", tags=[f"index:{idx_name}"]):
-                    merged: bool = maintain_index_locally(uri, idx_name, config, telemetry)
-                indexes.append(maintained_stats(vec_col, idx_name, fragments, merged))
-            else:
-                planned: int = derive_num_partitions(rows, config.num_partitions, config)
-                partitions: int = degrade_num_partitions(planned, rows, config.train_sample_rate)
-                clear_vector_config(uri, vec_col, config, telemetry)
-                with telemetry.timed("index.build_ms", tags=[f"index:{idx_name}"]):
-                    dataset.create_index(
-                        vec_col,
-                        "IVF_RQ",
-                        name=idx_name,
-                        metric=config.metric,
-                        replace=True,
-                        num_partitions=partitions,
-                        num_bits=config.ivf_rq_num_bits,
-                    )
-                telemetry.incr("index.committed", tags=[f"index:{idx_name}"])
-                indexes.append(
-                    {
-                        "column": vec_col,
-                        "index": idx_name,
-                        "segments": 1,
-                        "fragments": fragments,
-                        "num_partitions": partitions,
-                    }
+                continue
+            fragment_ids: list[int] = [fragment.fragment_id for fragment in dataset.get_fragments()]
+            if not fragment_ids:
+                done.append({"column": column, "index": index_name, "segments": 0, "fragments": 0})
+                continue
+            specs.append(
+                {
+                    "kind": kind,
+                    "column": column,
+                    "index_name": index_name,
+                    "mode": "rebuild",
+                    "shards": split_evenly(fragment_ids, shard_count(len(fragment_ids), config)),
+                    "fragments": fragment_ids,
+                    "index_uuid": str(uuid.uuid4()),
+                    "has_existing": bool(fts_handler.covered_fragments(dataset)),
+                }
+            )
+            continue
+
+        if kind == VECTOR_KIND and index_name in forced_full_rebuild:
+            handler.full_rebuild = True
+        target_ids: list[int] = handler.target_fragments(dataset)
+        if not target_ids:
+            done.append({"column": column, "index": index_name, "segments": 0, "fragments": 0})
+            continue
+        spec: dict[str, Any] = {
+            "kind": kind,
+            "column": column,
+            "index_name": index_name,
+            "mode": "segments",
+            "shards": split_evenly(target_ids, shard_count(len(target_ids), config)),
+            "fragments": len(target_ids),
+        }
+        if kind == VECTOR_KIND:
+            spec["full_rebuild"] = bool(getattr(handler, "full_rebuild", False))
+        specs.append(spec)
+
+    return {"uri": uri, "version": dataset.version, "specs": specs, "done": done}
+
+
+def resolve_vector_artifacts(
+    uri: str,
+    column: str,
+    index_name: str,
+    full_rebuild: bool,
+    config: IndexJobConfig,
+) -> tuple[str, str, tuple, bool, int | None]:
+    """Resolve one vector index's IVF_RQ artifacts on an executor: reuse or train in process.
+
+    Delegates to :meth:`VectorIndexHandler.prepare` with ``spark=None`` so the reuse branch
+    reads centroids back from the committed index right here and the train branch runs the
+    k-means in this executor process under the train semaphore. The driver never holds the
+    training sample.
+
+    Args:
+        uri: Dataset URI.
+        column: The vector column.
+        index_name: The index name.
+        full_rebuild: Whether the plan phase decided a full rebuild for this index.
+        config: Indexing configuration.
+
+    Returns:
+        ``(uri, column, artifacts, reused, num_partitions)`` where ``artifacts`` is the tuple
+        the segment builders expect.
+    """
+    telemetry: Telemetry = Telemetry.create(config.telemetry)
+    handler: VectorIndexHandler = VectorIndexHandler(config, column, index_name)
+    handler.full_rebuild = full_rebuild
+    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+    artifacts: tuple = handler.prepare(dataset, uri, telemetry, spark=None)
+    return uri, column, artifacts, handler.reused_artifacts, handler.num_partitions_used
+
+
+def build_one_shard(
+    task: dict[str, Any],
+    artifacts_by_key: dict[tuple[str, str], tuple],
+    config: IndexJobConfig,
+    telemetry: Telemetry,
+) -> tuple[str, str, dict[str, Any]]:
+    """Build one flat-job task on an executor: a segment shard, FTS fragment shard, or FTS maintain.
+
+    Args:
+        task: The shard task spec from the plan phase, flattened with ``uri`` and ``version``.
+        artifacts_by_key: The fleet's vector artifacts keyed by ``(uri, column)``.
+        config: Indexing configuration.
+        telemetry: Telemetry facade for the current executor process.
+
+    Returns:
+        ``(uri, index_name, payload)`` where the payload carries a serialized ``segment``, an
+        FTS ``built`` count, or a finished ``stats`` dict for maintain tasks.
+    """
+    uri: str = task["uri"]
+    kind: str = task["kind"]
+    column: str = task["column"]
+    index_name: str = task["index_name"]
+    tags: list[str] = [f"index_type:{kind}"]
+
+    if kind == FTS_KIND and task["mode"] == "maintain":
+        with telemetry.timed("index.build_ms", tags=[f"index:{index_name}"]):
+            merged: bool = maintain_index_locally(uri, index_name, config, telemetry)
+        stats: dict[str, Any] = {
+            "column": column,
+            "index": index_name,
+            "segments": 0,
+            "fragments": 0,
+            "maintained": True,
+            "deltas_merged": merged,
+        }
+        return uri, index_name, {"stats": stats}
+
+    shard: list[int] = task["shard"]
+    dataset: lance.LanceDataset = lance.dataset(uri, version=task["version"], storage_options=config.storage_options)
+    if kind == FTS_KIND:
+        built: int = 0
+        for fragment_id in shard:
+            with telemetry.timed("segment.build_ms", tags=tags):
+                dataset.create_scalar_index(
+                    column=column,
+                    index_type="INVERTED",
+                    name=index_name,
+                    replace=True,
+                    index_uuid=task["index_uuid"],
+                    fragment_ids=[fragment_id],
+                    **config.fts_params(),
                 )
-        scalar_targets: list[tuple[str, str, str, dict[str, Any]]] = [
-            *((column, "BTREE", scalar_index_name(column), {}) for column in config.scalar_columns),
-            *((column, "BITMAP", bitmap_index_name(column), {}) for column in config.bitmap_columns),
-            *((column, "INVERTED", fts_index_name(column), config.fts_params()) for column in config.text_columns),
-        ]
-        for column, index_type, name, params in scalar_targets:
-            if name in existing and not config.rebuild:
-                with telemetry.timed("index.build_ms", tags=[f"index:{name}"]):
-                    merged = maintain_index_locally(uri, name, config, telemetry)
-                indexes.append(maintained_stats(column, name, fragments, merged))
-            else:
-                with telemetry.timed("index.build_ms", tags=[f"index:{name}"]):
-                    dataset.create_scalar_index(column, index_type, name=name, replace=True, **params)
-                telemetry.incr("index.committed", tags=[f"index:{name}"])
-                indexes.append({"column": column, "index": name, "segments": 1, "fragments": fragments})
-    return {"uri": uri, "indexes": indexes, "tier": "small"}
+            built += 1
+            telemetry.incr("segment.built", tags=tags)
+        return uri, index_name, {"built": built}
+
+    with telemetry.timed("segment.build_ms", tags=tags):
+        if kind == VECTOR_KIND:
+            segment = build_vector_segment(
+                dataset,
+                shard,
+                artifacts_by_key[(uri, column)],
+                column=column,
+                index_name=index_name,
+                metric=config.metric,
+            )
+        else:
+            index_type: str = "BTREE" if kind == BTREE_KIND else "BITMAP"
+            segment = build_scalar_segment(
+                dataset, shard, None, column=column, index_name=index_name, index_type=index_type
+            )
+    telemetry.incr("segment.built", tags=tags)
+    return uri, index_name, {"segment": serialize_segment(segment)}
+
+
+def commit_one_index(
+    uri: str,
+    spec: dict[str, Any],
+    payloads: list[dict[str, Any]],
+    config: IndexJobConfig,
+    telemetry: Telemetry,
+) -> dict[str, Any]:
+    """Commit one dataset's index on an executor (phase C), classifying stale-fragment failures.
+
+    Segment kinds go through the production :func:`commit_segments`, which merges vector
+    segments before publishing — running here keeps the merge off the driver. FTS rebuilds drop
+    the old index only now, after the executor builds finished, then merge the per-fragment
+    metadata and publish, so the old index stayed live for the whole build. A stale-fragment
+    error returns a ``stale`` marker so the fleet re-plans this index in the next round.
+
+    Args:
+        uri: Dataset URI.
+        spec: The index spec from the plan phase.
+        payloads: The build payloads collected for this index.
+        config: Indexing configuration.
+        telemetry: Telemetry facade for the current executor process.
+
+    Returns:
+        The index stats dict, or ``{"stale": True, ...}`` when the index must be re-planned.
+    """
+    kind: str = spec["kind"]
+    column: str = spec["column"]
+    index_name: str = spec["index_name"]
+
+    try:
+        if kind == FTS_KIND:
+            handler: FtsIndexHandler = FtsIndexHandler(config, column, index_name)
+            built: int = sum(int(payload.get("built", 0)) for payload in payloads)
+            commit_fts_index(
+                uri,
+                column,
+                index_name,
+                spec["index_uuid"],
+                spec["fragments"],
+                spec["has_existing"],
+                config,
+                telemetry,
+            )
+            del handler
+            return {"column": column, "index": index_name, "segments": built, "fragments": len(spec["fragments"])}
+
+        documents: list[str] = [payload["segment"] for payload in payloads if "segment" in payload]
+        merge: bool = kind == VECTOR_KIND
+        with telemetry.timed("index.commit_ms", tags=[f"index:{index_name}"]):
+            committed: int = commit_segments(uri, documents, column, index_name, merge, config, telemetry)
+        stats: dict[str, Any] = {
+            "column": column,
+            "index": index_name,
+            "segments": committed,
+            "fragments": int(spec.get("fragments", 0)),
+        }
+        if committed < len(documents):
+            stats["stale"] = True
+        return stats
+    except ValueError as exc:
+        if not is_stale_fragment_error(exc):
+            raise
+        telemetry.incr("index.stale_fragment_replan", tags=[f"index:{index_name}"])
+        logger.warning(
+            "re-planning %s on %s: a concurrent compaction invalidated the planned fragment set (%s)",
+            index_name,
+            uri,
+            exc,
+        )
+        return {"column": column, "index": index_name, "segments": 0, "fragments": 0, "stale": True}
+
+
+def merge_deltas_if_needed(uri: str, index_name: str, config: IndexJobConfig, telemetry: Telemetry) -> bool:
+    """Merge one index's accumulated deltas on an executor when over the configured cap.
+
+    Args:
+        uri: Dataset URI.
+        index_name: The index whose deltas to bound.
+        config: Indexing configuration.
+        telemetry: Telemetry facade for the current executor process.
+
+    Returns:
+        ``True`` if a merge ran.
+    """
+    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+    if index_name not in {description.name for description in dataset.describe_indices()}:
+        return False
+    if index_delta_count(dataset, index_name) <= config.max_index_deltas:
+        return False
+    with telemetry.timed("index.delta_merge_ms", tags=[f"index:{index_name}"]):
+        return merge_index_deltas_now(uri, index_name, config, telemetry)
 
 
 class LanceIndexer:
-    """Builds the configured indices on Lance datasets via per-type handlers."""
+    """Builds the configured indices over a Lance fleet with unified task-based phases."""
 
     def __init__(self, config: IndexJobConfig) -> None:
         """Initialize the indexer.
@@ -253,187 +527,153 @@ class LanceIndexer:
         """
         self.config: IndexJobConfig = config
 
-    def handlers(self) -> list[IndexHandler]:
-        """Build the index handlers selected by the configuration.
-
-        One :class:`VectorIndexHandler` is created for each column in
-        :attr:`IndexJobConfig.vector_columns`. All vector handlers share the same metric,
-        partition policy, and row floor but each gets its own column and derived index name from
-        :func:`~lance_etl.indexing.config.vector_index_name`.
-
-        Returns:
-            One handler per configured index column, in the order vector to scalar to bitmap to
-            text.
-        """
-        config: IndexJobConfig = self.config
-        result: list[IndexHandler] = []
-        for column in config.vector_columns:
-            result.append(VectorIndexHandler(config, column, vector_index_name(column)))
-        for column in config.scalar_columns:
-            result.append(BTreeIndexHandler(config, column, scalar_index_name(column)))
-        for column in config.bitmap_columns:
-            result.append(BitmapIndexHandler(config, column, bitmap_index_name(column)))
-        for column in config.text_columns:
-            result.append(FtsIndexHandler(config, column, fts_index_name(column)))
-        return result
-
-    def build(self, spark: SparkSession, uri: str, telemetry: Telemetry) -> dict[str, Any]:
-        """Build every configured index for one dataset.
+    def resolve_fleet_artifacts(
+        self, spark: SparkSession, vector_specs: list[tuple[str, dict[str, Any]]]
+    ) -> tuple[dict[tuple[str, str], tuple], dict[tuple[str, str], dict[str, Any]]]:
+        """Resolve every vector index's artifacts in one flat Spark job.
 
         Args:
             spark: Active Spark session.
-            uri: Dataset URI.
-            telemetry: Driver telemetry facade.
+            vector_specs: ``(uri, spec)`` pairs for the fleet's vector indexes.
 
         Returns:
-            A statistics dictionary for the dataset's indices.
-        """
-        indexes: list[dict[str, Any]] = []
-        for handler in self.handlers():
-            with telemetry.span("lance.indexing.index") as index_span:
-                index_span.set_tag("index", handler.index_name)
-                index_span.set_tag("index_type", handler.index_type())
-                indexes.append(handler.build(spark, uri, telemetry))
-        return {"uri": uri, "indexes": indexes}
-
-    def classify(self, spark: SparkSession, dataset_uris: list[str]) -> tuple[list[str], list[str]]:
-        """Split datasets into the small and large tiers by fragment count and row count.
-
-        Both the fragment count and the row count are gathered in one distributed job so the driver
-        never opens datasets itself. A dataset goes to the large tier when its fragment count reaches
-        ``small_dataset_fragment_threshold`` or, when ``large_dataset_row_threshold`` is set, when its
-        row count reaches that threshold. The row dimension keeps a dataset that is large by rows but
-        holds few large fragments off the single-task small tier. Both counts come from fragment
-        metadata, so the row probe adds no data scan to the existing pass.
-
-        Args:
-            spark: Active Spark session.
-            dataset_uris: Datasets to classify.
-
-        Returns:
-            The small-tier URIs and the large-tier URIs.
+            The artifacts keyed by ``(uri, column)``, and per-key extra stats
+            (``reused_artifacts``, ``num_partitions``).
         """
         config: IndexJobConfig = self.config
-        storage_options: dict[str, Any] | None = config.storage_options
-        threshold: int = config.small_dataset_fragment_threshold
-        row_threshold: int | None = config.large_dataset_row_threshold
+        if not vector_specs:
+            return {}, {}
 
-        def dataset_sizes(uri: str) -> tuple[str, int, int]:
-            """Read one dataset's fragment count and row count on an executor.
+        def resolve_one(item: tuple[str, str, str, bool]) -> tuple[str, str, tuple, bool, int | None]:
+            """Resolve one vector index's artifacts on an executor.
 
             Args:
-                uri: Dataset URI.
+                item: ``(uri, column, index_name, full_rebuild)``.
 
             Returns:
-                The URI paired with its fragment count and row count.
+                The artifacts and reuse stats for the index.
             """
-            dataset: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
-            return uri, len(dataset.get_fragments()), dataset.count_rows()
+            return resolve_vector_artifacts(item[0], item[1], item[2], item[3], config)
 
-        slices: int = max(1, min(config.small_tier_slices, len(dataset_uris)))
-        sizes: list[tuple[str, int, int]] = (
-            spark.sparkContext.parallelize(dataset_uris, slices).map(dataset_sizes).collect()
+        items: list[tuple[str, str, str, bool]] = [
+            (uri, spec["column"], spec["index_name"], bool(spec.get("full_rebuild"))) for uri, spec in vector_specs
+        ]
+        slices: int = max(1, min(len(items), config.max_build_tasks))
+        resolved: list[tuple[str, str, tuple, bool, int | None]] = (
+            spark.sparkContext.parallelize(items, slices).map(resolve_one).collect()
         )
-        small: list[str] = []
-        large: list[str] = []
-        for uri, fragments, rows in sizes:
-            is_large: bool = fragments >= threshold or (row_threshold is not None and rows >= row_threshold)
-            (large if is_large else small).append(uri)
-        return small, large
+        artifacts: dict[tuple[str, str], tuple] = {}
+        extras: dict[tuple[str, str], dict[str, Any]] = {}
+        for uri, column, artifact, reused, partitions in resolved:
+            artifacts[(uri, column)] = artifact
+            extras[(uri, column)] = {"reused_artifacts": reused, "num_partitions": partitions}
+        return artifacts, extras
 
-    def run_small_tier(self, spark: SparkSession, uris: list[str], telemetry: Telemetry) -> list[dict[str, Any]]:
-        """Index many small datasets in one batched Spark job.
-
-        Each executor task indexes one whole dataset end-to-end with plain non-distributed index
-        builds. The driver only collects statistics.
-
-        Args:
-            spark: Active Spark session.
-            uris: Small-tier dataset URIs.
-            telemetry: Driver telemetry facade.
-
-        Returns:
-            One statistics dictionary per dataset.
-        """
-        config: IndexJobConfig = self.config
-
-        def index_one(uri: str) -> dict[str, Any]:
-            """Index one whole dataset on an executor.
-
-            Args:
-                uri: Dataset URI.
-
-            Returns:
-                The dataset's statistics dictionary.
-            """
-            return index_dataset_locally(uri, config)
-
-        slices: int = max(1, min(config.small_tier_slices, len(uris)))
-        with telemetry.timed("tier.small_ms"):
-            results: list[dict[str, Any]] = spark.sparkContext.parallelize(uris, slices).map(index_one).collect()
-        telemetry.gauge("tier.small_datasets", len(results))
-        return results
-
-    def run_large_tier(self, spark: SparkSession, uris: list[str], telemetry: Telemetry) -> list[dict[str, Any]]:
-        """Index large datasets concurrently with the segment fan-out.
-
-        Each dataset keeps its distributed per-segment build, but multiple datasets are driven
-        concurrently from a driver thread pool. Every submission is tagged with the configured
-        Spark FAIR scheduler pool so concurrent jobs share the cluster fairly.
-        ``spark.scheduler.mode=FAIR`` must be set on the session for the pools to take effect.
+    def build_fleet_segments(
+        self,
+        spark: SparkSession,
+        shard_tasks: list[dict[str, Any]],
+        artifacts: dict[tuple[str, str], tuple],
+    ) -> list[tuple[str, str, dict[str, Any]]]:
+        """Run every dataset's build tasks in one flat Spark job.
 
         Args:
             spark: Active Spark session.
-            uris: Large-tier dataset URIs.
-            telemetry: Driver telemetry facade.
+            shard_tasks: Flattened shard task specs across the fleet.
+            artifacts: The fleet's vector artifacts, broadcast once to all tasks.
 
         Returns:
-            One statistics dictionary per dataset, in input order.
+            ``(uri, index_name, payload)`` triples collected from the executors.
         """
         config: IndexJobConfig = self.config
+        if not shard_tasks:
+            return []
+        broadcast = spark.sparkContext.broadcast(artifacts)
 
-        def index_one(uri: str) -> dict[str, Any]:
-            """Drive one dataset's distributed build from a worker thread.
+        def build_partition(items: Any) -> Any:
+            """Build the shard tasks assigned to this executor task.
 
             Args:
-                uri: Dataset URI.
+                items: The task specs for this partition.
 
-            Returns:
-                The dataset's statistics dictionary.
+            Yields:
+                One build payload per task.
             """
-            dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-            skip: str | None = index_skip_reason(dataset, config)
-            if skip is not None:
-                telemetry.incr("dataset.skipped_no_work")
-                return {"uri": uri, "indexes": [], "tier": "large", "skipped": skip}
-            try:
-                spark.sparkContext.setLocalProperty("spark.scheduler.pool", config.scheduler_pool)
-                with telemetry.timed("dataset.total_ms"):
-                    stats: dict[str, Any] = self.build(spark, uri, telemetry)
-            except Exception:
-                telemetry.error(f"indexing failed for {uri}")
-                raise
-            finally:
-                spark.sparkContext.setLocalProperty("spark.scheduler.pool", None)
-            segment_total: int = sum(int(item["segments"]) for item in stats["indexes"])
-            telemetry.gauge("dataset.segments", segment_total)
-            logger.info("indexed %s: %d indices, %d segments", uri, len(stats["indexes"]), segment_total)
-            stats["tier"] = "large"
-            return stats
+            executor_telemetry: Telemetry = Telemetry.create(config.telemetry)
+            with executor_telemetry.span("lance.indexing.build_segment"):
+                for task in items:
+                    yield build_one_shard(task, broadcast.value, config, executor_telemetry)
 
-        workers: int = max(1, min(config.driver_concurrency, len(uris)))
-        with telemetry.timed("tier.large_ms"), ThreadPoolExecutor(max_workers=workers) as pool:
-            results: list[dict[str, Any]] = list(pool.map(index_one, uris))
-        telemetry.gauge("tier.large_datasets", len(results))
-        return results
+        slices: int = max(1, min(len(shard_tasks), config.max_build_tasks))
+        return spark.sparkContext.parallelize(shard_tasks, slices).mapPartitions(build_partition).collect()
+
+    def commit_fleet(
+        self, spark: SparkSession, entries: list[tuple[str, dict[str, Any], list[dict[str, Any]]]]
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Commit every built index in a per-(dataset, index) executor fan-out.
+
+        Args:
+            spark: Active Spark session.
+            entries: ``(uri, spec, payloads)`` triples for the fleet's built indexes.
+
+        Returns:
+            ``(uri, stats)`` pairs, stale-marked where a re-plan is needed.
+        """
+        config: IndexJobConfig = self.config
+        if not entries:
+            return []
+
+        def commit_partition(items: Any) -> Any:
+            """Commit the indexes assigned to this executor task.
+
+            Args:
+                items: The ``(uri, spec, payloads)`` triples for this partition.
+
+            Yields:
+                One ``(uri, stats)`` pair per index.
+            """
+            executor_telemetry: Telemetry = Telemetry.create(config.telemetry)
+            for uri, spec, payloads in items:
+                yield uri, commit_one_index(uri, spec, payloads, config, executor_telemetry)
+
+        slices: int = max(1, min(len(entries), config.batch_partitions))
+        return spark.sparkContext.parallelize(entries, slices).mapPartitions(commit_partition).collect()
+
+    def bound_fleet_deltas(self, spark: SparkSession, entries: list[tuple[str, str]]) -> dict[tuple[str, str], bool]:
+        """Bound accumulated index deltas across the fleet in one fan-out.
+
+        Args:
+            spark: Active Spark session.
+            entries: ``(uri, index_name)`` pairs for indexes that committed segments this run.
+
+        Returns:
+            Whether a delta merge ran, keyed by ``(uri, index_name)``.
+        """
+        config: IndexJobConfig = self.config
+        if not entries:
+            return {}
+
+        def merge_partition(items: Any) -> Any:
+            """Bound the deltas of the indexes assigned to this executor task.
+
+            Args:
+                items: The ``(uri, index_name)`` pairs for this partition.
+
+            Yields:
+                ``(uri, index_name, merged)`` per index.
+            """
+            executor_telemetry: Telemetry = Telemetry.create(config.telemetry)
+            for uri, index_name in items:
+                yield uri, index_name, merge_deltas_if_needed(uri, index_name, config, executor_telemetry)
+
+        slices: int = max(1, min(len(entries), config.batch_partitions))
+        merged: list[tuple[str, str, bool]] = (
+            spark.sparkContext.parallelize(entries, slices).mapPartitions(merge_partition).collect()
+        )
+        return {(uri, index_name): flag for uri, index_name, flag in merged}
 
     def run(self, spark: SparkSession, dataset_uris: list[str]) -> list[dict[str, Any]]:
-        """Index every dataset with two-tier orchestration.
-
-        Datasets are classified by fragment count: small datasets are batched into one Spark job
-        where each executor task indexes a whole dataset, and large datasets keep the distributed
-        segment fan-out, driven concurrently from the driver. Any failure propagates and fails the
-        run.
+        """Index every dataset through the unified plan-artifacts-build-commit rounds.
 
         Args:
             spark: Active Spark session.
@@ -442,31 +682,130 @@ class LanceIndexer:
         Returns:
             One statistics dictionary per dataset, in input order.
         """
-        driver_telemetry: Telemetry = Telemetry.create(self.config.telemetry)
+        config: IndexJobConfig = self.config
+        driver_telemetry: Telemetry = Telemetry.create(config.telemetry)
         with driver_telemetry.span("lance.indexing.run") as run_span:
             run_span.set_tag("dataset_count", len(dataset_uris))
             if not dataset_uris:
                 return []
-            small, large = self.classify(spark, dataset_uris)
-            run_span.set_tag("small_datasets", len(small))
-            run_span.set_tag("large_datasets", len(large))
-            stats_by_uri: dict[str, dict[str, Any]] = {}
-            if small:
-                for stats in self.run_small_tier(spark, small, driver_telemetry):
-                    stats_by_uri[stats["uri"]] = stats
-            if large:
-                for stats in self.run_large_tier(spark, large, driver_telemetry):
-                    stats_by_uri[stats["uri"]] = stats
+
+            stats_by_uri: dict[str, dict[str, Any]] = {uri: {"uri": uri, "indexes": []} for uri in dataset_uris}
+            pending_uris: list[str] = list(dataset_uris)
+            forced_by_uri: dict[str, set[str]] = {uri: set() for uri in dataset_uris}
+            kind_by_index: dict[tuple[str, str], str] = {}
+
+            for round_index in range(config.max_stale_replans):
+                plans: list[dict[str, Any]] = fan_out_per_dataset(
+                    spark,
+                    pending_uris,
+                    config.telemetry,
+                    lambda uri, telemetry, forced=forced_by_uri: plan_dataset_indexes(
+                        uri, config, forced.get(uri, set()), telemetry
+                    ),
+                    config.batch_partitions,
+                )
+
+                specs_by_uri: dict[str, list[dict[str, Any]]] = {}
+                for plan in plans:
+                    uri = plan["uri"]
+                    if "skipped" in plan:
+                        stats_by_uri[uri]["skipped"] = plan["skipped"]
+                        continue
+                    stats_by_uri[uri]["indexes"].extend(plan.get("done", []))
+                    if plan["specs"]:
+                        specs_by_uri[uri] = plan["specs"]
+                        for spec in plan["specs"]:
+                            kind_by_index[(uri, spec["index_name"])] = spec["kind"]
+                            if spec["kind"] == VECTOR_KIND and spec.get("full_rebuild"):
+                                forced_by_uri[uri].add(spec["index_name"])
+                        stats_by_uri[uri]["version"] = plan["version"]
+                if not specs_by_uri:
+                    pending_uris = []
+                    break
+
+                vector_specs: list[tuple[str, dict[str, Any]]] = [
+                    (uri, spec) for uri, specs in specs_by_uri.items() for spec in specs if spec["kind"] == VECTOR_KIND
+                ]
+                with driver_telemetry.timed("run.artifacts_ms"):
+                    artifacts, artifact_extras = self.resolve_fleet_artifacts(spark, vector_specs)
+
+                shard_tasks: list[dict[str, Any]] = []
+                for uri, specs in specs_by_uri.items():
+                    version: int = stats_by_uri[uri]["version"]
+                    for spec in specs:
+                        base: dict[str, Any] = {**spec, "uri": uri, "version": version}
+                        if spec["kind"] == FTS_KIND and spec["mode"] == "maintain":
+                            shard_tasks.append({**base, "shard": []})
+                            continue
+                        for shard in spec["shards"]:
+                            shard_tasks.append({**base, "shard": list(shard)})
+                logger.info(
+                    "indexing round %d/%d: %d datasets, %d build tasks",
+                    round_index + 1,
+                    config.max_stale_replans,
+                    len(specs_by_uri),
+                    len(shard_tasks),
+                )
+                with driver_telemetry.timed("run.build_ms"):
+                    built: list[tuple[str, str, dict[str, Any]]] = self.build_fleet_segments(
+                        spark, shard_tasks, artifacts
+                    )
+
+                payloads_by_index: dict[tuple[str, str], list[dict[str, Any]]] = {}
+                for uri, index_name, payload in built:
+                    if "stats" in payload:
+                        stats_by_uri[uri]["indexes"].append(payload["stats"])
+                        continue
+                    payloads_by_index.setdefault((uri, index_name), []).append(payload)
+
+                commit_entries: list[tuple[str, dict[str, Any], list[dict[str, Any]]]] = []
+                for uri, specs in specs_by_uri.items():
+                    for spec in specs:
+                        key: tuple[str, str] = (uri, spec["index_name"])
+                        if key in payloads_by_index:
+                            commit_entries.append((uri, spec, payloads_by_index[key]))
+                with driver_telemetry.timed("run.commit_ms"):
+                    outcomes: list[tuple[str, dict[str, Any]]] = self.commit_fleet(spark, commit_entries)
+
+                stale_uris: set[str] = set()
+                for uri, stats in outcomes:
+                    if stats.pop("stale", False):
+                        stale_uris.add(uri)
+                        continue
+                    extra: dict[str, Any] = artifact_extras.get((uri, stats["column"]), {})
+                    stats_by_uri[uri]["indexes"].append({**stats, **extra})
+                pending_uris = sorted(stale_uris)
+                if not pending_uris:
+                    break
+
+            for uri in pending_uris:
+                logger.warning(
+                    "index build on %s still has uncovered fragments after %d stale-replan rounds; "
+                    "next scheduled run re-covers",
+                    uri,
+                    config.max_stale_replans,
+                )
+
+            delta_entries: list[tuple[str, str]] = sorted(
+                {
+                    (uri, item["index"])
+                    for uri, stats in stats_by_uri.items()
+                    for item in stats["indexes"]
+                    if int(item.get("segments", 0)) > 0 and kind_by_index.get((uri, item["index"])) != FTS_KIND
+                }
+            )
+            merged_flags: dict[tuple[str, str], bool] = self.bound_fleet_deltas(spark, delta_entries)
+            for uri, stats in stats_by_uri.items():
+                for item in stats["indexes"]:
+                    key = (uri, item["index"])
+                    if key in merged_flags:
+                        item["deltas_merged"] = merged_flags[key]
+                stats.pop("version", None)
+
             results: list[dict[str, Any]] = [stats_by_uri[uri] for uri in dataset_uris]
             skipped: int = sum(1 for stats in results if stats.get("skipped"))
             run_span.set_tag("skipped_datasets", skipped)
             driver_telemetry.gauge("run.datasets", len(results))
             driver_telemetry.gauge("run.datasets_skipped", skipped)
-            logger.info(
-                "indexing run: %d datasets (%d small, %d large, %d skipped)",
-                len(results),
-                len(small),
-                len(large),
-                skipped,
-            )
+            logger.info("indexing run: %d datasets (%d skipped)", len(results), skipped)
             return results
