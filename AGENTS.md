@@ -267,9 +267,10 @@ cargo build                  # compile
 cargo test                   # unit tests
 ```
 
-The lance crates are sourced via path dependencies pointing at
-`/Users/gstamatakis/IdeaProjects/lance/rust/*`. If the checkout moves, update the paths in
-`rust/search-api/Cargo.toml`.
+The lance crates are sourced from crates.io (`lance = "8.0.0"` and friends in
+`rust/search-api/Cargo.toml`). Bump them together with the pylance dependency and the
+`LANCE_CACHE_STAMP` in `src/cache/layout.rs`, which wipes the on-disk caches across lance
+versions because the cache codec format is unstable between releases.
 
 ---
 

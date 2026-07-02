@@ -24,7 +24,8 @@ use object_store::{
 use serde_json::Value;
 
 use crate::cache::layout::{
-    META_FILE, SweepStats, atomic_write, dir_stats, hash_hex, remove_dir_accounted, sweep_tier, touch_file,
+    META_FILE, SweepStats, atomic_write, dir_stats, frame_bytes, hash_hex, remove_dir_accounted, sweep_tier,
+    touch_file, unframe_bytes,
 };
 use crate::telemetry::{CacheName, EvictionReason, Metrics, Tier};
 
@@ -305,29 +306,31 @@ impl CachedStore {
             tokio::fs::read_to_string(object_dir.join(META_FILE))
         );
         if let Ok(buf) = entry_read {
-            if buf.is_empty() {
-                self.state.invalidate_object(&self.store_prefix, location).await;
-                self.state
-                    .metrics
-                    .cache_evictions(CacheName::Store, EvictionReason::Corrupt, 1);
-            } else {
-                let touch_path = entry_path.clone();
-                drop(tokio::task::spawn_blocking(move || touch_file(&touch_path)));
-                self.state.metrics.cache_lookup(CacheName::Store, Tier::Disk, true);
-                tracing::Span::current().record("cache.hit", true);
-                let meta = match sidecar_read {
-                    Ok(raw) => {
-                        meta_from_json(&raw, location).unwrap_or_else(|| fallback_meta(location, buf.len() as u64))
-                    }
-                    Err(_) => fallback_meta(location, buf.len() as u64),
-                };
-                let start = match &options.range {
-                    None => 0,
-                    Some(GetRange::Bounded(bounds)) => bounds.start,
-                    Some(GetRange::Offset(offset)) => *offset,
-                    Some(GetRange::Suffix(suffix)) => meta.size.saturating_sub(*suffix),
-                };
-                return Ok(synthesize_result(Bytes::from(buf), meta, start));
+            match unframe_bytes(buf) {
+                None => {
+                    self.state.invalidate_object(&self.store_prefix, location).await;
+                    self.state
+                        .metrics
+                        .cache_evictions(CacheName::Store, EvictionReason::Corrupt, 1);
+                }
+                Some(payload) => {
+                    let touch_path = entry_path.clone();
+                    drop(tokio::task::spawn_blocking(move || touch_file(&touch_path)));
+                    self.state.metrics.cache_lookup(CacheName::Store, Tier::Disk, true);
+                    tracing::Span::current().record("cache.hit", true);
+                    let meta = match sidecar_read {
+                        Ok(raw) => meta_from_json(&raw, location)
+                            .unwrap_or_else(|| fallback_meta(location, payload.len() as u64)),
+                        Err(_) => fallback_meta(location, payload.len() as u64),
+                    };
+                    let start = match &options.range {
+                        None => 0,
+                        Some(GetRange::Bounded(bounds)) => bounds.start,
+                        Some(GetRange::Offset(offset)) => *offset,
+                        Some(GetRange::Suffix(suffix)) => meta.size.saturating_sub(*suffix),
+                    };
+                    return Ok(synthesize_result(payload, meta, start));
+                }
             }
         }
         self.state.metrics.cache_lookup(CacheName::Store, Tier::Disk, false);
@@ -342,11 +345,13 @@ impl CachedStore {
             if tokio::fs::metadata(&meta_path).await.is_err() {
                 let _ = atomic_write(&meta_path, meta_to_json(&meta).as_bytes()).await;
             }
-            if tokio::fs::metadata(&entry_path).await.is_err() && atomic_write(&entry_path, &bytes).await.is_ok() {
-                self.state.record_insert(bytes.len() as u64);
-                self.state
-                    .metrics
-                    .cache_insert_bytes(CacheName::Store, bytes.len() as u64);
+            if tokio::fs::metadata(&entry_path).await.is_err() {
+                let framed = frame_bytes(&bytes);
+                let framed_len = framed.len() as u64;
+                if atomic_write(&entry_path, &framed).await.is_ok() {
+                    self.state.record_insert(framed_len);
+                    self.state.metrics.cache_insert_bytes(CacheName::Store, framed_len);
+                }
             }
         }
         Ok(synthesize_result(bytes, meta, start))

@@ -89,13 +89,18 @@ impl CacheJanitor {
         }
     }
 
-    /// Spawns the periodic sweep loop. Dropping the returned handle aborts nothing, callers
-    /// should `abort()` it on shutdown if needed.
+    /// Spawns the sweep loop, sweeping once immediately before entering the interval cadence.
+    ///
+    /// The startup sweep matters after a crash or a long downtime: the tiers may hold expired or
+    /// over-budget entries seeded straight into the accounting gauges by `open`, and without it
+    /// the service would serve from an unenforced cache for a full interval. Dropping the
+    /// returned handle aborts nothing, callers should `abort()` it on shutdown if needed.
     pub fn spawn(self, interval: Duration) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             ticker.tick().await;
+            self.sweep_once().await;
             loop {
                 ticker.tick().await;
                 self.sweep_once().await;

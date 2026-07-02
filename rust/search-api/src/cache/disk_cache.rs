@@ -8,14 +8,14 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures::Future;
 use lance_core::Result as LanceResult;
-use lance_core::cache::{CacheBackend, CacheCodec, CacheEntry, InternalCacheKey, MokaCacheBackend};
+use lance_core::cache::{CacheBackend, CacheCodec, CacheDecode, CacheEntry, InternalCacheKey, MokaCacheBackend};
 use serde_json::Value;
 
 use crate::cache::layout::{
-    SweepStats, atomic_write, dir_stats, gauge_sub, hash_hex, remove_dir_accounted, sweep_tier, touch_file,
+    SweepStats, atomic_write, dir_stats, frame_bytes, gauge_sub, hash_hex, remove_dir_accounted, sweep_tier,
+    touch_file, unframe_bytes,
 };
 use crate::telemetry::{CacheName, EvictionReason, Metrics, Tier};
 
@@ -131,20 +131,29 @@ impl DiskIndexCacheBackend {
         let _ = tokio::fs::remove_file(path).await;
     }
 
-    /// Reads and deserializes a disk entry. Any failure deletes the file and reports a miss.
+    /// Reads, verifies, and deserializes a disk entry. Any failure deletes the file and reports
+    /// a miss. Verification happens before the codec runs: a torn write or bit rot fails the
+    /// frame checksum instead of reaching the deserializer (which cannot detect flips that still
+    /// decode).
     async fn read_disk_entry(&self, key: &InternalCacheKey, codec: &CacheCodec) -> Option<(CacheEntry, usize)> {
         let path = self.entry_path(key, false);
         let buf = match tokio::fs::read(&path).await {
             Ok(buf) => buf,
             Err(_) => return None,
         };
-        let size = buf.len();
-        match codec.deserialize(&Bytes::from(buf)) {
-            Ok(entry) => {
+        let Some(payload) = unframe_bytes(buf) else {
+            self.drop_corrupt_entry(&path).await;
+            self.metrics
+                .cache_evictions(CacheName::Index, EvictionReason::Corrupt, 1);
+            return None;
+        };
+        let size = payload.len();
+        match codec.deserialize(&payload) {
+            CacheDecode::Hit(entry) => {
                 drop(tokio::task::spawn_blocking(move || touch_file(&path)));
                 Some((entry, size))
             }
-            Err(_) => {
+            CacheDecode::Miss(_) => {
                 self.drop_corrupt_entry(&path).await;
                 self.metrics
                     .cache_evictions(CacheName::Index, EvictionReason::Corrupt, 1);
@@ -170,6 +179,7 @@ impl DiskIndexCacheBackend {
             self.metrics.cache_serialize_error(CacheName::Index);
             return;
         }
+        let buf = frame_bytes(&buf);
         let path = self.entry_path(key, true);
         let old_len = tokio::fs::metadata(&path).await.map(|meta| meta.len()).ok();
         if atomic_write(&path, &buf).await.is_ok() {
@@ -385,13 +395,21 @@ fn load_prefixes(path: &Path) -> HashMap<String, String> {
         .collect()
 }
 
-/// Persists the prefix sidecar. Failures are swallowed (the map is rebuilt on demand).
+/// Persists the prefix sidecar atomically (temp file plus rename), so a crash mid-write leaves
+/// the previous sidecar intact instead of a torn JSON that would blank the map on restart.
+/// Failures are swallowed (the map is rebuilt on demand).
 fn persist_prefixes(path: &Path, map: &HashMap<String, String>) {
     let object: serde_json::Map<String, Value> = map
         .iter()
         .map(|(prefix, dir_name)| (prefix.clone(), Value::String(dir_name.clone())))
         .collect();
-    let _ = std::fs::write(path, Value::Object(object).to_string());
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let tmp = parent.join(format!("prefixes.json.tmp-{}", std::process::id()));
+    if std::fs::write(&tmp, Value::Object(object).to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
 }
 
 #[cfg(test)]
@@ -405,13 +423,15 @@ mod tests {
     struct Payload(Vec<u8>);
 
     impl CacheCodecImpl for Payload {
-        fn serialize(&self, writer: &mut dyn std::io::Write) -> LanceResult<()> {
-            writer.write_all(&self.0)?;
-            Ok(())
+        const TYPE_ID: &'static str = "search-api.test.Payload";
+        const CURRENT_VERSION: u32 = 1;
+
+        fn serialize(&self, writer: &mut lance_core::cache::CacheEntryWriter<'_>) -> LanceResult<()> {
+            writer.write_raw(&self.0)
         }
 
-        fn deserialize(data: &Bytes) -> LanceResult<Self> {
-            Ok(Payload(data.to_vec()))
+        fn deserialize(reader: &mut lance_core::cache::CacheEntryReader<'_>) -> LanceResult<Self> {
+            Ok(Payload(reader.read_raw()?.to_vec()))
         }
     }
 
@@ -488,19 +508,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let backend =
             DiskIndexCacheBackend::open(tmp.path().to_path_buf(), 1024 * 1024, Arc::new(Metrics::disabled())).unwrap();
-        let codec = CacheCodec::new(
-            |_, writer| {
-                writer.write_all(b"valid")?;
-                Ok(())
-            },
-            |data| {
-                if data.as_ref() == b"valid" {
-                    Ok(Arc::new(Payload(data.to_vec())))
-                } else {
-                    Err(lance_core::Error::internal("corrupt".to_string()))
-                }
-            },
-        );
+        let codec = CacheCodec::from_impl::<Payload>();
         let cache_key = key("s3://bucket/ds.lance/", "page-1");
         backend
             .insert(&cache_key, Arc::new(Payload(b"valid".to_vec())), 5, Some(codec))
@@ -518,6 +526,33 @@ mod tests {
             DiskIndexCacheBackend::open(tmp.path().to_path_buf(), 1024 * 1024, Arc::new(Metrics::disabled())).unwrap();
         assert!(fresh.get(&cache_key, Some(codec)).await.is_none());
         assert_eq!(entry_file_count(tmp.path()), 0);
+    }
+
+    #[tokio::test]
+    async fn bit_flip_inside_payload_is_detected_by_the_frame() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = DiskIndexCacheBackend::open(tmp.path().to_path_buf(), 0, Arc::new(Metrics::disabled())).unwrap();
+        let codec = CacheCodec::from_impl::<Payload>();
+        let cache_key = key("s3://bucket/ds.lance/", "page-flip");
+        backend
+            .insert(&cache_key, Arc::new(Payload(vec![7u8; 64])), 64, Some(codec))
+            .await;
+        let bin = walkdir(tmp.path())
+            .into_iter()
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".bin"))
+            })
+            .unwrap();
+        let mut bytes = std::fs::read(&bin).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&bin, &bytes).unwrap();
+        assert!(
+            backend.get(&cache_key, Some(codec)).await.is_none(),
+            "a flipped payload byte must fail the frame checksum and miss"
+        );
+        assert_eq!(entry_file_count(tmp.path()), 0, "the corrupt file must be deleted");
     }
 
     #[tokio::test]

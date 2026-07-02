@@ -6,11 +6,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 /// Version of our on-disk cache schema. Bump on any layout or format change.
-pub const CACHE_SCHEMA_VERSION: u32 = 1;
+///
+/// v2 wraps every entry payload in a checksummed frame (see [`frame_bytes`]) so torn writes and
+/// bit rot are detected on read instead of being served to lance readers verbatim.
+pub const CACHE_SCHEMA_VERSION: u32 = 2;
 
-/// Lance crate version baked into the stamp. Bump together with the `lance` path dependency
-/// because the cache codec format is explicitly unstable across lance releases.
-pub const LANCE_CACHE_STAMP: &str = "8.0.0-beta.6";
+/// Lance crate version baked into the stamp. Bump together with the `lance` dependency in
+/// `Cargo.toml` because the cache codec format is explicitly unstable across lance releases.
+pub const LANCE_CACHE_STAMP: &str = "8.0.0";
+
+/// Magic prefix of a framed cache entry, versioned with the frame layout.
+const FRAME_MAGIC: &[u8; 4] = b"LEC2";
+
+/// Bytes a frame adds ahead of the payload: the magic plus a 32-byte blake3 checksum.
+pub const FRAME_OVERHEAD: usize = 4 + 32;
 
 /// Substring marking in-progress write files which readers must ignore and sweeps may delete.
 const TMP_MARKER: &str = ".tmp-";
@@ -45,6 +54,30 @@ pub fn prepare_cache_root(cache_dir: &Path) -> std::io::Result<PathBuf> {
         }
     }
     Ok(root)
+}
+
+/// Wraps a payload in the checksummed on-disk frame: magic, blake3 of the payload, payload.
+pub fn frame_bytes(payload: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(FRAME_OVERHEAD + payload.len());
+    framed.extend_from_slice(FRAME_MAGIC);
+    framed.extend_from_slice(blake3::hash(payload).as_bytes());
+    framed.extend_from_slice(payload);
+    framed
+}
+
+/// Verifies and strips the frame, returning the payload. `None` means the entry is corrupt:
+/// too short, wrong magic (including pre-v2 unframed files), or a checksum mismatch from a torn
+/// write or bit rot. Callers treat `None` as a cache miss and delete the file.
+pub fn unframe_bytes(buf: Vec<u8>) -> Option<bytes::Bytes> {
+    if buf.len() < FRAME_OVERHEAD || &buf[..4] != FRAME_MAGIC {
+        return None;
+    }
+    let expected: [u8; 32] = buf[4..FRAME_OVERHEAD].try_into().ok()?;
+    let payload = bytes::Bytes::from(buf).slice(FRAME_OVERHEAD..);
+    if blake3::hash(&payload).as_bytes() != &expected {
+        return None;
+    }
+    Some(payload)
 }
 
 /// Hashes `input` with blake3 and returns the first `hex_len` hex characters.
@@ -289,6 +322,27 @@ mod tests {
         assert_eq!(stats.ttl_evicted, 1);
         assert_eq!(stats.size_evicted, 1);
         assert_eq!(bytes.load(Ordering::Relaxed), 64);
+    }
+
+    #[test]
+    fn frame_round_trip_and_corruption_detection() {
+        let payload = b"index page bytes".to_vec();
+        let framed = frame_bytes(&payload);
+        assert_eq!(framed.len(), FRAME_OVERHEAD + payload.len());
+        assert_eq!(unframe_bytes(framed.clone()).unwrap().as_ref(), payload.as_slice());
+
+        let mut flipped = framed.clone();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 0xFF;
+        assert!(unframe_bytes(flipped).is_none(), "bit flip must be detected");
+
+        let truncated = framed[..framed.len() - 1].to_vec();
+        assert!(unframe_bytes(truncated).is_none(), "torn write must be detected");
+
+        assert!(unframe_bytes(b"raw pre-v2 content".to_vec()).is_none());
+        assert!(unframe_bytes(Vec::new()).is_none());
+        let empty = frame_bytes(b"");
+        assert_eq!(unframe_bytes(empty).unwrap().len(), 0, "empty payload is representable");
     }
 
     #[test]

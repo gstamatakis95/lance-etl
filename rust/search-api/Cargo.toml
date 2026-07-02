@@ -16,11 +16,11 @@ name = "search-api"
 path = "src/main.rs"
 
 [dependencies]
-lance = { path = "../../../lance/rust/lance" }
-lance-core = { path = "../../../lance/rust/lance-core" }
-lance-index = { path = "../../../lance/rust/lance-index" }
-lance-io = { path = "../../../lance/rust/lance-io" }
-lance-linalg = { path = "../../../lance/rust/lance-linalg" }
+lance = "8.0.0"
+lance-core = "8.0.0"
+lance-index = "8.0.0"
+lance-io = "8.0.0"
+lance-linalg = "8.0.0"
 arrow = { version = "58.0.0", features = ["json"] }
 arrow-array = "58.0.0"
 arrow-schema = "58.0.0"
