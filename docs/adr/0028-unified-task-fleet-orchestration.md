@@ -4,6 +4,7 @@
 
 Accepted. Supersedes the two-tier compaction orchestration of ADR 0002 and the small-tier plain
 ``create_index`` path of ADR 0001. Builds on the sidecar-free vector artifacts of ADR 0025.
+Amended by ADR 0029: ``scalar`` role columns now auto-index with BTREE.
 
 ## Context
 
@@ -45,7 +46,8 @@ The ETL pivot records each created column's role in the dataset config KV under
 ``texts`` are ``text`` columns, and keys from ``metadata`` are ``scalar`` columns. The mapping
 is grow-only and idempotent. When no explicit index columns are configured, the indexing plan
 phase derives per-dataset targets from these roles: vector roles get IVF_RQ and text roles get
-BM25 INVERTED. Scalar roles build nothing unless explicitly configured, per the current scope.
+BM25 INVERTED. Scalar roles originally built nothing unless explicitly configured. ADR 0029
+amends this: scalar roles now auto-index with BTREE.
 
 The Lance write seam is formalized in ``etl/sink.py``. A Spark DataSourceV2 connector was
 evaluated and rejected because a DSv2 write targets one table per write, while this sink routes

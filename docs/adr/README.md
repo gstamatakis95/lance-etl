@@ -37,3 +37,4 @@ The companion narrative, with the live-verified numbers and the stale-branch cor
 | [0026](0026-three-job-isolation.md) | Three-job isolation | Accepted |
 | [0027](0027-unified-pipeline.md) | Unified pipeline job | Accepted |
 | [0028](0028-unified-task-fleet-orchestration.md) | Unified task-based fleet orchestration, format 2.1, column roles | Accepted |
+| [0029](0029-all-indexes-distributed-segments.md) | Every index builds distributed through segments, scalar roles auto-index | Accepted |

@@ -36,7 +36,7 @@ from typing import Any
 import lance
 from pyspark.sql import SparkSession
 
-from lance_etl.column_roles import TEXT_ROLE, VECTOR_ROLE, load_column_roles
+from lance_etl.column_roles import SCALAR_ROLE, TEXT_ROLE, VECTOR_ROLE, load_column_roles
 from lance_etl.indexing.config import (
     IndexJobConfig,
     bitmap_index_name,
@@ -106,12 +106,12 @@ def make_handler(kind: str, column: str, index_name: str, config: IndexJobConfig
 def resolve_index_targets(dataset: lance.LanceDataset, config: IndexJobConfig) -> list[tuple[str, str, str]]:
     """Resolve which indexes a dataset should carry, from explicit config or role metadata.
 
-    When any column list is set on the config, the explicit lists win unchanged. Otherwise the
-    dataset's own ``lance-etl.columns`` role metadata (written by the ETL sink) drives the
-    decision per dataset: every ``vector`` role column gets an IVF_RQ index and every ``text``
-    role column gets a BM25 INVERTED index. Scalar roles build nothing unless explicitly
-    configured. This lets one fleet run serve heterogeneous per-tenant schemas without
-    per-dataset CLI flags.
+    When any column list is set on the config, the explicit lists win unchanged (which is also
+    the opt-out for role discovery). Otherwise the dataset's own ``lance-etl.columns`` role
+    metadata (written by the ETL sink) drives the decision per dataset: every ``vector`` role
+    column gets an IVF_RQ index, every ``scalar`` role column gets a BTREE index, and every
+    ``text`` role column gets a BM25 INVERTED index (ADR 0029). This lets one fleet run serve
+    heterogeneous per-tenant schemas without per-dataset CLI flags.
 
     Args:
         dataset: The open dataset.
@@ -136,6 +136,8 @@ def resolve_index_targets(dataset: lance.LanceDataset, config: IndexJobConfig) -
     discovered: list[tuple[str, str, str]] = []
     for column in sorted(name for name, role in roles.items() if role == VECTOR_ROLE and name in columns):
         discovered.append((VECTOR_KIND, column, vector_index_name(column)))
+    for column in sorted(name for name, role in roles.items() if role == SCALAR_ROLE and name in columns):
+        discovered.append((BTREE_KIND, column, scalar_index_name(column)))
     for column in sorted(name for name, role in roles.items() if role == TEXT_ROLE and name in columns):
         discovered.append((FTS_KIND, column, fts_index_name(column)))
     return discovered

@@ -358,8 +358,12 @@ def test_unified_run_builds_fts_end_to_end(dataset_uri: str) -> None:
 
 
 def test_unified_run_discovers_columns_from_roles(dataset_uri: str) -> None:
-    """With no explicit columns configured, the run derives FTS targets from role metadata."""
-    lance.dataset(dataset_uri).update_config({"lance-etl.columns": '{"text": "text"}'})
+    """With no explicit columns configured, the run derives BTREE and FTS targets from role metadata.
+
+    Every ``scalar`` role column gets a BTREE index and every ``text`` role column gets a BM25
+    INVERTED index (ADR 0029), both built through the distributed segment paths.
+    """
+    lance.dataset(dataset_uri).update_config({"lance-etl.columns": '{"text": "text", "id": "scalar"}'})
     config: IndexJobConfig = IndexJobConfig(
         telemetry=TelemetryConfig(),
         fragments_per_index_task=2,
@@ -367,8 +371,12 @@ def test_unified_run_discovers_columns_from_roles(dataset_uri: str) -> None:
         commit_backoff_seconds=0.0,
     )
     results: list[dict[str, object]] = LanceIndexer(config).run(FakeSpark(), [dataset_uri])
-    assert "text_fts_idx" in listed_index_names(dataset_uri)
-    assert results[0]["indexes"][0]["index"] == "text_fts_idx"
+    names: set[str] = set(listed_index_names(dataset_uri))
+    assert {"id_idx", "text_fts_idx"} <= names
+    built: set[str] = {item["index"] for item in results[0]["indexes"]}
+    assert built == {"id_idx", "text_fts_idx"}
+    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
+    assert dataset.to_table(filter="id = 7").num_rows == 1
 
 
 def test_unified_run_builds_all_types(dataset_uri: str) -> None:
