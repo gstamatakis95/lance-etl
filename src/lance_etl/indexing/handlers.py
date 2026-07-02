@@ -7,7 +7,6 @@ the steps they specialise.
 
 from __future__ import annotations
 
-import functools
 import logging
 from typing import Any
 
@@ -15,22 +14,16 @@ import lance
 import pyarrow as pa
 from lance.dataset import Index
 from lance.indices import IndicesBuilder
-from pyspark.sql import SparkSession
 
 from lance_etl.indexing.config import (
     IndexJobConfig,
     config_reusable,
-    degrade_num_partitions,
-    derive_num_partitions,
-    memory_bounded_num_partitions,
 )
 from lance_etl.indexing.optimize import (
     drop_existing_index,
     load_vector_config,
-    write_vector_config,
 )
 from lance_etl.indexing.segments import (
-    TRAIN_SEMAPHORE,
     all_fragment_ids,
     build_scalar_segment,
     build_vector_segment,
@@ -38,7 +31,6 @@ from lance_etl.indexing.segments import (
     commit_index_with_retries,
     lance_field_id,
     live_fragment_ids,
-    train_vector_artifacts,
 )
 from lance_etl.telemetry import Telemetry
 
@@ -138,13 +130,7 @@ class IndexHandler:
         covered: set[int] = self.covered_fragments(dataset)
         return [fragment_id for fragment_id in all_ids if fragment_id not in covered]
 
-    def prepare(
-        self,
-        dataset: lance.LanceDataset,
-        uri: str,
-        telemetry: Telemetry,
-        spark: SparkSession | None = None,
-    ) -> object | None:
+    def prepare(self, dataset: lance.LanceDataset, uri: str, telemetry: Telemetry) -> object | None:
         """Build artifacts to broadcast to the segment builders.
 
         Subclasses override this to train or load artifacts that are broadcast to each executor
@@ -154,12 +140,11 @@ class IndexHandler:
             dataset: The dataset being indexed.
             uri: Dataset URI.
             telemetry: Driver telemetry facade.
-            spark: Active Spark session, unused by the base implementation.
 
         Returns:
             A broadcastable artifact, or ``None`` when none is needed.
         """
-        del dataset, uri, telemetry, spark
+        del dataset, uri, telemetry
         return None
 
     def build_segment(self, dataset: lance.LanceDataset, fragment_ids: list[int], artifacts: object | None) -> Index:
@@ -334,148 +319,60 @@ class VectorIndexHandler(IndexHandler):
             return all_fragment_ids(dataset)
         return super().target_fragments(dataset)
 
-    def prepare(
-        self,
-        dataset: lance.LanceDataset,
-        uri: str,
-        telemetry: Telemetry,
-        spark: SparkSession | None = None,
-    ) -> object | None:
-        """Load or train the IVF_RQ artifacts for this dataset's vector column.
+    def prepare(self, dataset: lance.LanceDataset, uri: str, telemetry: Telemetry) -> tuple:
+        """Load the reusable IVF_RQ artifacts for this dataset's vector column.
 
-        Returns the memoized result immediately on subsequent calls within the same build (replan
-        loop). On the first call the reuse branch is taken when the dataset config contains a
-        valid, reusable entry for this column, the index is actually committed (a stored config
-        can outlive its index when a first commit was skipped as all-stale, and ``get_ivf_model``
-        raises on a missing index), and the committed index has a non-None IVF model with
-        centroids. Centroids are read back from the committed index via
-        :meth:`lance.LanceDataset.get_ivf_model` and IPC-serialized for the Spark broadcast using
+        Returns the memoized result immediately on subsequent calls within the same build.
+        Centroids are read back from the committed index via
+        :meth:`lance.LanceDataset.get_ivf_model` and IPC-serialized for the build tasks using
         :func:`~lance_etl.indexing.segments.centroids_to_ipc`. The ``rabitq_model`` string comes
-        from the stored config. ``num_partitions`` is derived as ``len(centroids)`` — no stored
-        value is needed.
+        from the stored config, and ``num_partitions`` is derived as ``len(centroids)``.
 
-        If any reuse condition fails (absent config, config mismatch, growth trigger, absent or
-        None IVF model), the train branch runs. When ``spark`` is provided, IVF centroid training
-        is offloaded to a single-task Spark job via
-        :func:`~lance_etl.indexing.segments.train_vector_artifacts`, keeping heavy sample I/O and
-        k-means compute off the driver. When ``spark`` is ``None`` (tests or no-cluster callers),
-        training runs in-process under :data:`~lance_etl.indexing.segments.TRAIN_SEMAPHORE`.
-        After training the config is written once via
-        :func:`~lance_etl.indexing.optimize.write_vector_config` with the key shape
-        ``{"rows_at_train": int, "dimension": int, "metric": str, "num_bits": int,
-        "rabitq_model": str}``.
+        This is reuse-only by invariant: the plan phase routes any dataset whose artifacts are
+        absent, mismatched, or growth-stale to a streaming bootstrap build instead (ADR 0030),
+        so reaching this method without a committed index and a reusable config is a planning
+        bug and raises.
 
         Args:
-            dataset: The dataset to train on if artifacts are absent or stale.
-            uri: Dataset URI used for the config write and executor training.
-            telemetry: Driver telemetry facade.
-            spark: Active Spark session. When provided, centroid training is dispatched to one
-                executor task so the driver does not hold the training sample in its heap. When
-                ``None`` training runs in-process (test or no-cluster fallback).
+            dataset: The dataset whose committed index carries the centroids.
+            uri: Dataset URI, for error messages.
+            telemetry: Telemetry facade for the current process.
 
         Returns:
-            The centroids IPC bytes, the RaBitQ model JSON string, num_bits, and the IVF partition
-            count.
+            The centroids IPC bytes, the RaBitQ model JSON string, num_bits, and the IVF
+            partition count.
+
+        Raises:
+            RuntimeError: If the artifacts are not reusable. The plan phase should have chosen
+                a bootstrap build for this index.
         """
         if self.cached_artifacts is not None:
             return self.cached_artifacts
 
         config: IndexJobConfig = self.config
-        dimension: int = self.dimension(dataset)
-        rows: int = dataset.count_rows()
-
-        if not config.rebuild:
-            cfg: dict[str, Any] | None = load_vector_config(dataset, self.column)
-            if cfg is not None and config_reusable(cfg, dimension, config.metric, config.ivf_rq_num_bits):
-                if not self.growth_requires_retrain(cfg, rows):
-                    committed: set[str] = {description.name for description in dataset.describe_indices()}
-                    ivf_model = dataset.get_ivf_model(self.index_name) if self.index_name in committed else None
-                    if ivf_model is not None and ivf_model.centroids is not None:
-                        centroids: pa.Array = ivf_model.centroids
-                        centroids_bytes: bytes = centroids_to_ipc(centroids)
-                        rabitq_model: str = cfg["rabitq_model"]
-                        num_partitions: int = len(centroids)
-                        self.reused_artifacts = True
-                        self.num_partitions_used = num_partitions
-                        telemetry.incr("artifacts.reused")
-                        self.cached_artifacts = (centroids_bytes, rabitq_model, config.ivf_rq_num_bits, num_partitions)
-                        return self.cached_artifacts
-                    logger.info(
-                        "IVF model for %s on %s is absent or has no centroids; falling through to train",
-                        self.index_name,
-                        uri,
-                    )
-                else:
-                    telemetry.incr("artifacts.retrained_for_growth")
-                    logger.info(
-                        "retraining IVF artifacts for %s: %d rows exceed %.1fx rows_at_train=%s",
-                        uri,
-                        rows,
-                        config.retrain_growth_factor,
-                        cfg.get("rows_at_train"),
-                    )
-            elif cfg is not None:
-                logger.warning(
-                    "stored vector config for %s is not reusable (missing rabitq_model or config mismatch); "
-                    "retraining artifacts",
-                    uri,
-                )
-
-        planned: int = derive_num_partitions(rows, config.num_partitions, config)
-        after_degrade: int = degrade_num_partitions(planned, rows, config.train_sample_rate)
-        partitions: int = memory_bounded_num_partitions(after_degrade, dimension, config)
-        if partitions < planned:
-            telemetry.incr("artifacts.partitions_degraded")
-            if partitions < after_degrade:
-                logger.warning(
-                    "capped num_partitions %d -> %d for %s (dim=%d): training sample would exceed memory budget",
-                    after_degrade,
-                    partitions,
-                    uri,
-                    dimension,
-                )
-            else:
-                logger.info("degraded num_partitions %d -> %d for %s (%d rows)", planned, partitions, uri, rows)
-
-        with TRAIN_SEMAPHORE, telemetry.timed("artifacts.train_ms", tags=[f"index:{self.index_name}"]):
-            if spark is not None:
-                train_fn = functools.partial(
-                    train_vector_artifacts,
-                    column=self.column,
-                    num_partitions=partitions,
-                    sample_rate=config.train_sample_rate,
-                    max_iters=config.train_max_iters,
-                    num_bits=config.ivf_rq_num_bits,
-                    distance_type=config.resolved_distance_type(),
-                    storage_options=config.storage_options,
-                )
-                result: tuple[bytes, str] = spark.sparkContext.parallelize([uri], 1).map(train_fn).collect()[0]
-                trained_centroids_bytes, trained_rabitq_model = result
-            else:
-                trained_centroids_bytes, trained_rabitq_model = train_vector_artifacts(
-                    uri=uri,
-                    column=self.column,
-                    num_partitions=partitions,
-                    sample_rate=config.train_sample_rate,
-                    max_iters=config.train_max_iters,
-                    num_bits=config.ivf_rq_num_bits,
-                    distance_type=config.resolved_distance_type(),
-                    storage_options=config.storage_options,
-                )
-
-        new_cfg: dict[str, Any] = {
-            "rows_at_train": rows,
-            "dimension": dimension,
-            "metric": config.metric,
-            "num_bits": config.ivf_rq_num_bits,
-            "num_partitions": partitions,
-            "rabitq_model": trained_rabitq_model,
-        }
-        write_vector_config(uri, self.column, new_cfg, config, telemetry)
-        self.reused_artifacts = False
-        self.num_partitions_used = partitions
-        telemetry.incr("artifacts.trained")
-        self.cached_artifacts = (trained_centroids_bytes, trained_rabitq_model, config.ivf_rq_num_bits, partitions)
+        cfg: dict[str, Any] | None = load_vector_config(dataset, self.column)
+        committed: set[str] = {description.name for description in dataset.describe_indices()}
+        reusable: bool = (
+            cfg is not None
+            and config_reusable(cfg, self.dimension(dataset), config.metric, config.ivf_rq_num_bits)
+            and self.index_name in committed
+        )
+        ivf_model = dataset.get_ivf_model(self.index_name) if reusable else None
+        if ivf_model is None or ivf_model.centroids is None:
+            raise RuntimeError(
+                f"vector artifacts for {self.index_name} on {uri} are not reusable; "
+                "the plan phase should have chosen a streaming bootstrap build"
+            )
+        centroids: pa.Array = ivf_model.centroids
+        self.reused_artifacts = True
+        self.num_partitions_used = len(centroids)
+        telemetry.incr("artifacts.reused")
+        self.cached_artifacts = (
+            centroids_to_ipc(centroids),
+            cfg["rabitq_model"],
+            config.ivf_rq_num_bits,
+            len(centroids),
+        )
         return self.cached_artifacts
 
     def build_segment(self, dataset: lance.LanceDataset, fragment_ids: list[int], artifacts: object | None) -> Index:

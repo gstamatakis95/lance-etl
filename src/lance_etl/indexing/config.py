@@ -64,12 +64,16 @@ class IndexJobConfig:
         max_ivf_partitions: Cap on the derived IVF partition count; operators needing more set ``num_partitions``.
         target_rows_per_ivf_partition: Target rows per partition for the size-aware policy.
         ivf_rq_num_bits: RaBitQ bits per sub-dimension; 1 gives maximum compression with a refine pass.
-        train_sample_rate: Rows sampled per IVF partition when training centroids.
-        train_max_iters: Maximum k-means iterations when training the IVF.
+        streaming_sample_rate: Streaming k-means chunk rate for bootstrap builds. The trainer
+            loads at most ``num_partitions * streaming_sample_rate`` vectors per step instead of
+            one giant sample, so training memory is bounded regardless of partition count. For
+            more than 256 partitions lance compresses chunks into a weighted coreset and trains
+            final centroids with weighted hierarchical k-means.
+        streaming_coreset_rate: Optional override of the final weighted coreset budget
+            (``num_partitions * streaming_coreset_rate``). ``None`` uses the lance default.
+        streaming_refine_passes: Extra streaming Lloyd refinement passes after coreset training.
+            Each pass loads at most ``num_partitions * streaming_sample_rate`` raw vectors.
         retrain_growth_factor: Retrain when row count exceeds this multiple of ``rows_at_train`` in the config.
-        train_sample_memory_budget_bytes: Executor RAM cap for the IVF training sample; caps partition count.
-            The sample lands in executor heap, so this budget should track executor sizing (the default 8g
-            executor covers the 8 GiB default).
         max_stale_replans: Fleet-level plan-build-commit rounds for stale indexes before giving up.
     """
 
@@ -102,10 +106,10 @@ class IndexJobConfig:
     max_ivf_partitions: int = 32768
     target_rows_per_ivf_partition: int = 8192
     ivf_rq_num_bits: int = 1
-    train_sample_rate: int = 256
-    train_max_iters: int = 50
+    streaming_sample_rate: int = 32
+    streaming_coreset_rate: int | None = None
+    streaming_refine_passes: int = 1
     retrain_growth_factor: float = 4.0
-    train_sample_memory_budget_bytes: int = 8 * 1024**3
     max_stale_replans: int = 3
 
     def resolved_distance_type(self) -> str:
@@ -243,9 +247,8 @@ def derive_num_partitions(rows: int, configured: int | None, config: IndexJobCon
 
     Follows the size-aware policy
     ``clamp(rows // config.target_rows_per_ivf_partition, config.min_ivf_partitions,
-    config.max_ivf_partitions)`` unless an explicit partition count was configured. The caller may
-    apply :func:`memory_bounded_num_partitions` before training to stay within the driver memory
-    budget.
+    config.max_ivf_partitions)`` unless an explicit partition count was configured. No memory
+    bound applies: streaming k-means trains in fixed-size chunks regardless of partition count.
 
     Args:
         rows: The dataset row count.
@@ -279,23 +282,3 @@ def degrade_num_partitions(planned: int, rows: int, sample_rate: int) -> int:
     """
     supportable: int = rows // sample_rate
     return max(1, min(planned, supportable))
-
-
-def memory_bounded_num_partitions(planned: int, dimension: int, config: IndexJobConfig) -> int:
-    """Cap the planned IVF partition count so the training sample fits within the executor memory budget.
-
-    ``train_ivf`` loads ``planned * config.train_sample_rate`` float32 vectors of length
-    ``dimension`` into executor heap (training is offloaded to a single Spark task). This function
-    floors the planned count to what ``config.train_sample_memory_budget_bytes`` can accommodate on
-    a single executor. The result is always at least 1.
-
-    Args:
-        planned: The partition count derived by policy or degraded for row count.
-        dimension: The vector dimension of the column being indexed.
-        config: Indexing configuration supplying the memory budget and sample rate.
-
-    Returns:
-        A partition count whose training sample fits within the configured budget, at least 1.
-    """
-    budget: int = config.train_sample_memory_budget_bytes // (config.train_sample_rate * dimension * 4)
-    return max(1, min(planned, budget))

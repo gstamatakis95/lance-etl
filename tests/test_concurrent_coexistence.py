@@ -89,6 +89,7 @@ from lance_etl.indexing import (
     IndexHandler,
     IndexJobConfig,
     VectorIndexHandler,
+    bootstrap_vector_index,
     build_one_shard,
     commit_one_index,
     fts_index_name,
@@ -458,19 +459,17 @@ def index_tail_dataset(uri: str, config: IndexJobConfig, telemetry: Telemetry) -
         config: Indexing configuration.
         telemetry: Telemetry facade shared by the actors.
     """
-    plan: dict[str, object] = plan_dataset_indexes(uri, config, set(), telemetry)
+    plan: dict[str, object] = plan_dataset_indexes(uri, config, telemetry)
     if "skipped" in plan:
         return
     artifacts: dict[tuple[str, str], tuple] = {}
     for spec in plan["specs"]:
-        if spec["kind"] == "vector":
-            _, _, artifact, _, _ = resolve_vector_artifacts(
-                uri, spec["column"], spec["index_name"], bool(spec.get("full_rebuild")), config
-            )
+        if spec["kind"] == "vector" and spec["mode"] == "segments":
+            _, _, artifact, _, _ = resolve_vector_artifacts(uri, spec["column"], spec["index_name"], config)
             artifacts[(uri, spec["column"])] = artifact
     for spec in plan["specs"]:
         base: dict[str, object] = {**spec, "uri": uri, "version": plan["version"]}
-        if spec["kind"] == "fts" and spec["mode"] == "maintain":
+        if not spec["shards"]:
             build_one_shard({**base, "shard": []}, artifacts, config, telemetry)
             continue
         payloads: list[dict[str, object]] = []
@@ -543,7 +542,10 @@ def maintain_head_indexes(
         telemetry: Telemetry facade shared by the actors.
         events: Test-side event counter recording deferred FTS builds.
     """
-    build_segment_index(uri, vector_handler, config, telemetry)
+    if vector_handler.index_name not in {description.name for description in lance.dataset(uri).describe_indices()}:
+        bootstrap_vector_index(uri, vector_handler.column, vector_handler.index_name, config, telemetry)
+    else:
+        build_segment_index(uri, vector_handler, config, telemetry)
     build_segment_index(uri, btree_handler, config, telemetry)
     dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
     existing: set[str] = {description.name for description in dataset.describe_indices()}
@@ -1045,7 +1047,7 @@ def test_vector_segment_commit_survives_compaction_orphan(tmp_path: Path, monkey
     }
     build_config: IndexJobConfig = IndexJobConfig(**shared)
     index_name: str = vector_index_name("vector")
-    build_segment_index(uri, VectorIndexHandler(build_config, "vector", index_name), build_config, telemetry)
+    bootstrap_vector_index(uri, "vector", index_name, build_config, telemetry)
     assert unindexed_fragment_count(lance.dataset(uri), index_name) == 0
 
     lance.dataset(uri).delete("id >= 300 and id < 450")

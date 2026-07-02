@@ -104,7 +104,7 @@ def test_plan_skips_vector_below_floor(tmp_path: Path, telemetry: Telemetry) -> 
         vector_min_rows=50_000,
         scalar_columns=["id"],
     )
-    plan: dict[str, object] = plan_dataset_indexes(uri, config, set(), telemetry)
+    plan: dict[str, object] = plan_dataset_indexes(uri, config, telemetry)
     by_index: dict[str, dict[str, object]] = {item["index"]: item for item in plan["done"]}
     assert "skipped" in by_index["vector_idx"]
     assert all(spec["index_name"] != "vector_idx" for spec in plan["specs"])

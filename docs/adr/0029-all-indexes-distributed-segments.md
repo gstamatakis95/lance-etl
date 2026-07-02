@@ -3,7 +3,8 @@
 ## Status
 
 Accepted. Amends ADR 0028 (whose scope left ``scalar`` role columns unindexed) and reinforces
-ADR 0001. Depends on pylance ``>=8.0.0``.
+ADR 0001. Depends on pylance ``>=8.0.0``. Amended by ADR 0030: fresh vector builds bootstrap
+through a committed ``create_index`` with streaming k-means and an explicit stored rotation.
 
 ## Context
 

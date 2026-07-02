@@ -34,12 +34,15 @@ import uuid
 from typing import Any
 
 import lance
+from lance.lance import indices as native_indices
 from pyspark.sql import SparkSession
 
 from lance_etl.column_roles import SCALAR_ROLE, TEXT_ROLE, VECTOR_ROLE, load_column_roles
 from lance_etl.indexing.config import (
     IndexJobConfig,
     bitmap_index_name,
+    degrade_num_partitions,
+    derive_num_partitions,
     fts_index_name,
     scalar_index_name,
     vector_index_name,
@@ -52,7 +55,12 @@ from lance_etl.indexing.handlers import (
     VectorIndexHandler,
     commit_fts_index,
 )
-from lance_etl.indexing.optimize import index_delta_count, load_vector_config, maintain_index_locally
+from lance_etl.indexing.optimize import (
+    index_delta_count,
+    load_vector_config,
+    maintain_index_locally,
+    write_vector_config,
+)
 from lance_etl.indexing.optimize import merge_index_deltas as merge_index_deltas_now
 from lance_etl.indexing.segments import (
     build_scalar_segment,
@@ -224,28 +232,27 @@ def shard_count(target_fragments: int, config: IndexJobConfig) -> int:
 def plan_dataset_indexes(
     uri: str,
     config: IndexJobConfig,
-    forced_full_rebuild: set[str],
     telemetry: Telemetry,
 ) -> dict[str, Any]:
     """Run the plan phase for one dataset on an executor.
 
     Opens the dataset once (failure isolation: an unreadable dataset returns a skip record),
     resolves the index targets, applies the fleet-level and per-index skip checks, and shards
-    each index's target fragments into build tasks. Vector indexes carry their full-rebuild
-    decision so a stale replan keeps rebuilding everything even after the stored config was
-    refreshed (the ``forced_full_rebuild`` names re-force it in later rounds).
+    each index's target fragments into build tasks. A vector index whose artifacts are absent,
+    mismatched, or growth-stale (or a ``rebuild`` run) plans one ``bootstrap`` task: a committed
+    ``create_index`` whose internal streaming k-means trains the centroids (ADR 0030). A vector
+    index with reusable artifacts plans incremental ``segments`` shards as usual.
 
     Args:
         uri: Dataset URI.
         config: Indexing configuration.
-        forced_full_rebuild: Index names whose earlier round decided a full rebuild.
         telemetry: Telemetry facade for the current executor process.
 
     Returns:
         A dict with ``uri`` and either ``skipped`` or ``version`` plus per-index ``specs``.
         Each spec carries ``kind``, ``column``, ``index_name``, ``mode``, ``shards``, and the
-        FTS extras (``index_uuid``, ``has_existing``) or the vector ``full_rebuild`` flag.
-        Indexes with nothing to do land in ``done`` as finished stats.
+        FTS extras (``index_uuid``, ``has_existing``). Indexes with nothing to do land in
+        ``done`` as finished stats.
     """
     try:
         dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
@@ -260,6 +267,7 @@ def plan_dataset_indexes(
         telemetry.incr("dataset.skipped_no_work")
         return {"uri": uri, "indexes": [], "skipped": skip}
 
+    existing_names: set[str] = {description.name for description in dataset.describe_indices()}
     specs: list[dict[str, Any]] = []
     done: list[dict[str, Any]] = []
     for kind, column, index_name in targets:
@@ -296,23 +304,36 @@ def plan_dataset_indexes(
             )
             continue
 
-        if kind == VECTOR_KIND and index_name in forced_full_rebuild:
-            handler.full_rebuild = True
         target_ids: list[int] = handler.target_fragments(dataset)
+        if kind == VECTOR_KIND:
+            needs_bootstrap: bool = (
+                config.rebuild or index_name not in existing_names or bool(getattr(handler, "full_rebuild", False))
+            )
+            if needs_bootstrap:
+                specs.append(
+                    {
+                        "kind": kind,
+                        "column": column,
+                        "index_name": index_name,
+                        "mode": "bootstrap",
+                        "shards": [],
+                        "fragments": len(dataset.get_fragments()),
+                    }
+                )
+                continue
         if not target_ids:
             done.append({"column": column, "index": index_name, "segments": 0, "fragments": 0})
             continue
-        spec: dict[str, Any] = {
-            "kind": kind,
-            "column": column,
-            "index_name": index_name,
-            "mode": "segments",
-            "shards": split_evenly(target_ids, shard_count(len(target_ids), config)),
-            "fragments": len(target_ids),
-        }
-        if kind == VECTOR_KIND:
-            spec["full_rebuild"] = bool(getattr(handler, "full_rebuild", False))
-        specs.append(spec)
+        specs.append(
+            {
+                "kind": kind,
+                "column": column,
+                "index_name": index_name,
+                "mode": "segments",
+                "shards": split_evenly(target_ids, shard_count(len(target_ids), config)),
+                "fragments": len(target_ids),
+            }
+        )
 
     return {"uri": uri, "version": dataset.version, "specs": specs, "done": done}
 
@@ -321,21 +342,19 @@ def resolve_vector_artifacts(
     uri: str,
     column: str,
     index_name: str,
-    full_rebuild: bool,
     config: IndexJobConfig,
 ) -> tuple[str, str, tuple, bool, int | None]:
-    """Resolve one vector index's IVF_RQ artifacts on an executor: reuse or train in process.
+    """Read one vector index's reusable IVF_RQ artifacts back on an executor.
 
-    Delegates to :meth:`VectorIndexHandler.prepare` with ``spark=None`` so the reuse branch
-    reads centroids back from the committed index right here and the train branch runs the
-    k-means in this executor process under the train semaphore. The driver never holds the
-    training sample.
+    Delegates to the reuse-only :meth:`VectorIndexHandler.prepare`: centroids come from the
+    committed index via ``get_ivf_model`` and the RaBitQ rotation from the stored config. Only
+    ``segments``-mode specs reach this phase — datasets needing training plan a streaming
+    bootstrap build instead (ADR 0030).
 
     Args:
         uri: Dataset URI.
         column: The vector column.
         index_name: The index name.
-        full_rebuild: Whether the plan phase decided a full rebuild for this index.
         config: Indexing configuration.
 
     Returns:
@@ -344,10 +363,85 @@ def resolve_vector_artifacts(
     """
     telemetry: Telemetry = Telemetry.create(config.telemetry)
     handler: VectorIndexHandler = VectorIndexHandler(config, column, index_name)
-    handler.full_rebuild = full_rebuild
     dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-    artifacts: tuple = handler.prepare(dataset, uri, telemetry, spark=None)
+    artifacts: tuple = handler.prepare(dataset, uri, telemetry)
     return uri, column, artifacts, handler.reused_artifacts, handler.num_partitions_used
+
+
+def bootstrap_vector_index(
+    uri: str,
+    column: str,
+    index_name: str,
+    config: IndexJobConfig,
+    telemetry: Telemetry,
+) -> dict[str, Any]:
+    """Build one vector index from scratch with streaming k-means, committed in one task.
+
+    Runs a committed ``create_index`` whose internal training uses lance's streaming k-means
+    (bounded memory regardless of partition count), sharing a freshly minted RaBitQ rotation so
+    later incremental segments stay on the same model. After the commit the artifact config is
+    stored so future runs reuse the centroids through ``get_ivf_model``. ``replace=True`` makes
+    a growth retrain a wholesale index replacement.
+
+    Args:
+        uri: Dataset URI.
+        column: The vector column to index.
+        index_name: The index name to publish under.
+        config: Indexing configuration.
+        telemetry: Telemetry facade for the current executor process.
+
+    Returns:
+        The finished index stats dict.
+    """
+    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+    handler: VectorIndexHandler = VectorIndexHandler(config, column, index_name)
+    dimension: int = handler.dimension(dataset)
+    rows: int = dataset.count_rows()
+    planned: int = derive_num_partitions(rows, config.num_partitions, config)
+    partitions: int = degrade_num_partitions(planned, rows, config.streaming_sample_rate)
+    rabitq_model: str = native_indices.build_rq_model(dimension=dimension, num_bits=config.ivf_rq_num_bits)
+    streaming_kwargs: dict[str, Any] = {
+        "streaming_sample_rate": config.streaming_sample_rate,
+        "streaming_refine_passes": config.streaming_refine_passes,
+    }
+    if config.streaming_coreset_rate is not None:
+        streaming_kwargs["streaming_coreset_rate"] = config.streaming_coreset_rate
+    with telemetry.timed("index.build_ms", tags=[f"index:{index_name}"]):
+        dataset.create_index(
+            column,
+            "IVF_RQ",
+            name=index_name,
+            metric=config.metric,
+            replace=True,
+            num_partitions=partitions,
+            num_bits=config.ivf_rq_num_bits,
+            rabitq_model=rabitq_model,
+            **streaming_kwargs,
+        )
+    telemetry.incr("index.committed", tags=[f"index:{index_name}"])
+    telemetry.incr("artifacts.trained")
+    write_vector_config(
+        uri,
+        column,
+        {
+            "rows_at_train": rows,
+            "dimension": dimension,
+            "metric": config.metric,
+            "num_bits": config.ivf_rq_num_bits,
+            "num_partitions": partitions,
+            "rabitq_model": rabitq_model,
+        },
+        config,
+        telemetry,
+    )
+    return {
+        "column": column,
+        "index": index_name,
+        "segments": 1,
+        "fragments": len(dataset.get_fragments()),
+        "num_partitions": partitions,
+        "reused_artifacts": False,
+    }
 
 
 def build_one_shard(
@@ -373,6 +467,10 @@ def build_one_shard(
     column: str = task["column"]
     index_name: str = task["index_name"]
     tags: list[str] = [f"index_type:{kind}"]
+
+    if kind == VECTOR_KIND and task["mode"] == "bootstrap":
+        bootstrap_stats: dict[str, Any] = bootstrap_vector_index(uri, column, index_name, config, telemetry)
+        return uri, index_name, {"stats": bootstrap_stats}
 
     if kind == FTS_KIND and task["mode"] == "maintain":
         with telemetry.timed("index.build_ms", tags=[f"index:{index_name}"]):
@@ -546,20 +644,18 @@ class LanceIndexer:
         if not vector_specs:
             return {}, {}
 
-        def resolve_one(item: tuple[str, str, str, bool]) -> tuple[str, str, tuple, bool, int | None]:
+        def resolve_one(item: tuple[str, str, str]) -> tuple[str, str, tuple, bool, int | None]:
             """Resolve one vector index's artifacts on an executor.
 
             Args:
-                item: ``(uri, column, index_name, full_rebuild)``.
+                item: ``(uri, column, index_name)``.
 
             Returns:
                 The artifacts and reuse stats for the index.
             """
-            return resolve_vector_artifacts(item[0], item[1], item[2], item[3], config)
+            return resolve_vector_artifacts(item[0], item[1], item[2], config)
 
-        items: list[tuple[str, str, str, bool]] = [
-            (uri, spec["column"], spec["index_name"], bool(spec.get("full_rebuild"))) for uri, spec in vector_specs
-        ]
+        items: list[tuple[str, str, str]] = [(uri, spec["column"], spec["index_name"]) for uri, spec in vector_specs]
         slices: int = max(1, min(len(items), config.max_build_tasks))
         resolved: list[tuple[str, str, tuple, bool, int | None]] = (
             spark.sparkContext.parallelize(items, slices).map(resolve_one).collect()
@@ -693,7 +789,6 @@ class LanceIndexer:
 
             stats_by_uri: dict[str, dict[str, Any]] = {uri: {"uri": uri, "indexes": []} for uri in dataset_uris}
             pending_uris: list[str] = list(dataset_uris)
-            forced_by_uri: dict[str, set[str]] = {uri: set() for uri in dataset_uris}
             kind_by_index: dict[tuple[str, str], str] = {}
 
             for round_index in range(config.max_stale_replans):
@@ -701,9 +796,7 @@ class LanceIndexer:
                     spark,
                     pending_uris,
                     config.telemetry,
-                    lambda uri, telemetry, forced=forced_by_uri: plan_dataset_indexes(
-                        uri, config, forced.get(uri, set()), telemetry
-                    ),
+                    lambda uri, telemetry: plan_dataset_indexes(uri, config, telemetry),
                     config.batch_partitions,
                 )
 
@@ -718,15 +811,16 @@ class LanceIndexer:
                         specs_by_uri[uri] = plan["specs"]
                         for spec in plan["specs"]:
                             kind_by_index[(uri, spec["index_name"])] = spec["kind"]
-                            if spec["kind"] == VECTOR_KIND and spec.get("full_rebuild"):
-                                forced_by_uri[uri].add(spec["index_name"])
                         stats_by_uri[uri]["version"] = plan["version"]
                 if not specs_by_uri:
                     pending_uris = []
                     break
 
                 vector_specs: list[tuple[str, dict[str, Any]]] = [
-                    (uri, spec) for uri, specs in specs_by_uri.items() for spec in specs if spec["kind"] == VECTOR_KIND
+                    (uri, spec)
+                    for uri, specs in specs_by_uri.items()
+                    for spec in specs
+                    if spec["kind"] == VECTOR_KIND and spec["mode"] == "segments"
                 ]
                 with driver_telemetry.timed("run.artifacts_ms"):
                     artifacts, artifact_extras = self.resolve_fleet_artifacts(spark, vector_specs)
@@ -736,7 +830,7 @@ class LanceIndexer:
                     version: int = stats_by_uri[uri]["version"]
                     for spec in specs:
                         base: dict[str, Any] = {**spec, "uri": uri, "version": version}
-                        if spec["kind"] == FTS_KIND and spec["mode"] == "maintain":
+                        if not spec["shards"]:
                             shard_tasks.append({**base, "shard": []})
                             continue
                         for shard in spec["shards"]:

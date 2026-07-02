@@ -22,6 +22,7 @@ from lance_etl.indexing import (
     FtsIndexHandler,
     IndexJobConfig,
     VectorIndexHandler,
+    bootstrap_vector_index,
     commit_segments,
     index_delta_count,
     load_vector_config,
@@ -55,6 +56,27 @@ def dataset_uri(tmp_path: Path) -> str:
     uri: str = str(tmp_path / "maintenance.lance")
     write_fragmented_dataset(uri, make_vector_table(rows=ROWS, dim=DIM), max_rows_per_file=ROWS_PER_FRAGMENT)
     return uri
+
+
+def vector_only_config(**overrides: object) -> IndexJobConfig:
+    """Build an explicit vector-only indexing configuration for plan-phase assertions.
+
+    Args:
+        overrides: Field overrides applied on top of the test defaults.
+
+    Returns:
+        The indexing configuration targeting only the ``vector`` column.
+    """
+    base: dict[str, object] = {
+        "telemetry": TelemetryConfig(),
+        "vector_columns": ["vector"],
+        "num_partitions": 4,
+        "vector_min_rows": 10,
+        "commit_retries": 5,
+        "commit_backoff_seconds": 0.0,
+    }
+    base.update(overrides)
+    return IndexJobConfig(**base)
 
 
 def maintenance_config(**overrides: object) -> IndexJobConfig:
@@ -156,7 +178,7 @@ def test_plan_skips_when_all_indices_current(dataset_uri: str, telemetry: Teleme
     dataset.create_scalar_index("id", "BTREE", name="id_idx")
     lance.dataset(dataset_uri).create_scalar_index("text", "INVERTED", name="text_fts_idx")
 
-    plan: dict[str, object] = plan_dataset_indexes(dataset_uri, config, set(), telemetry)
+    plan: dict[str, object] = plan_dataset_indexes(dataset_uri, config, telemetry)
     assert plan.get("skipped") == "all indices current"
     refreshed: lance.LanceDataset = lance.dataset(dataset_uri)
     assert refreshed.to_table(filter="id = 7").num_rows == 1
@@ -175,7 +197,7 @@ def test_plan_rebuild_flag_forces_specs(dataset_uri: str, telemetry: Telemetry) 
         rebuild=True,
         commit_backoff_seconds=0.0,
     )
-    plan: dict[str, object] = plan_dataset_indexes(dataset_uri, rebuild_config, set(), telemetry)
+    plan: dict[str, object] = plan_dataset_indexes(dataset_uri, rebuild_config, telemetry)
     assert "skipped" not in plan
     assert {spec["index_name"] for spec in plan["specs"]} == {"id_idx", "text_fts_idx"}
     assert all(spec["shards"] for spec in plan["specs"])
@@ -202,28 +224,19 @@ def test_merge_index_deltas_bounds_accumulation(dataset_uri: str, telemetry: Tel
     assert lance.dataset(dataset_uri).to_table(filter="id = 7").num_rows == 1
 
 
-def test_prepare_records_rows_at_train(dataset_uri: str, telemetry: Telemetry) -> None:
-    """Training persists the row count the centroids were trained on in the dataset config."""
+def test_bootstrap_records_rows_at_train(dataset_uri: str, telemetry: Telemetry) -> None:
+    """The streaming bootstrap persists the trained row count in the dataset config."""
     config: IndexJobConfig = maintenance_config()
-    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
+    bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
     cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
     assert cfg is not None
     assert cfg["rows_at_train"] == ROWS
 
 
-def test_growth_trigger_retrains_and_targets_all_fragments(dataset_uri: str, telemetry: Telemetry) -> None:
-    """Rows growing past the factor force a retrain and a full-fragment rebuild."""
+def test_growth_trigger_plans_bootstrap_and_retrain_refreshes_config(dataset_uri: str, telemetry: Telemetry) -> None:
+    """Rows growing past the factor route the index back to a streaming bootstrap that refreshes the config."""
     config: IndexJobConfig = maintenance_config()
-    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
-    artifacts: object | None = handler.prepare(dataset, dataset_uri, telemetry)
-    version: int = dataset.version
-    documents: list[str] = []
-    for group in split_evenly(fragment_ids_of(dataset_uri), 2):
-        segment: Index = handler.build_segment(lance.dataset(dataset_uri, version=version), group, artifacts)
-        documents.append(serialize_segment(segment))
-    commit_segments(dataset_uri, documents, "vector", "vector_idx", True, config, telemetry)
+    bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
 
     covered_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
     assert covered_handler.target_fragments(lance.dataset(dataset_uri)) == []
@@ -234,28 +247,33 @@ def test_growth_trigger_retrains_and_targets_all_fragments(dataset_uri: str, tel
     patched_cfg["rows_at_train"] = ROWS // 8
     write_vector_config(dataset_uri, "vector", patched_cfg, config, telemetry)
 
-    retrain_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    current: lance.LanceDataset = lance.dataset(dataset_uri)
-    assert retrain_handler.target_fragments(current) == fragment_ids_of(dataset_uri)
-    retrain_handler.prepare(current, dataset_uri, telemetry)
-    assert retrain_handler.reused_artifacts is False
+    plan: dict[str, object] = plan_dataset_indexes(dataset_uri, vector_only_config(), telemetry)
+    vector_spec: dict[str, object] = next(spec for spec in plan["specs"] if spec["index_name"] == "vector_idx")
+    assert vector_spec["mode"] == "bootstrap"
+
+    bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
     refreshed_cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
     assert refreshed_cfg is not None
     assert refreshed_cfg["rows_at_train"] == ROWS
 
+    healthy_plan: dict[str, object] = plan_dataset_indexes(dataset_uri, vector_only_config(), telemetry)
+    assert all(spec["mode"] != "bootstrap" for spec in healthy_plan.get("specs", []))
 
-def test_manifest_without_rows_at_train_retrains_once(dataset_uri: str, telemetry: Telemetry) -> None:
-    """A config predating the retrain trigger retrains once to record the field."""
+
+def test_manifest_without_rows_at_train_plans_bootstrap(dataset_uri: str, telemetry: Telemetry) -> None:
+    """A config predating the retrain trigger routes the index to one refreshing bootstrap."""
     config: IndexJobConfig = maintenance_config()
-    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
+    bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
     cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
     assert cfg is not None
     patched_cfg: dict[str, object] = {k: v for k, v in cfg.items() if k != "rows_at_train"}
     write_vector_config(dataset_uri, "vector", patched_cfg, config, telemetry)
-    second: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    second.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
-    assert second.reused_artifacts is False
+
+    plan: dict[str, object] = plan_dataset_indexes(dataset_uri, vector_only_config(), telemetry)
+    vector_spec: dict[str, object] = next(spec for spec in plan["specs"] if spec["index_name"] == "vector_idx")
+    assert vector_spec["mode"] == "bootstrap"
+
+    bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
     refreshed_cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
     assert refreshed_cfg is not None
     assert refreshed_cfg["rows_at_train"] == ROWS
@@ -264,28 +282,19 @@ def test_manifest_without_rows_at_train_retrains_once(dataset_uri: str, telemetr
 def test_within_growth_factor_reuses_artifacts(dataset_uri: str, telemetry: Telemetry) -> None:
     """Artifacts keep being reused while rows stay within the growth factor."""
     config: IndexJobConfig = maintenance_config()
-    first_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
-    first_artifacts: object | None = first_handler.prepare(dataset, dataset_uri, telemetry)
-    assert first_artifacts is not None
-    version: int = dataset.version
-    documents: list[str] = []
-    for group in split_evenly(fragment_ids_of(dataset_uri), 2):
-        segment: Index = first_handler.build_segment(
-            lance.dataset(dataset_uri, version=version), group, first_artifacts
-        )
-        documents.append(serialize_segment(segment))
-    commit_segments(dataset_uri, documents, "vector", "vector_idx", True, config, telemetry)
+    bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
     second: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
     second.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
     assert second.reused_artifacts is True
 
+    plan: dict[str, object] = plan_dataset_indexes(dataset_uri, vector_only_config(), telemetry)
+    assert all(spec["mode"] != "bootstrap" for spec in plan.get("specs", []))
+
 
 def test_vector_config_key_is_stored_in_dataset(dataset_uri: str, telemetry: Telemetry) -> None:
-    """After training, the vector config key is present in the dataset config KV with no sidecar directory."""
+    """After the bootstrap, the vector config key is present in the dataset config KV with no sidecar directory."""
     config: IndexJobConfig = maintenance_config()
-    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
+    bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
     stored: dict[str, str] = lance.dataset(dataset_uri).config()
     assert vector_config_key("vector") in stored
     assert not Path(f"{dataset_uri}.artifacts").exists()
@@ -372,13 +381,12 @@ def test_fts_commit_index_raises_on_missing_fragments(dataset_uri: str, telemetr
         )
 
 
-def test_promoted_small_tier_index_triggers_full_rebuild(dataset_uri: str, telemetry: Telemetry) -> None:
-    """An index built outside the segment path (no stored config) is fully rebuilt on it.
+def test_artifact_less_index_plans_bootstrap(dataset_uri: str, telemetry: Telemetry) -> None:
+    """An index built outside the pipeline (no stored config) routes to a streaming bootstrap.
 
-    A plain ``create_index`` build (as pre-unification small-tier deployments produced) mints its
-    own IVF centroids and RaBitQ rotation and writes no config KV. The segment path must target
-    every fragment so the retrained model replaces the old delta instead of appending a delta on
-    a different model, whose later merge would silently corrupt the index.
+    A plain ``create_index`` (as pre-unification deployments produced) mints its own model and
+    writes no config KV. Appending segments built from fresh artifacts would put deltas on
+    mismatched models, so the plan phase replaces the whole index with a bootstrap instead.
     """
     config: IndexJobConfig = maintenance_config()
     lance.dataset(dataset_uri).create_index(
@@ -387,66 +395,35 @@ def test_promoted_small_tier_index_triggers_full_rebuild(dataset_uri: str, telem
     assert load_vector_config(lance.dataset(dataset_uri), "vector") is None
 
     append_fragment(dataset_uri, rows=ROWS_PER_FRAGMENT, start_id=ROWS)
-    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
-    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    targets: list[int] = handler.target_fragments(dataset)
-    assert targets == fragment_ids_of(dataset_uri)
-    assert handler.full_rebuild is True
+    plan: dict[str, object] = plan_dataset_indexes(dataset_uri, vector_only_config(), telemetry)
+    vector_spec: dict[str, object] = next(spec for spec in plan["specs"] if spec["index_name"] == "vector_idx")
+    assert vector_spec["mode"] == "bootstrap"
 
-    artifacts: object | None = handler.prepare(dataset, dataset_uri, telemetry)
-    assert handler.reused_artifacts is False
-    documents: list[str] = []
-    for group in split_evenly(targets, 2):
-        segment: Index = handler.build_segment(lance.dataset(dataset_uri, version=dataset.version), group, artifacts)
-        documents.append(serialize_segment(segment))
-    commit_segments(dataset_uri, documents, "vector", "vector_idx", True, config, telemetry)
-
+    bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
     refreshed: lance.LanceDataset = lance.dataset(dataset_uri)
     assert index_delta_count(refreshed, "vector_idx") == 1
-    assert handler.target_fragments(refreshed) == fragment_ids_of(dataset_uri)
-
+    assert load_vector_config(refreshed, "vector") is not None
     fresh_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
     assert fresh_handler.target_fragments(refreshed) == []
 
 
-def test_full_rebuild_is_sticky_across_replans(dataset_uri: str, telemetry: Telemetry) -> None:
-    """Once a retrain trigger fires, replans keep targeting every fragment after the config refresh."""
+def test_config_without_committed_index_plans_bootstrap(dataset_uri: str, telemetry: Telemetry) -> None:
+    """A stored config without a committed index routes to a bootstrap, and prepare refuses to reuse it."""
     config: IndexJobConfig = maintenance_config()
-    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
-    artifacts: object | None = handler.prepare(dataset, dataset_uri, telemetry)
-    documents: list[str] = []
-    for group in split_evenly(fragment_ids_of(dataset_uri), 2):
-        segment: Index = handler.build_segment(lance.dataset(dataset_uri, version=dataset.version), group, artifacts)
-        documents.append(serialize_segment(segment))
-    commit_segments(dataset_uri, documents, "vector", "vector_idx", True, config, telemetry)
-
-    cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
-    assert cfg is not None
-    patched_cfg: dict[str, object] = dict(cfg)
-    patched_cfg["rows_at_train"] = ROWS // 8
-    write_vector_config(dataset_uri, "vector", patched_cfg, config, telemetry)
-
-    retrain_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    current: lance.LanceDataset = lance.dataset(dataset_uri)
-    assert retrain_handler.target_fragments(current) == fragment_ids_of(dataset_uri)
-    retrain_handler.prepare(current, dataset_uri, telemetry)
-    refreshed_cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
-    assert refreshed_cfg is not None
-    assert refreshed_cfg["rows_at_train"] == ROWS
-    assert retrain_handler.target_fragments(lance.dataset(dataset_uri)) == fragment_ids_of(dataset_uri)
-
-
-def test_prepare_trains_when_config_present_but_index_absent(dataset_uri: str, telemetry: Telemetry) -> None:
-    """A stored config without a committed index falls through to training instead of raising."""
-    config: IndexJobConfig = maintenance_config()
-    seed_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    seed_handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
-    assert load_vector_config(lance.dataset(dataset_uri), "vector") is not None
+    write_vector_config(
+        dataset_uri,
+        "vector",
+        {"rows_at_train": ROWS, "dimension": DIM, "metric": config.metric, "num_bits": 1, "rabitq_model": "{}"},
+        config,
+        telemetry,
+    )
     names: set[str] = {description.name for description in lance.dataset(dataset_uri).describe_indices()}
     assert "vector_idx" not in names
 
+    plan: dict[str, object] = plan_dataset_indexes(dataset_uri, vector_only_config(), telemetry)
+    vector_spec: dict[str, object] = next(spec for spec in plan["specs"] if spec["index_name"] == "vector_idx")
+    assert vector_spec["mode"] == "bootstrap"
+
     handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    artifacts: object | None = handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
-    assert artifacts is not None
-    assert handler.reused_artifacts is False
+    with pytest.raises(RuntimeError, match="not reusable"):
+        handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)

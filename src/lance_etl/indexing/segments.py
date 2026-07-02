@@ -2,9 +2,9 @@
 
 Provides all the primitives needed by the distributed index build: serialise/deserialise
 uncommitted segment metadata, IPC-encode/decode IVF centroids, shard fragment lists, validate
-live fragments, commit collected segments with conflict retries, and the picklable
-:func:`train_vector_artifacts` executed on a Spark executor for IVF centroid training. The
-stale-fragment replan loop lives in :mod:`lance_etl.indexing.runner` as fleet-level rounds.
+live fragments, and commit collected segments with conflict retries. IVF centroid training
+happens inside the streaming bootstrap build (see :mod:`lance_etl.indexing.runner`), and the
+stale-fragment replan loop lives there as fleet-level rounds.
 """
 
 from __future__ import annotations
@@ -12,15 +12,12 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import threading
 from collections.abc import Callable
 from typing import Any
 
 import lance
 import pyarrow as pa
 from lance.dataset import Index
-from lance.indices import IndicesBuilder
-from lance.lance import indices as native_indices
 
 from lance_etl.indexing.config import IndexJobConfig
 from lance_etl.telemetry import Telemetry, commit_with_retries
@@ -29,14 +26,6 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 STALE_FRAGMENT_MARKERS: tuple[str, ...] = ("would orphan fragments", "no longer exist")
 """Error-message substrings that identify a segment commit invalidated by a concurrent compaction."""
-
-TRAIN_SEMAPHORE: threading.Semaphore = threading.Semaphore(1)
-"""Process-level semaphore that serialises IVF training tasks so two samples never co-locate on one executor.
-
-When training is offloaded to Spark, driver threads that are waiting for a training slot idle
-rather than consuming driver RAM or CPU. The semaphore still bounds concurrency when the
-fallback in-process path is used (e.g. in tests or no-Spark callers).
-"""
 
 
 def centroids_to_ipc(centroids: pa.Array) -> bytes:
@@ -213,54 +202,6 @@ def commit_index_with_retries(
         config.commit_backoff_seconds,
         lambda: telemetry.incr("index.commit_conflict", tags=tags),
     )
-
-
-def train_vector_artifacts(
-    uri: str,
-    column: str,
-    num_partitions: int,
-    sample_rate: int,
-    max_iters: int,
-    num_bits: int,
-    distance_type: str,
-    storage_options: dict[str, Any] | None,
-) -> tuple[bytes, str]:
-    """Train IVF centroids and mint a RaBitQ model for one vector column.
-
-    This is a module-level picklable function so it can be shipped to a Spark executor via
-    ``parallelize([uri], 1).map(functools.partial(train_vector_artifacts, column=..., ...))``.
-    All parameters are primitives or a plain dict so the closure serialises without capturing any
-    handler or telemetry state. The function opens the dataset itself, trains the IVF centroids,
-    IPC-serialises them, and mints a fresh RaBitQ model JSON string. The caller is responsible for
-    timing and telemetry.
-
-    Args:
-        uri: Dataset URI to open for training.
-        column: The vector column to train on.
-        num_partitions: The IVF partition count to train.
-        sample_rate: Rows sampled per partition during IVF training.
-        max_iters: Maximum k-means iterations.
-        num_bits: RaBitQ bits per sub-dimension.
-        distance_type: Lance distance type string (e.g. ``"l2"``).
-        storage_options: Object-store options forwarded to lance.
-
-    Returns:
-        A tuple of ``(centroids_ipc_bytes, rabitq_model_json)``. The bytes are an Arrow IPC stream
-        decodeable by :func:`centroids_from_ipc`. The JSON string is validated by lance when passed
-        to ``create_index_uncommitted``.
-    """
-    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
-    builder: IndicesBuilder = IndicesBuilder(dataset, column)
-    ivf_model = builder.train_ivf(
-        num_partitions=num_partitions,
-        distance_type=distance_type,
-        sample_rate=sample_rate,
-        max_iters=max_iters,
-    )
-    centroids_ipc: bytes = centroids_to_ipc(ivf_model.centroids)
-    dimension: int = builder.dimension
-    rabitq_model: str = native_indices.build_rq_model(dimension=dimension, num_bits=num_bits)
-    return centroids_ipc, rabitq_model
 
 
 def build_scalar_segment(

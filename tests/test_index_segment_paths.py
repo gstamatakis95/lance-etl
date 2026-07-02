@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 
 import lance
+import pyarrow as pa
 import pytest
 from conftest import FakeSpark, make_vector_table, write_fragmented_dataset
 from lance.dataset import Index
@@ -23,6 +24,7 @@ from lance_etl.indexing import (
     IndexJobConfig,
     LanceIndexer,
     VectorIndexHandler,
+    bootstrap_vector_index,
     centroids_from_ipc,
     commit_segments,
     lance_field_id,
@@ -70,6 +72,19 @@ def index_config() -> IndexJobConfig:
         commit_retries=5,
         commit_backoff_seconds=0.0,
     )
+
+
+def append_fragment(uri: str, rows: int, start_id: int) -> None:
+    """Append one new fragment of rows to a dataset.
+
+    Args:
+        uri: The dataset URI.
+        rows: How many rows to append.
+        start_id: The first id value of the appended range.
+    """
+    table: pa.Table = make_vector_table(rows=rows, dim=DIM, seed=start_id)
+    reindexed: pa.Table = table.set_column(0, "id", pa.array(range(start_id, start_id + rows), pa.int64()))
+    lance.write_dataset(reindexed, uri, mode="append")
 
 
 def fragment_ids_of(uri: str) -> list[int]:
@@ -193,71 +208,64 @@ def index_coverage(uri: str, index_name: str) -> set[int]:
 
 
 def test_vector_segment_path_end_to_end(dataset_uri: str, telemetry: Telemetry) -> None:
-    """IVF_RQ: train, per-shard uncommitted build, merge, commit, then query."""
+    """IVF_RQ: streaming bootstrap, then incremental per-shard build, merge, commit, and query."""
     config: IndexJobConfig = index_config()
-    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    stats: dict[str, object] = bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
+    assert stats["segments"] == 1
+    assert stats["num_partitions"] == 4
+    cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
+    assert cfg is not None
+    json.loads(cfg["rabitq_model"])
+    assert cfg["rows_at_train"] == ROWS
+
+    append_fragment(dataset_uri, ROWS_PER_FRAGMENT, ROWS)
     dataset: lance.LanceDataset = lance.dataset(dataset_uri)
-    handler.validate(dataset)
+    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    new_targets: list[int] = handler.target_fragments(dataset)
+    assert len(new_targets) == 1
     artifacts: object | None = handler.prepare(dataset, dataset_uri, telemetry)
-    assert artifacts is not None
-    centroids_bytes, rabitq_model, num_bits, num_partitions = artifacts
-    assert isinstance(centroids_bytes, bytes)
-    assert isinstance(rabitq_model, str)
-    json.loads(rabitq_model)
-    assert num_bits == 1
-    assert num_partitions == 4
-    version: int = dataset.version
+    assert handler.reused_artifacts is True
     documents: list[str] = []
-    for group in split_evenly(fragment_ids_of(dataset_uri), 2):
-        shard_dataset: lance.LanceDataset = lance.dataset(dataset_uri, version=version)
-        segment: Index = handler.build_segment(shard_dataset, group, artifacts)
+    for group in split_evenly(new_targets, 2):
+        segment: Index = handler.build_segment(lance.dataset(dataset_uri, version=dataset.version), group, artifacts)
         documents.append(serialize_segment(segment))
-    assert len(documents) == 2
     commit_segments(dataset_uri, documents, "vector", "vector_idx", True, config, telemetry)
 
     committed: lance.LanceDataset = lance.dataset(dataset_uri)
     indices: list[dict[str, object]] = committed.list_indices()
-    assert [(item["name"], item["type"]) for item in indices] == [("vector_idx", "IVF_RQ")]
+    assert {(item["name"], item["type"]) for item in indices} == {("vector_idx", "IVF_RQ")}
+    assert len(indices) == 2, "bootstrap delta plus one incremental delta"
     assert index_coverage(dataset_uri, "vector_idx") == set(fragment_ids_of(dataset_uri))
     result = committed.to_table(nearest={"column": "vector", "q": [0.5] * DIM, "k": 5})
     assert result.num_rows == 5
 
 
 def test_vector_segment_path_reuses_artifacts(dataset_uri: str, telemetry: Telemetry) -> None:
-    """A second prepare reads centroids from the committed index and the rotation from the dataset config.
+    """Every prepare reads centroids from the committed index and the rotation from the dataset config.
 
     Centroids are recovered via ``get_ivf_model`` and IPC-serialized, so the round-trip is checked by
-    array equality through ``centroids_from_ipc``. The ``rabitq_model`` string must match the first prepare
-    so independently built segments remain mergeable across runs. No ``.artifacts`` directory is created.
+    array equality through ``centroids_from_ipc``. The ``rabitq_model`` string must match the streaming
+    bootstrap's stored rotation so segments stay mergeable across runs. No ``.artifacts`` directory is
+    created.
     """
     config: IndexJobConfig = index_config()
-    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
-    first: object | None = handler.prepare(dataset, dataset_uri, telemetry)
-    assert handler.reused_artifacts is False
+    bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
+    cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
+    assert cfg is not None
+    assert "rabitq_model" in cfg
 
-    version: int = dataset.version
-    documents: list[str] = []
-    for group in split_evenly(fragment_ids_of(dataset_uri), 2):
-        segment: Index = handler.build_segment(lance.dataset(dataset_uri, version=version), group, first)
-        documents.append(serialize_segment(segment))
-    commit_segments(dataset_uri, documents, "vector", "vector_idx", True, config, telemetry)
+    first_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    first: object | None = first_handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
+    assert first_handler.reused_artifacts is True
 
     second_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
     second: object | None = second_handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
     assert second_handler.reused_artifacts is True
 
-    first_centroids = centroids_from_ipc(first[0])
-    second_centroids = centroids_from_ipc(second[0])
-    assert first_centroids.equals(second_centroids)
-    assert second[1] == first[1]
+    assert centroids_from_ipc(first[0]).equals(centroids_from_ipc(second[0]))
+    assert second[1] == first[1] == cfg["rabitq_model"]
     assert second[2] == first[2]
     assert second[3] == first[3]
-
-    cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
-    assert cfg is not None
-    assert "rabitq_model" in cfg
-    assert cfg["rabitq_model"] == first[1]
 
     assert vector_config_key("vector") in lance.dataset(dataset_uri).config()
     assert not Path(f"{dataset_uri}.artifacts").exists()

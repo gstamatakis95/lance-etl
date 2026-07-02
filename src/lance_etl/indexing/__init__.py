@@ -15,7 +15,6 @@ from lance_etl.indexing.config import (
     degrade_num_partitions,
     derive_num_partitions,
     fts_index_name,
-    memory_bounded_num_partitions,
     scalar_index_name,
     vector_config_key,
     vector_index_name,
@@ -41,6 +40,7 @@ from lance_etl.indexing.optimize import (
 )
 from lance_etl.indexing.runner import (
     LanceIndexer,
+    bootstrap_vector_index,
     build_one_shard,
     commit_one_index,
     index_skip_reason,
@@ -52,7 +52,6 @@ from lance_etl.indexing.runner import (
 )
 from lance_etl.indexing.segments import (
     STALE_FRAGMENT_MARKERS,
-    TRAIN_SEMAPHORE,
     all_fragment_ids,
     build_scalar_segment,
     build_vector_segment,
@@ -66,14 +65,12 @@ from lance_etl.indexing.segments import (
     live_fragment_ids,
     serialize_segment,
     split_evenly,
-    train_vector_artifacts,
 )
 
 __all__ = [
     "FTS_OPTIONAL_PARAMS",
     "METRIC_TO_DISTANCE",
     "STALE_FRAGMENT_MARKERS",
-    "TRAIN_SEMAPHORE",
     "IndexJobConfig",
     "IndexHandler",
     "VectorIndexHandler",
@@ -86,7 +83,6 @@ __all__ = [
     "degrade_num_partitions",
     "derive_num_partitions",
     "fts_index_name",
-    "memory_bounded_num_partitions",
     "scalar_index_name",
     "vector_config_key",
     "vector_index_name",
@@ -98,6 +94,7 @@ __all__ = [
     "merge_index_deltas",
     "optimize_existing_index",
     "write_vector_config",
+    "bootstrap_vector_index",
     "build_one_shard",
     "commit_fts_index",
     "commit_one_index",
@@ -121,5 +118,4 @@ __all__ = [
     "live_fragment_ids",
     "serialize_segment",
     "split_evenly",
-    "train_vector_artifacts",
 ]

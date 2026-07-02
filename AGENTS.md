@@ -186,13 +186,18 @@ task execution — run inside executor closures (`mapInArrow`, `mapPartitions`, 
 The only correct distributed index paths are:
 
 **Vector (IVF_RQ):**
-1. Driver: `IndicesBuilder.train_ivf(...)` to get IVF centroids.
-2. Driver: `lance.lance.indices.build_rq_model(dimension, num_bits)` to get the RaBitQ model JSON.
-3. Broadcast both artifacts to executors.
-4. Executor: `dataset.create_index_uncommitted(column, "IVF_RQ", name=, num_partitions=,
-   num_bits=, ivf_centroids=, rabitq_model=, fragment_ids=shard)`.
-5. Driver: `dataset.merge_existing_index_segments(segments)` then
-   `dataset.commit_existing_index_segments(name, column, [merged])`.
+1. Bootstrap (index absent, rebuild, or artifact triggers): ONE executor task runs a committed
+   `dataset.create_index(column, "IVF_RQ", name=, metric=, replace=True, num_partitions=,
+   num_bits=, rabitq_model=<minted via build_rq_model>, streaming_sample_rate=,
+   streaming_refine_passes=)`, whose internal streaming k-means trains the centroids with
+   bounded memory, then stores the artifact config (ADR 0030). This is the one sanctioned
+   non-segment vector build, and only with the explicit rotation plus stored config.
+2. Increment: executor reads centroids back via `get_ivf_model` plus the stored `rabitq_model`,
+   then `dataset.create_index_uncommitted(column, "IVF_RQ", name=, num_partitions=,
+   num_bits=, ivf_centroids=, rabitq_model=, fragment_ids=shard)` per shard.
+3. Commit fan-out: `dataset.merge_existing_index_segments(segments)` then
+   `dataset.commit_existing_index_segments(name, column, [merged])` on an executor.
+   The segment path hard-requires precomputed centroids, so training never happens there.
 
 **BTREE / BITMAP:**
 Same shard/commit flow but no `index_uuid`. Do not call `create_scalar_index(fragment_ids=)` or
@@ -280,6 +285,9 @@ Key facts to internalize:
 
 - `lance.lance.indices.build_rq_model(dimension, num_bits=1, dtype="float32")` is a real API
   returning a JSON string. The vector dimension must be divisible by 8.
+- Streaming k-means (`streaming_sample_rate`, `streaming_coreset_rate`,
+  `streaming_refine_passes`) is exposed only through the committed `create_index` path. The
+  distributed segment path refuses internal training and requires precomputed centroids.
 - `create_index_uncommitted(..., rabitq_model=str)` is validated. Passing a wrong JSON raises
   `ValueError`. The same string must reach every executor shard.
 - `CommitConflictError` is not reliably importable from `lance` directly. Use the fallback chain
