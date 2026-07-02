@@ -25,6 +25,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from pyspark import SparkContext
 from pyspark.sql import Row
 
 import lance_etl.tools.cli as tools_cli
@@ -196,6 +197,20 @@ def data_file_count(spark: object, table: str) -> int:
     return spark.sql(f"SELECT * FROM {table}.files").count()
 
 
+def jvm_gateway_already_launched() -> bool:
+    """Report whether this process already launched a Spark JVM gateway.
+
+    The Iceberg catalog requires ``spark.jars.packages`` to be resolved at JVM launch, so a
+    gateway started by an earlier Spark test module in the same pytest process can never load
+    the catalog plugin. Wrapped here to contain the private-attribute access per the repository
+    rule on third-party internals.
+
+    Returns:
+        ``True`` when a Spark JVM gateway already exists in this process.
+    """
+    return getattr(SparkContext, "_gateway", None) is not None
+
+
 @pytest.mark.integration
 def test_optimizer_compacts_data_files(tmp_path: Path) -> None:
     """Against a real local Iceberg catalog, ``rewrite_data_files`` bin-packs small files into fewer larger ones.
@@ -205,6 +220,8 @@ def test_optimizer_compacts_data_files(tmp_path: Path) -> None:
     ``expire_snapshots`` route through, so those two raise ``NoSuchMethodError`` on this pair. Their statement shape
     parsing are covered by the unit tests above. The module docstring documents this environmental constraint in full.
     """
+    if jvm_gateway_already_launched():
+        pytest.skip("Iceberg catalog jars resolve only at JVM launch. Run this file in its own pytest process.")
     config: BenchConfig = bench_config(tmp_path)
     table: str = config.table()
     spark = build_spark(config, "iceberg-optimize-test")

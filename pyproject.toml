@@ -3,7 +3,7 @@ name = "lance-etl"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "pylance>=8.0.0b6",
+    "pylance>=8.0.0",
     "pyarrow>=23",
     "pyspark>=3.5",
     "datadog",

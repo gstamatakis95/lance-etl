@@ -250,11 +250,11 @@ uvx ruff check src/ tests/ airflow/ bench/
 .venv/bin/pytest
 ```
 
-pylance `>=8.0.0b6` must be built from the lance checkout until released on PyPI:
+pylance `>=8.0.0` installs from PyPI (8.0.0 released 2026-07-01, superseding the
+build-from-checkout requirement of the 8.0.0b6 era):
 
 ```bash
-cd /Users/gstamatakis/IdeaProjects/lance
-maturin develop --release -m python/Cargo.toml
+uv pip install "pylance>=8.0.0"
 ```
 
 ### Rust (rust/search-api)
@@ -292,6 +292,11 @@ Key facts to internalize:
 - Iceberg 1.10 rejects `start-timestamp` / `end-timestamp` outside changelog scans. Use
   `snapshot_id_bounds` in `etl.py` to resolve wall-clock windows to `start-snapshot-id` /
   `end-snapshot-id` from the `{table}.snapshots` metadata table before reading.
+- KNOWN pylance 8.0.0 REGRESSION: concurrent `merge_insert` against a dataset carrying BTREE
+  index deltas can raise the internal error `RowAddrTreeMap::from_sorted_iter called with
+  non-sorted input`. The failure is loud (the merge errors and retries surface it, no silent
+  corruption), and the coexistence stress test is marked xfail with this reason. Re-test and
+  drop the marker when an upstream fix ships.
 - V2 manifest paths default on (`enable_v2_manifest_paths=True` at dataset creation). New datasets
   use V2. Existing datasets migrate via `migrate_manifest_paths_v2`. V2 makes every dataset open
   a single object-store request regardless of version-history depth.
