@@ -1,13 +1,10 @@
-//! Path-filtered read-through disk cache wrapping a Lance object store.
+//! Path-filtered read-through byte cache wrapping a Lance object store.
 //!
-//! Caches immutable metadata reads (version manifests, transactions, index file ranges) on local
-//! disk and passes every other operation, including all raw data reads under `data/`, straight
-//! through to the wrapped store.
+//! Caches immutable metadata reads (version manifests, transactions, index file ranges) in the
+//! configured persistent [`EntryStore`] and passes every other operation, including all raw data
+//! reads under `data/`, straight through to the wrapped store.
 
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -23,11 +20,9 @@ use object_store::{
 };
 use serde_json::Value;
 
-use crate::cache::layout::{
-    META_FILE, SweepStats, atomic_write, dir_stats, frame_bytes, hash_hex, remove_dir_accounted, sweep_tier,
-    touch_file, unframe_bytes,
-};
-use crate::telemetry::{CacheName, EvictionReason, Metrics, Tier};
+use crate::cache::entry_store::EntryStore;
+use crate::cache::layout::{META_FILE, frame_bytes, hash_hex, unframe_bytes};
+use crate::telemetry::{CacheName, EvictionReason, Metrics};
 
 /// File name for cached full-object bytes.
 const FULL_OBJECT_FILE: &str = "full.bin";
@@ -91,33 +86,24 @@ fn classify(location: &ObjectPath) -> Option<PathKind> {
 
 /// Shared state of the byte cache across all wrapped stores.
 struct StoreCacheState {
-    root: PathBuf,
+    store: Arc<dyn EntryStore>,
     max_index_range_bytes: u64,
-    disk_bytes: AtomicU64,
-    disk_entries: AtomicU64,
     metrics: Arc<Metrics>,
 }
 
 impl StoreCacheState {
-    /// Directory holding all cached entries of one `(store_prefix, path)` object.
-    fn object_dir(&self, store_prefix: &str, location: &ObjectPath) -> PathBuf {
-        self.root.join(hash_hex(&format!("{store_prefix}\n{location}"), 32))
+    /// Store dir holding all cached entries of one `(store_prefix, path)` object.
+    fn object_dir(&self, store_prefix: &str, location: &ObjectPath) -> String {
+        hash_hex(&format!("{store_prefix}\n{location}"), 32)
     }
 
-    /// Records a newly persisted entry in the accounting gauges.
-    fn record_insert(&self, bytes: u64) {
-        self.disk_bytes.fetch_add(bytes, Ordering::Relaxed);
-        self.disk_entries.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Removes every cached entry of one object, adjusting accounting.
+    /// Removes every cached entry of one object.
     async fn invalidate_object(&self, store_prefix: &str, location: &ObjectPath) {
-        let dir = self.object_dir(store_prefix, location);
-        remove_dir_accounted(&dir, &self.disk_bytes, &self.disk_entries).await;
+        self.store.remove_dir(&self.object_dir(store_prefix, location)).await;
     }
 }
 
-/// Path-filtered read-through disk cache. Inject via `ObjectStoreParams::object_store_wrapper`.
+/// Path-filtered read-through byte cache. Inject via `ObjectStoreParams::object_store_wrapper`.
 pub struct MetadataByteCache {
     state: Arc<StoreCacheState>,
 }
@@ -125,43 +111,27 @@ pub struct MetadataByteCache {
 impl std::fmt::Debug for MetadataByteCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MetadataByteCache")
-            .field("root", &self.state.root)
-            .field("disk_entries", &self.state.disk_entries.load(Ordering::Relaxed))
+            .field("store", &self.state.store)
             .finish()
     }
 }
 
 impl MetadataByteCache {
-    /// Opens (or creates) the byte cache under `root`. `max_index_range_bytes` bounds the largest
-    /// single `_indices/` byte range stored on disk.
-    pub fn open(root: PathBuf, max_index_range_bytes: u64, metrics: Arc<Metrics>) -> std::io::Result<Self> {
-        std::fs::create_dir_all(&root)?;
-        let (bytes, entries) = dir_stats(&root);
-        Ok(Self {
+    /// Composes the byte cache over a persistent store. `max_index_range_bytes` bounds the
+    /// largest single `_indices/` byte range persisted.
+    pub fn new(store: Arc<dyn EntryStore>, max_index_range_bytes: u64, metrics: Arc<Metrics>) -> Self {
+        Self {
             state: Arc::new(StoreCacheState {
-                root,
+                store,
                 max_index_range_bytes,
-                disk_bytes: AtomicU64::new(bytes),
-                disk_entries: AtomicU64::new(entries),
                 metrics,
             }),
-        })
-    }
-
-    /// Sweeps the byte cache tier with the shared TTL/budget policy.
-    pub fn sweep(&self, ttl: Duration, budget_bytes: u64) -> SweepStats {
-        sweep_tier(
-            &self.state.root,
-            ttl,
-            budget_bytes,
-            &self.state.disk_bytes,
-            &self.state.disk_entries,
-        )
+        }
     }
 
     /// Approximate bytes currently persisted by the byte cache.
     pub fn approx_size_bytes(&self) -> u64 {
-        self.state.disk_bytes.load(Ordering::Relaxed)
+        self.state.store.approx_stats().0
     }
 }
 
@@ -299,13 +269,11 @@ impl CachedStore {
         options: GetOptions,
         kind: PathKind,
     ) -> ObjectStoreResult<GetResult> {
+        let store = &self.state.store;
         let object_dir = self.state.object_dir(&self.store_prefix, location);
-        let entry_path = object_dir.join(entry_file_name(&options.range));
-        let (entry_read, sidecar_read) = tokio::join!(
-            tokio::fs::read(&entry_path),
-            tokio::fs::read_to_string(object_dir.join(META_FILE))
-        );
-        if let Ok(buf) = entry_read {
+        let entry_file = entry_file_name(&options.range);
+        let (entry_read, sidecar_read) = store.get_pair(&object_dir, &entry_file, META_FILE).await;
+        if let Some(buf) = entry_read {
             match unframe_bytes(buf) {
                 None => {
                     self.state.invalidate_object(&self.store_prefix, location).await;
@@ -314,15 +282,13 @@ impl CachedStore {
                         .cache_evictions(CacheName::Store, EvictionReason::Corrupt, 1);
                 }
                 Some(payload) => {
-                    let touch_path = entry_path.clone();
-                    drop(tokio::task::spawn_blocking(move || touch_file(&touch_path)));
-                    self.state.metrics.cache_lookup(CacheName::Store, Tier::Disk, true);
+                    store.touch(&object_dir, &entry_file);
+                    self.state.metrics.cache_lookup(CacheName::Store, store.tier(), true);
                     tracing::Span::current().record("cache.hit", true);
-                    let meta = match sidecar_read {
-                        Ok(raw) => meta_from_json(&raw, location)
-                            .unwrap_or_else(|| fallback_meta(location, payload.len() as u64)),
-                        Err(_) => fallback_meta(location, payload.len() as u64),
-                    };
+                    let meta = sidecar_read
+                        .and_then(|raw| String::from_utf8(raw).ok())
+                        .and_then(|raw| meta_from_json(&raw, location))
+                        .unwrap_or_else(|| fallback_meta(location, payload.len() as u64));
                     let start = match &options.range {
                         None => 0,
                         Some(GetRange::Bounded(bounds)) => bounds.start,
@@ -333,7 +299,7 @@ impl CachedStore {
                 }
             }
         }
-        self.state.metrics.cache_lookup(CacheName::Store, Tier::Disk, false);
+        self.state.metrics.cache_lookup(CacheName::Store, store.tier(), false);
         tracing::Span::current().record("cache.hit", false);
         let result = self.inner.get_opts(location, options.clone()).await?;
         let meta = result.meta.clone();
@@ -341,18 +307,14 @@ impl CachedStore {
         let bytes = result.bytes().await?;
         let within_limit = kind != PathKind::Index || bytes.len() as u64 <= self.state.max_index_range_bytes;
         if within_limit {
-            let meta_path = object_dir.join(META_FILE);
-            if tokio::fs::metadata(&meta_path).await.is_err() {
-                let _ = atomic_write(&meta_path, meta_to_json(&meta).as_bytes()).await;
-            }
-            if tokio::fs::metadata(&entry_path).await.is_err() {
-                let framed = frame_bytes(&bytes);
-                let framed_len = framed.len() as u64;
-                if atomic_write(&entry_path, &framed).await.is_ok() {
-                    self.state.record_insert(framed_len);
-                    self.state.metrics.cache_insert_bytes(CacheName::Store, framed_len);
-                }
-            }
+            store
+                .put_if_absent(&object_dir, META_FILE, meta_to_json(&meta).as_bytes())
+                .await;
+            let framed = frame_bytes(&bytes);
+            store.put_if_absent(&object_dir, &entry_file, &framed).await;
+            self.state
+                .metrics
+                .cache_insert_bytes(CacheName::Store, store.tier(), framed.len() as u64);
         }
         Ok(synthesize_result(bytes, meta, start))
     }
@@ -473,8 +435,11 @@ impl ObjectStore for CachedStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::disk_store::DiskEntryStore;
+    use crate::cache::entry_store::fake::MemoryEntryStore;
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Inner store counting reads so tests can assert what passes through the cache.
     #[derive(Debug)]
@@ -553,10 +518,40 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let cache =
-            MetadataByteCache::open(tmp.path().to_path_buf(), max_range, Arc::new(Metrics::disabled())).unwrap();
+        let store = Arc::new(DiskEntryStore::open(tmp.path().to_path_buf()).unwrap());
+        let cache = MetadataByteCache::new(store, max_range, Arc::new(Metrics::disabled()));
         let wrapped = cache.wrap("test$store", counting.clone());
         (tmp, counting, wrapped)
+    }
+
+    #[tokio::test]
+    async fn cached_get_pairs_the_entry_and_sidecar_in_one_lookup() {
+        let counting = Arc::new(CountingStore {
+            inner: InMemory::new(),
+            gets: AtomicU64::new(0),
+            lists: AtomicU64::new(0),
+        });
+        counting
+            .inner
+            .put(&ObjectPath::from("ds/_versions/7.manifest"), vec![1u8; 64].into())
+            .await
+            .unwrap();
+        let store = Arc::new(MemoryEntryStore::default());
+        let cache = MetadataByteCache::new(store.clone(), 4096, Arc::new(Metrics::disabled()));
+        let wrapped = cache.wrap("test$store", counting.clone());
+        let path = ObjectPath::from("ds/_versions/7.manifest");
+        wrapped.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(store.puts.load(Ordering::SeqCst), 2, "one entry plus one sidecar");
+        let lookups_before = store.gets.load(Ordering::SeqCst);
+        let served = wrapped.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(served.len(), 64);
+        assert_eq!(
+            store.gets.load(Ordering::SeqCst),
+            lookups_before + 1,
+            "the hit must pair the entry and sidecar reads into one store lookup"
+        );
+        assert_eq!(counting.gets.load(Ordering::SeqCst), 1);
+        assert!(store.touches.load(Ordering::SeqCst) >= 1);
     }
 
     #[tokio::test]

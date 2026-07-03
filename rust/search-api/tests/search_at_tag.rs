@@ -85,7 +85,7 @@ async fn vector_search_at_tag_pins_the_tagged_version() {
     dataset.tags().create("t1", v1).await.unwrap();
 
     let config = test_config(data_tmp.path(), cache_tmp.path());
-    let provider = CachingDatasetProvider::with_inner_store_wrapper(&config, None);
+    let provider = CachingDatasetProvider::with_inner_store_wrapper(&config, None).await;
     let backend = LanceSearchBackend::new(provider);
     let target = test_target();
 
@@ -127,7 +127,7 @@ async fn vector_search_at_explicit_version_pins_it() {
     assert!(latest >= 2, "index builds must produce several versions, got {latest}");
 
     let config = test_config(data_tmp.path(), cache_tmp.path());
-    let provider = CachingDatasetProvider::with_inner_store_wrapper(&config, None);
+    let provider = CachingDatasetProvider::with_inner_store_wrapper(&config, None).await;
     let backend = LanceSearchBackend::new(provider);
     let target = test_target();
 
@@ -179,7 +179,7 @@ async fn older_tag_remains_queryable_after_a_later_commit() {
     assert!(after_append > after_first_build, "append must produce a newer version");
 
     let config = test_config(data_tmp.path(), cache_tmp.path());
-    let provider = CachingDatasetProvider::with_inner_store_wrapper(&config, None);
+    let provider = CachingDatasetProvider::with_inner_store_wrapper(&config, None).await;
     let backend = LanceSearchBackend::new(provider);
     let target = test_target();
 
@@ -224,7 +224,7 @@ async fn unset_reference_follows_serve_policy() {
     let latest = dataset.version_id();
 
     let config = test_config(data_tmp.path(), cache_tmp.path());
-    let provider = CachingDatasetProvider::with_inner_store_wrapper(&config, None);
+    let provider = CachingDatasetProvider::with_inner_store_wrapper(&config, None).await;
     let backend = LanceSearchBackend::new(provider);
     let target = test_target();
 

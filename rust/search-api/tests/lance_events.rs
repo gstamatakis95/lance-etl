@@ -33,7 +33,7 @@ async fn lance_event_layer_captures_open_and_io_events_from_a_real_scan() {
     build_indexed_dataset(&uri).await;
 
     let config = test_config(data_tmp.path(), cache_tmp.path());
-    let backend = LanceSearchBackend::new(CachingDatasetProvider::new(&config));
+    let backend = LanceSearchBackend::new(CachingDatasetProvider::new(&config).await);
 
     let mut query = TextQuery::simple("apple", 10);
     query.columns = vec!["text".to_string()];

@@ -28,7 +28,8 @@ async fn searches_after_prewarm_do_no_index_or_manifest_io() {
     let provider = CachingDatasetProvider::with_inner_store_wrapper(
         &config,
         Some(Arc::new(CountingWrapper { counts: counts.clone() })),
-    );
+    )
+    .await;
     let backend = LanceSearchBackend::new(provider);
     let report = backend
         .prewarm(

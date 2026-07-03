@@ -1,21 +1,23 @@
 //! Background janitor enforcing TTL and disk budgets over both persistent cache tiers.
+//!
+//! Disk-only by design: the Redis backend needs no local sweep because entry TTLs are native
+//! (per-dir `EXPIRE`) and the capacity bound is the Redis server's `maxmemory` policy.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::cache::disk_cache::DiskIndexCacheBackend;
+use crate::cache::disk_store::DiskEntryStore;
 use crate::cache::layout::SweepStats;
-use crate::cache::store_cache::MetadataByteCache;
 use crate::telemetry::{CacheName, EvictionReason, Metrics};
 
-/// Sweeps the index and store cache tiers on a fixed interval.
+/// Sweeps the index and store disk tiers on a fixed interval.
 ///
 /// Each sweep deletes entries older than the TTL, then deletes oldest-mtime entries until each
 /// tier fits in its byte budget, reconciles the in-memory size accounting, and publishes the
 /// post-sweep residency gauges and eviction counters to Datadog.
 pub struct CacheJanitor {
-    index_cache: Arc<DiskIndexCacheBackend>,
-    store_cache: Arc<MetadataByteCache>,
+    index_store: Arc<DiskEntryStore>,
+    store_store: Arc<DiskEntryStore>,
     ttl: Duration,
     index_budget_bytes: u64,
     store_budget_bytes: u64,
@@ -23,18 +25,18 @@ pub struct CacheJanitor {
 }
 
 impl CacheJanitor {
-    /// Creates a janitor over the two disk tiers.
+    /// Creates a janitor over the two disk tiers' stores.
     pub fn new(
-        index_cache: Arc<DiskIndexCacheBackend>,
-        store_cache: Arc<MetadataByteCache>,
+        index_store: Arc<DiskEntryStore>,
+        store_store: Arc<DiskEntryStore>,
         ttl: Duration,
         index_budget_bytes: u64,
         store_budget_bytes: u64,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
-            index_cache,
-            store_cache,
+            index_store,
+            store_store,
             ttl,
             index_budget_bytes,
             store_budget_bytes,
@@ -47,17 +49,17 @@ impl CacheJanitor {
     /// Each tier is timed individually so the `cache`-tagged sweep duration reflects the cost of
     /// that tier's own directory walk.
     pub async fn sweep_once(&self) {
-        let index_cache = self.index_cache.clone();
-        let store_cache = self.store_cache.clone();
+        let index_store = self.index_store.clone();
+        let store_store = self.store_store.clone();
         let ttl = self.ttl;
         let index_budget = self.index_budget_bytes;
         let store_budget = self.store_budget_bytes;
         let swept = tokio::task::spawn_blocking(move || {
             let index_started = Instant::now();
-            let index_stats = index_cache.sweep(ttl, index_budget);
+            let index_stats = index_store.sweep(ttl, index_budget);
             let index_elapsed = index_started.elapsed();
             let store_started = Instant::now();
-            let store_stats = store_cache.sweep(ttl, store_budget);
+            let store_stats = store_store.sweep(ttl, store_budget);
             let store_elapsed = store_started.elapsed();
             (index_stats, index_elapsed, store_stats, store_elapsed)
         })

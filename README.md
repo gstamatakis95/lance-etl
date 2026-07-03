@@ -107,10 +107,13 @@ prewarm every replica against the green version explicitly (use the `version` or
 | `domain/fusion.rs` | `FusionSpec` (Rrf and Weighted variants) and within-dataset fusion logic |
 | `domain/rerank.rs` | `Reranker` seam, `IdentityReranker` (no-op default) |
 | `domain/intake.rs` | `IntakeBatch`, `Record`, `RecordWrite`, `WriteOp`, `RecordSink` trait, `StdoutSink` placeholder |
-| `cache/disk_cache.rs` | Hybrid disk + Moka `CacheBackend` for the Lance index cache |
+| `cache/entry_store.rs` | `EntryStore` trait: the persistent byte-store seam beneath both cache tiers |
+| `cache/disk_store.rs` | Local-disk `EntryStore` (the default backend) |
+| `cache/redis_store.rs` | Shared-Redis `EntryStore` (hash-per-dir keys, native TTL, registry hygiene) |
+| `cache/index_cache.rs` | `HybridIndexCacheBackend`: Moka hot tier + pluggable persistent `CacheBackend` |
 | `cache/store_cache.rs` | Read-through byte cache for immutable metadata |
-| `cache/layout.rs` | Versioned stamp dir, key hashing, atomic writes, TTL/budget sweep |
-| `cache/janitor.rs` | Periodic TTL + byte-budget sweep loop |
+| `cache/layout.rs` | Versioned stamp naming, key hashing, framing, atomic writes, TTL/budget sweep |
+| `cache/janitor.rs` | Periodic TTL + byte-budget sweep loop over the disk tiers |
 | `lance/backend.rs` | `LanceSearchBackend<P>` — single-dataset dispatch, post-fusion rerank |
 | `lance/provider.rs` | `DatasetProvider` trait, `CachingDatasetProvider`, tag-version TTL cache |
 | `lance/filter.rs` | `filter_to_expr`: domain filter -> DataFusion `Expr` |
@@ -480,10 +483,13 @@ Environment variables (`LANCE_ETL_BASE_URI` is required. All others are optional
 | `SEARCH_API_DATASET_CACHE_CAPACITY` | `1024` | Max open dataset handles in the LRU |
 | `SEARCH_API_INDEX_CACHE_BYTES` | `1073741824` (1 GiB) | In-memory index cache budget |
 | `SEARCH_API_METADATA_CACHE_BYTES` | `268435456` (256 MiB) | In-memory metadata cache budget |
-| `SEARCH_API_CACHE_DIR` | `/tmp/rust-search/cache` | Root directory for persistent disk caches |
+| `SEARCH_API_CACHE_BACKEND` | `disk` | Persistent cache backend: `disk`, `redis`, or `memory` |
+| `SEARCH_API_REDIS_URL` | (none) | Redis connection URL (`redis://` or `rediss://`), required for the `redis` backend |
+| `SEARCH_API_REDIS_NAMESPACE` | `search-api` | Key namespace prepended to every Redis cache key |
+| `SEARCH_API_CACHE_DIR` | `/tmp/rust-search/cache` | Root directory for the `disk` backend's caches |
 | `SEARCH_API_DISK_INDEX_CACHE_BYTES` | `8589934592` (8 GiB) | Disk budget for the index cache tier |
 | `SEARCH_API_DISK_STORE_CACHE_BYTES` | `2147483648` (2 GiB) | Disk budget for the metadata byte cache |
-| `SEARCH_API_DISK_CACHE_DISABLED` | `false` | Set to `true` for pure in-memory fallback |
+| `SEARCH_API_DISK_CACHE_DISABLED` | `false` | Deprecated alias for `SEARCH_API_CACHE_BACKEND=memory` |
 | `SEARCH_API_PREWARM_CONCURRENCY` | `4` | Indexes warmed concurrently per Prewarm RPC |
 | `SEARCH_API_IO_CONCURRENCY` | `256` | Parallel in-flight object-store requests per dataset |
 | `SEARCH_API_RECALL_SAMPLE_RATE` | `0.0` (off) | Fraction of requests sampled for offline recall |
@@ -496,6 +502,14 @@ Environment variables (`LANCE_ETL_BASE_URI` is required. All others are optional
 
 `DD_AGENT_HOST` is read by the default statsd address resolver: when set, the default becomes
 `${DD_AGENT_HOST}:8125`. `SEARCH_API_STATSD_ADDR` overrides it unconditionally.
+
+The `redis` cache backend persists both cache tiers in a shared Redis server instead of local
+disk, so replicas on ephemeral nodes share one warm cache (ADR 0031). The in-memory hot tier
+stays in front either way. Size the server with `maxmemory` and set
+`maxmemory-policy allkeys-lru` so eviction happens at whole-object granularity. Entry TTLs are
+native (7 days, refreshed on access), so no local janitor runs for this backend. An unreachable
+Redis at startup falls back to memory-only caching with a warning, and per-request Redis errors
+degrade to cache misses counted by `search_api.cache.backend_errors`.
 
 Both services live in one proto file, `proto/lance_etl/v1/lance_etl.proto` (package `lance_etl.v1`),
 and share the `DatasetTarget` message.

@@ -46,7 +46,7 @@ async fn serve_by_tag_opens_tagged_version_and_observes_a_flip() {
     dataset.tags().create("prod", 1u64).await.unwrap();
 
     let config = serve_by_tag_config(data_tmp.path(), cache_tmp.path(), 1);
-    let provider = CachingDatasetProvider::with_inner_store_wrapper(&config, None);
+    let provider = CachingDatasetProvider::with_inner_store_wrapper(&config, None).await;
     let backend = LanceSearchBackend::new(provider);
     let target = test_target();
 
@@ -79,7 +79,7 @@ async fn prewarm_by_tag_reports_the_resolved_version() {
     dataset.tags().create("staging", 1u64).await.unwrap();
 
     let config = test_config(data_tmp.path(), cache_tmp.path());
-    let provider = CachingDatasetProvider::with_inner_store_wrapper(&config, None);
+    let provider = CachingDatasetProvider::with_inner_store_wrapper(&config, None).await;
     let backend = LanceSearchBackend::new(provider);
 
     let report = backend
@@ -124,7 +124,8 @@ async fn prewarm_by_version_serves_warm_through_a_tag_flip_in_a_cold_process() {
         Some(Arc::new(CountingWrapper {
             counts: counts_a.clone(),
         })),
-    );
+    )
+    .await;
     let backend_a = LanceSearchBackend::new(provider_a);
     let report = backend_a
         .prewarm(
@@ -152,7 +153,8 @@ async fn prewarm_by_version_serves_warm_through_a_tag_flip_in_a_cold_process() {
         Some(Arc::new(CountingWrapper {
             counts: counts_b.clone(),
         })),
-    );
+    )
+    .await;
     let backend_b = LanceSearchBackend::new(provider_b);
 
     let text = backend_b

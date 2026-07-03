@@ -84,6 +84,8 @@ pub enum Tier {
     Memory,
     /// Local-disk tier.
     Disk,
+    /// Remote shared tier (the Redis backend).
+    Remote,
 }
 
 impl Tier {
@@ -92,6 +94,35 @@ impl Tier {
         match self {
             Self::Memory => "memory",
             Self::Disk => "disk",
+            Self::Remote => "remote",
+        }
+    }
+}
+
+/// Persistent-store operations used as the `op` tag on backend error counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreOp {
+    /// A read of one entry (or entry pair).
+    Get,
+    /// A write of one entry.
+    Put,
+    /// A removal of one entry or one dir.
+    Remove,
+    /// A whole-tier clear.
+    Clear,
+    /// A prefix-registry read or write.
+    Registry,
+}
+
+impl StoreOp {
+    /// Tag value for this operation.
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Put => "put",
+            Self::Remove => "remove",
+            Self::Clear => "clear",
+            Self::Registry => "registry",
         }
     }
 }
@@ -543,12 +574,24 @@ impl Metrics {
             .send();
     }
 
-    /// Bytes persisted to a disk tier by one insert.
-    pub fn cache_insert_bytes(&self, cache: CacheName, bytes: u64) {
+    /// Bytes persisted to one persistent tier by one insert.
+    pub fn cache_insert_bytes(&self, cache: CacheName, tier: Tier, bytes: u64) {
         self.client
             .count_with_tags("cache.insert_bytes", bytes as i64)
             .with_tag("cache", cache.as_tag())
-            .with_tag("tier", Tier::Disk.as_tag())
+            .with_tag("tier", tier.as_tag())
+            .send();
+    }
+
+    /// One persistent-backend operation that failed and degraded to a miss or a dropped write.
+    ///
+    /// Emitted by the Redis store on every errored round trip. A sustained non-zero rate means
+    /// the cache server is unreachable or overloaded while searches keep succeeding memory-only.
+    pub fn cache_backend_error(&self, cache: CacheName, op: StoreOp) {
+        self.client
+            .count_with_tags("cache.backend_errors", 1)
+            .with_tag("cache", cache.as_tag())
+            .with_tag("op", op.as_tag())
             .send();
     }
 
@@ -809,7 +852,8 @@ mod tests {
     fn cache_and_prewarm_metrics_render_expected_tags() {
         let (metrics, drain) = spy_metrics();
         metrics.cache_lookup(CacheName::Index, Tier::Memory, false);
-        metrics.cache_insert_bytes(CacheName::Store, 256);
+        metrics.cache_insert_bytes(CacheName::Store, Tier::Disk, 256);
+        metrics.cache_backend_error(CacheName::Index, StoreOp::Put);
         metrics.cache_evictions(CacheName::Index, EvictionReason::Ttl, 3);
         metrics.cache_evictions(CacheName::Index, EvictionReason::Size, 0);
         metrics.cache_sweep(CacheName::Store, Duration::from_millis(11), 5);
@@ -827,6 +871,7 @@ mod tests {
                 vec!["cache:index", "tier:memory", "outcome:miss"],
             ),
             ("search_api.cache.insert_bytes:256|c", vec!["cache:store", "tier:disk"]),
+            ("search_api.cache.backend_errors:1|c", vec!["cache:index", "op:put"]),
             ("search_api.cache.evictions:3|c", vec!["cache:index", "reason:ttl"]),
             ("search_api.cache.sweep.duration_ms:11|d", vec!["cache:store"]),
             ("search_api.cache.sweep.removed:5|d", vec!["cache:store"]),

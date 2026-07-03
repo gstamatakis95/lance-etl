@@ -77,11 +77,14 @@ lance-etl/
       rerank.rs           Reranker seam, IdentityReranker (no-op default)
       intake.rs           IntakeBatch, Record, RecordWrite, WriteOp, RecordSink trait, StdoutSink placeholder
       error.rs            SearchError
-    src/cache/            Persistent two-tier caching layer (index + metadata, no raw data)
-      layout.rs           Versioned stamp dir, key hashing, atomic writes, TTL/budget sweep
-      disk_cache.rs       Hybrid disk + Moka CacheBackend for the Lance index cache
+    src/cache/            Persistent two-tier caching layer (index + metadata, no raw data), pluggable disk/redis backends
+      layout.rs           Versioned stamp naming, key hashing, framing, atomic writes, TTL/budget sweep
+      entry_store.rs      EntryStore trait: the persistent byte-store seam beneath both tiers
+      disk_store.rs       Local-disk EntryStore (the default backend, prefixes.json registry)
+      redis_store.rs      Shared-Redis EntryStore (hash-per-dir keys, native TTL, registry hygiene)
+      index_cache.rs      HybridIndexCacheBackend: Moka hot tier + pluggable persistent CacheBackend
       store_cache.rs      Read-through byte cache for immutable metadata of wrapped stores
-      janitor.rs          Periodic TTL + budget sweep over both cache tiers
+      janitor.rs          Periodic TTL + budget sweep over the disk tiers (redis needs none)
     src/lance/            Lance backend implementations
       backend.rs          LanceSearchBackend — single-dataset dispatch, post-fusion rerank
       provider.rs         DatasetProvider trait, CachingDatasetProvider (shared session + LRU)
@@ -273,10 +276,16 @@ cargo build                  # compile
 cargo test                   # unit tests
 ```
 
+The Redis cache-backend integration tests (`tests/redis_cache.rs`) spawn a throwaway local
+`redis-server` per test and self-skip with a message when the binary is not installed, so
+`cargo test` stays green without Redis. Install `redis-server` to run them unskipped.
+
 The lance crates are sourced from crates.io (`lance = "8.0.0"` and friends in
 `rust/search-api/Cargo.toml`). Bump them together with the pylance dependency and the
 `LANCE_CACHE_STAMP` in `src/cache/layout.rs`, which wipes the on-disk caches across lance
-versions because the cache codec format is unstable between releases.
+versions because the cache codec format is unstable between releases. The same stamp also
+namespaces the Redis cache keys, so after a bump the old generation of keys simply ages out
+through its TTLs (ADR 0031).
 
 ---
 

@@ -42,7 +42,7 @@ fn handle_cache_config(capacity: u64) -> (Config, TempDir, TempDir) {
     let cache_tmp = TempDir::new().unwrap();
     let mut config = test_config(data_tmp.path(), cache_tmp.path());
     config.dataset_cache_capacity = capacity;
-    config.disk_cache_disabled = true;
+    config.cache_backend = search_api::config::CacheBackendKind::Memory;
     (config, data_tmp, cache_tmp)
 }
 
@@ -64,7 +64,7 @@ async fn weigher_assigns_clamped_fragment_weight() {
     let (config, data_tmp, _cache_tmp) = handle_cache_config(100_000);
     write_dataset(&uri_for(data_tmp.path(), "tiny"), 1).await;
     write_dataset(&uri_for(data_tmp.path(), "whale"), MAX_HANDLE_WEIGHT as usize + 8).await;
-    let provider = CachingDatasetProvider::new(&config);
+    let provider = CachingDatasetProvider::new(&config).await;
 
     provider.dataset(&target("tiny"), DatasetRef::Serve).await.unwrap();
     provider.dataset(&target("whale"), DatasetRef::Serve).await.unwrap();
@@ -88,7 +88,7 @@ async fn many_tiny_coexist_then_capacity_bounds_total_weight() {
         write_dataset(&uri_for(data_tmp.path(), &format!("tiny{index}")), 1).await;
     }
     write_dataset(&uri_for(data_tmp.path(), "whale"), MAX_HANDLE_WEIGHT as usize * 2).await;
-    let provider = CachingDatasetProvider::new(&config);
+    let provider = CachingDatasetProvider::new(&config).await;
 
     for index in 0..tiny_count {
         provider

@@ -124,7 +124,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     });
     let telemetry_guard = telemetry::init_tracing(config.telemetry_disabled, metrics.clone());
     let addr: SocketAddr = ([0, 0, 0, 0], config.port).into();
-    let provider = CachingDatasetProvider::with_telemetry(&config, metrics.clone());
+    let provider = CachingDatasetProvider::with_telemetry(&config, metrics.clone()).await;
     if let Some(janitor) = provider.janitor(&config) {
         janitor.spawn(std::time::Duration::from_secs(
             search_api::config::DEFAULT_DISK_CACHE_SWEEP_SECS,

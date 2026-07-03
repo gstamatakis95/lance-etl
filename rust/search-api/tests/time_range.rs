@@ -98,12 +98,12 @@ async fn build_timestamped_dataset(uri: &str) {
 }
 
 /// Builds a backend over a fresh provider rooted at `data_root`, with the given cache dir.
-fn build_backend(
+async fn build_backend(
     data_root: &std::path::Path,
     cache_root: &std::path::Path,
 ) -> LanceSearchBackend<CachingDatasetProvider> {
     let config = test_config(data_root, cache_root);
-    LanceSearchBackend::new(CachingDatasetProvider::new(&config))
+    LanceSearchBackend::new(CachingDatasetProvider::new(&config).await)
 }
 
 /// A vector query over all four rows with an optional event-time window.
@@ -134,7 +134,7 @@ async fn vector_time_range_restricts_to_the_window() {
     let cache_tmp = TempDir::new().unwrap();
     let uri = format!("file-object-store://{}/{TEST_DATASET_PATH}", data_tmp.path().display());
     build_timestamped_dataset(&uri).await;
-    let backend = build_backend(data_tmp.path(), cache_tmp.path());
+    let backend = build_backend(data_tmp.path(), cache_tmp.path()).await;
     let target = test_target();
 
     let all = backend.vector_search(&target, ranged_vector_query(None)).await.unwrap();
@@ -187,7 +187,7 @@ async fn time_range_ands_with_a_caller_filter() {
     let cache_tmp = TempDir::new().unwrap();
     let uri = format!("file-object-store://{}/{TEST_DATASET_PATH}", data_tmp.path().display());
     build_timestamped_dataset(&uri).await;
-    let backend = build_backend(data_tmp.path(), cache_tmp.path());
+    let backend = build_backend(data_tmp.path(), cache_tmp.path()).await;
 
     let mut query = ranged_vector_query(Some(TimeRange {
         start_ms: Some(event_ms(1)),
@@ -212,7 +212,7 @@ async fn text_and_hybrid_time_range_restricts_the_window() {
     let cache_tmp = TempDir::new().unwrap();
     let uri = format!("file-object-store://{}/{TEST_DATASET_PATH}", data_tmp.path().display());
     build_timestamped_dataset(&uri).await;
-    let backend = build_backend(data_tmp.path(), cache_tmp.path());
+    let backend = build_backend(data_tmp.path(), cache_tmp.path()).await;
     let target = test_target();
 
     let mut text = TextQuery::simple("apple", 10);
@@ -262,7 +262,9 @@ async fn time_range_against_a_missing_event_column_is_rejected() {
     let cache_tmp = TempDir::new().unwrap();
     let uri = format!("file-object-store://{}/{TEST_DATASET_PATH}", data_tmp.path().display());
     build_timestamped_dataset(&uri).await;
-    let backend = build_backend(data_tmp.path(), cache_tmp.path()).with_event_timestamp_column("no_such_column");
+    let backend = build_backend(data_tmp.path(), cache_tmp.path())
+        .await
+        .with_event_timestamp_column("no_such_column");
 
     let err = backend
         .vector_search(
@@ -289,7 +291,7 @@ async fn scan_stats_capture_records_object_store_stats() {
     let config = test_config(data_tmp.path(), cache_tmp.path());
     let captured: Arc<Mutex<Vec<ScanIoStats>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = captured.clone();
-    let backend = LanceSearchBackend::new(CachingDatasetProvider::new(&config))
+    let backend = LanceSearchBackend::new(CachingDatasetProvider::new(&config).await)
         .with_scan_stats_hook(Arc::new(move |stats| sink.lock().unwrap().push(*stats)));
 
     backend

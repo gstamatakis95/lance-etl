@@ -33,6 +33,46 @@ pub const DEFAULT_PORT: u16 = 8080;
 /// Default root directory for the persistent disk caches.
 pub const DEFAULT_CACHE_DIR: &str = "/tmp/rust-search/cache";
 
+/// Default Redis key namespace for the `redis` cache backend.
+pub const DEFAULT_REDIS_NAMESPACE: &str = "search-api";
+
+/// Fixed interval in seconds between Redis prefix-registry hygiene passes.
+///
+/// The registry hash maps raw cache-key prefixes to their dir keys and carries no TTL (expiring
+/// it would silently break prefix invalidation), so a background pass drops rows whose dir key
+/// has since expired or been evicted. Hardcoded: an hourly cadence is universal, not an env knob.
+pub const REDIS_REGISTRY_HYGIENE_SECS: u64 = 3600;
+
+/// Which persistent backend the two cache tiers use.
+///
+/// `Disk` is the default two-tier layout (memory hot tier plus local files under `cache_dir`).
+/// `Redis` keeps the same memory hot tier but persists entries in a shared Redis server, so
+/// replicas on ephemeral nodes share one warm cache. `Memory` disables persistence entirely and
+/// serves both tiers from the in-process caches alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheBackendKind {
+    /// Local-disk persistence under `cache_dir` (the default).
+    Disk,
+    /// Shared Redis persistence at `redis_url`.
+    Redis,
+    /// No persistence: in-memory caches only.
+    Memory,
+}
+
+impl FromStr for CacheBackendKind {
+    type Err = String;
+
+    /// Parses a backend name case-insensitively: `disk`, `redis`, or `memory`.
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.to_ascii_lowercase().as_str() {
+            "disk" => Ok(Self::Disk),
+            "redis" => Ok(Self::Redis),
+            "memory" => Ok(Self::Memory),
+            _ => Err(format!("expected one of disk, redis, memory, got {raw:?}")),
+        }
+    }
+}
+
 /// Default disk budget for the serialized index cache tier (8 GiB).
 pub const DEFAULT_DISK_INDEX_CACHE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
@@ -212,12 +252,12 @@ pub struct Config {
     pub dataset_cache_capacity: u64,
     /// Byte budget for the Lance index cache.
     ///
-    /// Dual role depending on whether disk caching is enabled:
-    /// - Disk caching ON: sizes the in-memory hot tier of the two-tier disk cache backend
-    ///   (`DiskIndexCacheBackend`). The on-disk tier is bounded separately by
-    ///   `disk_index_cache_bytes`. Hot entries evict from Moka under this budget while their
-    ///   serialised copies persist on disk.
-    /// - Disk caching OFF: sizes the Lance session's in-process Moka index cache directly
+    /// Dual role depending on the cache backend:
+    /// - `disk` or `redis`: sizes the in-memory hot tier of the two-tier hybrid backend
+    ///   (`HybridIndexCacheBackend`). The persistent tier is bounded separately: by
+    ///   `disk_index_cache_bytes` on disk, or by the Redis server's `maxmemory` policy.
+    ///   Hot entries evict from Moka under this budget while their serialised copies persist.
+    /// - `memory`: sizes the Lance session's in-process Moka index cache directly
     ///   (the only index cache tier).
     ///
     /// In both cases this budget covers IVF centroid pages, RaBitQ codebook pages, and HNSW
@@ -228,15 +268,24 @@ pub struct Config {
     pub metadata_cache_bytes: usize,
     /// TCP port the gRPC server binds to.
     pub port: u16,
-    /// Root directory for all persistent caches. Default `/tmp/rust-search/cache`. Env: `SEARCH_API_CACHE_DIR`.
+    /// Root directory for the `disk` backend's caches. Default `/tmp/rust-search/cache`.
+    /// Env: `SEARCH_API_CACHE_DIR`.
     pub cache_dir: PathBuf,
     /// Disk budget in bytes for the serialized index cache tier (default 8 GiB).
     /// Env: `SEARCH_API_DISK_INDEX_CACHE_BYTES`.
     pub disk_index_cache_bytes: u64,
     /// Disk budget in bytes for the metadata byte cache (default 2 GiB). Env: `SEARCH_API_DISK_STORE_CACHE_BYTES`.
     pub disk_store_cache_bytes: u64,
-    /// Set to disable disk caching entirely (pure in-memory fallback). Env: `SEARCH_API_DISK_CACHE_DISABLED`.
-    pub disk_cache_disabled: bool,
+    /// Which persistent backend the cache tiers use (default `Disk`). Env: `SEARCH_API_CACHE_BACKEND`
+    /// (`disk`, `redis`, or `memory`). The deprecated `SEARCH_API_DISK_CACHE_DISABLED=true` is
+    /// honored as an alias for `memory` when `SEARCH_API_CACHE_BACKEND` is unset.
+    pub cache_backend: CacheBackendKind,
+    /// Redis connection URL (`redis://` or `rediss://`), required when the backend is `redis`.
+    /// Env: `SEARCH_API_REDIS_URL`.
+    pub redis_url: Option<String>,
+    /// Key namespace prepended to every Redis cache key (default `search-api`), letting multiple
+    /// services or environments share one Redis server. Env: `SEARCH_API_REDIS_NAMESPACE`.
+    pub redis_namespace: String,
     /// Max indexes prewarmed concurrently per Prewarm RPC (default 4). Env: `SEARCH_API_PREWARM_CONCURRENCY`.
     pub prewarm_concurrency: usize,
     /// DogStatsD (UDP) address metrics are sent to. Defaults to `{DD_AGENT_HOST}:8125` when
@@ -344,7 +393,10 @@ impl Config {
     /// (a trailing slash is stripped). Optional overrides: `SEARCH_API_DATASET_CACHE_CAPACITY`,
     /// `SEARCH_API_INDEX_CACHE_BYTES`, `SEARCH_API_METADATA_CACHE_BYTES`, `SEARCH_API_PORT`,
     /// `SEARCH_API_CACHE_DIR`, `SEARCH_API_DISK_INDEX_CACHE_BYTES`,
-    /// `SEARCH_API_DISK_STORE_CACHE_BYTES`, `SEARCH_API_DISK_CACHE_DISABLED`,
+    /// `SEARCH_API_DISK_STORE_CACHE_BYTES`, `SEARCH_API_CACHE_BACKEND` (`disk`, `redis`, or
+    /// `memory`, with `SEARCH_API_DISK_CACHE_DISABLED=true` honored as a deprecated alias for
+    /// `memory`), `SEARCH_API_REDIS_URL` (required for the `redis` backend),
+    /// `SEARCH_API_REDIS_NAMESPACE` (default `search-api`),
     /// `SEARCH_API_PREWARM_CONCURRENCY`, `SEARCH_API_STATSD_ADDR`
     /// (default honors `DD_AGENT_HOST`), `SEARCH_API_TELEMETRY_DISABLED`,
     /// `SEARCH_API_RECALL_SAMPLE_RATE` (must lie in `[0, 1]`),
@@ -373,6 +425,11 @@ impl Config {
         if base_uri.is_empty() {
             return Err("LANCE_ETL_BASE_URI must be a non-empty base URI".to_string());
         }
+        let cache_backend = env_cache_backend()?;
+        let redis_url = std::env::var("SEARCH_API_REDIS_URL").ok().filter(|url| !url.is_empty());
+        if cache_backend == CacheBackendKind::Redis && redis_url.is_none() {
+            return Err("SEARCH_API_REDIS_URL must be set when SEARCH_API_CACHE_BACKEND=redis".to_string());
+        }
         Ok(Self {
             base_uri,
             dataset_cache_capacity: env_number("SEARCH_API_DATASET_CACHE_CAPACITY", DEFAULT_DATASET_CACHE_CAPACITY)?,
@@ -382,7 +439,9 @@ impl Config {
             cache_dir: PathBuf::from(env_string("SEARCH_API_CACHE_DIR", DEFAULT_CACHE_DIR)),
             disk_index_cache_bytes: env_number("SEARCH_API_DISK_INDEX_CACHE_BYTES", DEFAULT_DISK_INDEX_CACHE_BYTES)?,
             disk_store_cache_bytes: env_number("SEARCH_API_DISK_STORE_CACHE_BYTES", DEFAULT_DISK_STORE_CACHE_BYTES)?,
-            disk_cache_disabled: env_bool("SEARCH_API_DISK_CACHE_DISABLED", false)?,
+            cache_backend,
+            redis_url,
+            redis_namespace: env_string("SEARCH_API_REDIS_NAMESPACE", DEFAULT_REDIS_NAMESPACE),
             prewarm_concurrency: env_number("SEARCH_API_PREWARM_CONCURRENCY", DEFAULT_PREWARM_CONCURRENCY)?,
             statsd_addr: env_string("SEARCH_API_STATSD_ADDR", &default_statsd_addr()),
             telemetry_disabled: env_bool("SEARCH_API_TELEMETRY_DISABLED", false)?,
@@ -413,6 +472,24 @@ impl Config {
             },
         })
     }
+}
+
+/// Resolves the cache backend selection.
+///
+/// `SEARCH_API_CACHE_BACKEND` wins when set. Otherwise the deprecated
+/// `SEARCH_API_DISK_CACHE_DISABLED=true` alias maps to [`CacheBackendKind::Memory`] (with a
+/// deprecation warning), and the default is [`CacheBackendKind::Disk`].
+fn env_cache_backend() -> Result<CacheBackendKind, String> {
+    if let Ok(raw) = std::env::var("SEARCH_API_CACHE_BACKEND") {
+        return raw
+            .parse::<CacheBackendKind>()
+            .map_err(|err| format!("SEARCH_API_CACHE_BACKEND {err}"));
+    }
+    if env_bool("SEARCH_API_DISK_CACHE_DISABLED", false)? {
+        tracing::warn!("SEARCH_API_DISK_CACHE_DISABLED is deprecated, use SEARCH_API_CACHE_BACKEND=memory");
+        return Ok(CacheBackendKind::Memory);
+    }
+    Ok(CacheBackendKind::Disk)
 }
 
 /// Default DogStatsD address: the Datadog Agent host when advertised, else localhost.
@@ -492,7 +569,10 @@ mod tests {
     }
 
     /// Env var names cleared so defaults apply in tests.
-    const OPTIONAL_VARS: [&str; 27] = [
+    const OPTIONAL_VARS: [&str; 30] = [
+        "SEARCH_API_CACHE_BACKEND",
+        "SEARCH_API_REDIS_URL",
+        "SEARCH_API_REDIS_NAMESPACE",
         "SEARCH_API_SERVE_BY_TAG",
         "SEARCH_API_SERVE_TAG",
         "SEARCH_API_SERVE_TAG_TTL_SECS",
@@ -533,7 +613,9 @@ mod tests {
             assert_eq!(config.cache_dir, PathBuf::from(DEFAULT_CACHE_DIR));
             assert_eq!(config.disk_index_cache_bytes, DEFAULT_DISK_INDEX_CACHE_BYTES);
             assert_eq!(config.disk_store_cache_bytes, DEFAULT_DISK_STORE_CACHE_BYTES);
-            assert!(!config.disk_cache_disabled);
+            assert_eq!(config.cache_backend, CacheBackendKind::Disk);
+            assert!(config.redis_url.is_none());
+            assert_eq!(config.redis_namespace, DEFAULT_REDIS_NAMESPACE);
             assert_eq!(config.prewarm_concurrency, DEFAULT_PREWARM_CONCURRENCY);
             assert_eq!(config.statsd_addr, DEFAULT_STATSD_ADDR);
             assert!(!config.telemetry_disabled);
@@ -628,6 +710,7 @@ mod tests {
                 ("LANCE_ETL_BASE_URI", Some("/data/lance")),
                 ("SEARCH_API_CACHE_DIR", Some("/var/cache/search")),
                 ("SEARCH_API_DISK_INDEX_CACHE_BYTES", Some("4096")),
+                ("SEARCH_API_CACHE_BACKEND", None),
                 ("SEARCH_API_DISK_CACHE_DISABLED", Some("true")),
                 ("SEARCH_API_PREWARM_CONCURRENCY", Some("9")),
                 ("SEARCH_API_RECALL_SAMPLE_RATE", Some("0.25")),
@@ -636,7 +719,7 @@ mod tests {
                 let config = Config::from_env().unwrap();
                 assert_eq!(config.cache_dir, PathBuf::from("/var/cache/search"));
                 assert_eq!(config.disk_index_cache_bytes, 4096);
-                assert!(config.disk_cache_disabled);
+                assert_eq!(config.cache_backend, CacheBackendKind::Memory);
                 assert_eq!(config.prewarm_concurrency, 9);
                 assert_eq!(config.recall_sample_rate, 0.25);
             },
@@ -674,24 +757,104 @@ mod tests {
 
     #[test]
     fn bool_parsing_accepts_common_spellings_and_rejects_garbage() {
-        for (raw, expected) in [("1", true), ("Yes", true), ("off", false), ("FALSE", false)] {
+        for (raw, expected) in [
+            ("1", CacheBackendKind::Memory),
+            ("Yes", CacheBackendKind::Memory),
+            ("off", CacheBackendKind::Disk),
+            ("FALSE", CacheBackendKind::Disk),
+        ] {
             with_env(
                 &[
                     ("LANCE_ETL_BASE_URI", Some("/data/lance")),
+                    ("SEARCH_API_CACHE_BACKEND", None),
                     ("SEARCH_API_DISK_CACHE_DISABLED", Some(raw)),
                 ],
                 || {
-                    assert_eq!(Config::from_env().unwrap().disk_cache_disabled, expected);
+                    assert_eq!(Config::from_env().unwrap().cache_backend, expected);
                 },
             );
         }
         with_env(
             &[
                 ("LANCE_ETL_BASE_URI", Some("/data/lance")),
+                ("SEARCH_API_CACHE_BACKEND", None),
                 ("SEARCH_API_DISK_CACHE_DISABLED", Some("maybe")),
             ],
             || {
                 assert!(Config::from_env().is_err());
+            },
+        );
+    }
+
+    #[test]
+    fn cache_backend_parses_case_insensitively_and_rejects_garbage() {
+        for (raw, expected) in [
+            ("disk", CacheBackendKind::Disk),
+            ("Redis", CacheBackendKind::Redis),
+            ("MEMORY", CacheBackendKind::Memory),
+        ] {
+            with_env(
+                &[
+                    ("LANCE_ETL_BASE_URI", Some("/data/lance")),
+                    ("SEARCH_API_CACHE_BACKEND", Some(raw)),
+                    ("SEARCH_API_REDIS_URL", Some("redis://127.0.0.1:6379")),
+                ],
+                || {
+                    assert_eq!(Config::from_env().unwrap().cache_backend, expected);
+                },
+            );
+        }
+        with_env(
+            &[
+                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
+                ("SEARCH_API_CACHE_BACKEND", Some("tape")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err();
+                assert!(err.contains("SEARCH_API_CACHE_BACKEND"), "unexpected error: {err}");
+            },
+        );
+    }
+
+    #[test]
+    fn redis_backend_requires_a_url() {
+        with_env(
+            &[
+                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
+                ("SEARCH_API_CACHE_BACKEND", Some("redis")),
+                ("SEARCH_API_REDIS_URL", None),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err();
+                assert!(err.contains("SEARCH_API_REDIS_URL"), "unexpected error: {err}");
+            },
+        );
+        with_env(
+            &[
+                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
+                ("SEARCH_API_CACHE_BACKEND", Some("redis")),
+                ("SEARCH_API_REDIS_URL", Some("rediss://cache.internal:6380")),
+                ("SEARCH_API_REDIS_NAMESPACE", Some("staging")),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.cache_backend, CacheBackendKind::Redis);
+                assert_eq!(config.redis_url.as_deref(), Some("rediss://cache.internal:6380"));
+                assert_eq!(config.redis_namespace, "staging");
+            },
+        );
+    }
+
+    #[test]
+    fn explicit_backend_wins_over_the_deprecated_disabled_alias() {
+        with_env(
+            &[
+                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
+                ("SEARCH_API_CACHE_BACKEND", Some("disk")),
+                ("SEARCH_API_DISK_CACHE_DISABLED", Some("true")),
+            ],
+            || {
+                assert_eq!(Config::from_env().unwrap().cache_backend, CacheBackendKind::Disk);
             },
         );
     }

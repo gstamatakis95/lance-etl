@@ -241,7 +241,9 @@ pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) 
         cache_dir: cache_dir.to_path_buf(),
         disk_index_cache_bytes: 1024 * 1024 * 1024,
         disk_store_cache_bytes: 1024 * 1024 * 1024,
-        disk_cache_disabled: false,
+        cache_backend: search_api::config::CacheBackendKind::Disk,
+        redis_url: None,
+        redis_namespace: search_api::config::DEFAULT_REDIS_NAMESPACE.to_string(),
         prewarm_concurrency: 4,
         statsd_addr: "127.0.0.1:8125".to_string(),
         telemetry_disabled: true,
@@ -260,6 +262,78 @@ pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) 
         max_concurrent_streams: search_api::config::DEFAULT_MAX_CONCURRENT_STREAMS,
         concurrency_limit_per_connection: search_api::config::DEFAULT_CONCURRENCY_LIMIT_PER_CONNECTION,
         prewarm_targets_path: None,
+    }
+}
+
+/// Like [`test_config`] but selecting the Redis cache backend at the given URL.
+pub fn redis_test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path, redis_url: &str) -> Config {
+    let mut config = test_config(dataset_root, cache_dir);
+    config.cache_backend = search_api::config::CacheBackendKind::Redis;
+    config.redis_url = Some(redis_url.to_string());
+    config
+}
+
+/// A locally spawned `redis-server` child on a free port, killed on drop.
+pub struct RedisServerGuard {
+    child: std::process::Child,
+    /// The connection URL of the spawned server.
+    pub url: String,
+}
+
+impl RedisServerGuard {
+    /// Spawns a throwaway `redis-server` on a free localhost port and waits for it to answer
+    /// `PING`. Returns `None` (after an explanatory eprintln) when the binary is not installed,
+    /// so redis-backed tests skip gracefully on machines without Redis.
+    pub async fn spawn() -> Option<Self> {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+            listener.local_addr().ok()?.port()
+        };
+        let child = match std::process::Command::new("redis-server")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--save")
+            .arg("")
+            .arg("--appendonly")
+            .arg("no")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => {
+                eprintln!("redis-server binary not found, skipping redis cache test");
+                return None;
+            }
+        };
+        let url = format!("redis://127.0.0.1:{port}");
+        let guard = Self { child, url };
+        for _ in 0..50 {
+            if let Ok(client) = redis::Client::open(guard.url.as_str())
+                && let Ok(mut conn) = client.get_multiplexed_async_connection().await
+                && redis::cmd("PING").query_async::<String>(&mut conn).await.is_ok()
+            {
+                return Some(guard);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        eprintln!("spawned redis-server did not answer PING in time, skipping redis cache test");
+        None
+    }
+}
+
+impl RedisServerGuard {
+    /// Kills the server immediately, simulating a mid-run Redis outage.
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for RedisServerGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

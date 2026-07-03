@@ -151,7 +151,9 @@ async fn serve_full(
         cache_dir: tmp.path().join("disk-cache"),
         disk_index_cache_bytes: 64 * 1024 * 1024,
         disk_store_cache_bytes: 64 * 1024 * 1024,
-        disk_cache_disabled: false,
+        cache_backend: search_api::config::CacheBackendKind::Disk,
+        redis_url: None,
+        redis_namespace: search_api::config::DEFAULT_REDIS_NAMESPACE.to_string(),
         prewarm_concurrency: 4,
         statsd_addr: "127.0.0.1:8125".to_string(),
         telemetry_disabled: true,
@@ -171,7 +173,7 @@ async fn serve_full(
         concurrency_limit_per_connection: search_api::config::DEFAULT_CONCURRENCY_LIMIT_PER_CONNECTION,
         prewarm_targets_path: None,
     };
-    let provider = CachingDatasetProvider::with_telemetry(&config, metrics.clone());
+    let provider = CachingDatasetProvider::with_telemetry(&config, metrics.clone()).await;
     let backend = Arc::new(LanceSearchBackend::new(provider).with_metrics(metrics.clone()));
     let mut service = SearchGrpc::with_metrics(backend, metrics);
     if let Some(recall) = recall {

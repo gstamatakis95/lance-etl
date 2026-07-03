@@ -10,11 +10,13 @@ use lance_core::cache::CacheBackend;
 use lance_io::object_store::{ChainedWrappingObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore};
 use moka::future::Cache;
 
-use crate::cache::disk_cache::DiskIndexCacheBackend;
+use crate::cache::disk_store::DiskEntryStore;
+use crate::cache::index_cache::HybridIndexCacheBackend;
 use crate::cache::janitor::CacheJanitor;
 use crate::cache::layout::prepare_cache_root;
+use crate::cache::redis_store::RedisEntryStore;
 use crate::cache::store_cache::MetadataByteCache;
-use crate::config::Config;
+use crate::config::{CacheBackendKind, Config};
 use crate::domain::{DatasetRef, DatasetTarget, SearchError};
 use crate::lance::error::classify_lance_error;
 use crate::telemetry::{CacheName, Metrics, Tier};
@@ -69,12 +71,13 @@ pub trait DatasetProvider: Send + Sync + 'static {
 /// Builds the single shared Lance session used by every dataset handle in the process.
 ///
 /// Index and metadata cache entries are URI- and index-UUID-prefixed inside the session, so one
-/// global cache safely spans tens of thousands of datasets. When a disk backend is given, the
-/// index cache persists codec-bearing entries to local disk. The metadata cache always uses the
-/// in-memory Moka backend sized by `metadata_cache_bytes` (lance exposes no metadata-cache
-/// backend injection, persistent metadata comes from the [`MetadataByteCache`] store wrapper).
-pub fn build_session(config: &Config, disk_backend: Option<Arc<DiskIndexCacheBackend>>) -> Arc<Session> {
-    match disk_backend {
+/// global cache safely spans tens of thousands of datasets. When a hybrid backend is given, the
+/// index cache persists codec-bearing entries through its configured store (disk or Redis). The
+/// metadata cache always uses the in-memory Moka backend sized by `metadata_cache_bytes` (lance
+/// exposes no metadata-cache backend injection, persistent metadata comes from the
+/// [`MetadataByteCache`] store wrapper).
+pub fn build_session(config: &Config, index_backend: Option<Arc<HybridIndexCacheBackend>>) -> Arc<Session> {
+    match index_backend {
         Some(backend) => Arc::new(Session::with_index_cache_backend(
             backend as Arc<dyn CacheBackend>,
             config.metadata_cache_bytes,
@@ -88,7 +91,8 @@ pub fn build_session(config: &Config, disk_backend: Option<Arc<DiskIndexCacheBac
     }
 }
 
-/// Default provider: base-URI layout, one shared Lance session with optional disk-backed caches,
+/// Default provider: base-URI layout, one shared Lance session with the configured persistent
+/// caches (disk, Redis, or memory-only),
 /// and an LRU of open handles keyed by `(uri, resolved version)` and bounded by total handle
 /// weight ([`handle_weight`]) rather than a flat entry count, so the cheap tiny-tenant tail stays
 /// resident while a few heavy whale handles are capped.
@@ -110,43 +114,58 @@ pub struct CachingDatasetProvider {
     serve_by_tag: bool,
     serve_tag: String,
     store_params: Option<ObjectStoreParams>,
-    disk_index_cache: Option<Arc<DiskIndexCacheBackend>>,
+    index_cache: Option<Arc<HybridIndexCacheBackend>>,
     store_cache: Option<Arc<MetadataByteCache>>,
+    disk_stores: Option<(Arc<DiskEntryStore>, Arc<DiskEntryStore>)>,
     metrics: Arc<Metrics>,
 }
 
 impl CachingDatasetProvider {
-    /// Creates the provider with telemetry disabled, building the shared session, the disk cache
-    /// tiers (unless disabled), and sizing the dataset-handle LRU. Disk cache setup failures fall
-    /// back to in-memory caching so the service still serves traffic.
-    pub fn new(config: &Config) -> Self {
-        Self::build(config, Arc::new(Metrics::disabled()), None)
+    /// Creates the provider with telemetry disabled, building the shared session, the configured
+    /// persistent cache tiers, and sizing the dataset-handle LRU. Cache backend setup failures
+    /// fall back to in-memory caching so the service still serves traffic.
+    pub async fn new(config: &Config) -> Self {
+        Self::build(config, Arc::new(Metrics::disabled()), None).await
     }
 
     /// Like [`Self::new`] but emitting cache and dataset-resolution metrics through `metrics`.
-    pub fn with_telemetry(config: &Config, metrics: Arc<Metrics>) -> Self {
-        Self::build(config, metrics, None)
+    pub async fn with_telemetry(config: &Config, metrics: Arc<Metrics>) -> Self {
+        Self::build(config, metrics, None).await
     }
 
     /// Like [`Self::new`] but chains an extra wrapper *inside* the metadata byte cache (between
     /// the cache and the real store). Used by tests to count the reads that pass through.
-    pub fn with_inner_store_wrapper(config: &Config, inner_wrapper: Option<Arc<dyn WrappingObjectStore>>) -> Self {
-        Self::build(config, Arc::new(Metrics::disabled()), inner_wrapper)
+    pub async fn with_inner_store_wrapper(
+        config: &Config,
+        inner_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    ) -> Self {
+        Self::build(config, Arc::new(Metrics::disabled()), inner_wrapper).await
     }
 
-    /// Shared constructor wiring the disk tiers, the store wrapper chain, and telemetry.
-    fn build(config: &Config, metrics: Arc<Metrics>, inner_wrapper: Option<Arc<dyn WrappingObjectStore>>) -> Self {
-        let (disk_index_cache, store_cache) = if config.disk_cache_disabled {
-            (None, None)
-        } else {
-            match build_disk_caches(config, metrics.clone()) {
-                Ok(caches) => caches,
-                Err(error) => {
-                    tracing::warn!(error = %error, "disk cache setup failed, falling back to memory-only caching");
-                    (None, None)
-                }
-            }
+    /// Shared constructor wiring the persistent tiers, the store wrapper chain, and telemetry.
+    async fn build(
+        config: &Config,
+        metrics: Arc<Metrics>,
+        inner_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    ) -> Self {
+        let caches = match config.cache_backend {
+            CacheBackendKind::Memory => BuiltCaches::none(),
+            CacheBackendKind::Disk => build_disk_caches(config, metrics.clone()).unwrap_or_else(|error| {
+                tracing::warn!(error = %error, "disk cache setup failed, falling back to memory-only caching");
+                BuiltCaches::none()
+            }),
+            CacheBackendKind::Redis => build_redis_caches(config, metrics.clone())
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(error = %error, "redis cache setup failed, falling back to memory-only caching");
+                    BuiltCaches::none()
+                }),
         };
+        let BuiltCaches {
+            index_cache,
+            store_cache,
+            disk_stores,
+        } = caches;
         let mut wrappers: Vec<Arc<dyn WrappingObjectStore>> = Vec::new();
         if let Some(inner) = inner_wrapper {
             wrappers.push(inner);
@@ -170,7 +189,7 @@ impl CachingDatasetProvider {
         };
         Self {
             base_uri: config.base_uri.clone(),
-            session: build_session(config, disk_index_cache.clone()),
+            session: build_session(config, index_cache.clone()),
             datasets: Cache::builder()
                 .max_capacity(config.dataset_cache_capacity)
                 .weigher(|_key: &(String, Option<u64>), dataset: &Arc<Dataset>| handle_weight(dataset))
@@ -184,8 +203,9 @@ impl CachingDatasetProvider {
             serve_by_tag: config.serve_by_tag,
             serve_tag: config.serve_tag.clone(),
             store_params,
-            disk_index_cache,
+            index_cache,
             store_cache,
+            disk_stores,
             metrics,
         }
     }
@@ -202,11 +222,14 @@ impl CachingDatasetProvider {
         (self.datasets.entry_count(), self.datasets.weighted_size())
     }
 
-    /// Builds the janitor over both disk tiers. `None` when disk caching is disabled.
+    /// Builds the janitor over both disk tiers. `None` for the redis and memory backends, whose
+    /// expiry and capacity are handled by the Redis server (native TTL plus `maxmemory`) or by
+    /// Moka respectively.
     pub fn janitor(&self, config: &Config) -> Option<CacheJanitor> {
+        let (index_store, store_store) = self.disk_stores.clone()?;
         Some(CacheJanitor::new(
-            self.disk_index_cache.clone()?,
-            self.store_cache.clone()?,
+            index_store,
+            store_store,
             Duration::from_secs(crate::config::DEFAULT_DISK_CACHE_TTL_SECS),
             config.disk_index_cache_bytes,
             config.disk_store_cache_bytes,
@@ -214,12 +237,12 @@ impl CachingDatasetProvider {
         ))
     }
 
-    /// The disk index cache backend, when disk caching is active.
-    pub fn disk_index_cache(&self) -> Option<&Arc<DiskIndexCacheBackend>> {
-        self.disk_index_cache.as_ref()
+    /// The hybrid index cache backend, when a persistent backend is active.
+    pub fn index_cache(&self) -> Option<&Arc<HybridIndexCacheBackend>> {
+        self.index_cache.as_ref()
     }
 
-    /// The metadata byte cache, when disk caching is active.
+    /// The metadata byte cache, when a persistent backend is active.
     pub fn store_cache(&self) -> Option<&Arc<MetadataByteCache>> {
         self.store_cache.as_ref()
     }
@@ -318,19 +341,88 @@ struct ResolvedRef {
     warm_intent: bool,
 }
 
-/// The two optional disk tiers: the index cache backend and the metadata byte cache.
-type DiskCaches = (Option<Arc<DiskIndexCacheBackend>>, Option<Arc<MetadataByteCache>>);
+/// The constructed persistent cache tiers plus the raw disk stores the janitor sweeps.
+struct BuiltCaches {
+    /// Hybrid index cache backend injected into the Lance session, when persistence is active.
+    index_cache: Option<Arc<HybridIndexCacheBackend>>,
+    /// Metadata byte cache pushed into the object-store wrapper chain, when persistence is active.
+    store_cache: Option<Arc<MetadataByteCache>>,
+    /// The two disk stores for janitor construction. `None` for the redis and memory backends.
+    disk_stores: Option<(Arc<DiskEntryStore>, Arc<DiskEntryStore>)>,
+}
+
+impl BuiltCaches {
+    /// The memory-only outcome: no persistent tiers and nothing for the janitor to sweep.
+    fn none() -> Self {
+        Self {
+            index_cache: None,
+            store_cache: None,
+            disk_stores: None,
+        }
+    }
+}
 
 /// Opens the two disk cache tiers under the versioned stamp directory.
-fn build_disk_caches(config: &Config, metrics: Arc<Metrics>) -> std::io::Result<DiskCaches> {
+fn build_disk_caches(config: &Config, metrics: Arc<Metrics>) -> std::io::Result<BuiltCaches> {
     let root = prepare_cache_root(&config.cache_dir)?;
-    let index_backend = DiskIndexCacheBackend::open(root.join("index"), config.index_cache_bytes, metrics.clone())?;
-    let store_cache = MetadataByteCache::open(
-        root.join("store"),
+    let index_store = Arc::new(DiskEntryStore::open(root.join("index"))?);
+    let store_store = Arc::new(DiskEntryStore::open(root.join("store"))?);
+    let index_backend = HybridIndexCacheBackend::new(index_store.clone(), config.index_cache_bytes, metrics.clone());
+    let store_cache = MetadataByteCache::new(
+        store_store.clone(),
         crate::config::DEFAULT_STORE_CACHE_MAX_RANGE_BYTES,
         metrics,
-    )?;
-    Ok((Some(Arc::new(index_backend)), Some(Arc::new(store_cache))))
+    );
+    Ok(BuiltCaches {
+        index_cache: Some(Arc::new(index_backend)),
+        store_cache: Some(Arc::new(store_cache)),
+        disk_stores: Some((index_store, store_store)),
+    })
+}
+
+/// Connects the two Redis-backed cache tiers and spawns the index tier's registry hygiene loop.
+///
+/// Each tier gets its own connection under its own key namespace segment (`index` / `store`).
+/// A connection failure (bounded by a short timeout) surfaces here so the caller can fall back
+/// to memory-only caching, exactly as a disk setup failure does.
+async fn build_redis_caches(config: &Config, metrics: Arc<Metrics>) -> Result<BuiltCaches, redis::RedisError> {
+    let url = config.redis_url.as_deref().ok_or_else(|| {
+        redis::RedisError::from((
+            redis::ErrorKind::InvalidClientConfig,
+            "redis_url must be set for the redis cache backend",
+        ))
+    })?;
+    let ttl = Duration::from_secs(crate::config::DEFAULT_DISK_CACHE_TTL_SECS);
+    let index_store = Arc::new(
+        RedisEntryStore::connect(
+            url,
+            &config.redis_namespace,
+            "index",
+            ttl,
+            CacheName::Index,
+            metrics.clone(),
+        )
+        .await?,
+    );
+    let store_store = Arc::new(
+        RedisEntryStore::connect(
+            url,
+            &config.redis_namespace,
+            "store",
+            ttl,
+            CacheName::Store,
+            metrics.clone(),
+        )
+        .await?,
+    );
+    drop(index_store.spawn_registry_hygiene(Duration::from_secs(crate::config::REDIS_REGISTRY_HYGIENE_SECS)));
+    let index_backend = HybridIndexCacheBackend::new(index_store, config.index_cache_bytes, metrics.clone());
+    let store_cache = MetadataByteCache::new(store_store, crate::config::DEFAULT_STORE_CACHE_MAX_RANGE_BYTES, metrics);
+    Ok(BuiltCaches {
+        index_cache: Some(Arc::new(index_backend)),
+        store_cache: Some(Arc::new(store_cache)),
+        disk_stores: None,
+    })
 }
 
 impl DatasetProvider for CachingDatasetProvider {
@@ -390,9 +482,9 @@ impl DatasetProvider for CachingDatasetProvider {
         result
     }
 
-    /// Approximate bytes resident in the shared index cache (memory tier plus disk tier).
+    /// Approximate bytes resident in the shared index cache (memory tier plus persistent tier).
     fn index_cache_size_bytes(&self) -> u64 {
-        self.disk_index_cache
+        self.index_cache
             .as_ref()
             .map(|backend| backend.approx_size_bytes() as u64)
             .unwrap_or(0)
