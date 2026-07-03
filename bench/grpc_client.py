@@ -299,6 +299,85 @@ def vector_search_at_tag(
     return timed_call(stub.VectorSearch, request)
 
 
+def text_search_at_tag(
+    stub: Any,
+    pb2: ModuleType,
+    org_id: str,
+    terms: str,
+    k: int,
+    tag: str | None = None,
+    version: int | None = None,
+) -> tuple[Any, float]:
+    """Run a text search pinned to a tag or exact version via the ``version_ref`` oneof.
+
+    When neither ``tag`` nor ``version`` is supplied the request follows the server's default
+    serve policy (latest committed version or configured serve tag).
+
+    Args:
+        stub: The connected service stub.
+        pb2: The generated proto module.
+        org_id: The organization to query.
+        terms: The space-separated query terms.
+        k: Hits to return.
+        tag: Optional tag name (sets ``version_ref.tag``).
+        version: Optional exact committed version id (sets ``version_ref.version``).
+
+    Returns:
+        The ``TextSearchResponse`` and the rpc latency in milliseconds.
+    """
+    kwargs: dict[str, Any] = {"target": dataset_target(pb2, org_id), "query": text_query(pb2, terms, k)}
+    if tag is not None:
+        kwargs["tag"] = tag
+    elif version is not None:
+        kwargs["version"] = version
+    request = pb2.TextSearchRequest(**kwargs)
+    return timed_call(stub.TextSearch, request)
+
+
+def hybrid_search_at_tag(
+    stub: Any,
+    pb2: ModuleType,
+    org_id: str,
+    query: np.ndarray,
+    terms: str,
+    k: int,
+    nprobes: int,
+    tag: str | None = None,
+    version: int | None = None,
+) -> tuple[Any, float]:
+    """Run a hybrid search pinned to a tag or exact version via the ``version_ref`` oneof.
+
+    Both legs open the same pinned snapshot server-side. When neither ``tag`` nor ``version``
+    is supplied the request follows the server's default serve policy.
+
+    Args:
+        stub: The connected service stub.
+        pb2: The generated proto module.
+        org_id: The organization to query.
+        query: The query vector for the vector leg.
+        terms: The space-separated query terms for the text leg.
+        k: Fused hits to return.
+        nprobes: Probed IVF partitions for the vector leg.
+        tag: Optional tag name (sets ``version_ref.tag``).
+        version: Optional exact committed version id (sets ``version_ref.version``).
+
+    Returns:
+        The ``HybridSearchResponse`` and the rpc latency in milliseconds.
+    """
+    kwargs: dict[str, Any] = {
+        "target": dataset_target(pb2, org_id),
+        "vector": vector_query(pb2, query, 0, nprobes, None),
+        "text": text_query(pb2, terms, 0),
+        "k": k,
+    }
+    if tag is not None:
+        kwargs["tag"] = tag
+    elif version is not None:
+        kwargs["version"] = version
+    request = pb2.HybridSearchRequest(**kwargs)
+    return timed_call(stub.HybridSearch, request)
+
+
 def fetch_clusters(stub: Any, pb2: ModuleType, org_id: str) -> tuple[Any, float]:
     """Read the IVF cluster centroids of one org's vector index through the ``Clusters`` rpc.
 

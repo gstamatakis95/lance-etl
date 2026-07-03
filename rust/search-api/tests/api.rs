@@ -9,6 +9,7 @@ use arrow_array::{FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterat
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use lance::Dataset;
+use lance::dataset::{WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
 use lance_index::IndexType;
@@ -1477,5 +1478,122 @@ async fn weighted_fusion_proto_variant_is_applied() {
         status.code(),
         Code::InvalidArgument,
         "vector_weight outside [0,1] must be rejected"
+    );
+}
+
+/// Appends one extra row at `uri`, producing a new committed version beyond any tagged one.
+async fn append_row(uri: &str, row: (i32, i32, &str, [f32; 4])) {
+    let schema = test_schema();
+    let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        vec![Some(row.3.iter().map(|value| Some(*value)).collect::<Vec<_>>())],
+        DIM,
+    );
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![row.0])),
+            Arc::new(Int32Array::from(vec![row.1])),
+            Arc::new(StringArray::from(vec![row.2])),
+            Arc::new(vectors),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    Dataset::write(
+        reader,
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn version_ref_pins_a_search_to_a_tagged_or_explicit_snapshot() {
+    let tmp = TempDir::new().unwrap();
+    let uri = org1_uri(&tmp);
+    build_test_dataset(&uri).await;
+    let dataset = Dataset::open(&uri).await.unwrap();
+    let tagged = dataset.version_id();
+    dataset.tags().create("20260611T120000Z", tagged).await.unwrap();
+    append_row(&uri, (9, 9, "purple grape jam", [0.9, 0.9, 0.0, 0.0])).await;
+
+    let channel = serve(&tmp).await;
+    let mut client = SearchServiceClient::new(channel);
+
+    let latest = client
+        .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
+            target: target("org1"),
+            query: Some(vector_query(vec![0.9, 0.9, 0.0, 0.0], 5)),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(latest.results.len(), 5, "an unpinned search must see the appended row");
+    assert_eq!(row_number(&latest.results[0].row, "id"), 9.0);
+
+    let at_tag = client
+        .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: Some(search_api::pb::vector_search_request::VersionRef::Tag(
+                "20260611T120000Z".to_string(),
+            )),
+            target: target("org1"),
+            query: Some(vector_query(vec![0.9, 0.9, 0.0, 0.0], 5)),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        at_tag.results.len(),
+        4,
+        "a tag-pinned search must only see the tagged snapshot's rows"
+    );
+    assert!(
+        at_tag.results.iter().all(|hit| row_number(&hit.row, "id") != 9.0),
+        "the appended row must be invisible at the tagged snapshot"
+    );
+
+    let at_version = client
+        .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: Some(search_api::pb::vector_search_request::VersionRef::Version(tagged)),
+            target: target("org1"),
+            query: Some(vector_query(vec![0.9, 0.9, 0.0, 0.0], 5)),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        at_version.results.len(),
+        4,
+        "an explicit version pin behaves like its tag"
+    );
+
+    let text_at_tag = client
+        .text_search(TextSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: Some(search_api::pb::text_search_request::VersionRef::Tag(
+                "20260611T120000Z".to_string(),
+            )),
+            target: target("org1"),
+            query: Some(simple_text_query("lemon", 3)),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        text_at_tag.results.len(),
+        1,
+        "a tag-pinned text search must serve FTS hits from the tagged snapshot"
     );
 }

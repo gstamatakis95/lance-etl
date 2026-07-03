@@ -17,6 +17,7 @@ from lance_etl.cliutil import (
     build_telemetry_config,
     configure_logging_from_args,
     parse_epoch_ms,
+    parse_hour_tag,
     parse_key_values,
     parse_storage_options,
 )
@@ -63,6 +64,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--tag-stamp",
+        default=None,
+        type=parse_hour_tag,
+        help=(
+            "ISO-8601 datetime whose truncated hour names the interval tag stamped on every dataset this run "
+            "writes (format %%Y%%m%%dT%%H%%M%%SZ). A later run in the same hour moves the tag to the newest "
+            "version. Tagged versions are exempt from version cleanup until the pipeline prunes old interval "
+            "tags. Absent disables stamping."
+        ),
+    )
+    parser.add_argument(
         "--spark-batches",
         type=int,
         default=1,
@@ -96,6 +108,7 @@ def run(args: argparse.Namespace) -> None:
             window_start=args.window_start,
             window_end=args.window_end,
             spark_batches=args.spark_batches,
+            tag_stamp=args.tag_stamp,
         )
         IcebergToLanceETL(config).run(spark, args.table, parse_epoch_ms(args.start), parse_epoch_ms(args.end))
     except Exception:

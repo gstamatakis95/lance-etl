@@ -143,6 +143,8 @@ def build_etl_application_args(params: dict[str, str | int]) -> list[str]:
         "{{ dag_run.conf.get('start', data_interval_start) | string }}",
         "--window-end",
         "{{ dag_run.conf.get('end', data_interval_end) | string }}",
+        "--tag-stamp",
+        "{{ data_interval_end | string }}",
     ]
     args += build_dd_tag_flags(params)
     return args

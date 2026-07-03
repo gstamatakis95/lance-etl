@@ -289,3 +289,32 @@ def parse_window_tag(value: str) -> str:
         parsed = parsed.replace(tzinfo=UTC)
     utc: datetime = parsed.astimezone(UTC)
     return utc.strftime("%Y%m%dT%H%M%SZ")
+
+
+def parse_hour_tag(value: str) -> str:
+    """Convert an ISO 8601 datetime string to the UTC interval tag of its truncated hour.
+
+    Like :func:`parse_window_tag` but the minutes, seconds, and microseconds are zeroed before
+    formatting, so any instant within an hour maps to that hour's tag name (for example
+    ``"2026-06-11 12:34:56+00:00"`` becomes ``"20260611T120000Z"``). The ETL uses this to stamp
+    every written dataset with the hour it was produced. The result parses under the same
+    ``%Y%m%dT%H%M%SZ`` format the interval-tag pruning recognizes.
+
+    Args:
+        value: An ISO 8601 datetime string, as templated by Airflow's
+            ``{{ data_interval_end | string }}`` or supplied by an operator.
+
+    Returns:
+        The truncated-hour tag name in ``%Y%m%dT%H%M%SZ`` format.
+
+    Raises:
+        ValueError: If ``value`` cannot be parsed by :func:`datetime.fromisoformat`.
+    """
+    try:
+        parsed: datetime = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"cannot parse {value!r} as an ISO 8601 datetime: {exc}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    truncated: datetime = parsed.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
+    return truncated.strftime("%Y%m%dT%H%M%SZ")

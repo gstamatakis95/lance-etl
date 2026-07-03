@@ -73,6 +73,14 @@ a flip propagates within the TTL. The correct operational sequence is: build the
 prewarm every replica against the green version explicitly (use the `version` or `tag` field in
 `PrewarmRequest`), then flip the tag. Never flip then warm.
 
+Query at a tag (ADR 0032): every search request carries an optional `version_ref` oneof (a
+committed version id or a tag name, such as an ETL hourly interval tag like
+`20260611T120000Z`). Unset follows the serve policy, so the common latest-version path pays
+nothing. A pinned request opens exactly that snapshot: the handle LRU keys on the resolved
+version (the pinned handle coexists with the serve handle), tag resolutions are cached per
+`(uri, tag)` for the serve-tag TTL, and the version-scoped index and metadata caches serve the
+pinned version's entries directly. A hybrid pin opens both legs at the same snapshot.
+
 ---
 
 ## Module map
@@ -238,6 +246,14 @@ lance-etl etl ... \
   --window-end 2024-01-15T12:00:00
 ```
 
+Hourly interval tagging (ADR 0032): with `--tag-stamp <iso datetime>` the run stamps every
+dataset it wrote with the Lance tag of that instant's truncated UTC hour (format
+`%Y%m%dT%H%M%SZ`, for example `20260611T120000Z`). The stamp is create-or-move, so a later run
+in the same hour advances that hour's tag to the newest version. Tagged versions are exempt
+from version cleanup until the pipeline job prunes old interval tags (keep-last 48 by
+default), and the search service can pin a query to any such tag via `version_ref`. The
+Airflow ETL DAG passes `--tag-stamp {{ data_interval_end }}` automatically.
+
 Full `etl` flag reference:
 
 | Flag | Default | Purpose |
@@ -251,6 +267,7 @@ Full `etl` flag reference:
 | `--iceberg-option` | none | Repeatable `key=value` Iceberg read option |
 | `--window-start` | none | Inclusive lower bound for the window pushdown filter |
 | `--window-end` | none | Exclusive upper bound for the window pushdown filter |
+| `--tag-stamp` | none | ISO 8601 datetime whose truncated UTC hour names the interval tag stamped on every written dataset |
 | `--storage-option` | none | Repeatable `key=value` passed to pylance |
 | `--dd-service` | `lance-pipeline` | Datadog service tag |
 | `--dd-env` | `prod` | Datadog env tag |

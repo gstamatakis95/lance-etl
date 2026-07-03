@@ -64,6 +64,11 @@ class ETLConfig:
             the batch size instead of the increment size. Raise this to absorb increments of tens
             of millions of rows per org without raising executor memory limits. 1 (the default)
             processes the whole increment in a single pass.
+        tag_stamp: Pre-formatted interval tag name (``%Y%m%dT%H%M%SZ``, typically the run's
+            truncated hour via ``cliutil.parse_hour_tag``) stamped on every dataset the run
+            wrote, after all batches commit. Create-or-move semantics: a later run in the same
+            hour advances that hour's tag to the newest version, so the tag always marks the
+            latest version produced within its hour. ``None`` (the default) disables stamping.
     """
 
     base_uri: str
@@ -85,6 +90,7 @@ class ETLConfig:
     merge_batch_bytes: int | None = 64 * 1024 * 1024
     data_storage_version: str = "2.1"
     spark_batches: int = 1
+    tag_stamp: str | None = None
 
 
 def stats_schema() -> pa.Schema:

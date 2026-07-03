@@ -54,7 +54,7 @@ impl<P: DatasetProvider> Prewarmer for LanceSearchBackend<P> {
                 resolved_version: 0,
             });
         }
-        let dataset = match self.provider.dataset(target, reference).await {
+        let dataset = match self.provider.dataset_for_prewarm(target, reference).await {
             Ok(dataset) => dataset,
             Err(error) => {
                 self.metrics.prewarm(PrewarmStatus::Error, total_start.elapsed());

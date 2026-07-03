@@ -14,7 +14,7 @@ lance-etl/
       __init__.py         Re-exports: IcebergToLanceETL, ETLConfig, ROUTING_COLS, apply_merge, and helpers
       cli.py              Entry point for lance-etl-etl script and python -m lance_etl.etl
       __main__.py         Calls cli.main()
-      job.py              IcebergToLanceETL: read_increment, collapse, spark_batches split, merge fan-out
+      job.py              IcebergToLanceETL: read_increment, collapse, spark_batches split, merge fan-out, hourly interval-tag stamp (stamp_interval_tags)
       pivot.py            ETLConfig, ROUTING_COLS, pivot_map_columns (returns column roles), group_by_routing, apply_fsl_cast, apply_ttl_cast
       sink.py             The Lance sink seam: apply_merge, table_chunks, build_update_condition, dataset_uri (format 2.1 bootstrap, role writes)
     indexing/             Indexing job package (python -m lance_etl.indexing)

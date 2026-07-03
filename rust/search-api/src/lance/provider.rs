@@ -62,6 +62,21 @@ pub trait DatasetProvider: Send + Sync + 'static {
         reference: DatasetRef,
     ) -> impl Future<Output = Result<Arc<Dataset>, SearchError>> + Send;
 
+    /// Returns an open dataset handle for a PREWARM open of one target.
+    ///
+    /// Identical to [`DatasetProvider::dataset`] except the open carries warm intent: providers
+    /// tracking cold-open telemetry record it as a prewarm instead of a serving open. The
+    /// intent must be explicit because serving requests can pin the same
+    /// [`DatasetRef::Tag`]/[`DatasetRef::Version`] references prewarm uses. The default
+    /// implementation just delegates, for providers without cold-open telemetry.
+    fn dataset_for_prewarm(
+        &self,
+        target: &DatasetTarget,
+        reference: DatasetRef,
+    ) -> impl Future<Output = Result<Arc<Dataset>, SearchError>> + Send {
+        self.dataset(target, reference)
+    }
+
     /// Approximate bytes resident in the shared index cache. Providers without one report 0.
     fn index_cache_size_bytes(&self) -> u64 {
         0
@@ -254,29 +269,23 @@ impl CachingDatasetProvider {
         format!("{base}/{org}/{tenant}/{namespace}.lance")
     }
 
-    /// Resolves a [`DatasetRef`] to the concrete version to open and whether the open is a
-    /// warm-intent (prewarm) pin.
+    /// Resolves a [`DatasetRef`] to the concrete version to open.
     ///
-    /// `Serve` follows the serve policy: the serve tag when `serve_by_tag` is on, else latest, and
-    /// is the only serving (non-warm) reference. `Latest`, `Version`, and `Tag` all come from the
-    /// prewarm path and mark the open as warm-intent, which is how prewarm is distinguished from
-    /// serving for the cold-open telemetry. `Latest` resolves to no version (the `(uri, None)`
-    /// handle key), so a later serving open of the same latest handle reads back the prewarmed
-    /// version and reports `warmed:true`. A returned version of `None` means open the latest
-    /// manifest.
-    async fn resolve_reference(&self, uri: &str, reference: DatasetRef) -> Result<ResolvedRef, SearchError> {
-        let warm_intent = matches!(
-            reference,
-            DatasetRef::Version(_) | DatasetRef::Tag(_) | DatasetRef::Latest
-        );
-        let version = match reference {
+    /// `Serve` follows the serve policy: the serve tag when `serve_by_tag` is on, else latest.
+    /// `Latest` resolves to no version (the `(uri, None)` handle key), so a later serving open
+    /// of the same latest handle reads back a prewarmed version and reports `warmed:true`.
+    /// `Version` and `Tag` pin an explicit committed version, whether the open is a prewarm or
+    /// a serving request pinned by `version_ref` — the open's INTENT is carried separately (see
+    /// [`DatasetProvider::dataset_for_prewarm`]), never inferred from the ref. A returned
+    /// version of `None` means open the latest manifest.
+    async fn resolve_reference(&self, uri: &str, reference: DatasetRef) -> Result<Option<u64>, SearchError> {
+        Ok(match reference {
             DatasetRef::Latest => None,
             DatasetRef::Serve if !self.serve_by_tag => None,
             DatasetRef::Serve => Some(self.resolve_tag_version(uri, &self.serve_tag).await?),
             DatasetRef::Version(version) => Some(version),
             DatasetRef::Tag(tag) => Some(self.resolve_tag_version(uri, &tag).await?),
-        };
-        Ok(ResolvedRef { version, warm_intent })
+        })
     }
 
     /// Resolves a tag to its committed version, trusting a cached resolution for the serve-tag TTL.
@@ -330,15 +339,6 @@ impl CachingDatasetProvider {
             self.metrics.serve_cold_open(warmed);
         }
     }
-}
-
-/// A [`DatasetRef`] resolved against the serve policy: the concrete version to open (`None` means
-/// latest) and whether the open is a warm-intent (prewarm) pin.
-struct ResolvedRef {
-    /// The committed version to open, or `None` to open the latest manifest.
-    version: Option<u64>,
-    /// True when the open came from an explicit version/tag pin (prewarm), false for serving.
-    warm_intent: bool,
 }
 
 /// The constructed persistent cache tiers plus the raw disk stores the janitor sweeps.
@@ -425,11 +425,14 @@ async fn build_redis_caches(config: &Config, metrics: Arc<Metrics>) -> Result<Bu
     })
 }
 
-impl DatasetProvider for CachingDatasetProvider {
+impl CachingDatasetProvider {
     /// Returns an open dataset handle for one target, opening and caching it on a miss.
     ///
     /// Concurrent requests for the same URI coalesce onto a single open via the Moka future
-    /// cache.
+    /// cache. `warm_intent` states whether the open came from the prewarm path (recorded as
+    /// the warmed version) or from serving (compared against the warmed version for the
+    /// `serve.cold_open` metric) — it is passed explicitly by the two trait entry points
+    /// because serving requests can pin the same tag/version references prewarm uses.
     #[tracing::instrument(
         name = "provider.dataset",
         skip_all,
@@ -441,16 +444,20 @@ impl DatasetProvider for CachingDatasetProvider {
             cache.dataset_handle_hit = tracing::field::Empty,
         )
     )]
-    async fn dataset(&self, target: &DatasetTarget, reference: DatasetRef) -> Result<Arc<Dataset>, SearchError> {
+    async fn open(
+        &self,
+        target: &DatasetTarget,
+        reference: DatasetRef,
+        warm_intent: bool,
+    ) -> Result<Arc<Dataset>, SearchError> {
         target.validate()?;
         let started = std::time::Instant::now();
         let uri = self.dataset_uri(target);
-        let resolved = self.resolve_reference(&uri, reference).await?;
-        let key = (uri.clone(), resolved.version);
+        let version = self.resolve_reference(&uri, reference).await?;
+        let key = (uri.clone(), version);
         let session = self.session.clone();
         let open_uri = uri.clone();
         let store_params = self.store_params.clone();
-        let version = resolved.version;
         let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let opened_flag = opened.clone();
         let result = self
@@ -477,9 +484,25 @@ impl DatasetProvider for CachingDatasetProvider {
         if cold && let Ok(dataset) = &result {
             let opened_version = dataset.version_id();
             tracing::Span::current().record("dataset.version", opened_version);
-            self.record_cold_open(&uri, opened_version, resolved.warm_intent).await;
+            self.record_cold_open(&uri, opened_version, warm_intent).await;
         }
         result
+    }
+}
+
+impl DatasetProvider for CachingDatasetProvider {
+    /// Returns an open dataset handle for a serving open, counting cold-open telemetry.
+    async fn dataset(&self, target: &DatasetTarget, reference: DatasetRef) -> Result<Arc<Dataset>, SearchError> {
+        self.open(target, reference, false).await
+    }
+
+    /// Returns an open dataset handle for a prewarm open, recording the warmed version.
+    async fn dataset_for_prewarm(
+        &self,
+        target: &DatasetTarget,
+        reference: DatasetRef,
+    ) -> Result<Arc<Dataset>, SearchError> {
+        self.open(target, reference, true).await
     }
 
     /// Approximate bytes resident in the shared index cache (memory tier plus persistent tier).

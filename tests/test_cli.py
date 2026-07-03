@@ -15,7 +15,7 @@ import lance_etl.indexing.cli as indexing_cli
 import lance_etl.maintenance.cli as maintenance_cli
 import lance_etl.pipeline.cli as pipeline_cli
 import lance_etl.tools.cli as tools_cli
-from lance_etl.cliutil import parse_key_values, parse_window_tag
+from lance_etl.cliutil import parse_hour_tag, parse_key_values, parse_window_tag
 
 
 def test_help_exits_zero() -> None:
@@ -84,6 +84,18 @@ def test_etl_spark_batches_is_parsed_as_int() -> None:
     """``--spark-batches 8`` parses to the integer batch count."""
     args = etl_cli.build_parser().parse_args([*REQUIRED_ETL_ARGV, "--spark-batches", "8"])
     assert args.spark_batches == 8
+
+
+def test_etl_tag_stamp_defaults_off() -> None:
+    """Without the flag, ``--tag-stamp`` is None so the ETL stamps no tags."""
+    args = etl_cli.build_parser().parse_args(REQUIRED_ETL_ARGV)
+    assert args.tag_stamp is None
+
+
+def test_etl_tag_stamp_truncates_to_the_hour() -> None:
+    """``--tag-stamp`` converts an Airflow datetime through parse_hour_tag."""
+    args = etl_cli.build_parser().parse_args([*REQUIRED_ETL_ARGV, "--tag-stamp", "2026-06-11 12:34:56+00:00"])
+    assert args.tag_stamp == "20260611T120000Z"
 
 
 REQUIRED_MAINTENANCE_RUN_ARGV: list[str] = [
@@ -351,3 +363,33 @@ def test_parse_window_tag_garbage_raises() -> None:
     """parse_window_tag raises ValueError on unparseable input."""
     with pytest.raises(ValueError, match="cannot parse"):
         parse_window_tag("not-a-date")
+
+
+def test_parse_hour_tag_truncates_minutes_and_seconds() -> None:
+    """parse_hour_tag zeroes minutes, seconds, and microseconds before formatting."""
+    result: str = parse_hour_tag("2026-06-11T12:34:56.789+00:00")
+    assert result == "20260611T120000Z"
+
+
+def test_parse_hour_tag_on_the_hour_is_identity() -> None:
+    """An instant already on the hour maps to that hour's tag."""
+    result: str = parse_hour_tag("2026-06-11 12:00:00+00:00")
+    assert result == "20260611T120000Z"
+
+
+def test_parse_hour_tag_converts_to_utc_before_truncating() -> None:
+    """A non-UTC instant is converted to UTC first, then truncated."""
+    result: str = parse_hour_tag("2026-06-11T14:45:00+02:00")
+    assert result == "20260611T120000Z"
+
+
+def test_parse_hour_tag_naive_treated_as_utc() -> None:
+    """A naive datetime is treated as UTC."""
+    result: str = parse_hour_tag("2026-06-11T12:59:59")
+    assert result == "20260611T120000Z"
+
+
+def test_parse_hour_tag_garbage_raises() -> None:
+    """parse_hour_tag raises ValueError on unparseable input."""
+    with pytest.raises(ValueError, match="cannot parse"):
+        parse_hour_tag("not-a-date")

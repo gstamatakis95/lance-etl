@@ -15,9 +15,18 @@ use arrow_schema::{DataType, Field, Schema};
 use common::{DIM, TEST_DATASET_PATH, build_indexed_dataset, test_config, test_target};
 use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
-use search_api::domain::{DatasetRef, SearchBackend, VectorQuery};
-use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
+use search_api::config::Config;
+use search_api::domain::{DatasetRef, HybridQuery, SearchBackend, TextQuery, VectorQuery};
+use search_api::lance::{CachingDatasetProvider, DatasetProvider, LanceSearchBackend};
 use tempfile::TempDir;
+
+/// Like [`test_config`] but serving through the `prod` tag.
+fn serve_by_tag_config(data_root: &std::path::Path, cache_root: &std::path::Path) -> Config {
+    let mut config = test_config(data_root, cache_root);
+    config.serve_by_tag = true;
+    config.serve_tag = "prod".to_string();
+    config
+}
 
 /// A small nearest-neighbor probe using flat search (no index required), identical to the probe
 /// in `blue_green.rs` so the dataset helpers can be shared without modification.
@@ -211,6 +220,155 @@ async fn older_tag_remains_queryable_after_a_later_commit() {
         at_old_tag.dataset_version != at_latest.dataset_version,
         "the old tag and latest must resolve to different versions"
     );
+}
+
+#[tokio::test]
+async fn text_search_at_tag_pins_the_tagged_version() {
+    let data_tmp = TempDir::new().unwrap();
+    let cache_tmp = TempDir::new().unwrap();
+    let uri = format!("file-object-store://{}/{TEST_DATASET_PATH}", data_tmp.path().display());
+    build_indexed_dataset(&uri).await;
+
+    let dataset = Dataset::open(&uri).await.unwrap();
+    let tagged = dataset.version_id();
+    dataset.tags().create("t1", tagged).await.unwrap();
+    let plain_uri = format!("{}/{TEST_DATASET_PATH}", data_tmp.path().display());
+    append_rows(&plain_uri).await;
+    let latest = Dataset::open(&plain_uri).await.unwrap().version_id();
+    assert!(latest > tagged, "append must produce a newer version");
+
+    let config = test_config(data_tmp.path(), cache_tmp.path());
+    let provider = CachingDatasetProvider::with_inner_store_wrapper(&config, None).await;
+    let backend = LanceSearchBackend::new(provider);
+    let target = test_target();
+
+    let mut query = TextQuery::simple("lemon", 4);
+    query.reference = DatasetRef::Tag("t1".to_string());
+    let at_tag = backend.text_search(&target, query).await.unwrap();
+    assert_eq!(
+        at_tag.dataset_version,
+        Some(tagged),
+        "tag-pinned text search must open the tagged snapshot"
+    );
+    assert_eq!(at_tag.hits.len(), 1, "the tagged snapshot must serve FTS hits");
+
+    let at_serve = backend
+        .text_search(&target, TextQuery::simple("lemon", 4))
+        .await
+        .unwrap();
+    assert_eq!(
+        at_serve.dataset_version,
+        Some(latest),
+        "an unset reference must serve the latest version"
+    );
+}
+
+#[tokio::test]
+async fn hybrid_search_at_tag_opens_both_legs_at_the_pinned_snapshot() {
+    let data_tmp = TempDir::new().unwrap();
+    let cache_tmp = TempDir::new().unwrap();
+    let uri = format!("file-object-store://{}/{TEST_DATASET_PATH}", data_tmp.path().display());
+    build_indexed_dataset(&uri).await;
+
+    let dataset = Dataset::open(&uri).await.unwrap();
+    let tagged = dataset.version_id();
+    dataset.tags().create("t1", tagged).await.unwrap();
+    let plain_uri = format!("{}/{TEST_DATASET_PATH}", data_tmp.path().display());
+    append_rows(&plain_uri).await;
+
+    let config = test_config(data_tmp.path(), cache_tmp.path());
+    let provider = CachingDatasetProvider::with_inner_store_wrapper(&config, None).await;
+    let backend = LanceSearchBackend::new(provider);
+    let target = test_target();
+
+    let query = HybridQuery {
+        vector: probe_with_ref(DatasetRef::Serve),
+        text: TextQuery::simple("lemon", 4),
+        k: 4,
+        fusion: Default::default(),
+        reference: DatasetRef::Tag("t1".to_string()),
+    };
+    let outcome = backend.hybrid_search(&target, query).await.unwrap();
+    assert_eq!(
+        outcome.dataset_version,
+        Some(tagged),
+        "a hybrid search pinned to a tag must fuse both legs at the tagged snapshot"
+    );
+    assert!(!outcome.hits.is_empty(), "the pinned snapshot must produce fused hits");
+}
+
+#[tokio::test]
+async fn serve_by_tag_resolves_the_serve_tag_while_an_explicit_tag_overrides_it() {
+    let data_tmp = TempDir::new().unwrap();
+    let cache_tmp = TempDir::new().unwrap();
+    let uri = format!("file-object-store://{}/{TEST_DATASET_PATH}", data_tmp.path().display());
+    build_indexed_dataset(&uri).await;
+
+    let dataset = Dataset::open(&uri).await.unwrap();
+    let prod_version = dataset.version_id();
+    dataset.tags().create("prod", prod_version).await.unwrap();
+    dataset.tags().create("t1", 1u64).await.unwrap();
+    let plain_uri = format!("{}/{TEST_DATASET_PATH}", data_tmp.path().display());
+    append_rows(&plain_uri).await;
+
+    let config = serve_by_tag_config(data_tmp.path(), cache_tmp.path());
+    let provider = CachingDatasetProvider::with_inner_store_wrapper(&config, None).await;
+    let backend = LanceSearchBackend::new(provider);
+    let target = test_target();
+
+    let at_serve = backend
+        .vector_search(&target, probe_with_ref(DatasetRef::Serve))
+        .await
+        .unwrap();
+    assert_eq!(
+        at_serve.dataset_version,
+        Some(prod_version),
+        "Serve with serve-by-tag on must resolve the prod tag, not latest"
+    );
+
+    let at_pin = backend
+        .vector_search(&target, probe_with_ref(DatasetRef::Tag("t1".to_string())))
+        .await
+        .unwrap();
+    assert_eq!(
+        at_pin.dataset_version,
+        Some(1),
+        "an explicit tag pin must override the serve policy"
+    );
+}
+
+#[tokio::test]
+async fn pinned_tag_and_serve_handles_coexist_in_the_handle_cache() {
+    let data_tmp = TempDir::new().unwrap();
+    let cache_tmp = TempDir::new().unwrap();
+    let uri = format!("file-object-store://{}/{TEST_DATASET_PATH}", data_tmp.path().display());
+    build_indexed_dataset(&uri).await;
+
+    let dataset = Dataset::open(&uri).await.unwrap();
+    dataset.tags().create("t1", 1u64).await.unwrap();
+
+    let config = test_config(data_tmp.path(), cache_tmp.path());
+    let provider = CachingDatasetProvider::with_inner_store_wrapper(&config, None).await;
+    let target = test_target();
+
+    provider.dataset(&target, DatasetRef::Serve).await.unwrap();
+    provider
+        .dataset(&target, DatasetRef::Tag("t1".to_string()))
+        .await
+        .unwrap();
+    let (entries, _) = provider.handle_cache_stats().await;
+    assert_eq!(
+        entries, 2,
+        "the serve handle and the tag-pinned handle must coexist under distinct version keys"
+    );
+
+    provider.dataset(&target, DatasetRef::Serve).await.unwrap();
+    provider
+        .dataset(&target, DatasetRef::Tag("t1".to_string()))
+        .await
+        .unwrap();
+    let (entries_after, _) = provider.handle_cache_stats().await;
+    assert_eq!(entries_after, 2, "repeat opens must reuse the cached handles");
 }
 
 #[tokio::test]

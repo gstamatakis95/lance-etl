@@ -40,3 +40,4 @@ The companion narrative, with the live-verified numbers and the stale-branch cor
 | [0029](0029-all-indexes-distributed-segments.md) | Every index builds distributed through segments, scalar roles auto-index | Accepted |
 | [0030](0030-streaming-kmeans-bootstrap.md) | Streaming k-means bootstrap for IVF_RQ vector indexes | Accepted |
 | [0031](0031-pluggable-cache-backend.md) | Pluggable cache backend for the search service (disk, redis, memory) | Accepted |
+| [0032](0032-hourly-interval-tags-and-query-pinning.md) | Hourly interval tags at ETL write time and per-query tag pinning | Accepted |

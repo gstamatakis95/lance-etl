@@ -66,7 +66,8 @@ from lance_etl.etl.pivot import (
     stats_schema,
     stats_spark_ddl,
 )
-from lance_etl.etl.sink import apply_merge
+from lance_etl.etl.sink import apply_merge, dataset_uri
+from lance_etl.maintenance.tools import update_serving_tags
 from lance_etl.telemetry import Telemetry
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -394,7 +395,9 @@ class IcebergToLanceETL:
         routing key, pivot+cast+merge on executors. Batches run sequentially as separate Spark
         jobs, so executor memory needs scale with the batch size instead of the increment size —
         an org increment of 50M+ rows is absorbed by raising ``spark_batches``, not memory limits.
-        Null routing rows are counted as ``dataset.null_routing_rows``.
+        Null routing rows are counted as ``dataset.null_routing_rows``. After all batches commit,
+        every written dataset is stamped with the configured interval tag
+        (:meth:`stamp_interval_tags`).
 
         Args:
             source: A source DataFrame carrying the operation column.
@@ -445,3 +448,37 @@ class IcebergToLanceETL:
                 upserted,
                 deleted,
             )
+            self.stamp_interval_tags(source.sparkSession, seen_datasets, driver_telemetry)
+
+    def stamp_interval_tags(
+        self, spark: SparkSession, seen_datasets: set[tuple[str, ...]], telemetry: Telemetry
+    ) -> None:
+        """Stamp the configured interval tag on every dataset this run wrote.
+
+        Runs once on the driver after all batches commit (never inside the executor-side
+        merges, which touch one dataset from multiple partitions) and fans the create-or-move
+        tag update out per dataset via :func:`~lance_etl.maintenance.tools.update_serving_tags`
+        at each dataset's latest version. A second run within the same hour moves that hour's
+        tag forward, so the tag always marks the hour's newest version. Skipped when
+        ``config.tag_stamp`` is unset or the run wrote nothing.
+
+        Args:
+            spark: Active Spark session.
+            seen_datasets: Routing keys of every dataset the run wrote.
+            telemetry: The driver telemetry facade.
+        """
+        config: ETLConfig = self.config
+        if config.tag_stamp is None or not seen_datasets:
+            return
+        uris: list[str] = sorted(dataset_uri(config, *key) for key in seen_datasets)
+        logger.info("stamping interval tag %r on %d datasets", config.tag_stamp, len(uris))
+        with telemetry.timed("run.tag_stamp_ms"):
+            results: list[dict[str, Any]] = update_serving_tags(
+                spark,
+                uris,
+                config.telemetry,
+                config.storage_options,
+                tag=config.tag_stamp,
+                partitions=config.num_partitions,
+            )
+        telemetry.gauge("run.tags_stamped", len(results))
