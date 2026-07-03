@@ -45,41 +45,43 @@ pub fn prewarm_ref_from_proto(request: &pb::PrewarmRequest) -> DatasetRef {
     }
 }
 
-/// Maps the `version_ref` oneof of a [`pb::VectorSearchRequest`] onto a [`DatasetRef`].
+/// Defines one `version_ref` oneof mapper per search request type.
 ///
-/// An unset selector defaults to [`DatasetRef::Serve`] (follow the serve policy), preserving the
-/// behavior of existing clients that never set the field.
-pub fn vector_search_ref_from_proto(version_ref: &Option<pb::vector_search_request::VersionRef>) -> DatasetRef {
-    match version_ref {
-        Some(pb::vector_search_request::VersionRef::Version(v)) => DatasetRef::Version(*v),
-        Some(pb::vector_search_request::VersionRef::Tag(t)) => DatasetRef::Tag(t.clone()),
-        None => DatasetRef::Serve,
-    }
+/// The three generated oneof types are structurally identical but distinct Rust types, so one
+/// macro emits the identical `Version`/`Tag`/unset mapping for each. An unset selector defaults
+/// to [`DatasetRef::Serve`] (follow the serve policy), preserving the behavior of existing
+/// clients that never set the field.
+macro_rules! search_ref_from_proto {
+    ($(#[$doc:meta])* $name:ident, $oneof:path) => {
+        $(#[$doc])*
+        pub fn $name(version_ref: &Option<$oneof>) -> DatasetRef {
+            use $oneof as Oneof;
+            match version_ref {
+                Some(Oneof::Version(version)) => DatasetRef::Version(*version),
+                Some(Oneof::Tag(tag)) => DatasetRef::Tag(tag.clone()),
+                None => DatasetRef::Serve,
+            }
+        }
+    };
 }
 
-/// Maps the `version_ref` oneof of a [`pb::TextSearchRequest`] onto a [`DatasetRef`].
-///
-/// An unset selector defaults to [`DatasetRef::Serve`] (follow the serve policy), preserving the
-/// behavior of existing clients that never set the field.
-pub fn text_search_ref_from_proto(version_ref: &Option<pb::text_search_request::VersionRef>) -> DatasetRef {
-    match version_ref {
-        Some(pb::text_search_request::VersionRef::Version(v)) => DatasetRef::Version(*v),
-        Some(pb::text_search_request::VersionRef::Tag(t)) => DatasetRef::Tag(t.clone()),
-        None => DatasetRef::Serve,
-    }
-}
+search_ref_from_proto!(
+    /// Maps the `version_ref` oneof of a [`pb::VectorSearchRequest`] onto a [`DatasetRef`].
+    vector_search_ref_from_proto,
+    pb::vector_search_request::VersionRef
+);
 
-/// Maps the `version_ref` oneof of a [`pb::HybridSearchRequest`] onto a [`DatasetRef`].
-///
-/// An unset selector defaults to [`DatasetRef::Serve`] (follow the serve policy), preserving the
-/// behavior of existing clients that never set the field.
-pub fn hybrid_search_ref_from_proto(version_ref: &Option<pb::hybrid_search_request::VersionRef>) -> DatasetRef {
-    match version_ref {
-        Some(pb::hybrid_search_request::VersionRef::Version(v)) => DatasetRef::Version(*v),
-        Some(pb::hybrid_search_request::VersionRef::Tag(t)) => DatasetRef::Tag(t.clone()),
-        None => DatasetRef::Serve,
-    }
-}
+search_ref_from_proto!(
+    /// Maps the `version_ref` oneof of a [`pb::TextSearchRequest`] onto a [`DatasetRef`].
+    text_search_ref_from_proto,
+    pb::text_search_request::VersionRef
+);
+
+search_ref_from_proto!(
+    /// Maps the `version_ref` oneof of a [`pb::HybridSearchRequest`] onto a [`DatasetRef`].
+    hybrid_search_ref_from_proto,
+    pb::hybrid_search_request::VersionRef
+);
 
 /// Converts a proto clusters request into the domain spec (the target travels separately).
 pub fn cluster_spec_from_proto(request: &pb::ClustersRequest) -> ClusterSpec {

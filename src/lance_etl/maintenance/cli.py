@@ -4,7 +4,7 @@ Exposes the ``main()`` entry point consumed by the ``lance-etl-maintenance`` scr
 ``python -m lance_etl.maintenance``.  Three subcommands are provided.
 
 ``run`` applies maintenance to a fleet of datasets: per-row TTL expiration (when ``--ttl-column``
-names a per-row TTL column), two-tier distributed compaction, and version cleanup in that order.
+names a per-row TTL column), unified distributed compaction, and version cleanup in that order.
 
 ``tag`` flips a serving tag (default ``HEAD``) to a target dataset version for blue-green
 promotion.  With no ``--tag-version`` the tag is moved to each dataset's latest version.
@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
         description=(
             "Run maintenance operations on Lance datasets: per-row TTL expiration, "
-            "two-tier compaction, version cleanup, serving-tag promotion, and V2 manifest migration."
+            "distributed compaction, version cleanup, serving-tag promotion, and V2 manifest migration."
         )
     )
     parser.add_argument("--log-level", default="INFO")
@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
         "run",
         help=(
             "Per-dataset maintenance: per-row TTL expiration (when --ttl-column is set), "
-            "two-tier distributed compaction, and version cleanup, in that order."
+            "unified distributed compaction, and version cleanup, in that order."
         ),
     )
     add_common_arguments(run_parser)

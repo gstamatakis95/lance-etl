@@ -241,10 +241,10 @@ impl CachingDatasetProvider {
     /// expiry and capacity are handled by the Redis server (native TTL plus `maxmemory`) or by
     /// Moka respectively.
     pub fn janitor(&self, config: &Config) -> Option<CacheJanitor> {
-        let (index_store, store_store) = self.disk_stores.clone()?;
+        let (index_store, metadata_store) = self.disk_stores.clone()?;
         Some(CacheJanitor::new(
             index_store,
-            store_store,
+            metadata_store,
             Duration::from_secs(crate::config::DEFAULT_DISK_CACHE_TTL_SECS),
             config.disk_index_cache_bytes,
             config.disk_store_cache_bytes,
@@ -366,17 +366,17 @@ impl BuiltCaches {
 fn build_disk_caches(config: &Config, metrics: Arc<Metrics>) -> std::io::Result<BuiltCaches> {
     let root = prepare_cache_root(&config.cache_dir)?;
     let index_store = Arc::new(DiskEntryStore::open(root.join("index"))?);
-    let store_store = Arc::new(DiskEntryStore::open(root.join("store"))?);
+    let metadata_store = Arc::new(DiskEntryStore::open(root.join("store"))?);
     let index_backend = HybridIndexCacheBackend::new(index_store.clone(), config.index_cache_bytes, metrics.clone());
     let store_cache = MetadataByteCache::new(
-        store_store.clone(),
+        metadata_store.clone(),
         crate::config::DEFAULT_STORE_CACHE_MAX_RANGE_BYTES,
         metrics,
     );
     Ok(BuiltCaches {
         index_cache: Some(Arc::new(index_backend)),
         store_cache: Some(Arc::new(store_cache)),
-        disk_stores: Some((index_store, store_store)),
+        disk_stores: Some((index_store, metadata_store)),
     })
 }
 
@@ -404,7 +404,7 @@ async fn build_redis_caches(config: &Config, metrics: Arc<Metrics>) -> Result<Bu
         )
         .await?,
     );
-    let store_store = Arc::new(
+    let metadata_store = Arc::new(
         RedisEntryStore::connect(
             url,
             &config.redis_namespace,
@@ -417,7 +417,11 @@ async fn build_redis_caches(config: &Config, metrics: Arc<Metrics>) -> Result<Bu
     );
     drop(index_store.spawn_registry_hygiene(Duration::from_secs(crate::config::REDIS_REGISTRY_HYGIENE_SECS)));
     let index_backend = HybridIndexCacheBackend::new(index_store, config.index_cache_bytes, metrics.clone());
-    let store_cache = MetadataByteCache::new(store_store, crate::config::DEFAULT_STORE_CACHE_MAX_RANGE_BYTES, metrics);
+    let store_cache = MetadataByteCache::new(
+        metadata_store,
+        crate::config::DEFAULT_STORE_CACHE_MAX_RANGE_BYTES,
+        metrics,
+    );
     Ok(BuiltCaches {
         index_cache: Some(Arc::new(index_backend)),
         store_cache: Some(Arc::new(store_cache)),

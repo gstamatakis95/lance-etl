@@ -26,9 +26,9 @@ const TMP_MARKER: &str = ".tmp-";
 
 /// File name of the per-object `ObjectMeta` sidecar written by the store cache.
 ///
-/// Sidecars are excluded from residency accounting and from the sweep's eviction set: they are
-/// never inserted through `record_insert`, so counting them in `dir_stats` would make the in-process
-/// gauges diverge from the on-disk reality. Lone sidecars are reclaimed by `prune_empty_dirs`.
+/// Sidecars are excluded from residency accounting and from the sweep's eviction set, so
+/// counting them in `dir_stats` would make the in-process gauges diverge from the on-disk
+/// reality. Lone sidecars are reclaimed by `prune_empty_dirs`.
 pub const META_FILE: &str = "meta.json";
 
 /// Returns the stamp directory name combining our schema version and the lance version.

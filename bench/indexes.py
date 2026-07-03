@@ -4,7 +4,7 @@ Four index stages run sequentially over all per-tenant datasets so each index ty
 IVF_RQ on ``vector`` (sweepable ``--num-partitions``, defaulting to the indexer's size-aware policy), BTREE on
 ``vector_id``, BITMAP on the low-cardinality ``category`` column, and INVERTED (BM25) on ``text``. The ``vector`` and
 ``text`` columns are the concrete columns the ETL pivots out of the source ``vectors`` and ``texts`` maps, so the index
-handlers target them by name exactly as for any other concrete column. Each stage uses the production two-tier
+handlers target them by name exactly as for any other concrete column. Each stage uses the production unified fleet
 orchestration in ``lance_etl.indexing`` unchanged. When ``--no-text`` is set the FTS stage is omitted entirely so no
 INVERTED index is built and the three-index vector-only layout is correct.
 

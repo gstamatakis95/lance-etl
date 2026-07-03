@@ -95,9 +95,6 @@ pub trait Prewarmer: Send + Sync + 'static {
     /// for clients that send no version), an explicit [`DatasetRef::Version`], or a
     /// [`DatasetRef::Tag`] resolved at warm time. Pinning a version is what lets an operator warm
     /// a green build into every replica before flipping the serve tag onto it.
-    ///
-    /// The target must address exactly one dataset: a date range, when present, has to cover a
-    /// single day.
     fn prewarm(
         &self,
         target: &DatasetTarget,

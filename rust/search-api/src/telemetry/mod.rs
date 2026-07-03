@@ -41,11 +41,15 @@
 //!   create or delete. All three carry fixed low-cardinality Lance enums only, never a uri or path.
 //!
 //! Caches and handles ([`metrics::Metrics::cache_lookup`], `cache_insert_bytes`,
-//! `cache_disk_gauges`, `cache_evictions`, `cache_serialize_error`, `dataset_open`,
-//! `dataset_handles`, `dataset_handles_weighted`):
-//! - `cache.lookup` (count, tagged `cache`/`tier`/`outcome`), `cache.insert_bytes` (count),
-//!   `cache.disk.bytes` + `cache.disk.entries` (gauges, tagged `cache`), `cache.evictions`
-//!   (count, tagged `cache`/`reason`), `cache.serialize_errors` (count, tagged `cache`).
+//! `cache_backend_error`, `cache_disk_gauges`, `cache_sweep`, `cache_evictions`,
+//! `cache_serialize_error`, `dataset_open`, `dataset_handles`, `dataset_handles_weighted`):
+//! - `cache.lookup` (count, tagged `cache`/`tier`/`outcome`), `cache.insert_bytes` (count,
+//!   tagged `cache`/`tier`), `cache.backend_errors` (count, tagged `cache`/`op`: persistent-store
+//!   operations that degraded to a miss or dropped write, emitted by the Redis backend),
+//!   `cache.disk.bytes` + `cache.disk.entries` (gauges, tagged `cache`, disk backend only —
+//!   published by the janitor sweep), `cache.sweep.duration_ms` + `cache.sweep.removed`
+//!   (distributions, tagged `cache`, disk backend only), `cache.evictions` (count, tagged
+//!   `cache`/`reason`), `cache.serialize_errors` (count, tagged `cache`).
 //! - `dataset.open.duration_ms` (distribution, tagged `cold`), `cache.handles.entries` (gauge:
 //!   open-handle LRU entry count), `cache.handles.weighted_size` (gauge: open-handle LRU total
 //!   weighted size against the configured weighted capacity).

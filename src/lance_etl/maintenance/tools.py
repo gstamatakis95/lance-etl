@@ -76,8 +76,8 @@ def migrate_manifest_paths(
 ) -> list[dict[str, Any]]:
     """Migrate a fleet of datasets to V2 manifest paths, one task per executor partition.
 
-    Each dataset is independent, so the migration fans out across executors exactly like
-    the compaction small tier. The per-dataset call is idempotent, so a retried task
+    Each dataset is independent, so the migration fans out across executors through the
+    shared per-dataset fan-out. The per-dataset call is idempotent, so a retried task
     converges instead of corrupting state. This is a maintenance operation: run it only
     with the targeted datasets quiesced.
 

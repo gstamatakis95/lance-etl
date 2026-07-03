@@ -27,9 +27,9 @@ pub(crate) const VECTOR_DETAILS_SUFFIX: &str = "VectorIndexDetails";
 /// into an empty report without opening the dataset, since opening is the only thing that warms
 /// metadata.
 ///
-/// Memory budget note: BTree/IVF prewarm loads every page/partition. With the disk index cache
+/// Memory budget note: BTree/IVF prewarm loads every page/partition. With a persistent cache
 /// backend the in-memory hot tier evicts under its Moka budget while the serialized copies stay
-/// on disk, which is exactly the desired outcome for cold-process warmups.
+/// in the persistent store, which is exactly the desired outcome for cold-process warmups.
 impl<P: DatasetProvider> Prewarmer for LanceSearchBackend<P> {
     #[tracing::instrument(
         name = "backend.prewarm",

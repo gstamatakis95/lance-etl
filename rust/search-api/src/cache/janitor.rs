@@ -17,7 +17,7 @@ use crate::telemetry::{CacheName, EvictionReason, Metrics};
 /// post-sweep residency gauges and eviction counters to Datadog.
 pub struct CacheJanitor {
     index_store: Arc<DiskEntryStore>,
-    store_store: Arc<DiskEntryStore>,
+    metadata_store: Arc<DiskEntryStore>,
     ttl: Duration,
     index_budget_bytes: u64,
     store_budget_bytes: u64,
@@ -28,7 +28,7 @@ impl CacheJanitor {
     /// Creates a janitor over the two disk tiers' stores.
     pub fn new(
         index_store: Arc<DiskEntryStore>,
-        store_store: Arc<DiskEntryStore>,
+        metadata_store: Arc<DiskEntryStore>,
         ttl: Duration,
         index_budget_bytes: u64,
         store_budget_bytes: u64,
@@ -36,7 +36,7 @@ impl CacheJanitor {
     ) -> Self {
         Self {
             index_store,
-            store_store,
+            metadata_store,
             ttl,
             index_budget_bytes,
             store_budget_bytes,
@@ -50,7 +50,7 @@ impl CacheJanitor {
     /// that tier's own directory walk.
     pub async fn sweep_once(&self) {
         let index_store = self.index_store.clone();
-        let store_store = self.store_store.clone();
+        let metadata_store = self.metadata_store.clone();
         let ttl = self.ttl;
         let index_budget = self.index_budget_bytes;
         let store_budget = self.store_budget_bytes;
@@ -59,7 +59,7 @@ impl CacheJanitor {
             let index_stats = index_store.sweep(ttl, index_budget);
             let index_elapsed = index_started.elapsed();
             let store_started = Instant::now();
-            let store_stats = store_store.sweep(ttl, store_budget);
+            let store_stats = metadata_store.sweep(ttl, store_budget);
             let store_elapsed = store_started.elapsed();
             (index_stats, index_elapsed, store_stats, store_elapsed)
         })

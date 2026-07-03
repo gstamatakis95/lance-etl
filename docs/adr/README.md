@@ -1,43 +1,55 @@
-# Architecture Decision Records
+# Architecture decisions
 
-This directory records the load-bearing decisions behind lance-etl. Each ADR is immutable once accepted. A
-later decision that reverses an earlier one gets its own ADR and the old one is marked Superseded or Rejected.
+The decisions behind lance-etl are consolidated into six thematic documents. Inside each
+document, every still-relevant decision keeps its original ADR number as a section heading, so
+a reference like "ADR 0030" anywhere in the code or docs resolves through the table below.
+Superseded decisions are one-line notes in their home document. The evidence behind the
+decisions lives in [`../../market-research/`](../../market-research).
 
-The companion narrative, with the live-verified numbers and the stale-branch correction episode, is in
-[`../FINDINGS.md`](../FINDINGS.md). The evidence behind each ADR lives in
-[`../../market-research/`](../../market-research).
+The six documents:
 
-| ADR | Title | Status |
-|---|---|---|
-| [0001](0001-distributed-indexing-segment-api.md) | Distributed indexing via the Lance segment API | Accepted |
-| [0002](0002-two-tier-compaction-orchestration.md) | Two-tier compaction orchestration (30k-org power law) | Superseded by [0028](0028-unified-task-fleet-orchestration.md) |
-| [0003](0003-read-increment-snapshot-bounds.md) | Incremental Iceberg reads via snapshot-id bounds | Accepted |
-| [0004](0004-dynamic-partition-targets.md) | Dynamic write-partition targets and duplicate semantics | Accepted |
-| [0005](0005-rust-grpc-layering-typed-filter.md) | Rust gRPC service layering and the typed filter AST | Accepted |
-| [0006](0006-date-range-fanout-dedup.md) | Date-range fan-out search with dedup-keep-best | Superseded by [0014](0014-drop-by-date-partitioning.md) |
-| [0007](0007-disk-cache-and-prewarm.md) | Disk-backed index/metadata cache and the Prewarm RPC | Accepted |
-| [0008](0008-observability-and-recall-audit.md) | Datadog observability, trace taps, and recall auditing | Accepted |
-| [0009](0009-compaction-index-coexistence.md) | Index-vs-compaction coexistence and the orphan-race guard | Accepted |
-| [0010](0010-stable-row-ids-rejected.md) | Move-stable row IDs | Rejected |
-| [0011](0011-ingested-at-column.md) | The `_ingested_at` ingestion-timestamp column | Superseded by [0016](0016-event-time-canonical-clock.md) |
-| [0012](0012-v2-manifest-paths.md) | V2 manifest paths fleet-wide | Accepted |
-| [0013](0013-blue-green-serving.md) | Tag-based blue/green serving | Proposed |
-| [0014](0014-drop-by-date-partitioning.md) | Drop by-date partitioning and cross-date fan-out | Accepted |
-| [0015](0015-cli-and-config-knob-reduction.md) | CLI and config knob reduction: opinionated defaults | Accepted |
-| [0016](0016-event-time-canonical-clock.md) | Event-time canonical clock: remove `_ingested_at`, use source event timestamp | Accepted |
-| [0017](0017-rust-intake-service.md) | Rust intake service with a pluggable record sink | Accepted |
-| [0018](0018-ttl-expiration.md) | TTL data-expiration by event age | Accepted |
-| [0019](0019-namespace-migrate-utility.md) | Namespace copy/migrate utility | Accepted |
-| [0020](0020-map-pivot-to-concrete-columns.md) | Pivot named vectors and texts out of maps into concrete indexable columns | Superseded by [0024](0024-dynamic-map-pivot.md) |
-| [0021](0021-grpc-event-time-range-search.md) | gRPC event-time range on the vector, text, and hybrid search RPCs | Accepted |
-| [0022](0022-object-store-request-tracing.md) | Object-store request counts and IO info on per-RPC search spans | Accepted |
-| [0023](0023-iceberg-table-optimization-job.md) | Iceberg source-table optimization job | Accepted |
-| [0024](0024-dynamic-map-pivot.md) | Dynamic per-dataset map pivot: every key becomes a column | Accepted |
-| [0025](0025-sidecar-free-vector-artifacts.md) | Sidecar-free vector artifacts in the dataset config KV | Accepted |
-| [0026](0026-three-job-isolation.md) | Three-job isolation | Accepted |
-| [0027](0027-unified-pipeline.md) | Unified pipeline job | Accepted |
-| [0028](0028-unified-task-fleet-orchestration.md) | Unified task-based fleet orchestration, format 2.1, column roles | Accepted |
-| [0029](0029-all-indexes-distributed-segments.md) | Every index builds distributed through segments, scalar roles auto-index | Accepted |
-| [0030](0030-streaming-kmeans-bootstrap.md) | Streaming k-means bootstrap for IVF_RQ vector indexes | Accepted |
-| [0031](0031-pluggable-cache-backend.md) | Pluggable cache backend for the search service (disk, redis, memory) | Accepted |
-| [0032](0032-hourly-interval-tags-and-query-pinning.md) | Hourly interval tags at ETL write time and per-query tag pinning | Accepted |
+| Document | Covers |
+|---|---|
+| [etl-and-data-model.md](etl-and-data-model.md) | Iceberg reads, routing, the event-time clock, the dynamic map pivot, write-time hour tags |
+| [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Job isolation, the unified pipeline, task-based fleet orchestration, TTL, coexistence, Iceberg upkeep |
+| [indexing.md](indexing.md) | Segment-API flows, sidecar-free vector artifacts, role auto-indexing, the streaming k-means bootstrap |
+| [serving-filters-and-tags.md](serving-filters-and-tags.md) | Crate layering, the typed filter AST, time ranges, blue-green serving, per-query version pinning |
+| [caching-and-observability.md](caching-and-observability.md) | The persistent cache and its pluggable backends, Prewarm, the Lance trace bridge, recall auditing |
+| [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | The stable-row-id rejection, V2 manifest paths, knob reduction, the intake service, namespace migration |
+
+Index of every original ADR number:
+
+| ADR | Title | Home | Status |
+|---|---|---|---|
+| 0001 | Distributed indexing via the Lance segment API | [indexing.md](indexing.md) | Accepted (vector training portion superseded by 0030) |
+| 0002 | Two-tier compaction orchestration | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Superseded by 0028 |
+| 0003 | Incremental Iceberg reads via snapshot-id bounds | [etl-and-data-model.md](etl-and-data-model.md) | Accepted |
+| 0004 | Routing targets and duplicate semantics | [etl-and-data-model.md](etl-and-data-model.md) | Accepted |
+| 0005 | Rust gRPC service layering and the typed filter AST | [serving-filters-and-tags.md](serving-filters-and-tags.md) | Accepted |
+| 0006 | Date-range fan-out search with dedup-keep-best | [serving-filters-and-tags.md](serving-filters-and-tags.md) | Superseded by 0014 |
+| 0007 | Persistent index/metadata cache and the Prewarm RPC | [caching-and-observability.md](caching-and-observability.md) | Accepted |
+| 0008 | Datadog observability and recall auditing | [caching-and-observability.md](caching-and-observability.md) | Accepted |
+| 0009 | Index-vs-compaction coexistence and the orphan-race guard | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
+| 0010 | Move-stable row IDs | [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | Rejected |
+| 0011 | The `_ingested_at` ingestion-timestamp column | [etl-and-data-model.md](etl-and-data-model.md) | Superseded by 0016 |
+| 0012 | V2 manifest paths fleet-wide | [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | Accepted |
+| 0013 | Tag-based blue-green serving | [serving-filters-and-tags.md](serving-filters-and-tags.md) | Accepted (implemented) |
+| 0014 | One dataset per target, time queries as scalar filters | [serving-filters-and-tags.md](serving-filters-and-tags.md) | Accepted |
+| 0015 | CLI and config knob reduction | [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | Accepted |
+| 0016 | Event-time canonical clock | [etl-and-data-model.md](etl-and-data-model.md) | Accepted |
+| 0017 | Rust intake service with a pluggable record sink | [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | Accepted |
+| 0018 | Per-row TTL expiration inside maintenance | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
+| 0019 | Namespace copy/migrate utility | [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | Accepted |
+| 0020 | Static declared-field map pivot | [etl-and-data-model.md](etl-and-data-model.md) | Superseded by 0024 |
+| 0021 | Event-time range on the search RPCs | [serving-filters-and-tags.md](serving-filters-and-tags.md) | Accepted |
+| 0022 | Lance trace-event bridge | [caching-and-observability.md](caching-and-observability.md) | Accepted |
+| 0023 | Iceberg source-table optimization job | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
+| 0024 | Dynamic per-dataset map pivot | [etl-and-data-model.md](etl-and-data-model.md) | Accepted |
+| 0025 | Sidecar-free vector artifacts | [indexing.md](indexing.md) | Accepted |
+| 0026 | Job isolation: separate packages and CLIs | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
+| 0027 | Unified pipeline: prune, maintenance, index, stamp | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
+| 0028 | Unified task-based fleet orchestration, format 2.1, column roles | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
+| 0029 | Every index builds distributed through segments | [indexing.md](indexing.md) | Accepted |
+| 0030 | Streaming k-means bootstrap for IVF_RQ | [indexing.md](indexing.md) | Accepted |
+| 0031 | Pluggable cache backend (disk, redis, memory) | [caching-and-observability.md](caching-and-observability.md) | Accepted |
+| 0032 | Hourly interval tags and per-query tag pinning | [etl-and-data-model.md](etl-and-data-model.md) + [serving-filters-and-tags.md](serving-filters-and-tags.md) | Accepted |

@@ -7,8 +7,8 @@
 //! Layering, bottom up:
 //! - [`domain`]: transport- and engine-agnostic request/response types, traits, and errors. It
 //!   never references protobuf, tonic, or Lance.
-//! - [`cache`]: persistent disk caching plugged into Lance through its cache and object-store
-//!   seams. It never references datasets, queries, or domain types.
+//! - [`cache`]: persistent caching (local disk or shared Redis) plugged into Lance through its
+//!   cache and object-store seams. It never references datasets, queries, or domain types.
 //! - [`lance`]: Lance-backed implementations of the domain traits.
 //! - [`grpc`]: thin tonic transport mapping protobuf onto the domain traits. It never references
 //!   Lance types.
@@ -30,8 +30,14 @@
 //!   it needs no change. [`lance::LanceSearchBackend`] is the reference implementation.
 //! - New dataset-resolution strategy (different URI layout, a catalog, a different blue-green
 //!   scheme): implement [`lance::DatasetProvider`]. It owns version/tag resolution and the
-//!   open-handle cache; the backend only states which version it wants via [`domain::DatasetRef`].
+//!   open-handle cache; the backend only states which version it wants via [`domain::DatasetRef`],
+//!   with prewarm opens routed through `dataset_for_prewarm` so cold-open telemetry stays honest.
 //!   [`lance::CachingDatasetProvider`] is the reference implementation.
+//! - New cache persistence backend (a distributed KV, a different object store): implement
+//!   [`cache::entry_store::EntryStore`]. The hybrid index cache and the metadata byte cache
+//!   compose over it, so the cache semantics never change with the backend.
+//!   [`cache::disk_store::DiskEntryStore`] and [`cache::redis_store::RedisEntryStore`] are the
+//!   reference implementations, selected by `SEARCH_API_CACHE_BACKEND`.
 //! - New hybrid fusion strategy: add a variant to [`domain::FusionSpec`] and a match arm to its
 //!   `fuse` method. Fusion is a pure function of the leg lists, so it is unit-testable with no
 //!   engine or server. Map it from proto in [`grpc::convert::fusion_from_proto`].

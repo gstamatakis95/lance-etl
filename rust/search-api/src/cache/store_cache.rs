@@ -57,7 +57,7 @@ enum PathKind {
     Transaction,
     /// A file under `_indices/`. Only reads up to the configured byte limit are cached, so
     /// re-open inputs (headers, footers, small token/doc files) persist while bulk partition
-    /// payloads pass through (their decoded form lives in the disk index cache instead).
+    /// payloads pass through (their decoded form lives in the hybrid index cache instead).
     Index,
 }
 

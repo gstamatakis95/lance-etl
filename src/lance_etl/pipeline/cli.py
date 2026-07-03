@@ -4,7 +4,7 @@ Exposes the ``main()`` entry point consumed by the ``lance-etl-pipeline`` script
 ``python -m lance_etl.pipeline``.  One subcommand is provided.
 
 ``run`` executes the full four-phase pipeline over a fleet of datasets: prune old interval
-tags, TTL expiration and two-tier compaction, two-tier index builds, and finally write an
+tags, TTL expiration and unified compaction, unified index builds, and finally write an
 interval tag (and optionally advance ``HEAD``) on every dataset that completed successfully.
 """
 
@@ -41,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
         description=(
             "Run the unified lance-etl pipeline: prune old interval tags, per-dataset TTL expiration "
-            "and two-tier compaction, two-tier index builds, and interval-tag stamping."
+            "and compaction, index builds, and interval-tag stamping."
         )
     )
     parser.add_argument("--log-level", default="INFO")

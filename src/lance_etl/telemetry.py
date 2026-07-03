@@ -60,7 +60,7 @@ distributed-compaction commits have.
 """
 
 DEFAULT_LARGE_COMMIT_RETRIES: int = 2
-"""Retry budget around the tier-B ``Compaction.commit`` call.
+"""Retry budget around the fleet compaction ``Compaction.commit`` call.
 
 Kept small because the commit pins its conflict scan to the plan version, so a semantic conflict re-fails
 deterministically and only the raw manifest-write race benefits from a retry.

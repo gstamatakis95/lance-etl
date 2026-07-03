@@ -365,8 +365,8 @@ impl FileAuditType {
 
 /// Typed facade over the DogStatsD client so call sites cannot invent metric names or tags.
 ///
-/// Tag policy: only `rpc`, `status`, `cold`, `cache`, `tier`, `outcome`, `reason`, `kind`,
-/// `filtered`, `warmed`, and `changed` — `org_id`/`tenant_id`/`version` never appear on
+/// Tag policy: only `rpc`, `status`, `cold`, `cache`, `tier`, `outcome`, `op`, `reason`,
+/// `kind`, `filtered`, `warmed`, and `changed` — `org_id`/`tenant_id`/`version` never appear on
 /// metrics (30k orgs would explode the timeseries count). Org-, tenant-, and version-level detail
 /// lives on traces and logs instead.
 pub struct Metrics {

@@ -391,7 +391,7 @@ Listed roughly in order of confidence (highest first).
 ## 5. Keep list (genuinely per-deployment or genuinely variable)
 
 > NOTE: This document reflects the analysis at its drafting date. The accepted decisions live in
-> `docs/adr/0014-drop-by-date-partitioning.md` and `docs/adr/0015-cli-and-config-knob-reduction.md`.
+> ADR 0014 in `docs/adr/serving-filters-and-tags.md` and ADR 0015 in `docs/adr/rejected-and-operator-tools.md`.
 > Where this document conflicts with those ADRs, the ADRs govern. In particular `--partition-derive`
 > and `partition_derivations` were removed by ADR-0014 and must not be re-added.
 

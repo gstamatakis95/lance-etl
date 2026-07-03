@@ -13,7 +13,7 @@ Phase order within each run
    Prune runs first so the same run's cleanup step reclaims the versions that were
    pinned by the dropped tags.
 2. **TTL + compact**: apply per-row TTL expiration (when ``lance_etl_ttl_column`` is set),
-   run two-tier distributed compaction, and clean up old versions.
+   run unified distributed compaction, and clean up old versions.
 3. **Index**: build or incrementally maintain IVF_RQ vector indices and scalar/FTS indices.
    Column-selection flags come from ``lance_etl_index_flags`` (shell-tokenized).
 4. **Stamp**: write an interval tag named from ``data_interval_end`` in colon-free

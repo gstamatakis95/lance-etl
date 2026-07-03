@@ -18,4 +18,4 @@ The four rules most likely to cause a review failure if missed:
    All column names are validated and literals are typed DataFusion `lit` expressions.
 4. No stable row IDs anywhere. `enable_stable_row_ids` was evaluated and rejected (silent data
    corruption on release builds with concurrent merge + compaction). See
-   `docs/adr/0010-stable-row-ids-rejected.md`. Do not offer it as an option.
+   ADR 0010 in `docs/adr/rejected-and-operator-tools.md`. Do not offer it as an option.

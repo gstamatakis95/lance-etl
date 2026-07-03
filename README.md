@@ -16,31 +16,24 @@ size distribution.
 
 ```
 Iceberg table
-  └─ IcebergToLanceETL.run()               driver: read + collapse + repartition
-       └─ mapInArrow(merge_partition)       executor: merge_insert upsert/delete per org dataset
-LanceIndexer.run()
-  └─ VectorIndexHandler.build()            driver: train IVF centroids + build RaBitQ model
-       └─ parallelize(shards).map(...)     executor: create_index_uncommitted per fragment shard
-       └─ merge_existing_index_segments    driver: merge segments
-       └─ commit_existing_index_segments   driver: commit
-  └─ BTreeIndexHandler / BitmapIndexHandler  same shard/commit flow, no shared uuid
-  └─ FtsIndexHandler.build()              driver: shared index_uuid
-       └─ create_scalar_index             executor: build per-fragment INVERTED segment
-       └─ merge_index_metadata            driver: merge INVERTED metadata
-       └─ LanceDataset.commit             driver: publish with LanceOperation.CreateIndex
-MaintenanceJob.run()
-  └─ TTL delete (optional)               executor: delete rows where ts + ttl_col < now
-  └─ Tier A (small datasets)             executor: Compaction.execute per dataset + cleanup
-  └─ Tier B (large datasets)
-       └─ Compaction.plan()              driver: build rewrite-task list
-       └─ parallelize(tasks).map(...)    executor: CompactionTask.execute
-       └─ Compaction.commit              driver: commit rewrites
-       └─ cleanup_old_versions           driver: prune old versions (tagged versions exempt)
+  └─ IcebergToLanceETL.run()              driver: resolve snapshot bounds, split key-hash batches
+       └─ mapInArrow(merge_partition)     executor: pivot + merge_insert upsert/delete per dataset
+       └─ stamp_interval_tags             executors: hour tag on every written dataset
+LanceIndexer.run()                        rounds of plan -> artifacts -> build -> commit
+  └─ plan_dataset_indexes                 executor fan-out: role discovery + shard specs
+  └─ bootstrap_vector_index               executor: committed create_index, streaming k-means
+  └─ build_one_shard                      ONE flat Spark job: vector/scalar/FTS segments
+  └─ commit_one_index                     executor fan-out: merge (vector) + publish
+MaintenanceJob.run()                      rounds of plan -> execute -> commit
+  └─ plan_one_dataset                     executor fan-out: TTL delete + Compaction.plan
+  └─ execute_rewrite_task                 ONE flat Spark job: CompactionTask.execute
+  └─ commit_one_dataset                   executor fan-out: Compaction.commit + cleanup
 ```
 
-All heavy I/O and compute runs in executors. The driver plans, broadcasts shared artifacts
-(IVF centroids, RaBitQ model), and commits. Move-stable row IDs are rejected (see
-`docs/adr/0010-stable-row-ids-rejected.md`). V2 manifest paths are on by default, making each of
+All heavy I/O and compute runs in executors. The driver plans the rounds, broadcasts read-only
+artifacts, and collects stats. Every dataset size follows the same task shape — a small dataset
+is simply the one-task case. Move-stable row IDs are rejected (see
+`docs/adr/rejected-and-operator-tools.md`, ADR 0010). V2 manifest paths are on by default, making each of
 the 30k dataset opens a single object-store request.
 
 ### Rust gRPC search service (`rust/search-api`)
@@ -50,7 +43,7 @@ Five-layer design over tonic:
 | Layer | Crate path | Responsibility |
 |---|---|---|
 | `domain` | `crate::domain` | Engine-agnostic types: `Filter` AST, query types, rerank seam, intake record/sink, traits |
-| `cache` | `crate::cache` | Disk + Moka index cache and metadata byte cache, plugged into Lance seams |
+| `cache` | `crate::cache` | Hybrid Moka + pluggable persistent (disk/redis) caches, plugged into Lance seams |
 | `lance` | `crate::lance` | `LanceSearchBackend`, `CachingDatasetProvider`, typed AST -> DataFusion `Expr` |
 | `grpc` | `crate::grpc` | Tonic adapters: `SearchGrpc<B>` (search) and `IntakeGrpc<S>` (intake) |
 | `telemetry` | `crate::telemetry` | OTLP traces, DogStatsD metrics, JSON logs with trace correlation |
@@ -61,10 +54,11 @@ identifier allowlist `[A-Za-z_][A-Za-z0-9_]*`. Literals are typed `datafusion::l
 parsed as expressions.
 
 `CachingDatasetProvider` holds one shared Lance `Session` plus a Moka LRU of open `Dataset`
-handles. Concurrent requests for the same org coalesce via the async cache. A hybrid disk-tier
-cache (`DiskIndexCacheBackend` + `MetadataByteCache`) extends the session caches to a local
-directory (default `/tmp/rust-search/cache`), so cold restarts skip the network for recently read
-indexes and metadata. Raw data bytes are never cached.
+handles. Concurrent requests for the same org coalesce via the async cache. A hybrid persistent
+cache (`HybridIndexCacheBackend` + `MetadataByteCache` over the pluggable `EntryStore` backends,
+local disk by default or shared Redis) extends the session caches beyond the process, so cold
+restarts skip the network for recently read indexes and metadata. Raw data bytes are never
+cached.
 
 Blue-green serving: a `HEAD` tag (or any named tag) is updated atomically with `tags.update`. When
 `SEARCH_API_SERVE_BY_TAG=true`, the provider resolves the tag to a concrete version, keys its LRU
@@ -98,7 +92,6 @@ pinned version's entries directly. A hybrid pin opens both legs at the same snap
 | `recall.py` | `RecallAuditJob`, `RecallJobConfig` | Offline recall@k / nDCG@k / MRR audit from Datadog spans |
 | `telemetry.py` | `Telemetry`, `TelemetryConfig` | ddtrace spans, DogStatsD, Lance event bridge |
 | `cloud_storage.py` | `resolve_filesystem`, `discover_datasets` | pyarrow filesystem + recursive dataset discovery |
-| `arrow_types.py` | `resolve_arrow_type`, `resolve_type_map` | Arrow type specs (`fixed_size_list<float32,768>`) |
 | `iceberg_optimize.py` | `IcebergOptimizer`, `IcebergOptimizeConfig`, `IcebergOptimizeReport` | Source Iceberg table maintenance via `CALL` procedures (`rewrite_data_files`, `rewrite_manifests`, `expire_snapshots`, opt-in `remove_orphan_files`). Distinct from the Lance maintenance job. |
 | `*/cli.py` | `main`, `build_parser` | Per-job entry points: `lance-etl-etl`, `lance-etl-index`, `lance-etl-maintenance`, `lance-etl-pipeline`, `lance-etl-tools` |
 | `migrate_namespace.py` | `NamespaceMigrator`, `MigrateConfig` | One-off operator utility to copy a whole namespace to a new namespace name |
@@ -145,8 +138,8 @@ the ingestion job (with an optional `optimize-iceberg` task, gated by the
 `lance_etl_pipeline_dag.py` runs the unified pipeline (`prune -> maintenance -> index -> stamp`)
 as `SparkSubmitOperator` tasks with `max_active_runs=1`. Maintenance runs before indexing so
 fresh fragments are compacted before the index covers them. Schedules are driven by Airflow
-Variables (`lance_etl_schedule`, default `@daily`). Data-interval windowing and `dag_run.conf`
-overrides are described in each module docstring.
+Variables (`lance_etl_etl_schedule` and `lance_etl_pipeline_schedule`, default `@hourly`).
+Data-interval windowing and `dag_run.conf` overrides are described in each module docstring.
 
 ### Benchmark package (`bench/`)
 
@@ -157,20 +150,15 @@ uv pip install --group bench
 ```
 
 Run with `python -m bench <subcommand>`. Subcommands: `download`, `prepare`, `ingest`, `index`,
-`compact`, `search`, `report`, `all`. Each subcommand accepts the full flag set, so one flag vector
-can drive the entire `all` chain.
+`compact`, `search`, `report`, `e2e`, `all`. Each subcommand accepts the full flag set, so one
+flag vector can drive the entire `all` chain.
 
 ### Documentation (`docs/`)
 
-- `docs/adr/` — 30 Architecture Decision Records (0001 through 0030) covering distributed
-  indexing, snapshot-id bounds, gRPC layering, disk cache and prewarm, observability and recall
-  audit, compaction/index coexistence, stable-row-id rejection, V2 manifest paths, blue-green
-  serving, event-time canonical clock, TTL expiration, dynamic map pivot, sidecar-free vector
-  artifacts, the unified task-based fleet orchestration with format 2.1 and column roles
-  (0028), all-distributed segment builds with scalar auto-indexing (0029), and the streaming
-  k-means vector bootstrap (0030).
-- `docs/FINDINGS.md` — narrative companion to the ADRs: verified APIs, production patterns,
-  scale design, coexistence results, and open items.
+- `docs/adr/` — the architecture decisions, consolidated into six thematic documents (ETL and
+  data model, fleet orchestration and maintenance, indexing, serving and tags, caching and
+  observability, rejected decisions and operator tools). Every original ADR number resolves
+  through the index in `docs/adr/README.md`.
 - `docs/datadog-dashboard-guide.md` — guide to the Datadog dashboards shipped with the pipeline.
 - `market-research/` — detailed evaluation notes, plans, and evidence underlying the ADRs.
 
@@ -202,46 +190,34 @@ fine-grained FTS tokenizer toggles, and task sizing — is set to an opinionated
 dataclasses (`ETLConfig`, `IndexJobConfig`, `MaintenanceConfig`) and stays tunable in
 code, not from the command line.
 
-The entry point is installed as `lance-etl`. Subcommands: `etl`, `maintenance`, `index`, `recall`,
-`tag`, `migrate-manifests`, `migrate-namespace`, `optimize-iceberg`.
+Five entry points are installed, one per job: `lance-etl-etl`, `lance-etl-index`,
+`lance-etl-maintenance`, `lance-etl-pipeline`, and `lance-etl-tools`. The maintenance CLI carries
+the `run`, `tag`, and `migrate-manifests` subcommands, and the tools CLI carries the unscheduled
+operator subcommands `recall`, `migrate-namespace`, and `optimize-iceberg`.
 
 #### `etl` — read a snapshot window from Iceberg and upsert/delete into Lance datasets
 
 ```bash
-lance-etl etl \
+lance-etl-etl \
   --table prod.vectors.events \
   --start 2024-01-15T00:00:00 \
   --end 2024-01-16T00:00:00 \
   --base-uri s3://my-bucket/lance \
-  --vector-field embedding \
-  --text-field body \
-  --column-type embedding=fixed_size_list<float16,768> \
   --dd-service lance-pipeline --dd-env prod
 ```
 
 `--start` / `--end` accept ISO 8601 strings or epoch milliseconds and resolve to Iceberg
-snapshot-id bounds. `--column-type` can be repeated for each column needing a type cast. The named
-vectors and texts in the source `vectors` / `texts` map columns are pivoted into concrete indexable
-columns: each `--vector-field` becomes a fixed-size-list column the IVF_RQ index can target (pair it
-with a matching `--column-type` cast) and each `--text-field` becomes a string column the INVERTED
-index can target. Undeclared map keys are dropped, a key absent from a row yields NULL, and the
-`metadata` map stays stored-only payload flattened into `metadata_keys` / `metadata_values` arrays.
-
-Partition routing:
-
-```bash
-lance-etl etl ... \
-  --partition-by org_id,tenant_id,namespace
-```
-
-`--partition-by` (default `org_id,tenant_id,namespace`) sets the columns that build the dataset
-path `base_uri/<val1>/.../<valN>.lance`. Every column must exist in the source table. Each key
-lives in exactly one dataset, so the per-dataset `merge_insert` is the sole dedup mechanism.
+snapshot-id bounds. Routing is the fixed trio `org_id/tenant_id/namespace`: each row lands in the
+dataset `base_uri/{org_id}/{tenant_id}/{namespace}.lance`, and because every key lives in exactly
+one dataset the per-dataset `merge_insert` is the sole dedup mechanism. Every key in the source
+`vectors`, `texts`, and `metadata` maps is pivoted automatically into a concrete typed column of
+that dataset (dynamic map pivot, ADR 0024) — no field declarations or type casts are needed, and
+a key absent from a row yields NULL.
 
 Window pushdown filter (applied after the Iceberg read):
 
 ```bash
-lance-etl etl ... \
+lance-etl-etl ... \
   --window-start 2024-01-15T06:00:00 \
   --window-end 2024-01-15T12:00:00
 ```
@@ -262,9 +238,8 @@ Full `etl` flag reference:
 | `--start` | (required) | Iceberg snapshot window start (ISO 8601 or epoch ms) |
 | `--end` | (required) | Iceberg snapshot window end (ISO 8601 or epoch ms) |
 | `--base-uri` | (required) | Root URI for per-tenant Lance datasets |
-| `--partition-by` | `org_id,tenant_id,namespace` | Comma-separated routing columns |
-| `--column-type` | none | Repeatable `name=arrow_type` cast |
 | `--iceberg-option` | none | Repeatable `key=value` Iceberg read option |
+| `--spark-batches` | `1` | Sequential key-hash batches the increment is split into (raise for very large increments) |
 | `--window-start` | none | Inclusive lower bound for the window pushdown filter |
 | `--window-end` | none | Exclusive upper bound for the window pushdown filter |
 | `--tag-stamp` | none | ISO 8601 datetime whose truncated UTC hour names the interval tag stamped on every written dataset |
@@ -277,48 +252,42 @@ Full `etl` flag reference:
 #### `maintenance` — TTL expiration, distributed compaction, and version cleanup
 
 ```bash
-lance-etl maintenance \
+lance-etl-maintenance run \
   --base-uri s3://my-bucket/lance \
   --dd-service lance-pipeline --dd-env prod
 ```
 
 Runs the ordered per-dataset steps: per-row TTL expiration (when `--ttl-column` is set), the
 unified plan-execute-commit compaction (one flat Spark job over every dataset's rewrite tasks),
-and version cleanup.
-The DQ guard calls `dataset.count_rows(filter=predicate)` over only the partition columns to confirm each
-dataset contains rows for only its own routing key. TTL deletes expired rows before compaction so the
-compaction reclaims that storage.
+and version cleanup. TTL deletes expired rows before compaction so the compaction reclaims that
+storage.
 
 Dataset selection: `--dataset-uri` (repeatable), `--datasets-file`, or `--base-uri` (discovers all
 `*.lance` paths recursively). All tuning knobs use opinionated defaults from `MaintenanceConfig`.
-
-DQ guard flags (require `--base-uri`):
-
-| Flag | Default | Purpose |
-|---|---|---|
-| `--no-verify-single-org` | off (guard on) | Disable the single-org DQ guard. The guard requires `--base-uri` to derive expected routing values from each dataset URI. |
-| `--raise-on-contamination` | off | Raise an error when contamination is found instead of logging and continuing. |
 
 TTL flags:
 
 | Flag | Default | Purpose |
 |---|---|---|
 | `--ttl-column` | none (TTL off) | Per-row TTL column holding each row's lifetime as an Arrow `Duration`. When set, rows are deleted before compaction by the predicate `ts_column + ttl_column < now`. Absent means TTL is off. |
-| `--ts-column` | `timestamp` | Event timestamp column used as the TTL clock. Must match `ETLConfig.ts_col`. Only consulted when `--ttl-column` is set. |
+| `--ts-column` | `event_timestamp` | Event timestamp column used as the TTL clock. Must match `ETLConfig.ts_col`. Only consulted when `--ttl-column` is set. |
 
 #### `index` — build or incrementally maintain indices
 
 ```bash
-lance-etl index \
+lance-etl-index \
   --base-uri s3://my-bucket/lance \
   --vector-column vector \
   --metric cosine \
   --scalar-column updated_at \
   --bitmap-column category \
   --text-column text \
-  --fts-with-position \
   --dd-service lance-pipeline --dd-env prod
 ```
+
+When no column flags are given, the indexer discovers per-dataset targets automatically from the
+`lance-etl.columns` role metadata the ETL writes (vector roles get IVF_RQ, scalar roles BTREE,
+text roles BM25 INVERTED). Explicit column flags override discovery for the run.
 
 Full `index` flag reference (data-shape flags only — tuning knobs use `IndexJobConfig` defaults):
 
@@ -329,7 +298,6 @@ Full `index` flag reference (data-shape flags only — tuning knobs use `IndexJo
 | `--scalar-column` | none | Repeatable column for a BTREE index |
 | `--bitmap-column` | none | Repeatable column for a BITMAP index |
 | `--text-column` | none | Repeatable column for an INVERTED (BM25) index |
-| `--fts-with-position` | off | Store token positions for phrase queries |
 | `--fts-base-tokenizer` | none | FTS base tokenizer name |
 | `--fts-language` | none | Stemming and stop-word language |
 | `--rebuild` | off | Reindex every fragment (use after tokenizer or parameter changes) |
@@ -341,7 +309,7 @@ brute-force or exact BM25 scan against the dataset version that served it, and r
 recall@k, nDCG@k, and MRR per RPC-parameter bucket and per organisation.
 
 ```bash
-lance-etl recall \
+lance-etl-tools recall \
   --from 2024-01-15T00:00:00 \
   --to 2024-01-16T00:00:00 \
   --base-uri s3://my-bucket/lance \
@@ -376,7 +344,7 @@ Updates a serving tag (default `HEAD`) to a target dataset version. Tagged versi
 version cleanup.
 
 ```bash
-lance-etl tag \
+lance-etl-maintenance tag \
   --base-uri s3://my-bucket/lance \
   --tag HEAD \
   --tag-version 42 \
@@ -388,7 +356,7 @@ Safe operational sequence:
 1. Build the green version (ETL + index + compact run).
 2. Prewarm every replica against the green version using the `Prewarm` RPC with an explicit
    `version` (or `tag`) field. Confirm `resolved_version` in the response matches the green version.
-3. Flip the tag with `lance-etl tag --tag-version <green>`. Never flip then warm.
+3. Flip the tag with `lance-etl-maintenance tag --tag-version <green>`. Never flip then warm.
 
 | Flag | Default | Purpose |
 |---|---|---|
@@ -398,7 +366,7 @@ Safe operational sequence:
 #### `migrate-manifests` — migrate to V2 manifest paths
 
 ```bash
-lance-etl migrate-manifests \
+lance-etl-maintenance migrate-manifests \
   --base-uri s3://my-bucket/lance \
   --dd-service lance-pipeline --dd-env prod
 ```
@@ -410,7 +378,7 @@ quiesced (no concurrent ingestion, compaction, or indexing).
 #### `migrate-namespace` — copy a whole namespace to a new name
 
 ```bash
-lance-etl migrate-namespace \
+lance-etl-tools migrate-namespace \
   --source-namespace legacy \
   --target-namespace v2 \
   --base-uri s3://my-bucket/lance \
@@ -435,8 +403,8 @@ copying. This is a one-off operator tool and is not scheduled in the Airflow DAG
 | `--overwrite-target` | off | Allow overwriting target datasets that already exist |
 
 Index column flags (`--vector-column`, `--scalar-column`, `--bitmap-column`, `--text-column`,
-`--metric`, `--fts-with-position`, `--fts-base-tokenizer`, `--fts-language`) are shared with the
-`index` subcommand and are optional. When none are given, reindexing is skipped with a warning.
+`--metric`, `--fts-base-tokenizer`, `--fts-language`) are shared with the
+`index` entry point and are optional. When none are given, reindexing is skipped with a warning.
 
 #### `optimize-iceberg` — optimize the upstream Iceberg source table
 
@@ -444,7 +412,7 @@ Runs Iceberg's own table maintenance procedures on the source Iceberg table, whi
 store from the Lance datasets maintained by the `maintenance` subcommand.
 
 ```bash
-lance-etl optimize-iceberg \
+lance-etl-tools optimize-iceberg \
   --table prod.vectors.events \
   --dd-service lance-pipeline --dd-env prod
 ```
@@ -597,7 +565,7 @@ Configure via Airflow Variables:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `lance_etl_schedule` | `@daily` | Airflow schedule expression |
+| `lance_etl_etl_schedule` / `lance_etl_pipeline_schedule` | `@hourly` | Per-DAG Airflow schedule expressions |
 | `lance_etl_iceberg_table` | `prod.vectors.events` | Fully-qualified Iceberg table name |
 | `lance_etl_lance_base_uri` | `s3://my-bucket/lance` | Base URI for Lance datasets |
 | `lance_etl_datasets_file` | `/opt/lance/datasets.txt` | File listing dataset URIs for `index` and `maintenance` |
@@ -610,7 +578,6 @@ Configure via Airflow Variables:
 | `lance_etl_dd_service` | `lance-pipeline` | Datadog service tag |
 | `lance_etl_dd_env` | `prod` | Datadog env tag |
 | `lance_etl_dd_tags` | empty | Comma-separated `key:value` constant tags |
-| `lance_etl_partition_by` | empty | Comma-separated partition columns for `--partition-by` |
 | `lance_etl_ttl_column` | empty (TTL off) | Per-row TTL column name forwarded to the `maintenance` step as `--ttl-column`. When set, the column must hold each row's lifetime as an Arrow `Duration`. Rows are expired before compaction by `ts_column + ttl_column < now`. Absent means TTL is off. |
 | `lance_etl_optimize_iceberg_enabled` | `false` | When truthy (`true`/`1`/`yes`), adds an optional `optimize-iceberg` task before `etl` that runs Iceberg's own source-table maintenance procedures (`rewrite_data_files`, `rewrite_manifests`, `expire_snapshots`). This is source-table maintenance and is distinct from the Lance `maintenance` task. |
 | `lance_etl_optimize_remove_orphan_files` | `false` | When truthy, the `optimize-iceberg` task also runs the destructive `remove_orphan_files` procedure. Only files older than Iceberg's three-day safety horizon are removed. Opt-in because this step can delete data files outright. |
@@ -633,7 +600,7 @@ Key flags shared by all subcommands:
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--dataset` | `sift1m` | Registered dataset adapter: `sift1m` or `synthetic` |
+| `--dataset` | `sift1m` | Registered dataset adapter: `sift1m` or `bigann` |
 | `--limit` | `1000000` | Base vectors to benchmark |
 | `--tenants` | `1` | Round-robin split into this many org datasets |
 | `--batches` | `1` | Sequential ETL merge batches (values above 1 create fragments for compaction) |
@@ -651,5 +618,5 @@ The `search` subcommand runs recall (nprobes x refine_factor sweep), FTS (BM25 l
 `all` chain skips `search` with a recorded reason when the gRPC server is unreachable.
 
 A new corpus plugs in by implementing `DatasetAdapter` and calling `register_adapter`. The
-`synthetic` adapter generates a deterministic in-memory Gaussian corpus with no download and backs
-the offline integration tests.
+`bigann` adapter serves the billion-scale BIGANN corpus, reading only the slice the configured
+scale needs.

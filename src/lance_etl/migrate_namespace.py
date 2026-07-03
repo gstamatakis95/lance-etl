@@ -10,10 +10,10 @@ The default behaviour is copy plus optimize, keep source. The source datasets ar
 build the new namespace, verify it, and only then flip serving to it through the blue-green tag helpers in
 :mod:`lance_etl.maintenance`. During the copy the targets are optimized in the same order as the production pipeline:
 write, then recompact, then reindex. Recompaction reuses :class:`lance_etl.maintenance.MaintenanceJob` and reindexing
-reuses :class:`lance_etl.indexing.LanceIndexer`, so the segment-API index flows and the two-tier compaction
+reuses :class:`lance_etl.indexing.LanceIndexer`, so the segment-API index flows and the unified compaction
 orchestration are shared rather than reimplemented.
 
-Two-tier scale mirrors :mod:`lance_etl.maintenance`. The set of source datasets is classified by fragment count in one
+The copy itself scales in two tiers of its own. The set of source datasets is classified by fragment count in one
 distributed job that also resolves each target URI and tests whether it already exists. Small datasets are copied whole
 inside one executor task each, batched into a single Spark job. Large datasets keep a distributed per-dataset copy: the
 driver shards the source fragment ids, executors read their shard and write new fragment files into the target, and the
@@ -101,7 +101,7 @@ class MigrateConfig:
         index: Index specification for the reindex step, naming the vector, scalar, bitmap, and text columns to build.
             When ``None`` reindexing is skipped because the columns to index cannot be guessed.
         large_dataset_fragment_threshold: Fragment count at or above which a dataset is copied with the distributed
-            per-dataset fan-out instead of in one executor task. Mirrors the compaction tiering knob.
+            per-dataset fan-out instead of in one executor task.
         batch_partitions: Maximum Spark partitions for the small-tier batch copy and the classification job.
         max_concurrent_large: Driver threads running large-dataset copies concurrently.
         num_shards: Fragment shards per large dataset, one executor task each.

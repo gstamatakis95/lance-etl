@@ -262,8 +262,7 @@ class RecallJobConfig:
         batch_size: Scanner batch size for the brute-force scan.
         large_group_fragment_threshold: Fragment count above which a ``(uri, version)`` group is scored with the
             per-fragment fan-out instead of one whole-dataset task. Groups at or below it are batched into the packed
-            small tier. The default mirrors the indexing small-tier threshold so a dataset that indexing treats as
-            large also brute-forces with the same fan-out here.
+            small tier.
         small_tier_slices: Spark partition count for the classification probe job and the packed small-tier scoring
             job. Fewer slices than groups packs many small groups per task, amortizing task scheduling and cold opens.
         large_tier_slices: Spark partition cap for the per-fragment fan-out job. One task scores one fragment up to
