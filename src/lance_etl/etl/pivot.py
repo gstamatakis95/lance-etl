@@ -38,7 +38,13 @@ class ETLConfig:
         delete_op_values: Operation values treated as deletes.
         ttl_col: Optional per-row lifetime column (BIGINT seconds). Cast to ``pa.duration("s")`` when present.
         storage_options: Object-store options forwarded to pylance.
-        num_partitions: Shuffle partitions for routing co-location.
+        num_partitions: Shuffle partitions for routing co-location. ``None`` (the default)
+            omits the explicit count so Spark AQE sizes the routing shuffle by bytes
+            (``advisoryPartitionSizeInBytes``, seeded from
+            ``coalescePartitions.initialPartitionNum`` and coalesced down), which scales the
+            task count with the increment instead of pinning it. AQE coalescing merges whole
+            hash buckets and never splits one, so every routing key still lands in exactly one
+            partition. An explicit integer keeps a fixed-width shuffle.
         conflict_retries: Retry budget for concurrent merge commits.
         retry_timeout: Total time budget for conflict retries.
         iceberg_read_options: Extra Iceberg reader options merged into the read.
@@ -79,7 +85,7 @@ class ETLConfig:
     delete_op_values: list[str] = field(default_factory=lambda: ["delete", "DELETE", "d"])
     ttl_col: str = "ttl"
     storage_options: dict[str, Any] | None = None
-    num_partitions: int = 512
+    num_partitions: int | None = None
     conflict_retries: int = DEFAULT_CONFLICT_RETRIES
     retry_timeout: timedelta = DEFAULT_RETRY_TIMEOUT
     iceberg_read_options: dict[str, str] = field(default_factory=dict)
@@ -225,24 +231,61 @@ def pivot_map_columns(table: pa.Table, config: ETLConfig) -> tuple[pa.Table, dic
     return result, counts, roles
 
 
-def group_by_routing(table: pa.Table, routing_cols: list[str]) -> Iterator[tuple[tuple[Any, ...], pa.Table]]:
-    """Yield each routing key's rows from a partition table.
+def group_run_starts(table: pa.Table, routing_cols: list[str]) -> list[int]:
+    """Find the start offset of every contiguous routing-key run in a table.
+
+    A single vectorized pass: each routing column is compared against itself shifted by one row
+    (``pc.not_equal`` over zero-copy slices), the per-column change masks are OR'd, and the
+    nonzero indices become run boundaries. Cost is ``O(rows)`` regardless of how many distinct
+    keys the table holds. Assumes the routing columns are non-null, which the ETL guarantees by
+    dropping null-routing rows before the shuffle.
 
     Args:
-        table: The materialized partition table.
+        table: The partition table, expected sorted by the routing columns.
+        routing_cols: The routing key columns.
+
+    Returns:
+        Sorted run-start row offsets, beginning with ``0``. Empty for an empty table.
+    """
+    if table.num_rows == 0:
+        return []
+    if table.num_rows == 1:
+        return [0]
+    routing: pa.Table = table.select(routing_cols).combine_chunks()
+    changed: pa.Array | None = None
+    for column_name in routing_cols:
+        column: pa.Array = routing.column(column_name).chunk(0)
+        differs: pa.Array = pc.not_equal(column.slice(1), column.slice(0, len(column) - 1))
+        changed = differs if changed is None else pc.or_(changed, differs)
+    boundaries: list[int] = [int(i.as_py()) + 1 for i in pc.indices_nonzero(changed)]
+    return [0, *boundaries]
+
+
+def group_by_routing(table: pa.Table, routing_cols: list[str]) -> Iterator[tuple[tuple[Any, ...], pa.Table]]:
+    """Yield each routing key's rows from a partition table sorted by the routing columns.
+
+    Expects the partition to arrive sorted by ``routing_cols`` (the ETL chains
+    ``sortWithinPartitions`` onto the routing shuffle), so each distinct key occupies one
+    contiguous run and every group is a zero-copy slice. Total cost is ``O(rows)`` in the run
+    scan regardless of how many distinct keys the partition holds, which is what keeps a
+    long-tail increment with tens of thousands of tiny groups per partition linear.
+
+    Degradation, not corruption, on unsorted input: a key split across non-adjacent runs is
+    yielded once per run, so its dataset receives multiple idempotent ``merge_insert`` calls
+    over disjoint row sets — correct output, extra commits.
+
+    Args:
+        table: The materialized partition table, sorted by the routing columns.
         routing_cols: The routing key columns.
 
     Yields:
-        ``(key_values, sub_table)`` for each distinct routing key.
+        ``(key_values, sub_table)`` for each contiguous routing-key run.
     """
-    combos: pa.Table = table.group_by(routing_cols).aggregate([])
-    for index in range(combos.num_rows):
-        key: tuple[Any, ...] = tuple(combos[c][index].as_py() for c in routing_cols)
-        mask: pa.Array | None = None
-        for position, column_name in enumerate(routing_cols):
-            equals: pa.Array = pc.equal(table[column_name], key[position])
-            mask = equals if mask is None else pc.and_(mask, equals)
-        yield key, table.filter(mask)
+    starts: list[int] = group_run_starts(table, routing_cols)
+    for position, start in enumerate(starts):
+        stop: int = starts[position + 1] if position + 1 < len(starts) else table.num_rows
+        key: tuple[Any, ...] = tuple(table.column(c)[start].as_py() for c in routing_cols)
+        yield key, table.slice(start, stop - start)
 
 
 def apply_ttl_cast(table: pa.Table, ttl_col: str) -> pa.Table:

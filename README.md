@@ -91,7 +91,7 @@ pinned version's entries directly. A hybrid pin opens both legs at the same snap
 | `fanout.py` | `fan_out_per_dataset` | Shared per-dataset Spark fan-out backing the maintenance, indexing, and operator-tool fleet phases |
 | `recall.py` | `RecallAuditJob`, `RecallJobConfig` | Offline recall@k / nDCG@k / MRR audit from Datadog spans |
 | `telemetry.py` | `Telemetry`, `TelemetryConfig` | ddtrace spans, DogStatsD, Lance event bridge |
-| `cloud_storage.py` | `resolve_filesystem`, `discover_datasets` | pyarrow filesystem + recursive dataset discovery |
+| `cloud_storage.py` | `resolve_filesystem`, `discover_datasets` | pyarrow filesystem + recursive dataset discovery, executor-fanned when a Spark session is passed |
 | `iceberg_optimize.py` | `IcebergOptimizer`, `IcebergOptimizeConfig`, `IcebergOptimizeReport` | Source Iceberg table maintenance via `CALL` procedures (`rewrite_data_files`, `rewrite_manifests`, `expire_snapshots`, opt-in `remove_orphan_files`). Distinct from the Lance maintenance job. |
 | `*/cli.py` | `main`, `build_parser` | Per-job entry points: `lance-etl-etl`, `lance-etl-index`, `lance-etl-maintenance`, `lance-etl-pipeline`, `lance-etl-tools` |
 | `migrate_namespace.py` | `NamespaceMigrator`, `MigrateConfig` | One-off operator utility to copy a whole namespace to a new namespace name |

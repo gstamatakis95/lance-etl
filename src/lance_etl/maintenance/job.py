@@ -285,7 +285,9 @@ def compaction_metrics_dict(metrics: CompactionMetrics) -> dict[str, int]:
     }
 
 
-def cleanup_dataset(uri: str, config: MaintenanceConfig, telemetry: Telemetry) -> int:
+def cleanup_dataset(
+    uri: str, config: MaintenanceConfig, telemetry: Telemetry, dataset: lance.LanceDataset | None = None
+) -> int:
     """Prune old versions of a dataset after compaction.
 
     ``delete_unverified`` is never passed, so the 7-day unverified threshold keeps protecting
@@ -300,6 +302,10 @@ def cleanup_dataset(uri: str, config: MaintenanceConfig, telemetry: Telemetry) -
         uri: Dataset URI.
         config: Maintenance configuration.
         telemetry: Telemetry facade for the current process.
+        dataset: An already-open handle to reuse instead of re-opening the URI. Pass only a
+            handle known to be at least as fresh as the last commit this task made — the
+            post-compaction prune in :func:`commit_one_dataset` deliberately re-opens so cleanup
+            sees the version its commit just superseded.
 
     Returns:
         The number of bytes reclaimed.
@@ -320,7 +326,8 @@ def cleanup_dataset(uri: str, config: MaintenanceConfig, telemetry: Telemetry) -
     older_than: timedelta | None = (
         timedelta(seconds=config.cleanup_older_than_seconds) if config.cleanup_older_than_seconds is not None else None
     )
-    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+    if dataset is None:
+        dataset = lance.dataset(uri, storage_options=config.storage_options)
     with telemetry.timed("dataset.cleanup_ms"):
         stats = dataset.cleanup_old_versions(
             older_than=older_than,
@@ -360,12 +367,20 @@ def plan_one_dataset(
 ) -> dict[str, Any]:
     """Run phase P for one dataset on an executor: TTL delete, skip check, and compaction plan.
 
-    Opens the dataset once, with failure isolation: a missing, corrupt, or unreadable dataset
-    returns a skip dict and never aborts the fleet run. When TTL is active and a cutoff is
-    supplied, expired rows are deleted first because the delete creates compaction work. The
-    derived-state :func:`compaction_skip_reason` check and an empty ``Compaction.plan`` both end
-    the dataset's run early with a cleanup pass. Otherwise the plan's rewrite tasks are
-    serialized for the fleet-wide execute phase.
+    Opens the dataset once and reuses that handle for the skip check, the early-exit cleanup, and
+    ``Compaction.plan`` — refreshing it exactly once only when the TTL step committed a delete
+    (``ttl_rows_deleted > 0``), so the plan sees the rows it must materialize. An idle tiny
+    dataset therefore costs one object-store open per maintenance run instead of two, and an
+    active one costs one instead of three, which is what keeps a mostly-idle million-dataset
+    fleet affordable. Any further staleness against concurrent writers is pre-existing and
+    absorbed by the stale-plan conflict replan in the commit phase.
+
+    Failure isolation: a missing, corrupt, or unreadable dataset returns a skip dict and never
+    aborts the fleet run. When TTL is active and a cutoff is supplied, expired rows are deleted
+    first because the delete creates compaction work. The derived-state
+    :func:`compaction_skip_reason` check and an empty ``Compaction.plan`` both end the dataset's
+    run early with a cleanup pass. Otherwise the plan's rewrite tasks are serialized for the
+    fleet-wide execute phase.
 
     The same function serves every dataset size: a small dataset yields one rewrite task and a
     large one yields many, so no separate in-process compaction path exists.
@@ -395,17 +410,21 @@ def plan_one_dataset(
         result["ttl_rows_deleted"] = ttl_result.get("ttl_rows_deleted", 0)
         if ttl_result.get("skipped"):
             result["ttl_skipped"] = ttl_result["skipped"]
+        if int(result["ttl_rows_deleted"]) > 0:
+            dataset = lance.dataset(uri, storage_options=config.storage_options)
 
     skip: str | None = compaction_skip_reason(dataset)
     if skip is not None:
         telemetry.incr("dataset.skipped_no_work")
-        result.update({"skipped": skip, "tasks": 0, "bytes_removed": cleanup_dataset(uri, config, telemetry)})
+        result.update({"skipped": skip, "tasks": 0, "bytes_removed": cleanup_dataset(uri, config, telemetry, dataset)})
         return result
 
-    plan = Compaction.plan(lance.dataset(uri, storage_options=config.storage_options), options=config.execute_options())
+    plan = Compaction.plan(dataset, options=config.execute_options())
     task_jsons: list[str] = [task.json() for task in plan.tasks]
     if not task_jsons:
-        result.update({"tasks": 0, "fragments_removed": 0, "bytes_removed": cleanup_dataset(uri, config, telemetry)})
+        result.update(
+            {"tasks": 0, "fragments_removed": 0, "bytes_removed": cleanup_dataset(uri, config, telemetry, dataset)}
+        )
         return result
 
     result.update({"read_version": plan.read_version, "task_jsons": task_jsons})

@@ -246,3 +246,90 @@ class TestRunOrdering:
         assert dataset.count_rows() == alive_count
         assert len(dataset.get_fragments()) == 1
         assert dataset.get_fragments()[0].metadata.deletion_file is None
+
+
+class TestPlanOpenCounts:
+    """plan_one_dataset reuses one dataset handle instead of re-opening per step.
+
+    At long-tail fleet scale every extra ``lance.dataset`` open multiplies into millions of
+    object-store round trips per run, so these tests pin the exact open counts of the plan
+    phase's paths by wrapping ``lance.dataset`` with a counting delegate.
+    """
+
+    def counting_dataset(self, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """Install a counting wrapper around ``lance.dataset`` and return its call log.
+
+        Args:
+            monkeypatch: Pytest monkeypatch fixture.
+
+        Returns:
+            A list receiving one URI entry per ``lance.dataset`` call made after installation.
+        """
+        opens: list[str] = []
+        real_dataset = lance.dataset
+
+        def counting(uri: str, *args: object, **kwargs: object) -> lance.LanceDataset:
+            """Delegate to the real open while recording the call.
+
+            Args:
+                uri: Dataset URI being opened.
+                *args: Positional arguments forwarded to the real open.
+                **kwargs: Keyword arguments forwarded to the real open.
+
+            Returns:
+                The real dataset handle.
+            """
+            opens.append(uri)
+            return real_dataset(uri, *args, **kwargs)
+
+        monkeypatch.setattr(lance, "dataset", counting)
+        return opens
+
+    def test_idle_skip_path_opens_once(
+        self, tmp_path: Path, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A single-fragment dataset with TTL off costs exactly one open on the skip path."""
+        uri: str = str(tmp_path / "idle.lance")
+        lance.write_dataset(pa.table({"id": pa.array([1, 2], pa.int64())}), uri)
+        opens: list[str] = self.counting_dataset(monkeypatch)
+        config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config)
+        result = maintenance_job.plan_one_dataset(uri, config, None, Telemetry.create(telemetry_config))
+        assert result["skipped"].startswith("only 1 fragment")
+        assert opens == [uri]
+
+    def test_multi_fragment_plan_opens_once(
+        self, tmp_path: Path, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A compactable dataset with TTL off plans its rewrite tasks from the single open."""
+        uri: str = str(tmp_path / "busy.lance")
+        lance.write_dataset(pa.table({"id": pa.array(range(10), pa.int64())}), uri, max_rows_per_file=2)
+        opens: list[str] = self.counting_dataset(monkeypatch)
+        config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config)
+        result = maintenance_job.plan_one_dataset(uri, config, None, Telemetry.create(telemetry_config))
+        assert result["task_jsons"]
+        assert opens == [uri]
+
+    def test_ttl_commit_refreshes_exactly_once(
+        self, ttl_dataset: tuple[str, int, int], telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A TTL delete costs the initial open, the retried delete's own open, and one refresh."""
+        uri, _, _ = ttl_dataset
+        opens: list[str] = self.counting_dataset(monkeypatch)
+        config: MaintenanceConfig = MaintenanceConfig(
+            telemetry=telemetry_config, ttl_column=TTL_COLUMN, ts_column=TS_COLUMN, commit_backoff_seconds=0.0
+        )
+        result = maintenance_job.plan_one_dataset(uri, config, compute_cutoff(), Telemetry.create(telemetry_config))
+        assert result["ttl_rows_deleted"] == 6
+        assert opens == [uri, uri, uri]
+
+    def test_cleanup_with_handle_opens_nothing(
+        self, tmp_path: Path, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """cleanup_dataset given an open handle performs zero additional opens."""
+        uri: str = str(tmp_path / "clean.lance")
+        lance.write_dataset(pa.table({"id": pa.array([1], pa.int64())}), uri)
+        handle: lance.LanceDataset = lance.dataset(uri)
+        opens: list[str] = self.counting_dataset(monkeypatch)
+        config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config)
+        maintenance_job.cleanup_dataset(uri, config, Telemetry.create(telemetry_config), handle)
+        assert opens == []

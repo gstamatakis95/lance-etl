@@ -62,11 +62,12 @@ def run(args: argparse.Namespace) -> None:
     Args:
         args: Parsed command-line arguments.
     """
-    uris = load_dataset_uris(args)
+    spark = build_spark(APP_NAME)
+    uris = load_dataset_uris(args, spark)
     if not uris:
         logger.info("index: no datasets in the URI list, nothing to do")
+        spark.stop()
         return
-    spark = build_spark(APP_NAME)
     try:
         config: IndexJobConfig = IndexJobConfig(
             telemetry=build_telemetry_config(args),

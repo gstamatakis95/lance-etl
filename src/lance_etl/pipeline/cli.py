@@ -119,9 +119,11 @@ def run_run(args: argparse.Namespace) -> None:
     Args:
         args: Parsed command-line arguments.
     """
-    uris: list[str] = load_dataset_uris(args)
+    spark = build_spark()
+    uris: list[str] = load_dataset_uris(args, spark)
     if not uris:
         logger.info("pipeline run: no datasets in the URI list, nothing to do")
+        spark.stop()
         return
 
     tag_keep_last: int | None = args.tag_keep_last if args.tag_keep_last != 0 else None
@@ -156,7 +158,6 @@ def run_run(args: argparse.Namespace) -> None:
         serve_tag=args.serve_tag,
     )
 
-    spark = build_spark()
     try:
         PipelineJob(config).run(spark, uris)
     except Exception:

@@ -4,7 +4,8 @@ The pipeline can run against AWS S3, Google Cloud Storage, or Azure Blob Storage
 its own Rust object-store layer, driven by each job's ``storage_options``, so it is already portable. This module
 provides :func:`resolve_filesystem` for callers that need a pyarrow filesystem handle and :func:`discover_datasets`,
 which recursively enumerates ``*.lance`` datasets at any depth under a base URI for the compact and index subcommands.
-Both run only on the driver.
+Discovery runs on the driver by default and fans the per-prefix listings out across Spark executors when a session is
+supplied, which is what keeps a fleet of around a million tiny datasets enumerable in minutes instead of hours.
 
 :func:`resolve_filesystem` builds the right ``pyarrow.fs`` filesystem for any of the three providers from the same
 ``storage_options`` mapping pylance uses. When no explicit credentials are supplied it delegates to
@@ -28,11 +29,13 @@ the installed pyarrow if explicit credentials are passed for those providers.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
 from enum import StrEnum
 from typing import Any
 from urllib.parse import urlparse
 
 import pyarrow.fs as pa_fs
+from pyspark.sql import SparkSession
 
 
 class CloudProvider(StrEnum):
@@ -201,26 +204,29 @@ def resolve_filesystem(uri: str, storage_options: dict[str, Any] | None) -> tupl
     return pa_fs.AzureFileSystem(**kwargs), path
 
 
-def discover_datasets(base_uri: str, storage_options: dict[str, Any] | None = None) -> list[str]:
-    """Recursively discover Lance datasets at any depth under a base URI.
+def dataset_paths_under(base_uri: str, storage_options: dict[str, Any] | None, subpath: str | None = None) -> set[str]:
+    """Flat-recursively list one location and collapse its entries to base-relative dataset paths.
 
-    Walks the base location with one recursive listing on the resolved filesystem (local or any supported object
-    store) and returns every distinct path whose component name ends in ``.lance``, however deep it sits. This keeps
-    discovery depth-agnostic: the historical ``{org}/{tenant}/{namespace}.lance`` layout and deeper custom partition
-    hierarchies such as ``{org}/{tenant}/{namespace}/{event_date}.lance`` are both picked up. Entries inside a dataset
-    are collapsed to the dataset path, and sidecar directories such as ``{dataset}.lance.artifacts`` do not match
-    because their final component does not end in ``.lance``.
+    One recursive listing enumerates every object under ``base_uri`` (or ``base_uri/subpath``), and each entry's path
+    is scanned for its first component ending in ``.lance`` — entries inside a dataset collapse to the dataset path,
+    and sidecar directories such as ``{dataset}.lance.artifacts`` do not match because their final component does not
+    end in ``.lance``. On object stores the flat recursive listing is the request-optimal strategy for shallow
+    datasets (one paginated LIST page per ~1000 objects), which is why discovery never walks directory-by-directory.
+    Resolves its own filesystem so the function is safe to run inside a Spark executor task without pickling a
+    filesystem handle.
 
     Args:
         base_uri: Root location under which datasets live, in any supported URI scheme or a local path.
         storage_options: The same options passed to pylance, or ``None``.
+        subpath: Base-relative prefix to list instead of the whole base, used by the executor fan-out.
 
     Returns:
-        The discovered dataset URIs, rooted at ``base_uri`` and sorted.
+        Distinct dataset paths relative to ``base_uri``.
     """
     filesystem, base_path = resolve_filesystem(base_uri, storage_options)
     base: str = base_path.rstrip("/")
-    selector: pa_fs.FileSelector = pa_fs.FileSelector(base, recursive=True, allow_not_found=True)
+    target: str = f"{base}/{subpath}" if subpath else base
+    selector: pa_fs.FileSelector = pa_fs.FileSelector(target, recursive=True, allow_not_found=True)
     datasets: set[str] = set()
     for info in filesystem.get_file_info(selector):
         relative: str = info.path[len(base) :].lstrip("/")
@@ -229,5 +235,73 @@ def discover_datasets(base_uri: str, storage_options: dict[str, Any] | None = No
             if component.endswith(".lance"):
                 datasets.add("/".join(components[: depth + 1]))
                 break
+    return datasets
+
+
+def discover_datasets(
+    base_uri: str,
+    storage_options: dict[str, Any] | None = None,
+    spark: SparkSession | None = None,
+    partitions: int = 64,
+) -> list[str]:
+    """Recursively discover Lance datasets at any depth under a base URI.
+
+    Depth-agnostic: the historical ``{org}/{tenant}/{namespace}.lance`` layout and deeper custom partition
+    hierarchies such as ``{org}/{tenant}/{namespace}/{event_date}.lance`` are both picked up, via the collapse
+    rules of :func:`dataset_paths_under`.
+
+    Without a Spark session the whole walk runs on the driver, exactly as before. With one, the driver performs a
+    single non-recursive listing of the base — first-level entries ending ``.lance`` are datasets directly (their
+    internals are never listed) — and fans the remaining first-level directory prefixes out across executors, each
+    task flat-listing its own subtree. Total request count is unchanged; wall time divides by executor parallelism
+    and the driver holds dataset URIs instead of every object entry. One whale prefix still lists as a single
+    paginated task, which is acceptable skew.
+
+    Args:
+        base_uri: Root location under which datasets live, in any supported URI scheme or a local path.
+        storage_options: The same options passed to pylance, or ``None``.
+        spark: Active session for the executor fan-out, or ``None`` for the pure-driver walk.
+        partitions: Upper bound on Spark partitions for the fan-out, capped at the prefix count.
+
+    Returns:
+        The discovered dataset URIs, rooted at ``base_uri`` and sorted.
+    """
     root: str = base_uri.rstrip("/")
+    if spark is None:
+        return sorted(f"{root}/{path}" for path in dataset_paths_under(base_uri, storage_options))
+
+    filesystem, base_path = resolve_filesystem(base_uri, storage_options)
+    base: str = base_path.rstrip("/")
+    selector: pa_fs.FileSelector = pa_fs.FileSelector(base, recursive=False, allow_not_found=True)
+    datasets: set[str] = set()
+    prefixes: list[str] = []
+    for info in filesystem.get_file_info(selector):
+        name: str = info.path[len(base) :].lstrip("/")
+        if name.endswith(".lance"):
+            datasets.add(name)
+        elif info.type == pa_fs.FileType.Directory:
+            prefixes.append(name)
+
+    if prefixes:
+        options: dict[str, Any] | None = storage_options
+
+        def list_partition(part: Iterable[str]) -> Iterator[set[str]]:
+            """List the first-level prefixes assigned to this executor task.
+
+            Args:
+                part: Base-relative directory prefixes for this partition.
+
+            Yields:
+                One base-relative dataset-path set per prefix.
+            """
+            for prefix in part:
+                yield dataset_paths_under(base_uri, options, prefix)
+
+        slices: int = max(1, min(len(prefixes), partitions))
+        found_sets: list[set[str]] = (
+            spark.sparkContext.parallelize(sorted(prefixes), slices).mapPartitions(list_partition).collect()
+        )
+        for found in found_sets:
+            datasets.update(found)
+
     return sorted(f"{root}/{path}" for path in datasets)

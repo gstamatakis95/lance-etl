@@ -35,7 +35,10 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
+import lance_etl.etl.pivot as pivot_module
+from lance_etl.cliutil import SPARK_CONF_DEFAULTS
 from lance_etl.etl import ETLConfig, IcebergToLanceETL, dataset_uri
+from lance_etl.etl.pivot import ROUTING_COLS, group_by_routing
 from lance_etl.telemetry import TelemetryConfig
 
 DIMENSION: int = 8
@@ -200,6 +203,180 @@ class TestPivotEndToEnd:
         dataset.create_scalar_index("text", "INVERTED")
         names: set[str] = {description.name for description in dataset.describe_indices()}
         assert "text_idx" in names
+
+
+def routing_batch(keys: list[tuple[str, str, str]], start: int = 0) -> pa.RecordBatch:
+    """Build one record batch with a row per routing key plus a distinct payload id.
+
+    Args:
+        keys: One ``(org_id, tenant_id, namespace)`` tuple per row, in row order.
+        start: First payload id, so batches concatenate without id collisions.
+
+    Returns:
+        A record batch with the three routing columns and a ``vector_id`` payload column.
+    """
+    return pa.RecordBatch.from_pydict(
+        {
+            "org_id": [k[0] for k in keys],
+            "tenant_id": [k[1] for k in keys],
+            "namespace": [k[2] for k in keys],
+            "vector_id": [f"v{start + i}" for i in range(len(keys))],
+        }
+    )
+
+
+class TestGroupByRouting:
+    """group_by_routing splits a routing-sorted partition table into contiguous zero-copy groups."""
+
+    ROUTING: list[str] = list(ROUTING_COLS)
+
+    def test_empty_table_yields_nothing(self) -> None:
+        """An empty partition table produces no groups."""
+        table: pa.Table = pa.Table.from_batches([], schema=routing_batch([]).schema)
+        assert list(group_by_routing(table, self.ROUTING)) == []
+
+    def test_single_group(self) -> None:
+        """A partition holding one routing key yields exactly that key with every row."""
+        table: pa.Table = pa.Table.from_batches([routing_batch([("o1", "t1", "n1")] * 3)])
+        groups: list[tuple[tuple[str, ...], pa.Table]] = list(group_by_routing(table, self.ROUTING))
+        assert len(groups) == 1
+        key, rows = groups[0]
+        assert key == ("o1", "t1", "n1")
+        assert rows.num_rows == 3
+
+    def test_sorted_groups_match_keys_and_rows(self) -> None:
+        """Sorted input yields one group per distinct key covering every row exactly once."""
+        keys: list[tuple[str, str, str]] = (
+            [("o1", "t1", "n1")] * 2 + [("o1", "t1", "n2")] + [("o1", "t2", "n1")] * 3 + [("o2", "t1", "n1")]
+        )
+        table: pa.Table = pa.Table.from_batches([routing_batch(keys)])
+        groups: list[tuple[tuple[str, ...], pa.Table]] = list(group_by_routing(table, self.ROUTING))
+        assert [key for key, rows in groups] == [
+            ("o1", "t1", "n1"),
+            ("o1", "t1", "n2"),
+            ("o1", "t2", "n1"),
+            ("o2", "t1", "n1"),
+        ]
+        assert [rows.num_rows for key, rows in groups] == [2, 1, 3, 1]
+        recovered: set[str] = {vid for key, rows in groups for vid in rows["vector_id"].to_pylist()}
+        assert recovered == set(table["vector_id"].to_pylist())
+
+    def test_grouping_cost_is_independent_of_group_count(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The vectorized boundary scan issues a fixed number of compute calls, not one per group.
+
+        The pre-rewrite implementation ran a full-table ``pc.equal`` scan per routing column per
+        distinct key (quadratic at long-tail cardinality). The rewrite performs exactly one
+        adjacent-inequality comparison per routing column regardless of how many thousands of
+        groups the partition holds, which this pins structurally instead of with a flaky timing
+        ratio.
+        """
+        calls: list[str] = []
+        real_not_equal = pivot_module.pc.not_equal
+
+        def counting_not_equal(*args: object, **kwargs: object) -> object:
+            """Delegate to the real comparison while recording the call."""
+            calls.append("not_equal")
+            return real_not_equal(*args, **kwargs)
+
+        monkeypatch.setattr(pivot_module.pc, "not_equal", counting_not_equal)
+        keys: list[tuple[str, str, str]] = [(f"o{i}", "t1", "n1") for i in range(5000) for _ in range(2)]
+        table: pa.Table = pa.Table.from_batches([routing_batch(sorted(keys))])
+        groups: list[tuple[tuple[str, ...], pa.Table]] = list(group_by_routing(table, self.ROUTING))
+        assert len(groups) == 5000
+        assert all(rows.num_rows == 2 for key, rows in groups)
+        assert len(calls) == len(self.ROUTING)
+
+    def test_multi_chunk_input_groups_across_chunk_boundaries(self) -> None:
+        """A group spanning two Arrow chunks is still yielded as one contiguous run."""
+        first: pa.RecordBatch = routing_batch([("o1", "t1", "n1"), ("o1", "t1", "n1")], start=0)
+        second: pa.RecordBatch = routing_batch([("o1", "t1", "n1"), ("o2", "t1", "n1")], start=2)
+        table: pa.Table = pa.Table.from_batches([first, second])
+        assert table.column("org_id").num_chunks == 2
+        groups: list[tuple[tuple[str, ...], pa.Table]] = list(group_by_routing(table, self.ROUTING))
+        assert [(key, rows.num_rows) for key, rows in groups] == [(("o1", "t1", "n1"), 3), (("o2", "t1", "n1"), 1)]
+
+    def test_unsorted_input_splits_runs_without_losing_rows(self) -> None:
+        """Unsorted input degrades to one group per contiguous run, never dropping or mixing rows.
+
+        This pins the documented safety property: a key split across non-adjacent runs is yielded
+        once per run with disjoint row sets, so downstream idempotent merges stay correct.
+        """
+        keys: list[tuple[str, str, str]] = [
+            ("o1", "t1", "n1"),
+            ("o2", "t1", "n1"),
+            ("o1", "t1", "n1"),
+        ]
+        table: pa.Table = pa.Table.from_batches([routing_batch(keys)])
+        groups: list[tuple[tuple[str, ...], pa.Table]] = list(group_by_routing(table, self.ROUTING))
+        assert [key for key, rows in groups] == [("o1", "t1", "n1"), ("o2", "t1", "n1"), ("o1", "t1", "n1")]
+        assert all(rows.num_rows == 1 for key, rows in groups)
+        recovered: list[str] = [vid for key, rows in groups for vid in rows["vector_id"].to_pylist()]
+        assert sorted(recovered) == sorted(table["vector_id"].to_pylist())
+        for key, rows in groups:
+            assert set(zip(*(rows[c].to_pylist() for c in self.ROUTING), strict=True)) == {key}
+
+
+class TestShuffleWidth:
+    """route_batch honors an explicit partition count and AQE-sizes when the count is None.
+
+    Both width assertions toggle AQE off for the measurement because ``DataFrame.rdd`` under
+    adaptive execution reports the post-coalesce count, which would make the expected widths
+    data-dependent.
+    """
+
+    def routed_partitions(self, spark: SparkSession, config: ETLConfig) -> int:
+        """Build a small increment, route it, and count its shuffle partitions without AQE.
+
+        Args:
+            spark: The module-scoped local Spark session.
+            config: The ETL configuration whose partitioning behavior is being measured.
+
+        Returns:
+            The routed DataFrame's partition count with adaptive execution disabled.
+        """
+        frame = spark.createDataFrame(
+            [(f"v{i}", "o1", "t1", "n1", TS, TS, "insert", None, None, None) for i in range(8)], source_schema()
+        )
+        original: str = str(spark.conf.get("spark.sql.adaptive.enabled"))
+        spark.conf.set("spark.sql.adaptive.enabled", "false")
+        try:
+            return IcebergToLanceETL(config).route_batch(frame).rdd.getNumPartitions()
+        finally:
+            spark.conf.set("spark.sql.adaptive.enabled", original)
+
+    def test_explicit_num_partitions_fixes_width(
+        self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
+    ) -> None:
+        """An explicit num_partitions produces exactly that many shuffle partitions."""
+        config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config, num_partitions=2)
+        assert self.routed_partitions(spark, config) == 2
+
+    def test_default_none_follows_session_shuffle_width(
+        self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
+    ) -> None:
+        """num_partitions=None omits the explicit count, deferring to the session's shuffle sizing."""
+        config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config)
+        assert config.num_partitions is None
+        assert self.routed_partitions(spark, config) == int(spark.conf.get("spark.sql.shuffle.partitions"))
+
+    def test_conf_defaults_seed_a_wide_initial_partition_count(self) -> None:
+        """SPARK_CONF_DEFAULTS carries the high AQE initial partition count coalescing shrinks from."""
+        assert SPARK_CONF_DEFAULTS["spark.sql.adaptive.coalescePartitions.initialPartitionNum"] == "8192"
+        assert SPARK_CONF_DEFAULTS["spark.sql.adaptive.enabled"] == "true"
+
+    def test_end_to_end_with_default_partitioning(
+        self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
+    ) -> None:
+        """A full run with the AQE-sized default writes the same per-dataset contents."""
+        config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config)
+        rows: list[tuple] = [
+            (f"v{i}", f"o{i % 3}", "t1", "n1", TS, TS, "insert", None, {"text": f"w{i}"}, {"k": str(i)})
+            for i in range(9)
+        ]
+        frame = spark.createDataFrame(rows, source_schema())
+        IcebergToLanceETL(config).run_on_dataframe(frame)
+        for org in ("o0", "o1", "o2"):
+            assert lance.dataset(dataset_uri(config, org, "t1", "n1")).count_rows() == 3
 
 
 class TestValidateSchema:

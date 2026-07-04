@@ -72,6 +72,13 @@ from lance_etl.telemetry import Telemetry
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+DEFAULT_TAG_STAMP_PARTITIONS: int = 512
+"""Partition cap for the interval-tag stamp fan-out when ``num_partitions`` is AQE-sized.
+
+Matches the ``update_serving_tags`` default so the tag flip keeps its historical width when the
+routing shuffle itself has no fixed count.
+"""
+
 
 def snapshot_id_bounds(
     spark: SparkSession, table: str, start_ms: int, end_ms: int
@@ -339,13 +346,40 @@ class IcebergToLanceETL:
         observed: DataFrame = source.observe(observation, F.count(F.when(any_null, True)).alias("null_routing_rows"))
         return observed.where(~any_null), observation
 
-    def merge_dataframe(self, batch: DataFrame) -> list[Any]:
-        """Collapse, shuffle, and merge one batch, returning the collected per-dataset stats rows.
+    def route_batch(self, batch: DataFrame) -> DataFrame:
+        """Collapse a batch, shuffle it by routing key, and sort each partition by the key.
 
-        Only the work that cannot be expressed in native Spark runs inside the ``mapInArrow``
-        closure: the dynamic per-dataset map pivot and the Lance ``merge_insert`` commits. The
-        closure materializes its partition, groups by routing key, and merges each group into its
-        dataset.
+        The shuffle omits an explicit partition count when ``config.num_partitions`` is ``None``
+        so Spark AQE sizes it by bytes, and keeps the fixed width otherwise. AQE coalescing merges
+        whole hash buckets and never splits one, so every routing key lands in exactly one
+        partition either way. ``sortWithinPartitions`` runs in Spark's spill-aware shuffle sort so
+        each partition reaches the Arrow closure with every dataset's rows as one contiguous run.
+
+        Args:
+            batch: The null-routing-filtered batch DataFrame.
+
+        Returns:
+            The collapsed, routing-partitioned, partition-sorted DataFrame.
+        """
+        routing_exprs: list[Column] = [F.col(c) for c in ROUTING_COLS]
+        collapsed: DataFrame = self.collapse(batch)
+        num_partitions: int | None = self.config.num_partitions
+        shuffled: DataFrame = (
+            collapsed.repartition(*routing_exprs)
+            if num_partitions is None
+            else collapsed.repartition(num_partitions, *routing_exprs)
+        )
+        return shuffled.sortWithinPartitions(*routing_exprs)
+
+    def merge_dataframe(self, batch: DataFrame) -> list[Any]:
+        """Collapse, shuffle, sort, and merge one batch, returning the collected per-dataset stats rows.
+
+        The shuffle hash-partitions by routing key (AQE byte-sized when ``num_partitions`` is
+        ``None``, fixed width otherwise) and ``sortWithinPartitions`` orders each partition by
+        the routing columns in Spark's spill-aware shuffle sort, so the Arrow closure receives
+        each dataset's rows as one contiguous run and grouping is a linear scan. Only the work
+        that cannot be expressed in native Spark runs inside the ``mapInArrow`` closure: the
+        dynamic per-dataset map pivot and the Lance ``merge_insert`` commits.
 
         Args:
             batch: The null-routing-filtered batch DataFrame.
@@ -355,7 +389,7 @@ class IcebergToLanceETL:
         """
         config: ETLConfig = self.config
         routing: list[str] = list(ROUTING_COLS)
-        routed: DataFrame = self.collapse(batch).repartition(config.num_partitions, *[F.col(c) for c in routing])
+        routed: DataFrame = self.route_batch(batch)
         partition_stats_schema: pa.Schema = stats_schema()
 
         def merge_partition(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
@@ -478,6 +512,6 @@ class IcebergToLanceETL:
                 config.telemetry,
                 config.storage_options,
                 tag=config.tag_stamp,
-                partitions=config.num_partitions,
+                partitions=config.num_partitions or DEFAULT_TAG_STAMP_PARTITIONS,
             )
         telemetry.gauge("run.tags_stamped", len(results))

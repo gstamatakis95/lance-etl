@@ -22,14 +22,18 @@ APP_NAME: str = "lance-pipeline"
 SPARK_CONF_DEFAULTS: dict[str, str] = {
     "spark.sql.adaptive.enabled": "true",
     "spark.sql.adaptive.advisoryPartitionSizeInBytes": "64m",
+    "spark.sql.adaptive.coalescePartitions.initialPartitionNum": "8192",
     "spark.sql.execution.arrow.maxRecordsPerBatch": "4096",
 }
 """Runtime Spark SQL defaults applied by :func:`build_spark` when the operator did not set them.
 
 Adaptive query execution right-sizes shuffle partitions from actual data volumes instead of the
-static partition count. The Arrow batch cap bounds the per-slice memory of every ``mapInArrow``
-stage for wide vector rows (a 4096-row batch of 512-byte rows stays around 2 MiB), which is the
-first line of defense against executor OOM on large increments.
+static partition count. AQE only coalesces DOWN from the initial partition count, so the high
+``initialPartitionNum`` lets a long-tail increment (up to ~1M tiny routing keys) start wide and
+shrink to the byte-sized advisory target instead of being capped at ``spark.sql.shuffle.partitions``.
+The Arrow batch cap bounds the per-slice memory of every ``mapInArrow`` stage for wide vector
+rows (a 4096-row batch of 512-byte rows stays around 2 MiB), which is the first line of defense
+against executor OOM on large increments.
 """
 
 
@@ -126,7 +130,7 @@ def build_telemetry_config(args: argparse.Namespace) -> TelemetryConfig:
     )
 
 
-def load_dataset_uris(args: argparse.Namespace) -> list[str]:
+def load_dataset_uris(args: argparse.Namespace, spark: SparkSession | None = None) -> list[str]:
     """Collect dataset URIs from arguments, an optional file, and base-URI discovery.
 
     Three sources are combined in order: explicit ``--dataset-uri`` flags, a ``--datasets-file`` (one URI per
@@ -136,10 +140,13 @@ def load_dataset_uris(args: argparse.Namespace) -> list[str]:
 
     When ``--base-uri`` is supplied, every ``*.lance`` dataset under it is discovered recursively at any
     depth, so the standard three-level ``org_id/tenant_id/namespace`` layout and any deeper
-    ``migrate-namespace`` hierarchies are both picked up.
+    ``migrate-namespace`` hierarchies are both picked up. Passing the job's Spark session fans the
+    per-prefix listings out across executors, which large fleets need for tolerable discovery time.
 
     Args:
         args: Parsed command-line arguments.
+        spark: Active session forwarded to :func:`~lance_etl.cloud_storage.discover_datasets` for
+            executor-fanned discovery, or ``None`` for the pure-driver walk.
 
     Returns:
         The list of dataset URIs, which may be empty when all sources are empty.
@@ -159,7 +166,7 @@ def load_dataset_uris(args: argparse.Namespace) -> list[str]:
         with open(args.datasets_file, encoding="utf-8") as handle:
             uris.extend(line.strip() for line in handle if line.strip())
     if args.base_uri:
-        uris.extend(discover_datasets(args.base_uri, parse_storage_options(args)))
+        uris.extend(discover_datasets(args.base_uri, parse_storage_options(args), spark=spark))
     return uris
 
 

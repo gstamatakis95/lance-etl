@@ -14,8 +14,8 @@ lance-etl/
       __init__.py         Re-exports: IcebergToLanceETL, ETLConfig, ROUTING_COLS, apply_merge, and helpers
       cli.py              Entry point for lance-etl-etl script and python -m lance_etl.etl
       __main__.py         Calls cli.main()
-      job.py              IcebergToLanceETL: read_increment, collapse, spark_batches split, merge fan-out, hourly interval-tag stamp (stamp_interval_tags)
-      pivot.py            ETLConfig, ROUTING_COLS, pivot_map_columns (returns column roles), group_by_routing, apply_fsl_cast, apply_ttl_cast
+      job.py              IcebergToLanceETL: read_increment, collapse, spark_batches split, route_batch (AQE-sized shuffle + partition sort), merge fan-out, hourly interval-tag stamp (stamp_interval_tags)
+      pivot.py            ETLConfig, ROUTING_COLS, pivot_map_columns (returns column roles), group_by_routing (sorted-run split), apply_fsl_cast, apply_ttl_cast
       sink.py             The Lance sink seam: apply_merge, table_chunks, build_update_condition, dataset_uri (format 2.1 bootstrap, role writes)
     indexing/             Indexing job package (python -m lance_etl.indexing)
       __init__.py         Re-exports: LanceIndexer, IndexJobConfig, all handlers, segments, optimize helpers
@@ -46,7 +46,7 @@ lance-etl/
     fanout.py             Shared per-dataset Spark fan-out (fan_out_per_dataset) used by the maintenance, indexing, and operator-tool fleet phases
     recall.py             RecallAuditJob, RecallJobConfig, DatadogSpanSource: replay Datadog spans, score recall@k/nDCG@k/MRR
     telemetry.py          Telemetry, TelemetryConfig, LanceRuntimeConfig, commit_with_retries
-    cloud_storage.py      resolve_filesystem + discover_datasets for pyarrow filesystem I/O
+    cloud_storage.py      resolve_filesystem + discover_datasets (driver walk or executor-fanned listing) for pyarrow filesystem I/O
     iceberg_optimize.py   IcebergOptimizer + IcebergOptimizeConfig: source Iceberg table maintenance via CALL procedures (rewrite_data_files, rewrite_manifests, expire_snapshots, opt-in remove_orphan_files)
     migrate_namespace.py  NamespaceMigrator + MigrateConfig: one-off namespace copy/optimize utility
   bench/                  Benchmark package (python -m bench)

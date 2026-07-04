@@ -115,11 +115,12 @@ def run_run(args: argparse.Namespace) -> None:
     Args:
         args: Parsed command-line arguments.
     """
-    uris: list[str] = load_dataset_uris(args)
+    spark = build_spark()
+    uris: list[str] = load_dataset_uris(args, spark)
     if not uris:
         logger.info("maintenance run: no datasets in the URI list, nothing to do")
+        spark.stop()
         return
-    spark = build_spark()
     try:
         config: MaintenanceConfig = MaintenanceConfig(
             telemetry=build_telemetry_config(args),
@@ -147,7 +148,7 @@ def run_tag(args: argparse.Namespace) -> None:
     try:
         update_serving_tags(
             spark,
-            load_dataset_uris(args),
+            load_dataset_uris(args, spark),
             build_telemetry_config(args),
             parse_storage_options(args),
             tag=args.tag,
@@ -172,7 +173,7 @@ def run_migrate_manifests(args: argparse.Namespace) -> None:
     try:
         migrate_manifest_paths(
             spark,
-            load_dataset_uris(args),
+            load_dataset_uris(args, spark),
             build_telemetry_config(args),
             parse_storage_options(args),
         )

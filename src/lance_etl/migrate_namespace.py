@@ -243,11 +243,13 @@ def target_uri_for(config: MigrateConfig, source_uri: str) -> str:
     return build_dataset_uri(config.base_uri, components)
 
 
-def source_dataset_uris(config: MigrateConfig) -> list[str]:
+def source_dataset_uris(config: MigrateConfig, spark: SparkSession | None = None) -> list[str]:
     """Discover every source dataset whose namespace component equals ``source_namespace``.
 
     Args:
         config: Migrate configuration.
+        spark: Active session forwarded to :func:`~lance_etl.cloud_storage.discover_datasets` for
+            executor-fanned discovery, or ``None`` for the pure-driver walk.
 
     Returns:
         The matching source dataset URIs, sorted.
@@ -255,7 +257,7 @@ def source_dataset_uris(config: MigrateConfig) -> list[str]:
     index: int = config.namespace_index()
     width: int = len(config.partition_cols)
     matched: list[str] = []
-    for uri in discover_datasets(config.base_uri, config.storage_options):
+    for uri in discover_datasets(config.base_uri, config.storage_options, spark=spark):
         components: list[str] = uri_components(config.base_uri, uri)
         if len(components) == width and components[index] == config.source_namespace:
             matched.append(uri)
@@ -657,7 +659,7 @@ class NamespaceMigrator:
         with telemetry.span("lance.migrate.run") as run_span:
             run_span.set_tag("source_namespace", config.source_namespace)
             run_span.set_tag("target_namespace", config.target_namespace)
-            source_uris: list[str] = source_dataset_uris(config)
+            source_uris: list[str] = source_dataset_uris(config, spark)
             run_span.set_tag("datasets_found", len(source_uris))
             report: MigrateReport = MigrateReport(
                 source_namespace=config.source_namespace,
