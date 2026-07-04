@@ -191,6 +191,52 @@ def commit_with_retries(
     raise last_exc
 
 
+def emit_execution_metrics(telemetry: Telemetry, args: dict[str, str], base_tags: list[str]) -> None:
+    """Emit the numeric execution-stats distributions carried by one ``execution`` event.
+
+    Args:
+        telemetry: The telemetry facade used to emit metrics.
+        args: The event's string arguments.
+        base_tags: Tags shared by every metric emitted for this event.
+    """
+    for key in EXECUTION_DISTRIBUTION_KEYS:
+        raw: str | None = args.get(key)
+        if raw is None:
+            continue
+        try:
+            telemetry.distribution(f"lance.execution.{key}", float(raw), tags=base_tags)
+        except ValueError:
+            continue
+
+
+def emit_throttle_metrics(telemetry: Telemetry, args: dict[str, str], base_tags: list[str]) -> None:
+    """Emit the rate gauges and error counter carried by one object-store ``throttle`` event.
+
+    Args:
+        telemetry: The telemetry facade used to emit metrics.
+        args: The event's string arguments.
+        base_tags: Tags shared by every metric emitted for this event.
+    """
+    for key in THROTTLE_GAUGE_KEYS:
+        raw: str | None = args.get(key)
+        if raw is None:
+            continue
+        try:
+            telemetry.gauge(f"lance.throttle.{key}", float(raw), tags=base_tags)
+        except ValueError:
+            continue
+    if args.get("error"):
+        telemetry.incr("lance.throttle.error", tags=base_tags)
+        logger.warning("lance object store throttle: %s", args)
+
+
+EVENT_METRIC_EMITTERS: dict[str, Callable[[Telemetry, dict[str, str], list[str]], None]] = {
+    "execution": emit_execution_metrics,
+    "throttle": emit_throttle_metrics,
+}
+"""Per-event-type metric emitters keyed by the short event name."""
+
+
 def build_lance_event_callback(telemetry: Telemetry) -> object:
     """Build the callback that reports Lance trace events to Datadog.
 
@@ -221,30 +267,12 @@ def build_lance_event_callback(telemetry: Telemetry) -> object:
             if value:
                 telemetry.incr(f"lance.{short}", tags=base_tags + [f"{key}:{value}"])
 
-        if short == "execution":
-            for key in EXECUTION_DISTRIBUTION_KEYS:
-                raw: str | None = args.get(key)
-                if raw is not None:
-                    try:
-                        telemetry.distribution(f"lance.execution.{key}", float(raw), tags=base_tags)
-                    except ValueError:
-                        continue
-        elif short == "throttle":
-            for key in THROTTLE_GAUGE_KEYS:
-                raw = args.get(key)
-                if raw is not None:
-                    try:
-                        telemetry.gauge(f"lance.throttle.{key}", float(raw), tags=base_tags)
-                    except ValueError:
-                        continue
-            if args.get("error"):
-                telemetry.incr("lance.throttle.error", tags=base_tags)
-                logger.warning("lance object store throttle: %s", args)
+        emitter: Callable[[Telemetry, dict[str, str], list[str]], None] | None = EVENT_METRIC_EMITTERS.get(short)
+        if emitter is not None:
+            emitter(telemetry, args, base_tags)
 
-        if short in HIGH_VOLUME_EVENTS:
-            logger.debug("lance event target=%s args=%s", target, args)
-        else:
-            logger.info("lance event target=%s args=%s", target, args)
+        level: int = logging.DEBUG if short in HIGH_VOLUME_EVENTS else logging.INFO
+        logger.log(level, "lance event target=%s args=%s", target, args)
 
     return on_event
 

@@ -97,7 +97,6 @@ def make_ttl_group(keys: list[str], op: str = "insert", lifetime_days: int = 30)
     Returns:
         A routed ETL group with an extra ``ttl`` duration column.
     """
-
     count: int = len(keys)
     return pa.table(
         {
@@ -114,7 +113,6 @@ def make_ttl_group(keys: list[str], op: str = "insert", lifetime_days: int = 30)
 
 def test_apply_merge_passes_ttl_column_through(etl_config: ETLConfig, telemetry: Telemetry) -> None:
     """A per-row Duration TTL column flows through merge_insert and is refreshed on re-upsert."""
-
     apply_merge(etl_config, telemetry, ROUTING_KEY, make_ttl_group(["a", "b"], lifetime_days=30))
     apply_merge(etl_config, telemetry, ROUTING_KEY, make_ttl_group(["a"], lifetime_days=90))
     uri: str = dataset_uri(etl_config, *ROUTING_KEY)

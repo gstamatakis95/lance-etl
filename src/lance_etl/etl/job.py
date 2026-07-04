@@ -163,7 +163,6 @@ class IcebergToLanceETL:
         Raises:
             ValueError: If a bound string is not a valid ISO-8601 datetime.
         """
-
         config: ETLConfig = self.config
         if config.window_start is None and config.window_end is None:
             return source

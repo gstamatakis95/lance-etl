@@ -1,7 +1,8 @@
-"""Unit tests for bench/bigann_io.py: u8bin write/read round-trip, slice reads, ibin parsing,
-gzipped-bvecs conversion, and streaming resume-from-partial.
+"""Unit tests for the binary corpus I/O helpers in bench/bigann_io.py.
 
-All tests use tiny in-memory files written to tmp_path so no network access is required.
+Covers the u8bin write/read round-trip, slice reads, ibin parsing, gzipped-bvecs conversion, and
+streaming resume-from-partial. All tests use tiny in-memory files written to tmp_path so no
+network access is required.
 """
 
 from __future__ import annotations

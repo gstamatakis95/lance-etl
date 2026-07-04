@@ -62,7 +62,6 @@ def run(args: argparse.Namespace) -> None:
     Args:
         args: Parsed command-line arguments.
     """
-
     uris = load_dataset_uris(args)
     if not uris:
         logger.info("index: no datasets in the URI list, nothing to do")

@@ -327,8 +327,9 @@ def commit_segments(
     The expensive work runs exactly once, outside the retry loop: stale segments (those whose
     fragments were rewritten between build and commit) are dropped with a metric, and the fresh
     survivors are merged when the index type requires it. For a large dataset that merge streams
-    the segment index files through the driver, so re-running it on every benign commit conflict
-    would amplify a manifest race into repeated whale-scale work. The retried action is therefore
+    the segment index files through the committing executor (this function's only caller is the
+    per-index commit fan-out), so re-running it on every benign commit conflict would amplify a
+    manifest race into repeated whale-scale work. The retried action is therefore
     only open, validate, and commit: each attempt re-opens the dataset at the latest version,
     verifies every prepared segment still covers only live fragments, and commits. When a
     concurrent rewrite invalidates the prepared segments mid-retry, the action raises a

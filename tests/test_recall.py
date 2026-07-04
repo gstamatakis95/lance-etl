@@ -191,7 +191,7 @@ class TestFilterTranslation:
         assert filter_ast_to_sql({"is_not_null": {"column": "category"}}, COLUMNS) == "(category IS NOT NULL)"
 
     def test_between(self) -> None:
-        """between renders a BETWEEN range with typed bounds."""
+        """Between renders a BETWEEN range with typed bounds."""
         node: dict[str, Any] = {"between": {"column": "value", "low": {"int": 1}, "high": {"int": 9}}}
         assert filter_ast_to_sql(node, COLUMNS) == "(value BETWEEN 1 AND 9)"
 

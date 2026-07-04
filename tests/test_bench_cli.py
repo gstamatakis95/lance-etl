@@ -74,7 +74,7 @@ class TestSubcommandFlags:
     """Phase-relevant flags reach the configuration."""
 
     def test_download_flags(self) -> None:
-        """download accepts a pinned checksum, workspace, and corpus-root."""
+        """Download accepts a pinned checksum, workspace, and corpus-root."""
         config: BenchConfig = config_for(
             ["download", "--sha256", "abc123", "--workspace", "/tmp/ws", "--corpus-root", "/tmp/corpora"]
         )
@@ -88,7 +88,7 @@ class TestSubcommandFlags:
         assert config.corpus_root == DEFAULT_CORPUS_ROOT
 
     def test_prepare_flags(self) -> None:
-        """prepare accepts corpus-shape flags."""
+        """Prepare accepts corpus-shape flags."""
         config: BenchConfig = config_for(
             ["prepare", "--limit", "5000", "--tenants", "4", "--seed", "7", "--num-clusters", "16", "--force"]
         )
@@ -99,13 +99,13 @@ class TestSubcommandFlags:
         assert config.force is True
 
     def test_ingest_flags(self) -> None:
-        """ingest accepts batches and ETL partitioning."""
+        """Ingest accepts batches and ETL partitioning."""
         config: BenchConfig = config_for(["ingest", "--batches", "4", "--etl-partitions", "16"])
         assert config.batches == 4
         assert config.etl_partitions == 16
 
     def test_index_flags(self) -> None:
-        """index accepts the IVF sweep and sharding knobs."""
+        """Index accepts the IVF sweep and sharding knobs."""
         config: BenchConfig = config_for(
             [
                 "index",
@@ -124,12 +124,12 @@ class TestSubcommandFlags:
         assert config.fts_with_position is True
 
     def test_compact_flags(self) -> None:
-        """compact accepts the target fragment size."""
+        """Compact accepts the target fragment size."""
         config: BenchConfig = config_for(["compact", "--target-rows-per-fragment", "500000"])
         assert config.compact_target_rows == 500000
 
     def test_search_flags(self) -> None:
-        """search accepts the sweep grid, endpoint, query caps, and load knobs."""
+        """Search accepts the sweep grid, endpoint, query caps, and load knobs."""
         config: BenchConfig = config_for(
             [
                 "search",
@@ -160,13 +160,13 @@ class TestSubcommandFlags:
         assert config.prewarm is True
 
     def test_report_and_run_id(self) -> None:
-        """report accepts an explicit run id and results root."""
+        """Report accepts an explicit run id and results root."""
         config: BenchConfig = config_for(["report", "--run-id", "run42", "--results-root", "/tmp/results"])
         assert config.run_id == "run42"
         assert config.run_dir() == Path("/tmp/results").resolve() / "run42"
 
     def test_all_flags(self) -> None:
-        """all accepts the union of phase flags."""
+        """All accepts the union of phase flags."""
         config: BenchConfig = config_for(["all", "--limit", "1000", "--batches", "2", "--tenants", "2"])
         assert config.command == "all"
         assert config.limit == 1000

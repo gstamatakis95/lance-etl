@@ -183,6 +183,71 @@ def verify_historical_tags(tag_records: list[dict[str, Any]]) -> list[dict[str, 
     return outcomes
 
 
+def prewarm_orgs_at_tag(stub: Any, pb2: Any, config: BenchConfig, tag: str) -> dict[str, Any]:
+    """Prewarm every org's dataset pinned to a serve tag, capturing per-org outcomes.
+
+    Args:
+        stub: The connected ``SearchServiceStub``.
+        pb2: The generated protobuf module.
+        config: Benchmark configuration.
+        tag: The serve tag to prewarm at.
+
+    Returns:
+        Per-org prewarm reports, with failures recorded as ``error`` strings.
+    """
+    outcomes: dict[str, Any] = {}
+    for org in config.org_ids():
+        try:
+            outcomes[org] = prewarm_dataset(stub, pb2, org, fts_with_position=False, tag=tag)
+        except Exception as exc:
+            outcomes[org] = {"error": str(exc)[:500]}
+    return outcomes
+
+
+def org_recall_at_tag(
+    stub: Any,
+    pb2: Any,
+    config: BenchConfig,
+    org: str,
+    queries: np.ndarray,
+    org_gt: np.ndarray,
+    tag: str,
+) -> dict[str, Any] | None:
+    """Run the vector recall sweep for one org pinned to a serve tag.
+
+    Args:
+        stub: The connected ``SearchServiceStub``.
+        pb2: The generated protobuf module.
+        config: Benchmark configuration.
+        org: The org to sweep.
+        queries: The query matrix.
+        org_gt: The org's ground-truth global ids.
+        tag: The serve tag to query at.
+
+    Returns:
+        The org's recall point with per-cutoff recall and mean latency, or ``None`` when every
+        query errored.
+    """
+    retrieved: list[np.ndarray] = []
+    latencies: list[float] = []
+    for query in queries:
+        try:
+            response, elapsed_ms = vector_search_at_tag(stub, pb2, org, query, config.search_k, E2E_NPROBES, tag=tag)
+            latencies.append(elapsed_ms)
+            retrieved.append(result_vector_ids(response.results))
+        except Exception as exc:
+            logger.warning("gRPC error during tag recall sweep for org %s: %s", org, exc)
+    if not retrieved:
+        return None
+    expected: np.ndarray = org_gt[: len(retrieved)]
+    point: dict[str, Any] = {"org": org, "tag": tag, "queries": len(retrieved)}
+    for cutoff in RECALL_CUTOFFS:
+        point[f"recall_at_{cutoff}"] = round(float(recall_at(expected, retrieved, cutoff)), 4)
+    if latencies:
+        point["mean_ms"] = round(float(np.mean(latencies)), 3)
+    return point
+
+
 def run_grpc_legs_at_tag(
     config: BenchConfig,
     tag: str,
@@ -214,13 +279,7 @@ def run_grpc_legs_at_tag(
     except Exception as exc:
         return {"skipped": f"gRPC server unreachable at {config.endpoint}: {exc}"}
 
-    prewarm_outcomes: dict[str, Any] = {}
-    for org in config.org_ids():
-        try:
-            pw = prewarm_dataset(stub, pb2, org, fts_with_position=False, tag=tag)
-            prewarm_outcomes[org] = pw
-        except Exception as exc:
-            prewarm_outcomes[org] = {"error": str(exc)[:500]}
+    prewarm_outcomes: dict[str, Any] = prewarm_orgs_at_tag(stub, pb2, config, tag)
 
     first_latencies: dict[str, Any] = {}
     for org in config.org_ids():
@@ -236,27 +295,9 @@ def run_grpc_legs_at_tag(
     for org in config.org_ids():
         if org not in ground_truth:
             continue
-        retrieved: list[np.ndarray] = []
-        latencies: list[float] = []
-        org_gt: np.ndarray = ground_truth[org]
-        for query in queries:
-            try:
-                response, elapsed_ms = vector_search_at_tag(
-                    stub, pb2, org, query, config.search_k, E2E_NPROBES, tag=tag
-                )
-                latencies.append(elapsed_ms)
-                retrieved.append(result_vector_ids(response.results))
-            except Exception as exc:
-                logger.warning("gRPC error during tag recall sweep for org %s: %s", org, exc)
-        if not retrieved:
-            continue
-        expected: np.ndarray = org_gt[: len(retrieved)]
-        point: dict[str, Any] = {"org": org, "tag": tag, "queries": len(retrieved)}
-        for cutoff in RECALL_CUTOFFS:
-            point[f"recall_at_{cutoff}"] = round(float(recall_at(expected, retrieved, cutoff)), 4)
-        if latencies:
-            point["mean_ms"] = round(float(np.mean(latencies)), 3)
-        sweep_recalls.append(point)
+        point: dict[str, Any] | None = org_recall_at_tag(stub, pb2, config, org, queries, ground_truth[org], tag)
+        if point is not None:
+            sweep_recalls.append(point)
 
     return {"prewarm": prewarm_outcomes, "first_latencies": first_latencies, "recall": sweep_recalls}
 

@@ -163,9 +163,12 @@ uvx ruff format src/ tests/ airflow/ bench/
 uvx ruff check src/ tests/ airflow/ bench/
 ```
 
-The enabled rule sets are `E, W, F, I, B, UP, SIM, ARG, PLC0415` (see `pyproject.toml`). Both
-commands must exit 0. Do not suppress warnings without a written justification in the PR
-description.
+The enabled rule sets are `E, W, F, I, B, UP, SIM, ARG, PLC0415, D, ANN, C901` (see
+`pyproject.toml`). Google docstring style, complete signature annotations, and the mccabe
+complexity cap of 12 are therefore lint-enforced, not just conventions (`ANN401` is ignored
+because `Any` is deliberate for Spark/Arrow/gRPC engine objects, and `C901` is relaxed for
+`tests/`). Both commands must exit 0. Do not suppress warnings without a written justification
+in the PR description.
 
 ### 4b. All imports at the top of the file, always
 

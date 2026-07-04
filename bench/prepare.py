@@ -20,7 +20,10 @@ into ``--batches`` windows through the ETL's real ``--window-start`` / ``--windo
 
 Ground truth: the dataset's published ground truth is used verbatim for the canonical full single-tenant run when the
 adapter provides one. Any ``--limit`` subset, multi-tenant split, or adapter without published truth triggers an exact
-batched numpy brute-force recomputation per tenant so the benchmark stays self-consistent.
+brute-force recomputation fanned out over Spark: each executor task loads only its own base-vector slice, computes
+per-tenant partial top-k bounded by the ground-truth depth against the broadcast-by-closure queries, and the driver
+reduces the partials into exact global top-k ids. Cluster assignment for FTS scoring rides the same fan-out, so the
+driver never loads the base matrix.
 
 All corpus access goes through the :class:`bench.datasets.DatasetAdapter` resolved from ``--dataset``: the driver reads
 the queries, the k-means training sample, and the ground truth from the adapter, and each Spark executor task reads its
@@ -44,7 +47,7 @@ from pyspark.sql import functions as F
 from bench.config import NAMESPACE, TENANT_ID, BenchConfig
 from bench.corpus import assign_clusters, build_vocabulary, train_centroids
 from bench.datasets import DatasetAdapter, adapter_for
-from bench.groundtruth import brute_force_topk
+from bench.groundtruth import brute_force_topk_scored, merge_topk_partials
 from bench.results import ensure_dir, read_json, save_phase, utc_now, write_json
 from bench.spark_session import build_spark
 
@@ -255,51 +258,124 @@ def write_iceberg_table(
     return elapsed
 
 
-def tenant_ground_truth(
-    config: BenchConfig, adapter: DatasetAdapter, queries: np.ndarray
-) -> tuple[dict[str, np.ndarray], str]:
-    """Compute or load the per-tenant ground truth as global vector ids.
+def published_ground_truth(config: BenchConfig, adapter: DatasetAdapter) -> np.ndarray | None:
+    """Load the adapter's published ground truth when it applies to this run.
 
-    The adapter's published ground truth is used verbatim for the canonical full single-tenant run. Any subset,
-    multi-tenant split, or adapter without published truth triggers an exact brute-force recomputation per tenant.
+    The published truth is usable verbatim only for the canonical full single-tenant run. Any ``--limit`` subset,
+    multi-tenant split, or adapter without published truth returns ``None`` so the caller recomputes it exactly.
 
     Args:
         config: Benchmark configuration.
         adapter: The dataset adapter.
-        queries: The full query matrix.
 
     Returns:
-        One ``(num_queries, depth)`` int64 array per org id, and the manifest source label.
+        The published ``(num_queries, depth)`` int64 ground truth, or ``None`` when it does not apply.
     """
     if config.limit == adapter.base_count and config.tenants == 1:
-        published: np.ndarray | None = adapter.ground_truth(config.corpus_root)
-        if published is not None:
-            return {"org0": published}, adapter.ground_truth_source
-    base: np.ndarray = adapter.base_vectors(config.corpus_root, limit=config.limit)
-    result: dict[str, np.ndarray] = {}
-    for tenant in range(config.tenants):
-        ids: np.ndarray = np.arange(tenant, config.limit, config.tenants, dtype=np.int64)
-        logger.info("brute-force ground truth for org%d over %d vectors", tenant, len(ids))
-        result[f"org{tenant}"] = brute_force_topk(base[ids], ids, queries, adapter.gt_depth)
-    return result, "brute_force"
+        return adapter.ground_truth(config.corpus_root)
+    return None
 
 
-def compute_cluster_artifact(config: BenchConfig, adapter: DatasetAdapter, centroids: np.ndarray) -> np.ndarray:
-    """Assign every base vector in scope to its cluster for FTS scoring.
+def slice_prepare_artifacts(
+    start: int,
+    count: int,
+    adapter: DatasetAdapter,
+    corpus_root: Path,
+    centroids: np.ndarray,
+    queries: np.ndarray | None,
+    tenants: int,
+    depth: int,
+) -> dict[str, Any]:
+    """Compute one base-vector slice's cluster assignments and per-tenant ground-truth partials.
+
+    Runs inside a Spark executor task: loads only its own slice through the pickled adapter, assigns clusters against
+    the broadcast-by-closure centroids, and (when ``queries`` is set) computes an exact partial top-k per tenant
+    bounded by ``depth``, sized for the driver-side reduce in :func:`merge_topk_partials`.
+
+    Args:
+        start: First global row index of the slice.
+        count: Rows in the slice.
+        adapter: The dataset adapter, pickled into the task closure.
+        corpus_root: The shared corpus cache directory, readable from the executor.
+        centroids: Broadcast-by-closure k-means centroids.
+        queries: Broadcast-by-closure query matrix, or ``None`` when published ground truth is used.
+        tenants: Round-robin tenant count.
+        depth: Ground-truth neighbors per query.
+
+    Returns:
+        The slice ``start``, its int32 ``clusters``, and per-org ``(ids, distances)`` ``partials``.
+    """
+    vectors: np.ndarray = adapter.base_vector_slice(corpus_root, start, count)
+    clusters: np.ndarray = assign_clusters(vectors, centroids)
+    partials: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    if queries is not None:
+        ids: np.ndarray = np.arange(start, start + count, dtype=np.int64)
+        for tenant in range(tenants):
+            mask: np.ndarray = ids % tenants == tenant
+            if mask.any():
+                partials[f"org{tenant}"] = brute_force_topk_scored(vectors[mask], ids[mask], queries, depth)
+    return {"start": start, "clusters": clusters, "partials": partials}
+
+
+def fan_out_prepare_artifacts(
+    config: BenchConfig, adapter: DatasetAdapter, centroids: np.ndarray, queries: np.ndarray | None
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Compute the cluster artifact and brute-force ground truth in one Spark fan-out.
+
+    Each executor task handles one base-vector slice via :func:`slice_prepare_artifacts`. The driver concatenates the
+    cluster slices in ascending start order and reduces the per-tenant partial top-k results into exact global ids —
+    the same partial-top-k reduce shape the recall job's large tier uses. The driver never loads the base matrix.
 
     Args:
         config: Benchmark configuration.
         adapter: The dataset adapter.
         centroids: Trained cluster centroids.
+        queries: The query matrix, or ``None`` to skip ground-truth computation.
 
     Returns:
-        An int32 array of cluster ids indexed by global vector id.
+        The int32 cluster ids indexed by global vector id, and one ``(num_queries, depth)`` int64 array per org id
+        (empty when ``queries`` is ``None``).
     """
-    parts: list[np.ndarray] = []
-    for start in range(0, config.limit, KMEANS_SAMPLE_ROWS):
-        count: int = min(KMEANS_SAMPLE_ROWS, config.limit - start)
-        parts.append(assign_clusters(adapter.base_vector_slice(config.corpus_root, start, count), centroids))
-    return np.concatenate(parts)
+    corpus_root: Path = config.corpus_root
+    tenants: int = config.tenants
+    depth: int = adapter.gt_depth
+    slices: list[tuple[int, int]] = [
+        (start, min(config.rows_per_slice, config.limit - start))
+        for start in range(0, config.limit, config.rows_per_slice)
+    ]
+
+    def compute_partition(items: Any) -> Any:
+        """Compute the slice artifacts assigned to this executor task.
+
+        Args:
+            items: The ``(start, count)`` slice specs for this partition.
+
+        Yields:
+            One slice-artifact record per spec.
+        """
+        for start, count in items:
+            yield slice_prepare_artifacts(start, count, adapter, corpus_root, centroids, queries, tenants, depth)
+
+    logger.info("prepare artifacts fan-out: %d slices, ground truth %s", len(slices), queries is not None)
+    spark = build_spark(config, "bench-prepare-artifacts")
+    try:
+        results: list[dict[str, Any]] = (
+            spark.sparkContext.parallelize(slices, len(slices)).mapPartitions(compute_partition).collect()
+        )
+    finally:
+        spark.stop()
+
+    results.sort(key=lambda record: record["start"])
+    clusters: np.ndarray = np.concatenate([record["clusters"] for record in results])
+    ground_truth: dict[str, np.ndarray] = {}
+    if queries is not None:
+        for tenant in range(tenants):
+            org: str = f"org{tenant}"
+            partials: list[tuple[np.ndarray, np.ndarray]] = [
+                record["partials"][org] for record in results if org in record["partials"]
+            ]
+            ground_truth[org] = merge_topk_partials(partials, depth)
+    return clusters, ground_truth
 
 
 def run_prepare(config: BenchConfig) -> dict[str, Any]:
@@ -330,8 +406,15 @@ def run_prepare(config: BenchConfig) -> dict[str, Any]:
         vocab = build_vocabulary(len(centroids), config.words_per_cluster, config.common_words, config.seed)
 
     write_seconds: float = write_iceberg_table(config, adapter, centroids, vocab)
-    clusters: np.ndarray = compute_cluster_artifact(config, adapter, centroids)
-    ground_truth, ground_truth_source = tenant_ground_truth(config, adapter, queries)
+    published: np.ndarray | None = published_ground_truth(config, adapter)
+    clusters, ground_truth = fan_out_prepare_artifacts(
+        config, adapter, centroids, None if published is not None else queries
+    )
+    if published is not None:
+        ground_truth = {"org0": published}
+        ground_truth_source: str = adapter.ground_truth_source
+    else:
+        ground_truth_source = "brute_force"
 
     np.save(prepared / "queries.npy", queries)
     np.save(prepared / "centroids.npy", centroids)

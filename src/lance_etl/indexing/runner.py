@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 import math
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 import lance
@@ -153,23 +154,81 @@ def resolve_index_targets(dataset: lance.LanceDataset, config: IndexJobConfig) -
     return discovered
 
 
+def vector_index_needs_retrain(
+    dataset: lance.LanceDataset, config: IndexJobConfig, column: str, count_rows: Callable[[], int]
+) -> bool:
+    """Report whether an existing vector index needs a full retrain.
+
+    The index needs work when its ``lance-etl.vector.{column}`` config entry is absent or carries
+    no positive ``rows_at_train`` (an index built outside the segment path awaiting a full
+    rebuild), or when the row count grew past ``config.retrain_growth_factor`` times the recorded
+    ``rows_at_train``. The config read comes from the already-loaded manifest.
+
+    Args:
+        dataset: The already-open dataset handle.
+        config: Indexing configuration.
+        column: The indexed vector column.
+        count_rows: Cached row-count supplier shared across the dataset's per-index checks.
+
+    Returns:
+        ``True`` when the vector index requires a retrain.
+    """
+    cfg: dict[str, Any] | None = load_vector_config(dataset, column)
+    if cfg is None:
+        return True
+    rows_at_train: int = int(cfg.get("rows_at_train") or 0)
+    if rows_at_train <= 0:
+        return True
+    return count_rows() > config.retrain_growth_factor * rows_at_train
+
+
+def index_needs_work(
+    dataset: lance.LanceDataset,
+    config: IndexJobConfig,
+    existing: set[str],
+    kind: str,
+    column: str,
+    name: str,
+    count_rows: Callable[[], int],
+) -> bool:
+    """Report whether one targeted index requires a build, delta merge, or retrain.
+
+    An absent index needs work, unless it is a vector index and the row count is below
+    ``config.vector_min_rows`` (intended skip — flat KNN suffices). A present index needs work
+    when ``dataset.stats.index_stats(name)`` shows unindexed fragments or more deltas than
+    ``config.max_index_deltas``, and a present vector index additionally when
+    :func:`vector_index_needs_retrain` reports so.
+
+    Args:
+        dataset: The already-open dataset handle.
+        config: Indexing configuration.
+        existing: Names of the indexes the dataset currently carries.
+        kind: One of the ``*_KIND`` constants.
+        column: The indexed column.
+        name: The index name.
+        count_rows: Cached row-count supplier shared across the dataset's per-index checks.
+
+    Returns:
+        ``True`` when the index requires attention this run.
+    """
+    if name not in existing:
+        return kind != VECTOR_KIND or count_rows() >= config.vector_min_rows
+    stats: dict[str, Any] = dataset.stats.index_stats(name)
+    if int(stats.get("num_unindexed_fragments") or 0) > 0:
+        return True
+    if int(stats.get("num_indices") or 0) > config.max_index_deltas:
+        return True
+    return kind == VECTOR_KIND and vector_index_needs_retrain(dataset, config, column, count_rows)
+
+
 def index_skip_reason(
     dataset: lance.LanceDataset, config: IndexJobConfig, targets: list[tuple[str, str, str]]
 ) -> str | None:
     """Return a reason string when all targeted indices are current, or None to proceed.
 
     Evaluates derived dataset state from the already-open handle so no extra object-store I/O is
-    needed. The check is bypassed when ``config.rebuild`` is True.
-
-    For each targeted index the check proceeds as follows. When the index is absent the dataset
-    needs indexing, unless it is a vector index and the row count is below
-    ``config.vector_min_rows`` (intended skip — flat KNN suffices). When the index is present,
-    ``dataset.stats.index_stats(name)`` is consulted: if ``num_unindexed_fragments`` is positive
-    or ``num_indices`` exceeds ``config.max_index_deltas``, the dataset needs work. An existing
-    vector index additionally needs work when its ``lance-etl.vector.{column}`` config entry is
-    absent (an index built outside the segment path awaiting a full rebuild) or when the row
-    count grew past ``config.retrain_growth_factor`` times the recorded ``rows_at_train``. Both
-    reads come from the already-loaded manifest.
+    needed. The check is bypassed when ``config.rebuild`` is True. Each target is judged by
+    :func:`index_needs_work`, with the row count computed at most once per dataset.
 
     Args:
         dataset: The already-open dataset handle.
@@ -188,33 +247,20 @@ def index_skip_reason(
     existing: set[str] = {description.name for description in dataset.describe_indices()}
     rows: int | None = None
 
+    def count_rows() -> int:
+        """Count the dataset rows once and cache the result across the per-index checks.
+
+        Returns:
+            The dataset row count.
+        """
+        nonlocal rows
+        if rows is None:
+            rows = dataset.count_rows()
+        return rows
+
     for kind, column, name in targets:
-        if name not in existing:
-            if kind == VECTOR_KIND:
-                if rows is None:
-                    rows = dataset.count_rows()
-                if rows < config.vector_min_rows:
-                    continue
+        if index_needs_work(dataset, config, existing, kind, column, name, count_rows):
             return None
-
-        stats: dict[str, Any] = dataset.stats.index_stats(name)
-        if int(stats.get("num_unindexed_fragments") or 0) > 0:
-            return None
-        if int(stats.get("num_indices") or 0) > config.max_index_deltas:
-            return None
-
-        if kind == VECTOR_KIND:
-            cfg: dict[str, Any] | None = load_vector_config(dataset, column)
-            if cfg is None:
-                return None
-            rows_at_train: int = int(cfg.get("rows_at_train") or 0)
-            if rows_at_train <= 0:
-                return None
-            if rows is None:
-                rows = dataset.count_rows()
-            if rows > config.retrain_growth_factor * rows_at_train:
-                return None
-
     return "all indices current"
 
 
@@ -624,6 +670,39 @@ def flatten_shard_tasks(
     return shard_tasks
 
 
+def collect_round_specs(
+    plans: list[dict[str, Any]],
+    stats_by_uri: dict[str, dict[str, Any]],
+    kind_by_index: dict[tuple[str, str], str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Fold one round's plan records into the fleet accumulators and collect buildable specs.
+
+    A skipped dataset records its skip reason, finished indexes append their stats, and each
+    dataset with buildable specs registers every spec's kind and pins its plan-time version.
+
+    Args:
+        plans: The per-dataset plan records from the plan fan-out.
+        stats_by_uri: Per-dataset result records, mutated in place.
+        kind_by_index: Index kinds keyed by ``(uri, index_name)``, mutated in place.
+
+    Returns:
+        The buildable index specs, keyed by dataset URI.
+    """
+    specs_by_uri: dict[str, list[dict[str, Any]]] = {}
+    for plan in plans:
+        uri: str = plan["uri"]
+        if "skipped" in plan:
+            stats_by_uri[uri]["skipped"] = plan["skipped"]
+            continue
+        stats_by_uri[uri]["indexes"].extend(plan.get("done", []))
+        if plan["specs"]:
+            specs_by_uri[uri] = plan["specs"]
+            for spec in plan["specs"]:
+                kind_by_index[(uri, spec["index_name"])] = spec["kind"]
+            stats_by_uri[uri]["version"] = plan["version"]
+    return specs_by_uri
+
+
 def merge_deltas_if_needed(uri: str, index_name: str, config: IndexJobConfig, telemetry: Telemetry) -> bool:
     """Merge one index's accumulated deltas on an executor when over the configured cap.
 
@@ -810,10 +889,11 @@ class LanceIndexer:
     ) -> list[str]:
         """Run one plan-artifacts-build-commit round over the pending datasets.
 
-        The plan fan-out resolves each dataset's index specs, one flat Spark job resolves the
-        fleet's vector artifacts, one flat Spark job builds every shard task, and the commit
-        fan-out publishes per index. Finished index stats accumulate into ``stats_by_uri`` and
-        every spec's kind is recorded in ``kind_by_index`` for the final delta bound.
+        The plan fan-out resolves each dataset's index specs (folded into the accumulators by
+        :func:`collect_round_specs`), one flat Spark job resolves the fleet's vector artifacts,
+        one flat Spark job builds every shard task, and the commit fan-out publishes per index.
+        Finished index stats accumulate into ``stats_by_uri`` and every spec's kind is recorded
+        in ``kind_by_index`` for the final delta bound.
 
         Args:
             spark: Active Spark session.
@@ -835,18 +915,7 @@ class LanceIndexer:
             config.batch_partitions,
         )
 
-        specs_by_uri: dict[str, list[dict[str, Any]]] = {}
-        for plan in plans:
-            uri: str = plan["uri"]
-            if "skipped" in plan:
-                stats_by_uri[uri]["skipped"] = plan["skipped"]
-                continue
-            stats_by_uri[uri]["indexes"].extend(plan.get("done", []))
-            if plan["specs"]:
-                specs_by_uri[uri] = plan["specs"]
-                for spec in plan["specs"]:
-                    kind_by_index[(uri, spec["index_name"])] = spec["kind"]
-                stats_by_uri[uri]["version"] = plan["version"]
+        specs_by_uri: dict[str, list[dict[str, Any]]] = collect_round_specs(plans, stats_by_uri, kind_by_index)
         if not specs_by_uri:
             return []
 

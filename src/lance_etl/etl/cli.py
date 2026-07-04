@@ -97,7 +97,6 @@ def run(args: argparse.Namespace) -> None:
     Args:
         args: Parsed command-line arguments.
     """
-
     spark = build_spark(APP_NAME)
     try:
         config: ETLConfig = ETLConfig(

@@ -15,10 +15,11 @@ orchestration are shared rather than reimplemented.
 
 The copy itself scales in two tiers of its own. The set of source datasets is classified by fragment count in one
 distributed job that also resolves each target URI and tests whether it already exists. Small datasets are copied whole
-inside one executor task each, batched into a single Spark job. Large datasets keep a distributed per-dataset copy: the
-driver shards the source fragment ids, executors read their shard and write new fragment files into the target, and the
-driver commits all fragments in one transaction. The driver only plans, lists, and commits. All heavy read and write
-I/O runs in executors. Every commit goes through :func:`lance_etl.telemetry.commit_with_retries`.
+inside one executor task each, batched into a single Spark job. Large datasets follow the fleet phase shape: a
+per-dataset plan fan-out pins each source version and shards its fragment ids on executors, ONE flat ``(dataset,
+shard)`` Spark job writes new fragment files into every target across the tier, and a per-dataset commit fan-out
+commits each target's collected fragments in one transaction. The driver only plans, groups, and dispatches. All heavy
+read and write I/O runs in executors. Every commit goes through :func:`lance_etl.telemetry.commit_with_retries`.
 
 The source and target namespace names are validated to be non-empty strings before any work runs.
 
@@ -29,7 +30,6 @@ from __future__ import annotations
 
 import json
 import logging
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -103,10 +103,8 @@ class MigrateConfig:
         large_dataset_fragment_threshold: Fragment count at or above which a dataset is copied with the distributed
             per-dataset fan-out instead of in one executor task.
         batch_partitions: Maximum Spark partitions for the small-tier batch copy and the classification job.
-        max_concurrent_large: Driver threads running large-dataset copies concurrently.
-        num_shards: Fragment shards per large dataset, one executor task each.
-        max_tasks: Upper bound on Spark tasks for one large dataset's copy.
-        scheduler_pool: Spark FAIR scheduler pool name set for large-dataset copies.
+        num_shards: Fragment shards per large dataset, one flat-job task each.
+        max_tasks: Upper bound on shards per large dataset and on the flat shard job's Spark partitions.
         max_rows_per_file: Row cap per written fragment file, or ``None`` for the Lance default. Recompaction
             re-fragments afterwards, so this only shapes the intermediate copy.
         data_storage_version: Lance file format version for the copied target datasets. The
@@ -129,10 +127,8 @@ class MigrateConfig:
     index: IndexJobConfig | None = None
     large_dataset_fragment_threshold: int = 128
     batch_partitions: int = 512
-    max_concurrent_large: int = 4
     num_shards: int = 64
     max_tasks: int = 256
-    scheduler_pool: str = "lance-migrate"
     max_rows_per_file: int | None = None
     data_storage_version: str = "2.1"
     commit_retries: int = DEFAULT_COMMIT_RETRIES
@@ -402,6 +398,34 @@ def write_fragment_shard(
     return [json.dumps(metadata.to_json()) for metadata in metadatas]
 
 
+def plan_large_copy(source_uri: str, target_uri: str, config: MigrateConfig, telemetry: Telemetry) -> dict[str, Any]:
+    """Plan one large dataset's distributed copy on an executor.
+
+    Pins the source version so every shard reads a consistent snapshot, captures the schema the target is created
+    with, and shards the fragment ids into flat-job tasks.
+
+    Args:
+        source_uri: Source dataset URI.
+        target_uri: Target dataset URI.
+        config: Migrate configuration.
+        telemetry: Telemetry facade for the current process.
+
+    Returns:
+        A mapping with ``source``, ``target``, ``version``, ``schema``, and the fragment-id ``shards``.
+    """
+    dataset: lance.LanceDataset = lance.dataset(source_uri, storage_options=config.storage_options)
+    fragment_ids: list[int] = [fragment.fragment_id for fragment in dataset.get_fragments()]
+    shards: list[list[int]] = split_evenly(fragment_ids, min(config.num_shards, config.max_tasks))
+    telemetry.incr("migrate.large_planned")
+    return {
+        "source": source_uri,
+        "target": target_uri,
+        "version": dataset.version,
+        "schema": dataset.schema,
+        "shards": shards,
+    }
+
+
 def commit_copied_fragments(
     target_uri: str, fragment_documents: list[str], schema: pa.Schema, config: MigrateConfig, telemetry: Telemetry
 ) -> None:
@@ -497,45 +521,14 @@ class NamespaceMigrator:
             )
         return [outcome["target"] for outcome in outcomes]
 
-    def copy_one_large(self, spark: SparkSession, plan: dict[str, Any], telemetry: Telemetry) -> str:
-        """Copy one large dataset distributed across executors, then commit it.
-
-        The driver pins the source version, shards its fragment ids, fans the per-shard fragment writes out across
-        executors, and commits the collected fragments in one transaction. Rewrite I/O runs on executors.
-
-        Args:
-            spark: Active Spark session.
-            plan: The large-tier classification mapping for this dataset.
-            telemetry: Driver telemetry facade.
-
-        Returns:
-            The copied target URI.
-        """
-        config: MigrateConfig = self.config
-        source_uri: str = plan["source"]
-        target_uri: str = plan["target"]
-        source: lance.LanceDataset = lance.dataset(source_uri, storage_options=config.storage_options)
-        version: int = source.version
-        schema: pa.Schema = source.schema
-        fragment_ids: list[int] = [fragment.fragment_id for fragment in source.get_fragments()]
-        shards: list[list[int]] = split_evenly(fragment_ids, min(config.num_shards, config.max_tasks))
-        try:
-            spark.sparkContext.setLocalProperty("spark.scheduler.pool", config.scheduler_pool)
-            with telemetry.timed("dataset.shard_write_ms", tags=[f"uri:{target_uri}"]):
-                documents: list[str] = (
-                    spark.sparkContext.parallelize(shards, min(len(shards), config.max_tasks))
-                    .flatMap(lambda shard: write_fragment_shard(source_uri, target_uri, version, shard, schema, config))
-                    .collect()
-                )
-            with telemetry.timed("dataset.commit_ms", tags=[f"uri:{target_uri}"]):
-                commit_copied_fragments(target_uri, documents, schema, config, telemetry)
-        finally:
-            spark.sparkContext.setLocalProperty("spark.scheduler.pool", None)
-        telemetry.incr("migrate.copied")
-        return target_uri
-
     def copy_large_tier(self, spark: SparkSession, plans: list[dict[str, Any]], telemetry: Telemetry) -> list[str]:
-        """Copy large datasets concurrently from a driver thread pool.
+        """Copy large datasets with one flat ``(dataset, shard)`` Spark job across the whole tier.
+
+        A per-dataset plan fan-out pins each source version, captures its schema, and shards its fragment ids
+        (:func:`plan_large_copy`). ONE flat Spark job then writes every shard's fragment files across all large
+        datasets at once, and a per-dataset commit fan-out commits each target's collected fragments in one
+        transaction on an executor. The driver only plans, groups, and dispatches, and any task failure fails
+        the tier's Spark job.
 
         Args:
             spark: Active Spark session.
@@ -544,27 +537,76 @@ class NamespaceMigrator:
 
         Returns:
             The copied target URIs.
-
-        Raises:
-            Exception: The first per-dataset failure, after all datasets finish.
         """
         config: MigrateConfig = self.config
-        targets: list[str] = []
-        failures: list[BaseException] = []
-        with telemetry.timed("run.large_tier_ms"), ThreadPoolExecutor(max_workers=config.max_concurrent_large) as pool:
-            futures: dict[Future[str], str] = {
-                pool.submit(self.copy_one_large, spark, plan, telemetry): plan["target"] for plan in plans
-            }
-            for future in as_completed(futures):
-                target: str = futures[future]
-                try:
-                    targets.append(future.result())
-                except Exception as exc:
-                    telemetry.error(f"migrate copy failed for {target}", tags=[f"uri:{target}"])
-                    failures.append(exc)
-        if failures:
-            raise failures[0]
-        return targets
+        targets: dict[str, str] = {plan["source"]: plan["target"] for plan in plans}
+        with telemetry.timed("run.large_tier_ms"):
+            with telemetry.timed("run.large_plan_ms"):
+                copy_plans: list[dict[str, Any]] = fan_out_per_dataset(
+                    spark,
+                    list(targets),
+                    config.telemetry,
+                    lambda uri, executor_telemetry: plan_large_copy(uri, targets[uri], config, executor_telemetry),
+                    config.batch_partitions,
+                )
+
+            shard_tasks: list[tuple[str, str, int, pa.Schema, list[int]]] = [
+                (plan["source"], plan["target"], plan["version"], plan["schema"], shard)
+                for plan in copy_plans
+                for shard in plan["shards"]
+                if shard
+            ]
+
+            def write_partition(items: Any) -> Any:
+                """Write the fragment-copy shard tasks assigned to this executor task.
+
+                Args:
+                    items: The ``(source, target, version, schema, shard)`` tasks for this partition.
+
+                Yields:
+                    One ``(target, fragment_document)`` pair per written fragment.
+                """
+                for source, target, version, schema, shard in items:
+                    for document in write_fragment_shard(source, target, version, shard, schema, config):
+                        yield target, document
+
+            documents_by_target: dict[str, list[str]] = {}
+            if shard_tasks:
+                slices: int = max(1, min(len(shard_tasks), config.max_tasks))
+                with telemetry.timed("run.large_write_ms"):
+                    pairs: list[tuple[str, str]] = (
+                        spark.sparkContext.parallelize(shard_tasks, slices).mapPartitions(write_partition).collect()
+                    )
+                for target, document in pairs:
+                    documents_by_target.setdefault(target, []).append(document)
+
+            schema_by_target: dict[str, pa.Schema] = {plan["target"]: plan["schema"] for plan in copy_plans}
+
+            def commit_one(target: str, executor_telemetry: Telemetry) -> dict[str, Any]:
+                """Commit one target's collected fragments on an executor.
+
+                Args:
+                    target: Target dataset URI.
+                    executor_telemetry: Telemetry facade for the current executor process.
+
+                Returns:
+                    A mapping with the committed ``target``.
+                """
+                commit_copied_fragments(
+                    target, documents_by_target.get(target, []), schema_by_target[target], config, executor_telemetry
+                )
+                executor_telemetry.incr("migrate.copied")
+                return {"target": target}
+
+            with telemetry.timed("run.large_commit_ms"):
+                outcomes: list[dict[str, Any]] = fan_out_per_dataset(
+                    spark,
+                    [plan["target"] for plan in copy_plans],
+                    config.telemetry,
+                    commit_one,
+                    config.batch_partitions,
+                )
+        return [outcome["target"] for outcome in outcomes]
 
     def optimize(self, spark: SparkSession, copied: list[str], telemetry: Telemetry) -> tuple[int, int]:
         """Recompact and reindex the copied targets, in pipeline order.
@@ -598,7 +640,7 @@ class NamespaceMigrator:
 
         Discovers every source dataset in ``source_namespace``, classifies them by fragment count, fails fast if any
         target already exists unless ``overwrite_target`` is set, copies small datasets in a batched job and large ones
-        with the distributed per-dataset fan-out, and then recompacts and reindexes the targets. The source datasets
+        with the flat ``(dataset, shard)`` tier job, and then recompacts and reindexes the targets. The source datasets
         are never deleted, so serving can be flipped to the new namespace only after verification.
 
         Args:

@@ -256,7 +256,6 @@ def configure_logging_from_args(args: argparse.Namespace) -> None:
     Args:
         args: Parsed command-line arguments carrying ``log_level``.
     """
-
     level: int = logging.getLevelName(args.log_level.upper())
     configure_logging(build_telemetry_config(args), level=level)
 

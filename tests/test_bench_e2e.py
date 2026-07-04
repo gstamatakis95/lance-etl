@@ -133,7 +133,7 @@ def assert_prepare_artifacts(config: BenchConfig, outcome: dict[str, Any]) -> No
 
 
 def test_offline_tiny_end_to_end(tmp_path: Path) -> None:
-    """prepare -> ingest -> index -> compact -> report runs offline against the bigann fixture."""
+    """Prepare -> ingest -> index -> compact -> report runs offline against the bigann fixture."""
     corpus_root: Path = tmp_path / "corpora"
     make_bigann_fixture(corpus_root)
 

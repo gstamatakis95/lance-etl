@@ -6,6 +6,7 @@ dependencies = [
     "pylance>=8.0.0",
     "pyarrow>=23",
     "pyspark>=3.5",
+    "numpy",
     "datadog",
     "ddtrace",
 ]
@@ -26,7 +27,7 @@ packages = ["src/lance_etl"]
 
 [dependency-groups]
 dev = ["pytest", "ruff"]
-bench = ["numpy", "pandas", "matplotlib", "grpcio", "grpcio-tools", "opentelemetry-proto"]
+bench = ["matplotlib", "grpcio", "grpcio-tools", "opentelemetry-proto"]
 
 [tool.ruff]
 line-length = 120
@@ -34,7 +35,17 @@ target-version = "py311"
 exclude = ["bench/workspace*", "bench/corpora/"]
 
 [tool.ruff.lint]
-select = ["E", "W", "F", "I", "B", "UP", "SIM", "ARG", "PLC0415"]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "ARG", "PLC0415", "D", "ANN", "C901"]
+ignore = ["ANN401"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["C901"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.mccabe]
+max-complexity = 12
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

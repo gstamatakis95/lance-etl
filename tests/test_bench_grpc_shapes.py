@@ -95,7 +95,7 @@ class TestSearchRequests:
         assert list(request.query.projection) == ["vector_id"]
 
     def test_vector_query_optionals_left_unset(self, pb2: ModuleType) -> None:
-        """nprobes and refine_factor stay absent when not requested."""
+        """Nprobes and refine_factor stay absent when not requested."""
         query: Any = vector_query(pb2, np.asarray([0.0], dtype=np.float32), 1, None, None)
         assert not query.HasField("nprobes")
         assert not query.HasField("refine_factor")
