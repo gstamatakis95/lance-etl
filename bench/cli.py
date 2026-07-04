@@ -21,6 +21,7 @@ from bench.compaction import run_compact
 from bench.config import BenchConfig, build_parser
 from bench.download import run_download
 from bench.e2e import run_e2e
+from bench.experiment import run_experiment
 from bench.indexes import run_index
 from bench.ingest import run_ingest
 from bench.prepare import run_prepare
@@ -39,6 +40,7 @@ PHASE_RUNNERS: dict[str, Callable[[BenchConfig], dict[str, Any]]] = {
     "search": run_search,
     "report": run_report,
     "e2e": run_e2e,
+    "experiment": run_experiment,
 }
 
 
@@ -124,6 +126,8 @@ def main(argv: list[str] | None = None) -> int:
             outcome: dict[str, Any] = run_all(config)
         elif config.command == "e2e":
             outcome = run_e2e(config)
+        elif config.command == "experiment":
+            outcome = run_experiment(config)
         else:
             outcome = run_phase(config, config.command)
     except Exception:

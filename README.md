@@ -150,8 +150,11 @@ uv pip install --group bench
 ```
 
 Run with `python -m bench <subcommand>`. Subcommands: `download`, `prepare`, `ingest`, `index`,
-`compact`, `search`, `report`, `e2e`, `all`. Each subcommand accepts the full flag set, so one
-flag vector can drive the entire `all` chain.
+`compact`, `search`, `report`, `e2e`, `experiment`, `all`. Each subcommand accepts the full flag
+set, so one flag vector can drive the entire `all` chain. The `experiment` subcommand is the
+agent-driveable iteration: it spawns and owns the search server, runs the e2e path, and emits a
+single `metrics.json` with latency, recall, and on-disk size plus an `experiments.jsonl` history
+line (see `bench/README.md`).
 
 ### Documentation (`docs/`)
 

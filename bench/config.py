@@ -27,7 +27,18 @@ SIFT_GT_DEPTH: int = 100
 TENANT_ID: str = "tenant0"
 NAMESPACE: str = "ns"
 SIFT_FILE_NAMES: tuple[str, str, str] = ("sift_base.fvecs", "sift_query.fvecs", "sift_groundtruth.ivecs")
-SUBCOMMANDS: tuple[str, ...] = ("download", "prepare", "ingest", "index", "compact", "search", "report", "all", "e2e")
+SUBCOMMANDS: tuple[str, ...] = (
+    "download",
+    "prepare",
+    "ingest",
+    "index",
+    "compact",
+    "search",
+    "report",
+    "all",
+    "e2e",
+    "experiment",
+)
 PHASE_NAMES: tuple[str, ...] = ("download", "prepare", "ingest", "index", "compact", "search", "report")
 
 
@@ -38,6 +49,27 @@ def default_run_id() -> str:
         A UTC timestamp string usable as a directory name.
     """
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def parse_env_pairs(pairs: list[str] | None) -> dict[str, str]:
+    """Parse repeatable ``KEY=VALUE`` environment overrides into a dict.
+
+    Args:
+        pairs: The raw flag values, or ``None`` when the flag was never given.
+
+    Returns:
+        The parsed environment mapping, empty when no pairs were given.
+
+    Raises:
+        ValueError: If a pair carries no ``=`` separator or an empty key.
+    """
+    env: dict[str, str] = {}
+    for pair in pairs or []:
+        key, separator, value = pair.partition("=")
+        if not separator or not key:
+            raise ValueError(f"--server-env expects KEY=VALUE, got {pair!r}")
+        env[key] = value
+    return env
 
 
 def parse_int_list(text: str) -> list[int]:
@@ -123,6 +155,15 @@ class BenchConfig:
             on 8125).
         otlp_port: gRPC port for the local OTLP trace capture receiver (default 14317, avoids clash with a real agent
             on 4317).
+        server_bin: Explicit path of the search-api binary the experiment spawns. ``None`` resolves the release
+            build then the debug build.
+        build_server: When True, run ``cargo build --release`` for search-api before spawning it.
+        spawn_server: When True (the default) the experiment spawns and owns a server. Disable to measure against
+            an externally managed server at ``endpoint``.
+        server_env: Extra environment variables for the spawned server, from repeatable ``--server-env KEY=VALUE``
+            flags. This is how an iteration varies server-side knobs such as the cache backend or cache budgets.
+        baseline: Run id of a previous experiment whose ``metrics.json`` is diffed against this run's headline
+            numbers.
     """
 
     command: str
@@ -169,6 +210,11 @@ class BenchConfig:
     capture_telemetry: bool = False
     statsd_port: int = 19125
     otlp_port: int = 14317
+    server_bin: str | None = None
+    build_server: bool = False
+    spawn_server: bool = True
+    server_env: dict[str, str] = field(default_factory=dict)
+    baseline: str | None = None
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> BenchConfig:
@@ -184,7 +230,10 @@ class BenchConfig:
         nullable_fields: frozenset[str] = frozenset(
             {"ivf_partitions", "compact_target_rows", "max_queries", "sha256", "statsd_port", "otlp_port"}
         )
+        values["server_env"] = parse_env_pairs(getattr(args, "server_env", None))
         for item in fields(cls):
+            if item.name == "server_env":
+                continue
             if hasattr(args, item.name):
                 value: Any = getattr(args, item.name)
                 if value is not None or item.name in nullable_fields:
@@ -350,6 +399,35 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
         help="UDP port for the local DogStatsD capture listener (default 19125)",
     )
     parser.add_argument(
+        "--server-bin",
+        default=None,
+        help="Path to the search-api binary the experiment spawns (default: release then debug build)",
+    )
+    parser.add_argument(
+        "--build-server",
+        dest="build_server",
+        action="store_true",
+        help="Run cargo build --release for search-api before spawning it",
+    )
+    parser.add_argument(
+        "--no-spawn-server",
+        dest="spawn_server",
+        action="store_false",
+        help="Do not spawn a server; use the externally managed one at --endpoint",
+    )
+    parser.add_argument(
+        "--server-env",
+        action="append",
+        default=None,
+        metavar="KEY=VALUE",
+        help="Extra environment for the spawned server, repeatable (e.g. SEARCH_API_CACHE_BACKEND=redis)",
+    )
+    parser.add_argument(
+        "--baseline",
+        default=None,
+        help="Run id of a previous experiment to print a metrics delta against",
+    )
+    parser.add_argument(
         "--otlp-port",
         dest="otlp_port",
         type=int,
@@ -377,6 +455,7 @@ def build_parser() -> argparse.ArgumentParser:
         "report": "Aggregate run artifacts into summary.md, results.csv, and pareto.png",
         "all": "Run the full chain: download, prepare, ingest, index, compact, search, report",
         "e2e": "Batch-major e2e: per-batch ETL+index+compact+tag, historical-tag verification, optional gRPC legs",
+        "experiment": "One agent iteration: prepare if needed, spawn the server, e2e, sizes, sweep, metrics.json",
     }
     for name in SUBCOMMANDS:
         sub: argparse.ArgumentParser = subparsers.add_parser(name, help=help_texts[name])

@@ -280,6 +280,58 @@ The difference between the two `cold_ms` values quantifies the benefit of prewar
 
 ---
 
+## Agent experiment loop — `python -m bench experiment`
+
+One command runs a complete, measurable iteration: knobs in, `metrics.json` out. It chains
+download and prepare when the corpus shape is missing (cached afterwards), wipes the Lance root
+so every iteration is a clean build of the configured knobs, spawns and owns the `search-api`
+server, runs the batch-major e2e body (real ETL, pipeline compaction, indexing, hour tags),
+measures the on-disk footprint, restarts the server for a true cold first query, runs the full
+`nprobes x refine_factors` recall sweep, and appends a one-line summary to
+`{results_root}/experiments.jsonl`.
+
+```bash
+python -m bench experiment \
+  --dataset sift1m --run-id iter-001 \
+  --num-partitions 256 --target-rows-per-fragment 1048576 \
+  --nprobes 1,10,25,50 --refine-factors none,5 \
+  --server-env SEARCH_API_CACHE_BACKEND=disk
+```
+
+Server lifecycle flags: `--server-bin PATH` (default: the release build, then the debug build),
+`--build-server` (run `cargo build --release` first), `--no-spawn-server` (measure an external
+server at `--endpoint`), and repeatable `--server-env KEY=VALUE` for server-side knobs (cache
+backend, cache budgets). Without any binary the run still completes and records the sweep as
+skipped, like the other server-dependent legs. The server's output lands in
+`{run_dir}/server.log`.
+
+`metrics.json` schema (stable keys, everything an agent needs to compare iterations):
+
+| Key | Contents |
+|---|---|
+| `run_id`, `knobs` | The full configuration dump, paths as strings |
+| `server` | Spawned binary, endpoint, and env, or the skip reason |
+| `build` | Total and per-batch ETL and pipeline wall seconds |
+| `sizes` | Per-dataset and fleet `data_bytes` / `index_bytes` / `meta_bytes` / `total_bytes` and the index-to-data ratio |
+| `sweep.points` | One record per `(nprobes, refine_factor)`: recall@1/10/100, mean/p50/p95/p99 ms, single-stream QPS |
+| `sweep.first_query` | Per-org cold and warm first-query ms, cold measured after a server restart |
+| `tags` | Tags created and whether historical-tag verification passed |
+| `headline` | The distilled comparison numbers: best recall@10 point, the fastest point at recall@10 >= 0.95 (the knee), cold first-query ms, build seconds, and bytes |
+| `baseline_delta` | Per-metric `{baseline, current, delta}` when `--baseline RUN_ID` was given |
+
+The loop an agent runs is: pick knobs, run with a fresh `--run-id`, read `metrics.json`, adjust
+knobs, run again with `--baseline <previous run id>`, and steer on the headline deltas. The
+`experiments.jsonl` history holds one line per iteration (run id, knob vector, headline), so
+the whole tuning trajectory is greppable:
+
+```bash
+python -m bench experiment --run-id iter-002 --num-partitions 512 --baseline iter-001
+jq -c '{run: .run_id, knobs: .knobs.ivf_partitions, r10: .headline.best_recall_at_10, p95: .headline.knee_p95_ms, bytes: .headline.total_bytes}' \
+  < bench/results/experiments.jsonl
+```
+
+---
+
 ## Tag naming and serve-tag semantics
 
 Each batch's serve tag is named after the batch window's end time in UTC, formatted as `%Y%m%dT%H%M%SZ` (e.g. `20240101T060000Z`). Tag names contain only `[A-Za-z0-9._-]` to satisfy the Lance tag name constraint.

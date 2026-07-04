@@ -51,7 +51,10 @@ lance-etl/
     migrate_namespace.py  NamespaceMigrator + MigrateConfig: one-off namespace copy/optimize utility
   bench/                  Benchmark package (python -m bench)
     cli.py                Subcommand dispatch: download / prepare / ingest / index / compact
-                          / search / report / e2e / all
+                          / search / report / e2e / experiment / all
+    experiment.py         Agent loop iteration: prepare + spawn server + e2e + sizes + sweep -> metrics.json + experiments.jsonl
+    server.py             ServerHandle: build/spawn/health-check/restart/stop the search-api binary
+    sizes.py              On-disk data/index/meta byte measurement across the Lance fleet
     config.py             BenchConfig dataclass + full flag set
     datasets.py           DatasetAdapter registry: Sift1mAdapter, BigannAdapter
     download.py           Corpus acquisition + checksum verification

@@ -11,6 +11,7 @@ that all artifacts materialize.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -22,11 +23,13 @@ from bench.bigann_io import write_u8bin
 from bench.compaction import run_compact
 from bench.config import BenchConfig, build_parser
 from bench.datasets import BigannAdapter
+from bench.experiment import run_experiment
 from bench.indexes import run_index
 from bench.ingest import run_ingest
 from bench.prepare import run_prepare
 from bench.report import run_report
 from bench.results import read_json
+from bench.server import resolve_binary
 
 pytestmark = pytest.mark.integration
 
@@ -174,3 +177,107 @@ def test_offline_tiny_end_to_end(tmp_path: Path) -> None:
     for artifact in ("prepare.json", "ingest.json", "index.json", "compact.json", "report.json"):
         assert (run_dir / artifact).exists()
     assert "# BIGANN benchmark run" in (run_dir / "summary.md").read_text(encoding="utf-8")
+
+
+def experiment_argv(tmp_path: Path) -> list[str]:
+    """Build the argv of the offline experiment-loop run.
+
+    Args:
+        tmp_path: The temporary workspace root.
+
+    Returns:
+        The argument vector for the ``experiment`` subcommand with a tiny sweep grid.
+    """
+    return [
+        "experiment",
+        "--dataset",
+        "bigann",
+        "--workspace",
+        str(tmp_path / "workspace"),
+        "--corpus-root",
+        str(tmp_path / "corpora"),
+        "--results-root",
+        str(tmp_path / "results"),
+        "--run-id",
+        "exp1",
+        "--limit",
+        str(BASE_ROWS),
+        "--tenants",
+        str(TENANTS),
+        "--batches",
+        "2",
+        "--num-clusters",
+        "4",
+        "--words-per-cluster",
+        "10",
+        "--common-words",
+        "5",
+        "--rows-per-slice",
+        "500",
+        "--etl-partitions",
+        "2",
+        "--num-shards",
+        "2",
+        "--vector-row-floor",
+        "100",
+        "--nprobes",
+        "1,4",
+        "--refine-factors",
+        "none",
+        "--max-queries",
+        "20",
+        "--spark-master",
+        "local[2]",
+        "--driver-memory",
+        "2g",
+    ]
+
+
+def test_offline_experiment_full_loop(tmp_path: Path) -> None:
+    """The experiment loop produces metrics.json, sizes, and a history line in one command.
+
+    When a search-api binary exists (the release or debug build), the run spawns it and the
+    sweep and cold/warm first queries must be populated. Without a binary the run must still
+    complete with the server and sweep recorded as skipped, so the loop degrades exactly like
+    the other server-dependent legs.
+    """
+    corpus_root: Path = tmp_path / "corpora"
+    make_bigann_fixture(corpus_root)
+    config: BenchConfig = BenchConfig.from_args(build_parser().parse_args(experiment_argv(tmp_path)))
+
+    metrics: dict[str, Any] = run_experiment(config)
+
+    run_dir: Path = config.run_dir()
+    assert (run_dir / "metrics.json").exists()
+    assert (run_dir / "e2e.json").exists()
+
+    sizes: dict[str, Any] = metrics["sizes"]
+    assert sizes["dataset_count"] == TENANTS
+    assert sizes["data_bytes"] > 0
+    assert sizes["index_bytes"] > 0, "index builds must produce on-disk index bytes"
+    assert sizes["total_bytes"] == sizes["data_bytes"] + sizes["index_bytes"] + sizes["meta_bytes"]
+
+    assert metrics["build"]["total_seconds"] > 0
+    assert len(metrics["build"]["batches"]) == 2
+    assert metrics["tags"]["verified"] is True
+
+    history: Path = config.results_root / "experiments.jsonl"
+    assert history.exists()
+    lines: list[dict[str, Any]] = [json.loads(line) for line in history.read_text().splitlines()]
+    assert lines[-1]["run_id"] == "exp1"
+    assert lines[-1]["knobs"]["batches"] == 2
+
+    if resolve_binary(config) is None:
+        assert "skipped" in metrics["sweep"]
+        assert "skipped" in metrics["server"]
+    else:
+        assert metrics["server"]["endpoint"].startswith("localhost:")
+        points: list[dict[str, Any]] = metrics["sweep"]["points"]
+        assert len(points) == 2, "the nprobes x refine grid must produce one point per combination"
+        for point in points:
+            assert 0.0 <= point["recall_at_10"] <= 1.0
+            assert point["p95_ms"] > 0
+        assert metrics["headline"]["best_recall_at_10"] == max(point["recall_at_10"] for point in points)
+        first_query: dict[str, Any] = metrics["sweep"]["first_query"]
+        assert any("cold_ms" in timing for timing in first_query.values())
+        assert (run_dir / "server.log").exists()
