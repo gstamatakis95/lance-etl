@@ -226,21 +226,31 @@ def org_recall_at_tag(
 
     Returns:
         The org's recall point with per-cutoff recall and mean latency, or ``None`` when every
-        query errored.
+        query errored. Queries that error are excluded from scoring by index, so the surviving
+        results are always compared against their own ground-truth rows, and the point carries
+        ``failed_queries`` so a lossy sweep is visible instead of masquerading as a recall drop.
     """
     retrieved: list[np.ndarray] = []
     latencies: list[float] = []
-    for query in queries:
+    kept_indices: list[int] = []
+    for index, query in enumerate(queries):
         try:
             response, elapsed_ms = vector_search_at_tag(stub, pb2, org, query, config.search_k, E2E_NPROBES, tag=tag)
-            latencies.append(elapsed_ms)
-            retrieved.append(result_vector_ids(response.results))
         except Exception as exc:
             logger.warning("gRPC error during tag recall sweep for org %s: %s", org, exc)
+            continue
+        latencies.append(elapsed_ms)
+        retrieved.append(result_vector_ids(response.results))
+        kept_indices.append(index)
     if not retrieved:
         return None
-    expected: np.ndarray = org_gt[: len(retrieved)]
-    point: dict[str, Any] = {"org": org, "tag": tag, "queries": len(retrieved)}
+    expected: np.ndarray = org_gt[np.asarray(kept_indices, dtype=np.int64)]
+    point: dict[str, Any] = {
+        "org": org,
+        "tag": tag,
+        "queries": len(retrieved),
+        "failed_queries": len(queries) - len(retrieved),
+    }
     for cutoff in RECALL_CUTOFFS:
         point[f"recall_at_{cutoff}"] = round(float(recall_at(expected, retrieved, cutoff)), 4)
     if latencies:
@@ -429,10 +439,10 @@ def run_e2e_body(config: BenchConfig) -> dict[str, Any]:
         grpc_legs_per_tag[current_tag] = run_grpc_legs_at_tag(config, current_tag, queries, ground_truth, grpc_gen_dir)
 
     last_tag: str = window_tag_name(windows[-1][1])
-    final_recall: dict[str, Any] = {}
-    last_grpc = grpc_legs_per_tag.get(last_tag, {})
-    if "skipped" not in last_grpc:
-        final_recall = run_grpc_legs_at_tag(config, last_tag, queries, ground_truth, grpc_gen_dir)
+    last_grpc: dict[str, Any] = grpc_legs_per_tag.get(last_tag) or run_grpc_legs_at_tag(
+        config, last_tag, queries, ground_truth, grpc_gen_dir
+    )
+    final_recall: dict[str, Any] = {} if "skipped" in last_grpc else last_grpc
 
     return save_phase(
         config,

@@ -1,13 +1,14 @@
 //! Dataset resolution: the provider trait and the caching base-URI implementation.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::session::Session;
 use lance_core::cache::CacheBackend;
 use lance_io::object_store::{ChainedWrappingObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore};
+use moka::Expiry;
 use moka::future::Cache;
 
 use crate::cache::disk_store::DiskEntryStore;
@@ -39,6 +40,32 @@ pub fn handle_weight(dataset: &Dataset) -> u32 {
     (dataset.count_fragments() as u64).clamp(1, MAX_HANDLE_WEIGHT as u64) as u32
 }
 
+/// Per-entry expiry policy for the open-handle LRU.
+///
+/// An unpinned `(uri, None)` handle tracks the dataset's *latest* version, so it must not
+/// outlive the freshness window — otherwise a low-traffic tenant would keep serving the version
+/// captured at first open until capacity pressure happened to evict the handle. Version-pinned
+/// `(uri, Some(v))` handles are immutable snapshots and never expire by time; capacity weighting
+/// alone bounds them. The window reuses `serve_tag_ttl_secs`, giving `Latest` and default
+/// `Serve` opens the same staleness bound the serve-by-tag path already has.
+struct UnpinnedHandleExpiry {
+    ttl: Duration,
+}
+
+impl Expiry<(String, Option<u64>), Arc<Dataset>> for UnpinnedHandleExpiry {
+    fn expire_after_create(
+        &self,
+        key: &(String, Option<u64>),
+        _value: &Arc<Dataset>,
+        _created_at: Instant,
+    ) -> Option<Duration> {
+        match key.1 {
+            None => Some(self.ttl),
+            Some(_) => None,
+        }
+    }
+}
+
 /// Resolves a dataset target (plus a version selector) to an open Lance dataset handle.
 ///
 /// This is the seam for swapping dataset resolution strategies (URI layouts, catalogs,
@@ -51,11 +78,12 @@ pub trait DatasetProvider: Send + Sync + 'static {
     /// The target resolves to `{base}/{org}/{tenant}/{namespace}.lance`.
     ///
     /// `reference` selects the committed version: [`DatasetRef::Serve`] follows the provider's
-    /// configured serve policy (a resolved serve tag, or latest), [`DatasetRef::Latest`] always
-    /// opens latest, and [`DatasetRef::Version`]/[`DatasetRef::Tag`] pin an explicit version. A
-    /// version-pinned open keys the handle cache on the resolved version, so blue and green
-    /// versions of one dataset coexist and a tag flip selects a different handle rather than
-    /// mutating one.
+    /// configured serve policy (a resolved serve tag, or latest), [`DatasetRef::Latest`] opens
+    /// latest (freshness-bounded: a cached latest handle is refreshed within the serve-tag TTL,
+    /// so a new commit becomes visible within that window), and
+    /// [`DatasetRef::Version`]/[`DatasetRef::Tag`] pin an explicit version. A version-pinned
+    /// open keys the handle cache on the resolved version, so blue and green versions of one
+    /// dataset coexist and a tag flip selects a different handle rather than mutating one.
     fn dataset(
         &self,
         target: &DatasetTarget,
@@ -208,6 +236,9 @@ impl CachingDatasetProvider {
             datasets: Cache::builder()
                 .max_capacity(config.dataset_cache_capacity)
                 .weigher(|_key: &(String, Option<u64>), dataset: &Arc<Dataset>| handle_weight(dataset))
+                .expire_after(UnpinnedHandleExpiry {
+                    ttl: Duration::from_secs(config.serve_tag_ttl_secs),
+                })
                 .build(),
             tag_versions: Cache::builder()
                 .max_capacity(config.dataset_cache_capacity)
@@ -273,7 +304,9 @@ impl CachingDatasetProvider {
     ///
     /// `Serve` follows the serve policy: the serve tag when `serve_by_tag` is on, else latest.
     /// `Latest` resolves to no version (the `(uri, None)` handle key), so a later serving open
-    /// of the same latest handle reads back a prewarmed version and reports `warmed:true`.
+    /// of the same latest handle reads back a prewarmed version and reports `warmed:true`. The
+    /// `(uri, None)` handle itself expires after the serve-tag TTL ([`UnpinnedHandleExpiry`]),
+    /// so a commit that lands after the open becomes visible within one TTL window.
     /// `Version` and `Tag` pin an explicit committed version, whether the open is a prewarm or
     /// a serving request pinned by `version_ref` — the open's INTENT is carried separately (see
     /// [`DatasetProvider::dataset_for_prewarm`]), never inferred from the ref. A returned

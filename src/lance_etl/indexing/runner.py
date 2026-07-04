@@ -679,6 +679,9 @@ def collect_round_specs(
 
     A skipped dataset records its skip reason, finished indexes append their stats, and each
     dataset with buildable specs registers every spec's kind and pins its plan-time version.
+    On a stale-replan round the re-plan reports every already-current index in ``done`` again,
+    so entries whose index name is already recorded for the dataset are not appended twice —
+    the result stats stay one entry per index per run.
 
     Args:
         plans: The per-dataset plan records from the plan fan-out.
@@ -694,7 +697,10 @@ def collect_round_specs(
         if "skipped" in plan:
             stats_by_uri[uri]["skipped"] = plan["skipped"]
             continue
-        stats_by_uri[uri]["indexes"].extend(plan.get("done", []))
+        recorded: set[str] = {entry.get("index", "") for entry in stats_by_uri[uri]["indexes"]}
+        stats_by_uri[uri]["indexes"].extend(
+            entry for entry in plan.get("done", []) if entry.get("index") not in recorded
+        )
         if plan["specs"]:
             specs_by_uri[uri] = plan["specs"]
             for spec in plan["specs"]:

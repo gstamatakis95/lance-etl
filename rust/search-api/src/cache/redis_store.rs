@@ -10,10 +10,10 @@
 //! Every operation degrades instead of failing: an errored round trip is a miss or a dropped
 //! write, metered through `cache.backend_errors`, so a down Redis never fails a search.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use redis::AsyncCommands;
@@ -32,13 +32,21 @@ const SCAN_BATCH: usize = 512;
 /// Dir keys probed per pipelined `EXISTS` round trip during registry hygiene.
 const HYGIENE_BATCH: usize = 128;
 
+/// Age after which a locally seen prefix is re-registered with `HSETNX`.
+///
+/// A sibling replica's hygiene pass may delete a shared registry row whose dir went cold while
+/// this replica's local seen-set still claims it is registered. Re-registering warm prefixes on
+/// this cadence (matching the hygiene interval) restores the shared row within one period, so a
+/// dataset purge can miss a re-warmed prefix for at most one refresh window instead of forever.
+const REGISTER_REFRESH: Duration = Duration::from_secs(crate::config::REDIS_REGISTRY_HYGIENE_SECS);
+
 /// Redis-backed [`EntryStore`] for one cache tier.
 pub struct RedisEntryStore {
     manager: ConnectionManager,
     key_prefix: String,
     ttl_secs: i64,
     cache: CacheName,
-    registered: Mutex<HashSet<String>>,
+    registered: Mutex<HashMap<String, Instant>>,
     put_bytes: AtomicU64,
     put_entries: AtomicU64,
     metrics: Arc<Metrics>,
@@ -85,7 +93,7 @@ impl RedisEntryStore {
             key_prefix: format!("{namespace}:{}:{tier_label}", stamp_dir_name()),
             ttl_secs: ttl.as_secs() as i64,
             cache,
-            registered: Mutex::new(HashSet::new()),
+            registered: Mutex::new(HashMap::new()),
             put_bytes: AtomicU64::new(0),
             put_entries: AtomicU64::new(0),
             metrics,
@@ -219,7 +227,9 @@ impl EntryStore for RedisEntryStore {
         let mut conn = self.manager.clone();
         let dir_key = self.dir_key(dir);
         let mut pipe = redis::pipe();
-        pipe.hset(&dir_key, file, bytes).expire(&dir_key, self.ttl_secs);
+        pipe.atomic()
+            .hset(&dir_key, file, bytes)
+            .expire(&dir_key, self.ttl_secs);
         match pipe.query_async::<(u64, i64)>(&mut conn).await {
             Ok((added, _)) => {
                 self.put_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
@@ -233,7 +243,9 @@ impl EntryStore for RedisEntryStore {
         let mut conn = self.manager.clone();
         let dir_key = self.dir_key(dir);
         let mut pipe = redis::pipe();
-        pipe.hset_nx(&dir_key, file, bytes).expire(&dir_key, self.ttl_secs);
+        pipe.atomic()
+            .hset_nx(&dir_key, file, bytes)
+            .expire(&dir_key, self.ttl_secs);
         match pipe.query_async::<(u64, i64)>(&mut conn).await {
             Ok((added, _)) => {
                 if added > 0 {
@@ -298,13 +310,18 @@ impl EntryStore for RedisEntryStore {
         self.put_entries.store(0, Ordering::Relaxed);
     }
 
-    /// A process-local seen-set caps the cost at one `HSETNX` per new prefix per process
-    /// lifetime instead of one per insert. On an errored write the prefix stays unrecorded
-    /// locally so a later insert retries the registration.
+    /// A process-local seen-set caps the cost at one `HSETNX` per prefix per
+    /// [`REGISTER_REFRESH`] window instead of one per insert. The entries are time-bounded
+    /// rather than kept for the process lifetime because a sibling replica's hygiene pass can
+    /// delete the shared row while this replica still remembers registering it — re-issuing the
+    /// idempotent `HSETNX` on each refresh restores the row for warm prefixes. On an errored
+    /// write the prefix stays unrecorded locally so a later insert retries the registration.
     async fn register_prefix(&self, prefix: &str, dir: &str) {
         {
             let registered = self.registered.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            if registered.contains(prefix) {
+            if let Some(seen_at) = registered.get(prefix)
+                && seen_at.elapsed() < REGISTER_REFRESH
+            {
                 return;
             }
         }
@@ -314,7 +331,7 @@ impl EntryStore for RedisEntryStore {
                 self.registered
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(prefix.to_string());
+                    .insert(prefix.to_string(), Instant::now());
             }
             Err(error) => self.note_error(StoreOp::Registry, &error),
         }

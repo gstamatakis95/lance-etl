@@ -120,3 +120,58 @@ async fn many_tiny_coexist_then_capacity_bounds_total_weight() {
         "a heavy whale plus overflow tiny handles cannot push resident weight past the budget, got {entries_after}"
     );
 }
+
+/// Appends `rows` more rows to an existing dataset, committing a new version.
+async fn append_rows(uri: &str, rows: usize) {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let ids: Vec<i32> = (0..rows as i32).collect();
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(ids))]).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: lance::dataset::WriteMode::Append,
+        ..Default::default()
+    };
+    Dataset::write(reader, uri, Some(params)).await.unwrap();
+}
+
+/// An unpinned (latest-tracking) handle must refresh within the serve-tag TTL, so a commit that
+/// lands after the first open becomes visible without waiting for capacity eviction. A
+/// version-pinned handle opened before the commit keeps serving its immutable snapshot.
+#[tokio::test]
+async fn latest_handle_refreshes_after_freshness_ttl() {
+    let (mut config, data_tmp, _cache_tmp) = handle_cache_config(100_000);
+    config.serve_tag_ttl_secs = 1;
+    let uri = uri_for(data_tmp.path(), "fresh");
+    write_dataset(&uri, 4).await;
+    let provider = CachingDatasetProvider::new(&config).await;
+
+    let first = provider.dataset(&target("fresh"), DatasetRef::Latest).await.unwrap();
+    let pinned_version = first.version().version;
+    assert_eq!(first.count_rows(None).await.unwrap(), 4);
+
+    append_rows(&uri, 3).await;
+    let stale = provider.dataset(&target("fresh"), DatasetRef::Latest).await.unwrap();
+    assert_eq!(
+        stale.count_rows(None).await.unwrap(),
+        4,
+        "within the freshness TTL the cached latest handle is still served"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+    let refreshed = provider.dataset(&target("fresh"), DatasetRef::Latest).await.unwrap();
+    assert_eq!(
+        refreshed.count_rows(None).await.unwrap(),
+        7,
+        "past the TTL the unpinned handle reopens and sees the new commit"
+    );
+
+    let pinned = provider
+        .dataset(&target("fresh"), DatasetRef::Version(pinned_version))
+        .await
+        .unwrap();
+    assert_eq!(
+        pinned.count_rows(None).await.unwrap(),
+        4,
+        "a version-pinned handle never expires by time and keeps its snapshot"
+    );
+}

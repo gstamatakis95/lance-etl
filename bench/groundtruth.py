@@ -97,25 +97,26 @@ def brute_force_topk(
 def merge_topk_partials(partials: list[tuple[np.ndarray, np.ndarray]], k: int) -> np.ndarray:
     """Reduce per-slice partial top-k results into one exact global top-k.
 
-    Concatenates the partial candidates along the neighbor axis, keeps the ``k`` smallest distances per query, and
-    fully sorts the survivors. Callers must supply the partials in ascending slice order so tie-breaking stays
-    deterministic across runs.
+    Concatenates the partial candidates along the neighbor axis (ragged widths are fine — only the query axis must
+    match) and fully orders every candidate by ``(distance, id)`` before taking the first ``k``. Breaking distance
+    ties by global id makes the merged result independent of slice count and slice order, so re-running prepare with
+    a different ``rows_per_slice`` selects the same ground-truth ids among equal-distance candidates. Residual
+    caveat: candidates that tie exactly at a slice's internal top-k boundary are chosen inside
+    :func:`brute_force_topk_scored` before this merge sees them, so like any top-k ground truth, sets of exactly
+    equal-distance neighbors beyond the per-slice depth may still differ.
 
     Args:
         partials: ``(ids, distances)`` pairs from :func:`brute_force_topk_scored`, each ``(num_queries, <=k)``.
         k: Neighbors per query. Clamped to the total candidate count.
 
     Returns:
-        An int64 ``(num_queries, k)`` array of global ids ordered nearest first.
+        An int64 ``(num_queries, k)`` array of global ids ordered nearest first, ties broken by ascending id.
     """
     all_ids: np.ndarray = np.concatenate([ids for ids, distances in partials], axis=1)
     all_distances: np.ndarray = np.concatenate([distances for ids, distances in partials], axis=1)
     depth: int = min(k, all_ids.shape[1])
-    keep: np.ndarray = np.argpartition(all_distances, depth - 1, axis=1)[:, :depth]
-    kept_distances: np.ndarray = np.take_along_axis(all_distances, keep, axis=1)
-    kept_ids: np.ndarray = np.take_along_axis(all_ids, keep, axis=1)
-    order: np.ndarray = np.argsort(kept_distances, axis=1, kind="stable")
-    return np.take_along_axis(kept_ids, order, axis=1)
+    order: np.ndarray = np.lexsort((all_ids, all_distances))[:, :depth]
+    return np.take_along_axis(all_ids, order, axis=1)
 
 
 def recall_at(expected: np.ndarray, retrieved: Sequence[np.ndarray] | np.ndarray, k: int) -> float:

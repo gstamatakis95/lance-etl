@@ -374,6 +374,11 @@ def fan_out_prepare_artifacts(
             partials: list[tuple[np.ndarray, np.ndarray]] = [
                 record["partials"][org] for record in results if org in record["partials"]
             ]
+            if not partials:
+                logger.warning(
+                    "no base rows for %s (limit %d, tenants %d); skipping its ground truth", org, config.limit, tenants
+                )
+                continue
             ground_truth[org] = merge_topk_partials(partials, depth)
     return clusters, ground_truth
 

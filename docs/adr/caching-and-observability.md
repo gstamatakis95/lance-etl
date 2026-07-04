@@ -45,8 +45,10 @@ entry-plus-sidecar read is one `HMGET`, and `allkeys-lru` evicts whole objects. 
 (per-dir `EXPIRE`, 7 days, refreshed on access) and capacity is the server's `maxmemory`, so
 the disk janitor does not run for Redis. The prefix registry HASH carries no TTL (expiring it
 would break prefix invalidation, a correctness path) and an hourly hygiene pass reclaims dead
-rows. Being shared, the registry lets one replica's invalidation cover entries written by
-siblings.
+rows. Each replica's local seen-set is time-bounded to the hygiene cadence, so a row a sibling
+reclaimed is re-registered within one window once its prefix warms again — a purge can miss a
+re-warmed prefix for at most that window, never indefinitely. Being shared, the registry lets
+one replica's invalidation cover entries written by siblings.
 
 The `{stamp}` segment (`v{CACHE_SCHEMA_VERSION}-lance-{version}`) binds keys to the cache
 schema and lance versions: bump `LANCE_CACHE_STAMP` in `src/cache/layout.rs` together with the

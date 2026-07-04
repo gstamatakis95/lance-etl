@@ -165,6 +165,9 @@ def headline_numbers(sweep: dict[str, Any], sizes: dict[str, Any], build_seconds
         "index_bytes": sizes["index_bytes"],
     }
     points: list[dict[str, Any]] = sweep.get("points", [])
+    headline["recall_measured"] = bool(points)
+    if not points:
+        headline["recall_skip_reason"] = str(sweep.get("skipped", "sweep produced no recall points"))
     if points:
         best = max(points, key=lambda point: (point["recall_at_10"], -point["p95_ms"]))
         headline["best_recall_at_10"] = best["recall_at_10"]

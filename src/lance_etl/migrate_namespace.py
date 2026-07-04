@@ -529,8 +529,9 @@ class NamespaceMigrator:
         A per-dataset plan fan-out pins each source version, captures its schema, and shards its fragment ids
         (:func:`plan_large_copy`). ONE flat Spark job then writes every shard's fragment files across all large
         datasets at once, and a per-dataset commit fan-out commits each target's collected fragments in one
-        transaction on an executor. The driver only plans, groups, and dispatches, and any task failure fails
-        the tier's Spark job.
+        transaction on an executor — each commit task ships only its own target's fragment documents, never the
+        whole tier's. The driver only plans, groups, and dispatches, and any task failure fails the tier's Spark
+        job. A source that was legitimately empty at plan time (zero fragments) still creates its empty target.
 
         Args:
             spark: Active Spark session.
@@ -539,6 +540,10 @@ class NamespaceMigrator:
 
         Returns:
             The copied target URIs.
+
+        Raises:
+            ValueError: If a non-empty plan produced no fragment documents, instead of silently
+                committing an empty overwrite over a target.
         """
         config: MigrateConfig = self.config
         targets: dict[str, str] = {plan["source"]: plan["target"] for plan in plans}
@@ -582,31 +587,42 @@ class NamespaceMigrator:
                 for target, document in pairs:
                     documents_by_target.setdefault(target, []).append(document)
 
-            schema_by_target: dict[str, pa.Schema] = {plan["target"]: plan["schema"] for plan in copy_plans}
+            commit_entries: list[tuple[str, list[str], pa.Schema]] = []
+            for plan in copy_plans:
+                target_uri: str = plan["target"]
+                documents: list[str] = documents_by_target.get(target_uri, [])
+                planned_fragments: int = sum(len(shard) for shard in plan["shards"])
+                if not documents and planned_fragments > 0:
+                    raise ValueError(
+                        f"large-tier copy wrote no fragments for {target_uri} despite a plan covering "
+                        f"{planned_fragments} source fragment(s); refusing to commit an empty overwrite"
+                    )
+                commit_entries.append((target_uri, documents, plan["schema"]))
 
-            def commit_one(target: str, executor_telemetry: Telemetry) -> dict[str, Any]:
-                """Commit one target's collected fragments on an executor.
+            def commit_partition(items: Any) -> Any:
+                """Commit the targets assigned to this executor task.
+
+                Each item carries only its own target's fragment documents and schema, so no task
+                deserializes the whole tier's metadata.
 
                 Args:
-                    target: Target dataset URI.
-                    executor_telemetry: Telemetry facade for the current executor process.
+                    items: The ``(target, documents, schema)`` entries for this partition.
 
-                Returns:
-                    A mapping with the committed ``target``.
+                Yields:
+                    One mapping with the committed ``target`` per entry.
                 """
-                commit_copied_fragments(
-                    target, documents_by_target.get(target, []), schema_by_target[target], config, executor_telemetry
-                )
-                executor_telemetry.incr("migrate.copied")
-                return {"target": target}
+                executor_telemetry: Telemetry = Telemetry.create(config.telemetry)
+                for target, documents, schema in items:
+                    commit_copied_fragments(target, documents, schema, config, executor_telemetry)
+                    executor_telemetry.incr("migrate.copied")
+                    yield {"target": target}
 
+            commit_slices: int = max(1, min(len(commit_entries), config.batch_partitions))
             with telemetry.timed("run.large_commit_ms"):
-                outcomes: list[dict[str, Any]] = fan_out_per_dataset(
-                    spark,
-                    [plan["target"] for plan in copy_plans],
-                    config.telemetry,
-                    commit_one,
-                    config.batch_partitions,
+                outcomes: list[dict[str, Any]] = (
+                    spark.sparkContext.parallelize(commit_entries, commit_slices)
+                    .mapPartitions(commit_partition)
+                    .collect()
                 )
         return [outcome["target"] for outcome in outcomes]
 

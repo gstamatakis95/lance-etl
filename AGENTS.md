@@ -309,7 +309,9 @@ Key facts to internalize:
 - `defer_index_remap=True` builds a `__lance_frag_reuse` system index at commit time through
   the options passed to `Compaction.commit`. pylance 8.0.0 carries the `options` parameter.
 - The FTS path requires a Lance field id (not a pyarrow schema index) for `Index(fields=[...])`.
-  Resolve it with `dataset._ds.lance_schema.field_case_insensitive(col).id()`.
+  Resolve it with `lance_field_id(dataset, column)` from `indexing/segments.py` — the single
+  documented helper for that internal access, per hard rule 1. Never inline the underlying
+  `_ds.lance_schema` lookup at call sites.
 - Iceberg 1.10 rejects `start-timestamp` / `end-timestamp` outside changelog scans. Use
   `snapshot_id_bounds` in `etl.py` to resolve wall-clock windows to `start-snapshot-id` /
   `end-snapshot-id` from the `{table}.snapshots` metadata table before reading.

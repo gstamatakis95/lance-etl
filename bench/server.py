@@ -39,6 +39,12 @@ READY_TIMEOUT_SECONDS: float = 30.0
 def free_port() -> int:
     """Reserve a free localhost TCP port.
 
+    Probe-then-close is inherently racy: another process can grab the port between the probe
+    closing and the server binding. On a local bench box the window is milliseconds and a lost
+    race fails loudly as a did-not-become-ready timeout, so the simplicity is kept deliberately.
+    Restarts rebind the same port safely because the server's tokio listener sets
+    ``SO_REUSEADDR``.
+
     Returns:
         A port number that was free at probe time.
     """

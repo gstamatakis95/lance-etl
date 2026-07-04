@@ -75,7 +75,10 @@ Status: Accepted
 
 Every search request carries an optional `version_ref` oneof (a committed version id or a tag
 name, such as an ETL hourly interval tag). Unset means the serve policy — latest, or the
-resolved serve tag when serve-by-tag is on — so the common latest path pays nothing. A pinned
+resolved serve tag when serve-by-tag is on — so the common latest path pays nothing. The
+unpinned latest handle is itself freshness-bounded by the serve-tag TTL (per-entry expiry in
+the handle LRU), so a new commit becomes visible within one TTL window even on a low-traffic
+tenant whose handle capacity pressure would never evict. A pinned
 request opens exactly that snapshot, and a hybrid pin opens both legs at the same resolved
 version so fusion dedup stays consistent. Open INTENT is explicit rather than inferred from the
 reference: prewarm opens route through `DatasetProvider::dataset_for_prewarm` while serving
