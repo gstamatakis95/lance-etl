@@ -6,8 +6,12 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{CountingWrapper, ReadCounts, TEST_DATASET_PATH, build_indexed_dataset, test_config, test_target};
-use search_api::domain::{FusionSpec, HybridQuery, PrewarmSpec, Prewarmer, SearchBackend, TextQuery, VectorQuery};
+use common::{
+    CountingWrapper, ReadCounts, TEST_DATASET_PATH, bin_file_count, build_indexed_dataset, test_config, test_target,
+};
+use search_api::domain::{
+    DatasetRef, FusionSpec, HybridQuery, PrewarmSpec, Prewarmer, SearchBackend, TextQuery, VectorQuery,
+};
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
 use tempfile::TempDir;
 
@@ -24,7 +28,8 @@ async fn searches_after_prewarm_do_no_index_or_manifest_io() {
     let provider = CachingDatasetProvider::with_inner_store_wrapper(
         &config,
         Some(Arc::new(CountingWrapper { counts: counts.clone() })),
-    );
+    )
+    .await;
     let backend = LanceSearchBackend::new(provider);
     let report = backend
         .prewarm(
@@ -35,12 +40,23 @@ async fn searches_after_prewarm_do_no_index_or_manifest_io() {
                 index_names: vec![],
                 fts_with_position: true,
             },
+            DatasetRef::Latest,
         )
         .await
         .unwrap();
     assert!(report.metadata_warmed);
     assert_eq!(report.indexes.len(), 2);
     assert!(report.indexes.iter().all(|index| index.error.is_none()), "{report:?}");
+
+    let stamp = cache_tmp.path().join(search_api::cache::layout::stamp_dir_name());
+    assert!(
+        bin_file_count(&stamp.join("index")) > 0,
+        "prewarm must populate the disk index cache tier that vector/text scans read from"
+    );
+    assert!(
+        bin_file_count(&stamp.join("store")) > 0,
+        "prewarm must populate the metadata byte (store) cache tier that manifest/index-reopen reads consult"
+    );
 
     let (indices_before, manifests_before, data_before) = counts.snapshot();
 
@@ -51,11 +67,11 @@ async fn searches_after_prewarm_do_no_index_or_manifest_io() {
     };
     let outcome = backend.vector_search(&target, vector.clone()).await.unwrap();
     assert_eq!(outcome.hits.len(), 2);
-    let hits = backend
+    let text = backend
         .text_search(&target, TextQuery::simple("pear", 3))
         .await
         .unwrap();
-    assert_eq!(hits.len(), 1);
+    assert_eq!(text.hits.len(), 1);
     let fused = backend
         .hybrid_search(
             &target,
@@ -64,11 +80,12 @@ async fn searches_after_prewarm_do_no_index_or_manifest_io() {
                 text: TextQuery::simple("pear", 0),
                 k: 2,
                 fusion: FusionSpec::default(),
+                reference: search_api::domain::DatasetRef::default(),
             },
         )
         .await
         .unwrap();
-    assert_eq!(fused.len(), 2);
+    assert_eq!(fused.hits.len(), 2);
 
     let (indices_after, manifests_after, data_after) = counts.snapshot();
     assert_eq!(

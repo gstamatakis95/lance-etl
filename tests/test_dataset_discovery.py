@@ -1,20 +1,45 @@
 """Depth-agnostic dataset discovery under a base URI.
 
-Covers :func:`lance_etl.cloud_storage.discover_datasets` on a local filesystem with datasets at mixed depths, exclusion
-of artifact sidecar directories, the empty and missing base cases, and the ``--base-uri`` wiring through the CLI's
-``load_dataset_uris``.
+Covers :func:`lance_etl.cloud_storage.discover_datasets` on a local filesystem with datasets at mixed depths,
+the empty and missing base cases, the executor-fanned Spark path returning identical results to the
+pure-driver walk, and the ``--base-uri`` wiring through the CLI's ``load_dataset_uris``.
 """
 
 from __future__ import annotations
 
+import os
+import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import lance
 import pyarrow as pa
 import pytest
+from pyspark.sql import SparkSession
 
-from lance_etl.cli import build_parser, load_dataset_uris
-from lance_etl.cloud_storage import discover_datasets
+import lance_etl.indexing.cli as indexing_cli
+import lance_etl.maintenance.cli as maintenance_cli
+from lance_etl.cliutil import load_dataset_uris
+from lance_etl.cloud_storage import dataset_paths_under, discover_datasets
+
+
+@pytest.fixture(scope="module")
+def spark() -> Iterator[SparkSession]:
+    """Provide a local Spark session for the executor-fanned discovery path.
+
+    Yields:
+        A two-core local session pinned to the test interpreter.
+    """
+    os.environ["PYSPARK_PYTHON"] = sys.executable
+    os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+    session: SparkSession = (
+        SparkSession.builder.master("local[2]")
+        .appName("lance-etl-discovery-tests")
+        .config("spark.ui.enabled", "false")
+        .getOrCreate()
+    )
+    yield session
+    session.stop()
 
 
 def write_tiny_dataset(uri: str) -> None:
@@ -28,7 +53,7 @@ def write_tiny_dataset(uri: str) -> None:
 
 @pytest.fixture
 def mixed_depth_base(tmp_path: Path) -> Path:
-    """Create datasets at depths one, two, and four under a base directory, plus a sidecar to ignore.
+    """Create datasets at depths one, two, and four under a base directory.
 
     Args:
         tmp_path: Pytest-provided temporary directory.
@@ -39,9 +64,6 @@ def mixed_depth_base(tmp_path: Path) -> Path:
     write_tiny_dataset(str(tmp_path / "x.lance"))
     write_tiny_dataset(str(tmp_path / "a" / "y.lance"))
     write_tiny_dataset(str(tmp_path / "a" / "b" / "c" / "z.lance"))
-    sidecar: Path = tmp_path / "a" / "y.lance.artifacts" / "vector"
-    sidecar.mkdir(parents=True)
-    (sidecar / "manifest.json").write_text("{}", encoding="utf-8")
     return tmp_path
 
 
@@ -55,12 +77,6 @@ def test_discovery_finds_datasets_at_mixed_depths(mixed_depth_base: Path) -> Non
             str(mixed_depth_base / "a" / "b" / "c" / "z.lance"),
         ]
     )
-
-
-def test_discovery_ignores_artifact_sidecars(mixed_depth_base: Path) -> None:
-    """Sidecar directories named {dataset}.lance.artifacts are not reported as datasets."""
-    found: list[str] = discover_datasets(str(mixed_depth_base))
-    assert all("artifacts" not in uri for uri in found)
 
 
 def test_discovery_collapses_dataset_internals(mixed_depth_base: Path) -> None:
@@ -79,9 +95,37 @@ def test_discovery_on_missing_base_returns_nothing(tmp_path: Path) -> None:
     assert discover_datasets(str(tmp_path / "missing")) == []
 
 
+def test_fanned_discovery_matches_driver_walk(mixed_depth_base: Path, spark: SparkSession) -> None:
+    """The executor-fanned path returns exactly the pure-driver path's sorted URI list."""
+    driver_found: list[str] = discover_datasets(str(mixed_depth_base))
+    fanned_found: list[str] = discover_datasets(str(mixed_depth_base), spark=spark)
+    assert fanned_found == driver_found
+    assert len(fanned_found) == 3
+
+
+def test_fanned_discovery_ignores_stray_first_level_files(tmp_path: Path, spark: SparkSession) -> None:
+    """A plain file at the first level is neither a dataset nor a prefix to descend into."""
+    write_tiny_dataset(str(tmp_path / "a" / "y.lance"))
+    (tmp_path / "notes.txt").write_text("not a dataset", encoding="utf-8")
+    assert discover_datasets(str(tmp_path), spark=spark) == [str(tmp_path / "a" / "y.lance")]
+    assert discover_datasets(str(tmp_path)) == [str(tmp_path / "a" / "y.lance")]
+
+
+def test_fanned_discovery_on_empty_and_missing_base(tmp_path: Path, spark: SparkSession) -> None:
+    """Empty and missing bases yield an empty list on the fanned path, matching the driver path."""
+    assert discover_datasets(str(tmp_path), spark=spark) == []
+    assert discover_datasets(str(tmp_path / "missing"), spark=spark) == []
+
+
+def test_dataset_paths_under_subpath_stays_base_relative(mixed_depth_base: Path) -> None:
+    """Listing one first-level prefix returns paths relative to the base, not the prefix."""
+    found: set[str] = dataset_paths_under(str(mixed_depth_base), None, "a")
+    assert found == {"a/y.lance", "a/b/c/z.lance"}
+
+
 def test_cli_base_uri_discovers_datasets(mixed_depth_base: Path) -> None:
-    """The compact subcommand's --base-uri flag feeds discovery through load_dataset_uris."""
-    args = build_parser().parse_args(["compact", "--base-uri", str(mixed_depth_base)])
+    """The maintenance run subcommand's --base-uri flag feeds discovery through load_dataset_uris."""
+    args = maintenance_cli.build_parser().parse_args(["run", "--base-uri", str(mixed_depth_base)])
     uris: list[str] = load_dataset_uris(args)
     assert len(uris) == 3
     assert all(uri.endswith(".lance") for uri in uris)
@@ -89,8 +133,8 @@ def test_cli_base_uri_discovers_datasets(mixed_depth_base: Path) -> None:
 
 def test_cli_base_uri_combines_with_explicit_uris(mixed_depth_base: Path) -> None:
     """Explicit --dataset-uri values and discovered datasets are combined."""
-    args = build_parser().parse_args(
-        ["index", "--dataset-uri", "s3://bucket/explicit.lance", "--base-uri", str(mixed_depth_base)]
+    args = indexing_cli.build_parser().parse_args(
+        ["--dataset-uri", "s3://bucket/explicit.lance", "--base-uri", str(mixed_depth_base)]
     )
     uris: list[str] = load_dataset_uris(args)
     assert uris[0] == "s3://bucket/explicit.lance"

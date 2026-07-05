@@ -25,6 +25,25 @@ data.
 Brute-force scoring streams ``(id, vector)`` batches through numpy, keeps a per-batch partial top-k merged into a
 running top-k, and computes ``recall@k = |served ids in true top-k| / min(k, candidate_count)``. The denominator is
 capped at the candidate count so a perfect retrieval over a filtered set smaller than k still scores 1.0.
+
+Beyond recall@k the job grades each served ranking with nDCG@k and MRR derived from the same distance-ordered
+brute-force ground truth (no new labels). Graded relevance is the position in the exact top-k: the item at true rank
+``j`` (1-based) is assigned grade ``n - j + 1`` where ``n = min(k, candidate_count)``, so the exact nearest result
+carries the largest grade and an item outside the exact top-k carries grade ``0``. nDCG@k is the served ranking's DCG
+over those grades divided by the ideal DCG of the exact ranking, and MRR is the reciprocal of the served rank at which
+the single exact top result (the first element of the ground-truth order) appears, or ``0`` when it is absent.
+
+The job also scores text and hybrid samples emitted by the Rust sampler. A text sample carries ``recall.query_type =
+"text"``, the serialized ``recall.text_query`` node tree, and ``recall.text_columns``. The job recomputes an exact
+Okapi BM25 ranking over the named text columns at the pinned dataset version as the ground-truth top-k, then grades the
+served ids with the same recall/nDCG/MRR functions. Full-text search returns exact results, so text recall is expected
+to be ~1.0 and is primarily a staleness and version-correctness signal rather than an approximation-quality signal: a
+served result set that disagrees with the pinned-version exact BM25 ranking points at version drift, a filter or
+offset mismatch, or a tokenizer divergence between the index and this reference. A hybrid sample additionally carries
+``recall.query_vector`` and ``recall.fusion``: the job computes both the exact vector top-k and the exact BM25 top-k at
+the pinned version and fuses them with the recorded fusion strategy (reciprocal-rank fusion or normalized weighted sum)
+before grading the served ids. Metrics and the aggregate tables are reported per query type alongside the existing
+per-RPC-parameter and per-organization buckets.
 """
 
 from __future__ import annotations
@@ -35,6 +54,7 @@ import math
 import os
 import re
 import urllib.request
+from collections import Counter
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -53,7 +73,13 @@ FILTER_COLUMN_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 PATH_COMPONENT_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z0-9._-]+$")
 COMPARE_OPS: dict[str, str] = {"eq": "=", "ne": "<>", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
 DISTANCE_TYPES: frozenset[str] = frozenset({"l2", "cosine", "dot", "hamming"})
+QUERY_TYPES: frozenset[str] = frozenset({"vector", "text", "hybrid"})
+TEXT_OPERATORS: frozenset[str] = frozenset({"or", "and"})
 SPANS_SEARCH_PATH: str = "api/v2/spans/events/search"
+TOKEN_PATTERN: re.Pattern[str] = re.compile(r"\w+", re.UNICODE)
+BM25_K1: float = 1.2
+BM25_B: float = 0.75
+DEFAULT_RRF_K: float = 60.0
 
 
 class SampleParseError(ValueError):
@@ -77,6 +103,14 @@ class FilterTranslationError(ValueError):
     """A captured filter AST failed strict validation during SQL generation."""
 
 
+class TextQueryTranslationError(ValueError):
+    """A captured text-query AST could not be translated into an exact BM25 reference plan."""
+
+
+class FusionReplayError(ValueError):
+    """A captured hybrid fusion specification could not be replayed."""
+
+
 @dataclass(frozen=True)
 class RecallSample:
     """One sampled vector query parsed from a recall span.
@@ -89,9 +123,14 @@ class RecallSample:
         namespace: Namespace routing component.
         dataset_version: The committed Lance version that served the query.
         k: The requested result count.
-        query_vector: The query vector values.
+        query_type: The captured query type, one of :data:`QUERY_TYPES`. Legacy captures default to ``vector``.
+        query_vector: The query vector values. Empty for pure text queries.
         result_ids: Served result ids in rank order, or None when the capture recorded null.
-        result_distances: Served result distances in rank order.
+        result_distances: Served vector result distances in rank order, empty for text queries.
+        result_scores: Served text or fused result scores in rank order, empty for vector queries.
+        text_query: The captured text-query node tree as a dictionary, or None for vector queries.
+        text_columns: The text columns the query searched, empty for vector queries.
+        fusion: The captured hybrid fusion specification, or None for non-hybrid queries.
         nprobes_min: Lower nprobes bound, or None for the index default.
         nprobes_max: Upper nprobes bound, or None for the index default.
         refine_factor: Refine factor, or None when unset.
@@ -109,6 +148,11 @@ class RecallSample:
     query_vector: tuple[float, ...]
     result_ids: tuple[Any, ...] | None
     result_distances: tuple[float, ...]
+    query_type: str = "vector"
+    result_scores: tuple[float, ...] = ()
+    text_query: dict[str, Any] | None = None
+    text_columns: tuple[str, ...] = ()
+    fusion: dict[str, Any] | None = None
     nprobes_min: int | None = None
     nprobes_max: int | None = None
     refine_factor: int | None = None
@@ -124,10 +168,13 @@ class SampleScore:
         sample_id: The sample's capture UUID.
         org_id: Organization routing component, used for the org-level table rows.
         k: The requested result count.
+        query_type: The sample's query type, used for the per-query-type table rows and metric tag.
         nprobes_min: Lower nprobes bound, or None for the index default.
         nprobes_max: Upper nprobes bound, or None for the index default.
         refine_factor: Refine factor, or None when unset.
         recall: The measured recall@k, or None when the sample was skipped.
+        ndcg: The measured nDCG@k, or None when the sample was skipped.
+        mrr: The measured reciprocal rank of the exact top result, or None when the sample was skipped.
         version_drift: True when the recorded version was unavailable and scoring fell back to latest.
         skip_reason: A bounded-cardinality reason when the sample was skipped, otherwise None.
     """
@@ -141,6 +188,9 @@ class SampleScore:
     recall: float | None
     version_drift: bool
     skip_reason: str | None
+    query_type: str = "vector"
+    ndcg: float | None = None
+    mrr: float | None = None
 
 
 @dataclass(frozen=True)
@@ -151,6 +201,8 @@ class AggregateRow:
         bucket: Human-readable bucket label for the stdout table.
         samples: Number of successfully scored samples in the bucket.
         mean_recall: Mean recall@k over scored samples, or None when none scored.
+        mean_ndcg: Mean nDCG@k over scored samples, or None when none scored.
+        mean_mrr: Mean MRR over scored samples, or None when none scored.
         p50: Median recall@k over scored samples, or None when none scored.
         p95: 95th-percentile recall@k over scored samples, or None when none scored.
         drift_count: Samples in the bucket scored against a drifted (latest) version.
@@ -158,12 +210,16 @@ class AggregateRow:
         nprobes_min: RPC bucket key carried for metric tagging, None outside RPC buckets.
         nprobes_max: RPC bucket key carried for metric tagging, None outside RPC buckets.
         refine_factor: RPC bucket key carried for metric tagging, None outside RPC buckets.
-        is_rpc_bucket: True for RPC-parameter buckets, which are the only buckets emitted as metrics.
+        query_type: Query-type bucket key carried for metric tagging, None outside query-type buckets.
+        is_rpc_bucket: True for RPC-parameter buckets, which are emitted as metrics tagged with the RPC parameters.
+        is_query_type_bucket: True for query-type buckets, which are emitted as metrics tagged with the query type.
     """
 
     bucket: str
     samples: int
     mean_recall: float | None
+    mean_ndcg: float | None
+    mean_mrr: float | None
     p50: float | None
     p95: float | None
     drift_count: int
@@ -171,7 +227,9 @@ class AggregateRow:
     nprobes_min: int | None = None
     nprobes_max: int | None = None
     refine_factor: int | None = None
+    query_type: str | None = None
     is_rpc_bucket: bool = False
+    is_query_type_bucket: bool = False
 
 
 @dataclass(frozen=True)
@@ -202,6 +260,13 @@ class RecallJobConfig:
         vector_column: Name of the fixed-size-list vector column scanned for brute-force distances.
         max_samples: Cap on the number of span records fetched from the source.
         batch_size: Scanner batch size for the brute-force scan.
+        large_group_fragment_threshold: Fragment count above which a ``(uri, version)`` group is scored with the
+            per-fragment fan-out instead of one whole-dataset task. Groups at or below it are batched into the packed
+            small tier.
+        small_tier_slices: Spark partition count for the classification probe job and the packed small-tier scoring
+            job. Fewer slices than groups packs many small groups per task, amortizing task scheduling and cold opens.
+        large_tier_slices: Spark partition cap for the per-fragment fan-out job. One task scores one fragment up to
+            this cap, beyond which fragments share tasks while the driver still reduces them exactly.
     """
 
     base_uri: str
@@ -211,6 +276,9 @@ class RecallJobConfig:
     vector_column: str = "vector"
     max_samples: int = 10_000
     batch_size: int = 8192
+    large_group_fragment_threshold: int = 32
+    small_tier_slices: int = 256
+    large_tier_slices: int = 512
 
 
 class SpanSource(Protocol):
@@ -483,10 +551,7 @@ def parse_query_vector(attrs: dict[str, Any]) -> tuple[float, ...]:
         SampleParseError: If the attribute is missing, is not a JSON number array, or is empty.
     """
     raw: str = attr_string(attrs, "recall.query_vector")
-    try:
-        parsed: Any = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise SampleParseError("invalid:recall.query_vector") from exc
+    parsed: Any = decode_json_attr(raw, "recall.query_vector")
     if not isinstance(parsed, list) or not parsed:
         raise SampleParseError("invalid:recall.query_vector")
     values: list[float] = []
@@ -495,6 +560,50 @@ def parse_query_vector(attrs: dict[str, Any]) -> tuple[float, ...]:
             raise SampleParseError("invalid:recall.query_vector")
         values.append(float(item))
     return tuple(values)
+
+
+def decode_json_attr(raw: Any, key: str) -> Any:
+    """Decode an attribute value that is either a JSON string or an already-parsed object.
+
+    Args:
+        raw: The raw attribute value.
+        key: The attribute key, used to build the error reason.
+
+    Returns:
+        The decoded value.
+
+    Raises:
+        SampleParseError: If a string value does not parse as JSON.
+    """
+    try:
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except json.JSONDecodeError as exc:
+        raise SampleParseError(f"invalid:{key}") from exc
+
+
+def parse_float_tuple_attr(attrs: dict[str, Any], key: str) -> tuple[float, ...]:
+    """Parse an optional JSON number-array attribute into a float tuple.
+
+    Args:
+        attrs: The flat attribute dictionary.
+        key: The attribute key.
+
+    Returns:
+        The values in rank order, empty when the attribute is absent.
+
+    Raises:
+        SampleParseError: If the attribute is present but is not a JSON number array.
+    """
+    raw: Any = attrs.get(key)
+    if raw is None:
+        return ()
+    parsed: Any = decode_json_attr(raw, key)
+    if not isinstance(parsed, list):
+        raise SampleParseError(f"invalid:{key}")
+    try:
+        return tuple(float(item) for item in parsed)
+    except (TypeError, ValueError) as exc:
+        raise SampleParseError(f"invalid:{key}") from exc
 
 
 def parse_result_ids(attrs: dict[str, Any]) -> tuple[Any, ...] | None:
@@ -512,42 +621,12 @@ def parse_result_ids(attrs: dict[str, Any]) -> tuple[Any, ...] | None:
     raw: Any = attrs.get("recall.result_ids")
     if raw is None:
         return None
-    try:
-        parsed: Any = json.loads(raw) if isinstance(raw, str) else raw
-    except json.JSONDecodeError as exc:
-        raise SampleParseError("invalid:recall.result_ids") from exc
+    parsed: Any = decode_json_attr(raw, "recall.result_ids")
     if parsed is None:
         return None
     if not isinstance(parsed, list):
         raise SampleParseError("invalid:recall.result_ids")
     return tuple(parsed)
-
-
-def parse_result_distances(attrs: dict[str, Any]) -> tuple[float, ...]:
-    """Parse the JSON-encoded served result distances.
-
-    Args:
-        attrs: The flat attribute dictionary.
-
-    Returns:
-        The served distances in rank order, empty when the attribute is absent.
-
-    Raises:
-        SampleParseError: If the attribute is present but is not a JSON number array.
-    """
-    raw: Any = attrs.get("recall.result_distances")
-    if raw is None:
-        return ()
-    try:
-        parsed: Any = json.loads(raw) if isinstance(raw, str) else raw
-    except json.JSONDecodeError as exc:
-        raise SampleParseError("invalid:recall.result_distances") from exc
-    if not isinstance(parsed, list):
-        raise SampleParseError("invalid:recall.result_distances")
-    try:
-        return tuple(float(item) for item in parsed)
-    except (TypeError, ValueError) as exc:
-        raise SampleParseError("invalid:recall.result_distances") from exc
 
 
 def parse_filter_ast(attrs: dict[str, Any]) -> dict[str, Any] | None:
@@ -568,12 +647,78 @@ def parse_filter_ast(attrs: dict[str, Any]) -> dict[str, Any] | None:
     raw: Any = attrs.get("recall.filter")
     if raw is None:
         return None
-    try:
-        parsed: Any = json.loads(raw) if isinstance(raw, str) else raw
-    except json.JSONDecodeError as exc:
-        raise SampleParseError("invalid:recall.filter") from exc
+    parsed: Any = decode_json_attr(raw, "recall.filter")
     if not isinstance(parsed, dict):
         raise SampleParseError("invalid:recall.filter")
+    return parsed
+
+
+def parse_text_query(attrs: dict[str, Any]) -> dict[str, Any]:
+    """Parse the JSON-encoded text-query node tree attribute.
+
+    Structural validation of the node tree happens at scoring time on the executor, where the dataset schema is
+    available for column-membership checks.
+
+    Args:
+        attrs: The flat attribute dictionary.
+
+    Returns:
+        The text-query node tree as a dictionary.
+
+    Raises:
+        SampleParseError: If the attribute is missing or is not a JSON object.
+    """
+    raw: Any = attrs.get("recall.text_query")
+    if raw is None:
+        raise SampleParseError("missing:recall.text_query")
+    parsed: Any = decode_json_attr(raw, "recall.text_query")
+    if not isinstance(parsed, dict):
+        raise SampleParseError("invalid:recall.text_query")
+    return parsed
+
+
+def parse_text_columns(attrs: dict[str, Any]) -> tuple[str, ...]:
+    """Parse the JSON-encoded text-columns array attribute.
+
+    Args:
+        attrs: The flat attribute dictionary.
+
+    Returns:
+        The text columns the query searched.
+
+    Raises:
+        SampleParseError: If the attribute is missing, is not a non-empty JSON array, or holds a non-string entry.
+    """
+    raw: Any = attrs.get("recall.text_columns")
+    if raw is None:
+        raise SampleParseError("missing:recall.text_columns")
+    parsed: Any = decode_json_attr(raw, "recall.text_columns")
+    if not isinstance(parsed, list) or not parsed:
+        raise SampleParseError("invalid:recall.text_columns")
+    for item in parsed:
+        if not isinstance(item, str) or not item:
+            raise SampleParseError("invalid:recall.text_columns")
+    return tuple(parsed)
+
+
+def parse_fusion(attrs: dict[str, Any]) -> dict[str, Any]:
+    """Parse the JSON-encoded hybrid fusion specification attribute.
+
+    Args:
+        attrs: The flat attribute dictionary.
+
+    Returns:
+        The fusion specification as a dictionary.
+
+    Raises:
+        SampleParseError: If the attribute is missing or is not a JSON object.
+    """
+    raw: Any = attrs.get("recall.fusion")
+    if raw is None:
+        raise SampleParseError("missing:recall.fusion")
+    parsed: Any = decode_json_attr(raw, "recall.fusion")
+    if not isinstance(parsed, dict):
+        raise SampleParseError("invalid:recall.fusion")
     return parsed
 
 
@@ -592,9 +737,25 @@ def parse_recall_sample(attrs: dict[str, Any]) -> RecallSample:
     distance_type: Any = attrs.get("recall.distance_type")
     if distance_type is not None and distance_type not in DISTANCE_TYPES:
         raise SampleParseError("invalid:recall.distance_type")
+    query_type: Any = attrs.get("recall.query_type")
+    if query_type is None:
+        query_type = "vector"
+    if query_type not in QUERY_TYPES:
+        raise SampleParseError("invalid:recall.query_type")
     k: int = attr_int(attrs, "recall.k")
     if k < 1:
         raise SampleParseError("invalid:recall.k")
+    query_vector: tuple[float, ...] = ()
+    if query_type in ("vector", "hybrid"):
+        query_vector = parse_query_vector(attrs)
+    text_query: dict[str, Any] | None = None
+    text_columns: tuple[str, ...] = ()
+    if query_type in ("text", "hybrid"):
+        text_query = parse_text_query(attrs)
+        text_columns = parse_text_columns(attrs)
+    fusion: dict[str, Any] | None = None
+    if query_type == "hybrid":
+        fusion = parse_fusion(attrs)
     return RecallSample(
         sample_id=attr_string(attrs, "recall.sample_id"),
         captured_at_unix_ms=attr_int(attrs, "recall.captured_at_unix_ms"),
@@ -603,9 +764,14 @@ def parse_recall_sample(attrs: dict[str, Any]) -> RecallSample:
         namespace=attr_path_component(attrs, "recall.namespace"),
         dataset_version=attr_int(attrs, "recall.dataset_version"),
         k=k,
-        query_vector=parse_query_vector(attrs),
+        query_type=query_type,
+        query_vector=query_vector,
         result_ids=parse_result_ids(attrs),
-        result_distances=parse_result_distances(attrs),
+        result_distances=parse_float_tuple_attr(attrs, "recall.result_distances"),
+        result_scores=parse_float_tuple_attr(attrs, "recall.result_scores"),
+        text_query=text_query,
+        text_columns=text_columns,
+        fusion=fusion,
         nprobes_min=attr_optional_int(attrs, "recall.nprobes_min"),
         nprobes_max=attr_optional_int(attrs, "recall.nprobes_max"),
         refine_factor=attr_optional_int(attrs, "recall.refine_factor"),
@@ -867,7 +1033,54 @@ def fixed_size_list_to_numpy(column: pa.Array) -> np.ndarray:
     return values.reshape(len(column), column.type.list_size)
 
 
-def brute_force_top_k(
+def merge_top_k(
+    best_ids: list[Any], best_dists: np.ndarray, add_ids: list[Any], add_dists: np.ndarray, k: int
+) -> tuple[list[Any], np.ndarray]:
+    """Stable-merge a new partial top-k into a running top-k.
+
+    Concatenates the running best ids and distances with the incoming partial, keeps the ``k`` smallest distances by a
+    stable argsort, and carries the aligned ids. The stable sort keeps the running-best (earlier) entries ahead of the
+    incoming ones on ties, so the merge order reflects scan order: this is the single primitive shared by the
+    per-batch streaming merge and the per-fragment reduce, which is what makes the fanned-out reduce bit-identical to
+    the single-stream scan.
+
+    Args:
+        best_ids: The running best ids in ascending-distance order.
+        best_dists: The running best distances aligned with ``best_ids``.
+        add_ids: The incoming partial's ids.
+        add_dists: The incoming partial's distances aligned with ``add_ids``.
+        k: The number of results to keep.
+
+    Returns:
+        ``(merged_ids, merged_dists)`` truncated to the ``k`` smallest distances in ascending-distance order.
+    """
+    merged_dists: np.ndarray = np.concatenate([best_dists, np.asarray(add_dists, dtype=np.float64)])
+    merged_ids: list[Any] = best_ids + list(add_ids)
+    order: np.ndarray = np.argsort(merged_dists, kind="stable")[:k]
+    return [merged_ids[index] for index in order], merged_dists[order]
+
+
+def reduce_partial_top_k(partials: list[tuple[list[Any], list[float]]], k: int) -> tuple[list[Any], list[float]]:
+    """Reduce per-fragment partial top-k results into one exact top-k.
+
+    Folds the partials with :func:`merge_top_k` in the order given, which the caller must supply in ascending fragment
+    scan order so the result matches the single-stream scan exactly, ties included.
+
+    Args:
+        partials: One ``(ids, distances)`` partial top-k per fragment, in ascending fragment scan order.
+        k: The number of results to keep.
+
+    Returns:
+        ``(true_top_k_ids, true_top_k_distances)`` in ascending-distance order.
+    """
+    best_ids: list[Any] = []
+    best_dists: np.ndarray = np.empty(0, dtype=np.float64)
+    for ids, dists in partials:
+        best_ids, best_dists = merge_top_k(best_ids, best_dists, ids, np.asarray(dists, dtype=np.float64), k)
+    return best_ids, best_dists.tolist()
+
+
+def brute_force_top_k_scored(
     dataset: lance.LanceDataset,
     query: np.ndarray,
     k: int,
@@ -876,11 +1089,14 @@ def brute_force_top_k(
     vector_column: str,
     filter_sql: str | None,
     batch_size: int,
-) -> tuple[list[Any], int]:
-    """Compute the exact top-k ids for a query by scanning the dataset.
+    fragments: list[lance.LanceFragment] | None = None,
+) -> tuple[list[Any], list[float], int]:
+    """Compute the exact top-k ids and their distances for a query by scanning the dataset.
 
     Streams ``(id, vector)`` batches, computes exact distances per batch in numpy, and merges each batch's partial
-    top-k into a running top-k so memory stays bounded by ``batch_size + k``.
+    top-k into a running top-k so memory stays bounded by ``batch_size + k``. When ``fragments`` is given the scan is
+    restricted to those fragments, which is how the large tier computes one fragment's partial top-k; the per-fragment
+    partials are then reduced with :func:`reduce_partial_top_k`.
 
     Args:
         dataset: The opened (possibly version-pinned) dataset.
@@ -891,16 +1107,18 @@ def brute_force_top_k(
         vector_column: Name of the fixed-size-list vector column.
         filter_sql: The internally generated filter string, or None for an unfiltered scan.
         batch_size: Scanner batch size.
+        fragments: The fragments to restrict the scan to, or None to scan the whole dataset.
 
     Returns:
-        ``(true_top_k_ids, candidate_count)`` where the ids are in ascending-distance order and the count is the
-        number of rows that passed the filter and carried a non-null vector.
+        ``(true_top_k_ids, true_top_k_distances, candidate_count)`` where the ids are in ascending-distance order, the
+        distances are aligned with them, and the count is the number of rows that passed the filter and carried a
+        non-null vector.
 
     Raises:
         ValueError: If a batch's vector dimension does not match the query dimension.
     """
     scanner: lance.LanceScanner = dataset.scanner(
-        columns=[id_column, vector_column], filter=filter_sql, batch_size=batch_size
+        columns=[id_column, vector_column], filter=filter_sql, batch_size=batch_size, fragments=fragments
     )
     best_ids: list[Any] = []
     best_dists: np.ndarray = np.empty(0, dtype=np.float64)
@@ -922,12 +1140,355 @@ def brute_force_top_k(
             )
         distances: np.ndarray = compute_distances(candidates, query, distance_type)
         candidate_count += table.num_rows
-        merged_dists: np.ndarray = np.concatenate([best_dists, distances])
-        merged_ids: list[Any] = best_ids + table.column(id_column).to_pylist()
-        order: np.ndarray = np.argsort(merged_dists, kind="stable")[:k]
-        best_dists = merged_dists[order]
-        best_ids = [merged_ids[index] for index in order]
-    return best_ids, candidate_count
+        best_ids, best_dists = merge_top_k(best_ids, best_dists, table.column(id_column).to_pylist(), distances, k)
+    return best_ids, best_dists.tolist(), candidate_count
+
+
+def brute_force_top_k(
+    dataset: lance.LanceDataset,
+    query: np.ndarray,
+    k: int,
+    distance_type: str,
+    id_column: str,
+    vector_column: str,
+    filter_sql: str | None,
+    batch_size: int,
+) -> tuple[list[Any], int]:
+    """Compute the exact top-k ids for a query by scanning the dataset.
+
+    Args:
+        dataset: The opened (possibly version-pinned) dataset.
+        query: The float64 query vector.
+        k: The requested result count.
+        distance_type: One of :data:`DISTANCE_TYPES`.
+        id_column: Name of the unique id column.
+        vector_column: Name of the fixed-size-list vector column.
+        filter_sql: The internally generated filter string, or None for an unfiltered scan.
+        batch_size: Scanner batch size.
+
+    Returns:
+        ``(true_top_k_ids, candidate_count)`` where the ids are in ascending-distance order and the count is the
+        number of rows that passed the filter and carried a non-null vector.
+
+    Raises:
+        ValueError: If a batch's vector dimension does not match the query dimension.
+    """
+    ids, scores, count = brute_force_top_k_scored(
+        dataset, query, k, distance_type, id_column, vector_column, filter_sql, batch_size
+    )
+    del scores
+    return ids, count
+
+
+def ranking_quality(
+    true_ids_ordered: list[Any], served_ids: list[Any], k: int, candidate_count: int
+) -> tuple[float, float, float]:
+    """Grade a served ranking against the exact ground-truth order with recall@k, nDCG@k, and MRR.
+
+    Graded relevance is the position in the exact top-k: the item at true rank ``j`` (1-based) is assigned grade
+    ``n - j + 1`` where ``n = len(true_ids_ordered)``, so the exact top result carries the largest grade and an item
+    outside the exact top-k carries grade ``0``. nDCG@k is the served ranking's discounted cumulative gain over those
+    grades divided by the ideal discounted cumulative gain of the exact order, with the standard ``1 / log2(rank + 1)``
+    position discount. MRR is the reciprocal of the served rank at which the single exact top result (the first element
+    of the ground-truth order) appears, or ``0`` when it is absent from the served top-k.
+
+    Args:
+        true_ids_ordered: The exact ground-truth ids in best-first order, length ``min(k, candidate_count)``.
+        served_ids: The served result ids in rank order.
+        k: The requested result count.
+        candidate_count: The number of eligible candidates the ground truth was drawn from.
+
+    Returns:
+        ``(recall, ndcg, mrr)`` over the served top-k.
+    """
+    denominator: int = min(k, candidate_count)
+    served_top: list[Any] = list(served_ids)[:k]
+    n: int = len(true_ids_ordered)
+    grade_map: dict[Any, int] = {tid: n - idx for idx, tid in enumerate(true_ids_ordered)}
+    hits: int = len(set(grade_map) & set(served_top))
+    recall: float = hits / denominator if denominator > 0 else 0.0
+    dcg: float = sum(grade_map.get(sid, 0) / math.log2(pos + 2) for pos, sid in enumerate(served_top))
+    idcg: float = sum((n - j) / math.log2(j + 2) for j in range(n))
+    ndcg: float = dcg / idcg if idcg > 0 else 0.0
+    mrr: float = 0.0
+    if true_ids_ordered:
+        top_true: Any = true_ids_ordered[0]
+        if top_true in served_top:
+            mrr = 1.0 / (served_top.index(top_true) + 1)
+    return recall, ndcg, mrr
+
+
+def tokenize_text(text: Any) -> list[str]:
+    """Tokenize one text value into lowercase word tokens.
+
+    The reference tokenizer is a Unicode word splitter over the lowercased string. It approximates the default Lance
+    full-text tokenizer. A divergence between this tokenizer and the index tokenizer shows up as a sub-1.0 text recall,
+    which the report attributes to the staleness and correctness signal documented at the module level.
+
+    Args:
+        text: The cell value, which may be None or non-string.
+
+    Returns:
+        The token list, empty when the value is None or not a string.
+    """
+    if not isinstance(text, str):
+        return []
+    return TOKEN_PATTERN.findall(text.lower())
+
+
+def bm25_column_scores(
+    token_lists: list[list[str]], query_terms: list[str], operator: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute exact Okapi BM25 scores and a match mask for one column.
+
+    Uses the Lucene BM25 parameterization with ``k1`` of :data:`BM25_K1`, ``b`` of :data:`BM25_B`, and the
+    always-positive inverse document frequency ``ln(1 + (N - df + 0.5) / (df + 0.5))``. A document matches under the
+    ``or`` operator when it contains at least one query term and under the ``and`` operator when it contains all of
+    them.
+
+    Args:
+        token_lists: One token list per document, aligned with the candidate order.
+        query_terms: The tokenized query terms.
+        operator: ``or`` or ``and``.
+
+    Returns:
+        ``(scores, matched)`` where ``scores`` holds the BM25 score per document and ``matched`` is the boolean match
+        mask per document.
+    """
+    count: int = len(token_lists)
+    scores: np.ndarray = np.zeros(count, dtype=np.float64)
+    if count == 0 or not query_terms:
+        return scores, np.zeros(count, dtype=bool)
+    lengths: np.ndarray = np.asarray([len(tokens) for tokens in token_lists], dtype=np.float64)
+    avgdl: float = float(lengths.mean()) if lengths.sum() > 0 else 1.0
+    if avgdl == 0.0:
+        avgdl = 1.0
+    counters: list[Counter[str]] = [Counter(tokens) for tokens in token_lists]
+    unique_terms: list[str] = sorted(set(query_terms))
+    present: dict[str, np.ndarray] = {}
+    for term in unique_terms:
+        tf: np.ndarray = np.asarray([counter.get(term, 0) for counter in counters], dtype=np.float64)
+        present[term] = tf
+        df: int = int(np.count_nonzero(tf))
+        idf: float = math.log(1.0 + (count - df + 0.5) / (df + 0.5))
+        denom: np.ndarray = tf + BM25_K1 * (1.0 - BM25_B + BM25_B * lengths / avgdl)
+        scores += np.where(tf > 0, idf * (tf * (BM25_K1 + 1.0)) / denom, 0.0)
+    term_present: np.ndarray = np.vstack([present[term] > 0 for term in unique_terms])
+    matched: np.ndarray = term_present.all(axis=0) if operator == "and" else term_present.any(axis=0)
+    return scores, matched
+
+
+def text_query_field_queries(
+    node: Any, text_columns: tuple[str, ...], columns: frozenset[str]
+) -> list[tuple[str, list[str], str, float]]:
+    """Extract per-column scoring clauses from a captured text-query node tree.
+
+    Supports the ``match`` and ``multi_match`` node shapes, which cover the sampled full-text and hybrid traffic. Every
+    referenced column is validated against the identifier allowlist and the dataset schema, honoring the same strict
+    no-raw-string replay rule as the filter AST. Other node shapes are rejected so the sample is skipped rather than
+    scored against an unsupported reference.
+
+    Args:
+        node: The externally tagged text-query node.
+        text_columns: The query's default columns, used by clauses that do not name a column.
+        columns: The dataset schema's column names.
+
+    Returns:
+        A list of ``(column, terms, operator, boost)`` clauses.
+
+    Raises:
+        TextQueryTranslationError: If the node shape is unsupported or any column fails validation.
+    """
+    if not isinstance(node, dict) or len(node) != 1:
+        raise TextQueryTranslationError(f"text query node must be a single-key tagged object: {node!r}")
+    tag, body = next(iter(node.items()))
+    if not isinstance(body, dict):
+        raise TextQueryTranslationError(f"text query body must be an object: {body!r}")
+    if tag == "match":
+        terms: list[str] = tokenize_text(body.get("terms"))
+        operator: str = body.get("operator", "or")
+        if operator not in TEXT_OPERATORS:
+            raise TextQueryTranslationError(f"unknown text operator: {operator!r}")
+        boost: float = float(body.get("boost", 1.0))
+        column: Any = body.get("column")
+        targets: tuple[str, ...] = (column,) if column is not None else text_columns
+        if not targets:
+            raise TextQueryTranslationError("match clause has no column and no default text columns")
+        return [(validate_text_column(target, columns), terms, operator, boost) for target in targets]
+    if tag == "multi_match":
+        terms = tokenize_text(body.get("terms"))
+        operator = body.get("operator", "or")
+        if operator not in TEXT_OPERATORS:
+            raise TextQueryTranslationError(f"unknown text operator: {operator!r}")
+        target_columns: Any = body.get("columns")
+        if not isinstance(target_columns, list) or not target_columns:
+            raise TextQueryTranslationError("multi_match requires a non-empty columns list")
+        boosts: Any = body.get("boosts") or [1.0] * len(target_columns)
+        if not isinstance(boosts, list) or len(boosts) != len(target_columns):
+            raise TextQueryTranslationError("multi_match boosts must match the columns length")
+        return [
+            (validate_text_column(target, columns), terms, operator, float(weight))
+            for target, weight in zip(target_columns, boosts, strict=True)
+        ]
+    raise TextQueryTranslationError(f"unsupported text query node tag: {tag!r}")
+
+
+def validate_text_column(name: Any, columns: frozenset[str]) -> str:
+    """Validate one text column identifier against the allowlist and the dataset schema.
+
+    Args:
+        name: The column name from the text-query AST.
+        columns: The dataset schema's column names.
+
+    Returns:
+        The validated identifier, unchanged.
+
+    Raises:
+        TextQueryTranslationError: If the name fails the identifier allowlist or is not in the schema.
+    """
+    if not isinstance(name, str) or not FILTER_COLUMN_PATTERN.match(name):
+        raise TextQueryTranslationError(f"text column fails identifier allowlist: {name!r}")
+    if name not in columns:
+        raise TextQueryTranslationError(f"text column not in dataset schema: {name!r}")
+    return name
+
+
+def bm25_top_k(
+    dataset: lance.LanceDataset,
+    field_queries: list[tuple[str, list[str], str, float]],
+    k: int,
+    id_column: str,
+    filter_sql: str | None,
+    batch_size: int,
+) -> tuple[list[Any], list[float], int]:
+    """Compute the exact BM25 top-k ids and scores over the named text columns.
+
+    Materializes the candidate text columns at the pinned version, computes per-column BM25 with
+    :func:`bm25_column_scores`, sums the boosted column scores, and ranks the documents that matched at least one
+    clause. Ties break on the id column so the reference order is deterministic.
+
+    Args:
+        dataset: The opened (possibly version-pinned) dataset.
+        field_queries: The ``(column, terms, operator, boost)`` clauses to score.
+        k: The requested result count.
+        id_column: Name of the unique id column.
+        filter_sql: The internally generated filter string, or None for an unfiltered scan.
+        batch_size: Scanner batch size.
+
+    Returns:
+        ``(true_top_k_ids, true_top_k_scores, candidate_count)`` where the ids are in descending-score order, the
+        scores are aligned with them, and the count is the number of documents that matched at least one clause.
+    """
+    needed_columns: list[str] = sorted({clause[0] for clause in field_queries})
+    scanner: lance.LanceScanner = dataset.scanner(
+        columns=[id_column, *needed_columns], filter=filter_sql, batch_size=batch_size
+    )
+    ids: list[Any] = []
+    column_tokens: dict[str, list[list[str]]] = {column: [] for column in needed_columns}
+    for batch in scanner.to_batches():
+        if batch.num_rows == 0:
+            continue
+        table: pa.Table = pa.Table.from_batches([batch])
+        ids.extend(table.column(id_column).to_pylist())
+        for column in needed_columns:
+            column_tokens[column].extend(tokenize_text(value) for value in table.column(column).to_pylist())
+    total: int = len(ids)
+    if total == 0:
+        return [], [], 0
+    scores: np.ndarray = np.zeros(total, dtype=np.float64)
+    matched_any: np.ndarray = np.zeros(total, dtype=bool)
+    for column, terms, operator, boost in field_queries:
+        column_scores, matched = bm25_column_scores(column_tokens[column], terms, operator)
+        scores += boost * np.where(matched, column_scores, 0.0)
+        matched_any |= matched
+    matched_indices: list[int] = [index for index in range(total) if matched_any[index]]
+    matched_indices.sort(key=lambda index: (-scores[index], ids[index]))
+    top: list[int] = matched_indices[:k]
+    return [ids[index] for index in top], [float(scores[index]) for index in top], len(matched_indices)
+
+
+def normalize_leg(ids: list[Any], scores: list[float], lower_is_better: bool) -> dict[Any, float]:
+    """Min-max normalize one fusion leg's scores into ``[0, 1]`` with best mapped to 1.0.
+
+    Args:
+        ids: The leg's ids in rank order.
+        scores: The leg's raw scores aligned with the ids.
+        lower_is_better: True for distance legs where a smaller score is better, False for BM25 legs.
+
+    Returns:
+        A mapping from id to normalized score, where the best id maps to 1.0 and ties or single-element legs map all
+        ids to 1.0.
+    """
+    if not ids:
+        return {}
+    values: np.ndarray = np.asarray(scores, dtype=np.float64)
+    if lower_is_better:
+        values = -values
+    low: float = float(values.min())
+    high: float = float(values.max())
+    if high == low:
+        return {rid: 1.0 for rid in ids}
+    normalized: np.ndarray = (values - low) / (high - low)
+    return {rid: float(normalized[index]) for index, rid in enumerate(ids)}
+
+
+def fuse_legs(
+    fusion_ast: dict[str, Any],
+    vector_ids: list[Any],
+    vector_scores: list[float],
+    text_ids: list[Any],
+    text_scores: list[float],
+    k: int,
+) -> list[Any]:
+    """Replay a captured hybrid fusion specification over the exact per-leg references.
+
+    Reciprocal-rank fusion mirrors the Rust ``rrf_fuse`` math exactly: each id accrues ``1 / (rrf_k + rank + 1)`` with
+    1-based ranks summed across the legs that contain it. Weighted fusion forms ``vector_weight * vector_norm +
+    (1 - vector_weight) * text_norm`` over the min-max normalized leg scores. Ties break on the id so the fused order
+    is deterministic where the Rust hash-map order is not.
+
+    Args:
+        fusion_ast: The single-key fusion specification, ``{"rrf": {"k": ...}}`` or ``{"weighted": {...}}``.
+        vector_ids: The exact vector leg ids in best-first order.
+        vector_scores: The exact vector leg distances aligned with ``vector_ids``.
+        text_ids: The exact BM25 leg ids in best-first order.
+        text_scores: The exact BM25 leg scores aligned with ``text_ids``.
+        k: The number of fused results to return.
+
+    Returns:
+        The fused top-k ids in best-first order.
+
+    Raises:
+        FusionReplayError: If the specification shape or its parameters are invalid.
+    """
+    if not isinstance(fusion_ast, dict) or len(fusion_ast) != 1:
+        raise FusionReplayError(f"fusion must be a single-key tagged object: {fusion_ast!r}")
+    tag, body = next(iter(fusion_ast.items()))
+    if not isinstance(body, dict):
+        raise FusionReplayError(f"fusion body must be an object: {body!r}")
+    if tag == "rrf":
+        rrf_k: Any = body.get("k", DEFAULT_RRF_K)
+        if isinstance(rrf_k, bool) or not isinstance(rrf_k, (int, float)) or rrf_k <= 0:
+            raise FusionReplayError(f"rrf k must be a positive number: {rrf_k!r}")
+        fused: dict[Any, float] = {}
+        for leg in (vector_ids, text_ids):
+            for rank, rid in enumerate(leg):
+                fused[rid] = fused.get(rid, 0.0) + 1.0 / (float(rrf_k) + rank + 1.0)
+        return sorted(fused, key=lambda rid: (-fused[rid], rid))[:k]
+    if tag == "weighted":
+        weight: Any = body.get("vector_weight")
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not 0.0 <= float(weight) <= 1.0:
+            raise FusionReplayError(f"weighted vector_weight must be in [0, 1]: {weight!r}")
+        vector_norm: dict[Any, float] = normalize_leg(vector_ids, vector_scores, lower_is_better=True)
+        text_norm: dict[Any, float] = normalize_leg(text_ids, text_scores, lower_is_better=False)
+        weight_value: float = float(weight)
+        union: set[Any] = set(vector_norm) | set(text_norm)
+        scored: dict[Any, float] = {
+            rid: weight_value * vector_norm.get(rid, 0.0) + (1.0 - weight_value) * text_norm.get(rid, 0.0)
+            for rid in union
+        }
+        return sorted(scored, key=lambda rid: (-scored[rid], rid))[:k]
+    raise FusionReplayError(f"unknown fusion tag: {tag!r}")
 
 
 def skipped_score(sample: RecallSample, reason: str, version_drift: bool = False) -> SampleScore:
@@ -945,6 +1506,7 @@ def skipped_score(sample: RecallSample, reason: str, version_drift: bool = False
         sample_id=sample.sample_id,
         org_id=sample.org_id,
         k=sample.k,
+        query_type=sample.query_type,
         nprobes_min=sample.nprobes_min,
         nprobes_max=sample.nprobes_max,
         refine_factor=sample.refine_factor,
@@ -954,35 +1516,140 @@ def skipped_score(sample: RecallSample, reason: str, version_drift: bool = False
     )
 
 
-def score_sample(
+def scored_sample(sample: RecallSample, recall: float, ndcg: float, mrr: float, version_drift: bool) -> SampleScore:
+    """Build the score record for a successfully scored sample.
+
+    Args:
+        sample: The scored sample.
+        recall: The measured recall@k.
+        ndcg: The measured nDCG@k.
+        mrr: The measured reciprocal rank of the exact top result.
+        version_drift: Whether the dataset was opened at a drifted version.
+
+    Returns:
+        The populated score record.
+    """
+    return SampleScore(
+        sample_id=sample.sample_id,
+        org_id=sample.org_id,
+        k=sample.k,
+        query_type=sample.query_type,
+        nprobes_min=sample.nprobes_min,
+        nprobes_max=sample.nprobes_max,
+        refine_factor=sample.refine_factor,
+        recall=recall,
+        ndcg=ndcg,
+        mrr=mrr,
+        version_drift=version_drift,
+        skip_reason=None,
+    )
+
+
+def grade_against_reference(
+    sample: RecallSample, true_ids: list[Any], candidate_count: int, version_drift: bool
+) -> SampleScore:
+    """Grade one served ranking against an exact single-leg reference top-k.
+
+    Shared by the vector and text scorers and by the large-tier reduce, so every path grades identically once it holds
+    the exact ground-truth ids and candidate count.
+
+    Args:
+        sample: The sample to grade.
+        true_ids: The exact ground-truth ids in best-first order.
+        candidate_count: The number of eligible candidates the reference was drawn from.
+        version_drift: Whether the dataset was opened at a drifted version.
+
+    Returns:
+        The sample's score, skipped with ``empty_candidate_set`` when no candidate was eligible.
+    """
+    if candidate_count == 0:
+        return skipped_score(sample, "empty_candidate_set", version_drift)
+    recall, ndcg, mrr = ranking_quality(true_ids, list(sample.result_ids or ()), sample.k, candidate_count)
+    return scored_sample(sample, recall, ndcg, mrr, version_drift)
+
+
+def grade_hybrid_reference(
+    sample: RecallSample,
+    vector_ids: list[Any],
+    vector_scores: list[float],
+    vector_count: int,
+    text_ids: list[Any],
+    text_scores: list[float],
+    text_count: int,
+    version_drift: bool,
+) -> SampleScore:
+    """Grade one served hybrid ranking against the exact vector and BM25 references fused with the recorded strategy.
+
+    Shared by the whole-dataset hybrid scorer and the large-tier path, where the vector leg arrives from the
+    per-fragment reduce and the BM25 leg from the whole-dataset scan.
+
+    Args:
+        sample: The hybrid sample to grade.
+        vector_ids: The exact vector leg ids in best-first order.
+        vector_scores: The exact vector leg distances aligned with ``vector_ids``.
+        vector_count: The vector leg candidate count.
+        text_ids: The exact BM25 leg ids in best-first order.
+        text_scores: The exact BM25 leg scores aligned with ``text_ids``.
+        text_count: The BM25 leg candidate count.
+        version_drift: Whether the dataset was opened at a drifted version.
+
+    Returns:
+        The sample's score, skipped when both legs are empty or the fusion replay fails.
+    """
+    if vector_count == 0 and text_count == 0:
+        return skipped_score(sample, "empty_candidate_set", version_drift)
+    try:
+        fused_ids: list[Any] = fuse_legs(
+            sample.fusion or {}, vector_ids, vector_scores, text_ids, text_scores, sample.k
+        )
+    except FusionReplayError:
+        return skipped_score(sample, "fusion_replay", version_drift)
+    candidate_count: int = len(fused_ids)
+    recall, ndcg, mrr = ranking_quality(fused_ids, list(sample.result_ids or ()), sample.k, candidate_count)
+    return scored_sample(sample, recall, ndcg, mrr, version_drift)
+
+
+def resolve_filter_sql(sample: RecallSample, schema_columns: frozenset[str]) -> tuple[str | None, str | None]:
+    """Translate the sample's filter AST into a scanner filter string.
+
+    Args:
+        sample: The sample whose filter is translated.
+        schema_columns: The dataset schema's column names, for filter validation.
+
+    Returns:
+        ``(filter_sql, skip_reason)`` where exactly one is None: a translated filter string with no skip reason, a
+        None filter with no skip reason for unfiltered samples, or a None filter with the ``filter_translation`` skip
+        reason when translation failed.
+    """
+    if sample.filter_ast is None:
+        return None, None
+    try:
+        return filter_ast_to_sql(sample.filter_ast, schema_columns), None
+    except FilterTranslationError:
+        return None, "filter_translation"
+
+
+def score_vector_sample(
     dataset: lance.LanceDataset,
     sample: RecallSample,
-    schema_columns: frozenset[str],
+    filter_sql: str | None,
     default_distance: str,
     config: RecallJobConfig,
     version_drift: bool,
 ) -> SampleScore:
-    """Score one sample against an already-opened dataset.
+    """Score one vector sample against an already-opened dataset.
 
     Args:
         dataset: The dataset checked out at the sample's recorded version, or at latest on drift.
-        sample: The sample to score.
-        schema_columns: The dataset schema's column names, for filter validation.
+        sample: The vector sample to score.
+        filter_sql: The translated scanner filter, or None for an unfiltered scan.
         default_distance: The index-metric default used when the sample omits a distance type.
         config: The job configuration.
         version_drift: Whether the dataset was opened at a drifted version.
 
     Returns:
-        The sample's score, with ``recall=None`` and a reason when the sample had to be skipped.
+        The sample's score, with a skip reason when scoring was not possible.
     """
-    if sample.result_ids is None:
-        return skipped_score(sample, "null_result_ids", version_drift)
-    filter_sql: str | None = None
-    if sample.filter_ast is not None:
-        try:
-            filter_sql = filter_ast_to_sql(sample.filter_ast, schema_columns)
-        except FilterTranslationError:
-            return skipped_score(sample, "filter_translation", version_drift)
     distance_type: str = sample.distance_type or default_distance
     query: np.ndarray = np.asarray(sample.query_vector, dtype=np.float64)
     try:
@@ -998,22 +1665,132 @@ def score_sample(
         )
     except (ValueError, OSError, RuntimeError):
         return skipped_score(sample, "scan_error", version_drift)
-    if candidate_count == 0:
-        return skipped_score(sample, "empty_candidate_set", version_drift)
-    denominator: int = min(sample.k, candidate_count)
-    served: set[Any] = set(list(sample.result_ids)[: sample.k])
-    hits: int = len(served & set(true_ids))
-    return SampleScore(
-        sample_id=sample.sample_id,
-        org_id=sample.org_id,
-        k=sample.k,
-        nprobes_min=sample.nprobes_min,
-        nprobes_max=sample.nprobes_max,
-        refine_factor=sample.refine_factor,
-        recall=hits / denominator,
-        version_drift=version_drift,
-        skip_reason=None,
+    return grade_against_reference(sample, true_ids, candidate_count, version_drift)
+
+
+def score_text_sample(
+    dataset: lance.LanceDataset,
+    sample: RecallSample,
+    filter_sql: str | None,
+    schema_columns: frozenset[str],
+    config: RecallJobConfig,
+    version_drift: bool,
+) -> SampleScore:
+    """Score one text sample against the exact BM25 reference at the pinned version.
+
+    Args:
+        dataset: The dataset checked out at the sample's recorded version, or at latest on drift.
+        sample: The text sample to score.
+        filter_sql: The translated scanner filter, or None for an unfiltered scan.
+        schema_columns: The dataset schema's column names, for text-column validation.
+        config: The job configuration.
+        version_drift: Whether the dataset was opened at a drifted version.
+
+    Returns:
+        The sample's score, with a skip reason when scoring was not possible.
+    """
+    try:
+        field_queries: list[tuple[str, list[str], str, float]] = text_query_field_queries(
+            sample.text_query, sample.text_columns, schema_columns
+        )
+    except TextQueryTranslationError:
+        return skipped_score(sample, "text_query_translation", version_drift)
+    try:
+        true_ids, true_scores, candidate_count = bm25_top_k(
+            dataset, field_queries, sample.k, config.id_column, filter_sql, config.batch_size
+        )
+    except (ValueError, OSError, RuntimeError):
+        return skipped_score(sample, "scan_error", version_drift)
+    del true_scores
+    return grade_against_reference(sample, true_ids, candidate_count, version_drift)
+
+
+def score_hybrid_sample(
+    dataset: lance.LanceDataset,
+    sample: RecallSample,
+    filter_sql: str | None,
+    schema_columns: frozenset[str],
+    default_distance: str,
+    config: RecallJobConfig,
+    version_drift: bool,
+) -> SampleScore:
+    """Score one hybrid sample by fusing exact vector and exact BM25 references at the pinned version.
+
+    The vector and text legs are each computed to the fused ``k`` (the common case where the leg ``k`` inherits the
+    fused ``k``), then merged with the recorded fusion strategy before grading the served ids.
+
+    Args:
+        dataset: The dataset checked out at the sample's recorded version, or at latest on drift.
+        sample: The hybrid sample to score.
+        filter_sql: The translated scanner filter, or None for an unfiltered scan.
+        schema_columns: The dataset schema's column names, for text-column validation.
+        default_distance: The index-metric default used when the sample omits a distance type.
+        config: The job configuration.
+        version_drift: Whether the dataset was opened at a drifted version.
+
+    Returns:
+        The sample's score, with a skip reason when scoring was not possible.
+    """
+    try:
+        field_queries: list[tuple[str, list[str], str, float]] = text_query_field_queries(
+            sample.text_query, sample.text_columns, schema_columns
+        )
+    except TextQueryTranslationError:
+        return skipped_score(sample, "text_query_translation", version_drift)
+    distance_type: str = sample.distance_type or default_distance
+    query: np.ndarray = np.asarray(sample.query_vector, dtype=np.float64)
+    try:
+        vector_ids, vector_scores, vector_count = brute_force_top_k_scored(
+            dataset,
+            query,
+            sample.k,
+            distance_type,
+            config.id_column,
+            config.vector_column,
+            filter_sql,
+            config.batch_size,
+        )
+        text_ids, text_scores, text_count = bm25_top_k(
+            dataset, field_queries, sample.k, config.id_column, filter_sql, config.batch_size
+        )
+    except (ValueError, OSError, RuntimeError):
+        return skipped_score(sample, "scan_error", version_drift)
+    return grade_hybrid_reference(
+        sample, vector_ids, vector_scores, vector_count, text_ids, text_scores, text_count, version_drift
     )
+
+
+def score_sample(
+    dataset: lance.LanceDataset,
+    sample: RecallSample,
+    schema_columns: frozenset[str],
+    default_distance: str,
+    config: RecallJobConfig,
+    version_drift: bool,
+) -> SampleScore:
+    """Score one sample against an already-opened dataset, dispatching on the query type.
+
+    Args:
+        dataset: The dataset checked out at the sample's recorded version, or at latest on drift.
+        sample: The sample to score.
+        schema_columns: The dataset schema's column names, for filter and text-column validation.
+        default_distance: The index-metric default used when the sample omits a distance type.
+        config: The job configuration.
+        version_drift: Whether the dataset was opened at a drifted version.
+
+    Returns:
+        The sample's score, with ``recall=None`` and a reason when the sample had to be skipped.
+    """
+    if sample.result_ids is None:
+        return skipped_score(sample, "null_result_ids", version_drift)
+    filter_sql, filter_skip = resolve_filter_sql(sample, schema_columns)
+    if filter_skip is not None:
+        return skipped_score(sample, filter_skip, version_drift)
+    if sample.query_type == "text":
+        return score_text_sample(dataset, sample, filter_sql, schema_columns, config, version_drift)
+    if sample.query_type == "hybrid":
+        return score_hybrid_sample(dataset, sample, filter_sql, schema_columns, default_distance, config, version_drift)
+    return score_vector_sample(dataset, sample, filter_sql, default_distance, config, version_drift)
 
 
 def score_version_group(
@@ -1051,6 +1828,225 @@ def score_version_group(
         ]
 
 
+def vector_leg_samples(samples: list[RecallSample]) -> list[RecallSample]:
+    """Select the samples of a group that need an exact vector leg.
+
+    Vector and hybrid samples carry a query vector and are fanned out per fragment. Samples with a null served-id
+    capture are excluded because they skip before any scan.
+
+    Args:
+        samples: The group's samples.
+
+    Returns:
+        The vector-bearing samples that are scorable.
+    """
+    return [s for s in samples if s.query_type in ("vector", "hybrid") and s.result_ids is not None]
+
+
+def text_leg_samples(samples: list[RecallSample]) -> list[RecallSample]:
+    """Select the samples of a group that need an exact BM25 leg.
+
+    Text and hybrid samples are scored against the whole-dataset BM25 reference because the BM25 inverse document
+    frequency and average document length are corpus-global statistics that cannot be sharded per fragment without
+    changing the scores, so the reference stays whole-dataset even in the large tier.
+
+    Args:
+        samples: The group's samples.
+
+    Returns:
+        The text-bearing samples that are scorable.
+    """
+    return [s for s in samples if s.query_type in ("text", "hybrid") and s.result_ids is not None]
+
+
+def fragment_vector_partials(
+    uri: str, version: int, fragment_index: int, samples: list[RecallSample], config: RecallJobConfig
+) -> dict[str, dict[str, Any]]:
+    """Compute one fragment's partial vector top-k for each vector-bearing sample of a large group.
+
+    Runs on an executor. Opens the dataset at the recorded version, restricts the brute-force scan to the single
+    fragment at ``fragment_index`` in the dataset's fragment order, and returns a per-sample partial top-k that the
+    driver reduces across fragments. Per-sample skip decisions that are deterministic across fragments (filter
+    translation, scan errors such as a vector-dimension mismatch) are returned as skip markers.
+
+    Args:
+        uri: The dataset URI shared by the group.
+        version: The recorded dataset version shared by the group.
+        fragment_index: The position of the fragment in the dataset's fragment order.
+        samples: The vector-bearing samples to score against this fragment.
+        config: The job configuration.
+
+    Returns:
+        A mapping from sample id to either ``{"status": "partial", "ids", "dists", "count"}`` or
+        ``{"status": "skip", "reason"}``.
+    """
+    dataset, _ = resolve_dataset(uri, version, config.storage_options)
+    if dataset is None:
+        return {sample.sample_id: {"status": "skip", "reason": "dataset_missing"} for sample in samples}
+    schema_columns: frozenset[str] = frozenset(dataset.schema.names)
+    default_distance: str = index_default_distance_type(dataset, config.vector_column)
+    fragment: lance.LanceFragment = dataset.get_fragments()[fragment_index]
+    partials: dict[str, dict[str, Any]] = {}
+    for sample in samples:
+        filter_sql, filter_skip = resolve_filter_sql(sample, schema_columns)
+        if filter_skip is not None:
+            partials[sample.sample_id] = {"status": "skip", "reason": filter_skip}
+            continue
+        distance_type: str = sample.distance_type or default_distance
+        query: np.ndarray = np.asarray(sample.query_vector, dtype=np.float64)
+        try:
+            ids, dists, count = brute_force_top_k_scored(
+                dataset,
+                query,
+                sample.k,
+                distance_type,
+                config.id_column,
+                config.vector_column,
+                filter_sql,
+                config.batch_size,
+                fragments=[fragment],
+            )
+        except (ValueError, OSError, RuntimeError):
+            partials[sample.sample_id] = {"status": "skip", "reason": "scan_error"}
+            continue
+        partials[sample.sample_id] = {"status": "partial", "ids": ids, "dists": dists, "count": count}
+    return partials
+
+
+def reduce_vector_legs(sample: RecallSample, fragment_partials: list[tuple[int, dict[str, Any]]]) -> dict[str, Any]:
+    """Reduce one sample's per-fragment vector partials into one exact leg, or propagate a skip.
+
+    The partials are reduced in ascending fragment-index order with :func:`reduce_partial_top_k`, the same stable merge
+    the single-stream scan uses across batches, so the reduced top-k equals the whole-dataset brute force exactly. A
+    deterministic per-fragment skip marker (every fragment agrees) becomes the leg's skip, independent of the order in
+    which the fan-out tasks returned. An empty partial set is itself a skip with the ``missing_partials`` reason.
+
+    Args:
+        sample: The sample whose vector leg is reduced.
+        fragment_partials: The ``(fragment_index, payload)`` partials gathered from the fan-out tasks.
+
+    Returns:
+        Either ``{"status": "leg", "ids", "dists", "count"}`` or ``{"status": "skip", "reason"}``.
+    """
+    if not fragment_partials:
+        return {"status": "skip", "reason": "missing_partials"}
+    skip_reasons: set[str] = {payload["reason"] for _, payload in fragment_partials if payload["status"] == "skip"}
+    if skip_reasons:
+        return {"status": "skip", "reason": next(iter(skip_reasons))}
+    ordered: list[tuple[int, dict[str, Any]]] = sorted(fragment_partials, key=lambda item: item[0])
+    partials: list[tuple[list[Any], list[float]]] = [(payload["ids"], payload["dists"]) for _, payload in ordered]
+    ids, dists = reduce_partial_top_k(partials, sample.k)
+    count: int = sum(int(payload["count"]) for _, payload in ordered)
+    return {"status": "leg", "ids": ids, "dists": dists, "count": count}
+
+
+def whole_dataset_text_legs(
+    uri: str, version: int, samples: list[RecallSample], config: RecallJobConfig
+) -> dict[str, dict[str, Any]]:
+    """Compute the whole-dataset exact BM25 leg for each text-bearing sample of a large group.
+
+    Runs on an executor. The BM25 reference stays whole-dataset because its corpus-global statistics cannot be sharded
+    per fragment without changing the scores. Skip decisions mirror the whole-dataset scorers.
+
+    Args:
+        uri: The dataset URI shared by the group.
+        version: The recorded dataset version shared by the group.
+        samples: The text-bearing samples to score.
+        config: The job configuration.
+
+    Returns:
+        A mapping from sample id to either ``{"status": "leg", "ids", "scores", "count"}`` or
+        ``{"status": "skip", "reason"}``.
+    """
+    dataset, _ = resolve_dataset(uri, version, config.storage_options)
+    if dataset is None:
+        return {sample.sample_id: {"status": "skip", "reason": "dataset_missing"} for sample in samples}
+    schema_columns: frozenset[str] = frozenset(dataset.schema.names)
+    legs: dict[str, dict[str, Any]] = {}
+    for sample in samples:
+        filter_sql, filter_skip = resolve_filter_sql(sample, schema_columns)
+        if filter_skip is not None:
+            legs[sample.sample_id] = {"status": "skip", "reason": filter_skip}
+            continue
+        try:
+            field_queries: list[tuple[str, list[str], str, float]] = text_query_field_queries(
+                sample.text_query, sample.text_columns, schema_columns
+            )
+        except TextQueryTranslationError:
+            legs[sample.sample_id] = {"status": "skip", "reason": "text_query_translation"}
+            continue
+        try:
+            ids, scores, count = bm25_top_k(
+                dataset, field_queries, sample.k, config.id_column, filter_sql, config.batch_size
+            )
+        except (ValueError, OSError, RuntimeError):
+            legs[sample.sample_id] = {"status": "skip", "reason": "scan_error"}
+            continue
+        legs[sample.sample_id] = {"status": "leg", "ids": ids, "scores": scores, "count": count}
+    return legs
+
+
+def combine_large_group_scores(
+    samples: list[RecallSample],
+    version_drift: bool,
+    vector_legs: dict[str, dict[str, Any]],
+    text_legs: dict[str, dict[str, Any]],
+) -> list[SampleScore]:
+    """Grade a large group's samples from their reduced vector legs and whole-dataset BM25 legs.
+
+    Vector samples grade against the reduced vector leg, text samples against the BM25 leg, and hybrid samples fuse the
+    two legs with the recorded strategy. Skip reasons carried on a leg propagate to the sample, and the skip-reason
+    vocabulary is identical to the whole-dataset path.
+
+    Args:
+        samples: The group's samples in capture order.
+        version_drift: Whether the dataset was opened at a drifted version, carried from the classification probe.
+        vector_legs: The reduced vector legs keyed by sample id, for vector and hybrid samples.
+        text_legs: The whole-dataset BM25 legs keyed by sample id, for text and hybrid samples.
+
+    Returns:
+        One score per sample.
+    """
+    scores: list[SampleScore] = []
+    for sample in samples:
+        if sample.result_ids is None:
+            scores.append(skipped_score(sample, "null_result_ids", version_drift))
+            continue
+        if sample.query_type == "vector":
+            leg: dict[str, Any] = vector_legs[sample.sample_id]
+            if leg["status"] == "skip":
+                scores.append(skipped_score(sample, leg["reason"], version_drift))
+            else:
+                scores.append(grade_against_reference(sample, leg["ids"], leg["count"], version_drift))
+        elif sample.query_type == "text":
+            leg = text_legs[sample.sample_id]
+            if leg["status"] == "skip":
+                scores.append(skipped_score(sample, leg["reason"], version_drift))
+            else:
+                scores.append(grade_against_reference(sample, leg["ids"], leg["count"], version_drift))
+        else:
+            vector_leg: dict[str, Any] = vector_legs[sample.sample_id]
+            text_leg: dict[str, Any] = text_legs[sample.sample_id]
+            if vector_leg["status"] == "skip":
+                scores.append(skipped_score(sample, vector_leg["reason"], version_drift))
+            elif text_leg["status"] == "skip":
+                scores.append(skipped_score(sample, text_leg["reason"], version_drift))
+            else:
+                scores.append(
+                    grade_hybrid_reference(
+                        sample,
+                        vector_leg["ids"],
+                        vector_leg["dists"],
+                        vector_leg["count"],
+                        text_leg["ids"],
+                        text_leg["scores"],
+                        text_leg["count"],
+                        version_drift,
+                    )
+                )
+    return scores
+
+
 def optional_label(value: int | None, fallback: str) -> str:
     """Render an optional integer bucket key for labels and tags.
 
@@ -1081,13 +2077,27 @@ def rpc_bucket_label(nprobes_min: int | None, nprobes_max: int | None, refine_fa
     return f"rpc nprobes={low}..{high} refine={refine}"
 
 
+def mean_or_none(values: list[float]) -> float | None:
+    """Return the mean of the values, or None when the list is empty.
+
+    Args:
+        values: The values to average.
+
+    Returns:
+        The mean, or None.
+    """
+    return float(np.asarray(values, dtype=np.float64).mean()) if values else None
+
+
 def summarize_bucket(
     bucket: str,
     scores: list[SampleScore],
     nprobes_min: int | None = None,
     nprobes_max: int | None = None,
     refine_factor: int | None = None,
+    query_type: str | None = None,
     is_rpc_bucket: bool = False,
+    is_query_type_bucket: bool = False,
 ) -> AggregateRow:
     """Aggregate one bucket of scores into a report row.
 
@@ -1097,17 +2107,23 @@ def summarize_bucket(
         nprobes_min: RPC bucket key carried for metric tagging.
         nprobes_max: RPC bucket key carried for metric tagging.
         refine_factor: RPC bucket key carried for metric tagging.
+        query_type: Query-type bucket key carried for metric tagging.
         is_rpc_bucket: Whether this row is an RPC-parameter bucket eligible for metric emission.
+        is_query_type_bucket: Whether this row is a query-type bucket eligible for metric emission.
 
     Returns:
-        The aggregate row with mean, p50, and p95 over the scored samples only.
+        The aggregate row with the mean recall, nDCG, and MRR plus recall p50 and p95 over the scored samples only.
     """
     recalls: list[float] = [score.recall for score in scores if score.recall is not None]
+    ndcgs: list[float] = [score.ndcg for score in scores if score.ndcg is not None]
+    mrrs: list[float] = [score.mrr for score in scores if score.mrr is not None]
     values: np.ndarray = np.asarray(recalls, dtype=np.float64)
     return AggregateRow(
         bucket=bucket,
         samples=len(recalls),
-        mean_recall=float(values.mean()) if recalls else None,
+        mean_recall=mean_or_none(recalls),
+        mean_ndcg=mean_or_none(ndcgs),
+        mean_mrr=mean_or_none(mrrs),
         p50=float(np.percentile(values, 50)) if recalls else None,
         p95=float(np.percentile(values, 95)) if recalls else None,
         drift_count=sum(1 for score in scores if score.version_drift),
@@ -1115,12 +2131,14 @@ def summarize_bucket(
         nprobes_min=nprobes_min,
         nprobes_max=nprobes_max,
         refine_factor=refine_factor,
+        query_type=query_type,
         is_rpc_bucket=is_rpc_bucket,
+        is_query_type_bucket=is_query_type_bucket,
     )
 
 
 def aggregate_scores(scores: list[SampleScore]) -> list[AggregateRow]:
-    """Aggregate scores into the report rows: overall, per RPC bucket, then per org.
+    """Aggregate scores into the report rows: overall, per RPC bucket, per query type, then per org.
 
     Args:
         scores: Every per-sample scoring outcome.
@@ -1130,10 +2148,12 @@ def aggregate_scores(scores: list[SampleScore]) -> list[AggregateRow]:
     """
     rows: list[AggregateRow] = [summarize_bucket("overall", scores)]
     rpc_groups: dict[tuple[int | None, int | None, int | None], list[SampleScore]] = {}
+    query_type_groups: dict[str, list[SampleScore]] = {}
     org_groups: dict[str, list[SampleScore]] = {}
     for score in scores:
         rpc_key: tuple[int | None, int | None, int | None] = (score.nprobes_min, score.nprobes_max, score.refine_factor)
         rpc_groups.setdefault(rpc_key, []).append(score)
+        query_type_groups.setdefault(score.query_type, []).append(score)
         org_groups.setdefault(score.org_id, []).append(score)
     for rpc_key in sorted(rpc_groups, key=lambda key: rpc_bucket_label(*key)):
         rows.append(
@@ -1144,6 +2164,15 @@ def aggregate_scores(scores: list[SampleScore]) -> list[AggregateRow]:
                 nprobes_max=rpc_key[1],
                 refine_factor=rpc_key[2],
                 is_rpc_bucket=True,
+            )
+        )
+    for query_type in sorted(query_type_groups):
+        rows.append(
+            summarize_bucket(
+                f"query_type {query_type}",
+                query_type_groups[query_type],
+                query_type=query_type,
+                is_query_type_bucket=True,
             )
         )
     for org_id in sorted(org_groups):
@@ -1174,12 +2203,14 @@ def format_report(report: RecallReport) -> str:
     """
     width: int = max([len("bucket"), *(len(row.bucket) for row in report.rows)])
     header: str = (
-        f"{'bucket':<{width}}  {'samples':>7}  {'mean':>8}  {'p50':>8}  {'p95':>8}  {'drift':>5}  {'skipped':>7}"
+        f"{'bucket':<{width}}  {'samples':>7}  {'recall':>8}  {'ndcg':>8}  {'mrr':>8}  "
+        f"{'p50':>8}  {'p95':>8}  {'drift':>5}  {'skipped':>7}"
     )
     lines: list[str] = [header]
     for row in report.rows:
         lines.append(
             f"{row.bucket:<{width}}  {row.samples:>7}  {format_metric(row.mean_recall):>8}  "
+            f"{format_metric(row.mean_ndcg):>8}  {format_metric(row.mean_mrr):>8}  "
             f"{format_metric(row.p50):>8}  {format_metric(row.p95):>8}  {row.drift_count:>5}  {row.skip_count:>7}"
         )
     if report.parse_skips:
@@ -1192,29 +2223,55 @@ def format_report(report: RecallReport) -> str:
     return "\n".join(lines)
 
 
-def emit_recall_metrics(telemetry: Telemetry, rows: list[AggregateRow]) -> None:
-    """Emit one ``recall.measured`` gauge per RPC-parameter bucket.
+def emit_bucket_metrics(telemetry: Telemetry, row: AggregateRow, tags: list[str]) -> None:
+    """Emit the recall, nDCG, and MRR gauges for one bucket under shared tags.
 
-    Tags carry the RPC parameters only. Org-level numbers stay in the stdout table so the metric's tag cardinality
-    does not explode with the organization count.
+    Args:
+        telemetry: The driver telemetry facade.
+        row: The aggregate row to emit.
+        tags: The shared metric tags for the bucket.
+    """
+    if row.mean_recall is not None:
+        telemetry.gauge("recall.measured", row.mean_recall, tags=tags)
+    if row.mean_ndcg is not None:
+        telemetry.gauge("recall.ndcg", row.mean_ndcg, tags=tags)
+    if row.mean_mrr is not None:
+        telemetry.gauge("recall.mrr", row.mean_mrr, tags=tags)
+
+
+def emit_recall_metrics(telemetry: Telemetry, rows: list[AggregateRow]) -> None:
+    """Emit the recall, nDCG, and MRR gauges per RPC-parameter bucket and per query-type bucket.
+
+    RPC buckets are tagged with the RPC parameters and query-type buckets with the query type. Both tag sets are
+    bounded-cardinality. Org-level numbers stay in the stdout table so the metric tag cardinality does not explode
+    with the organization count.
 
     Args:
         telemetry: The driver telemetry facade.
         rows: The aggregate rows of the report.
     """
     for row in rows:
-        if not row.is_rpc_bucket or row.mean_recall is None:
-            continue
-        tags: list[str] = [
-            f"nprobes_min:{optional_label(row.nprobes_min, 'default')}",
-            f"nprobes_max:{optional_label(row.nprobes_max, 'default')}",
-            f"refine_factor:{optional_label(row.refine_factor, 'unset')}",
-        ]
-        telemetry.gauge("recall.measured", row.mean_recall, tags=tags)
+        if row.is_rpc_bucket:
+            emit_bucket_metrics(
+                telemetry,
+                row,
+                [
+                    f"nprobes_min:{optional_label(row.nprobes_min, 'default')}",
+                    f"nprobes_max:{optional_label(row.nprobes_max, 'default')}",
+                    f"refine_factor:{optional_label(row.refine_factor, 'unset')}",
+                ],
+            )
+        elif row.is_query_type_bucket and row.query_type is not None:
+            emit_bucket_metrics(telemetry, row, [f"query_type:{row.query_type}"])
 
 
 class RecallAuditJob:
-    """Replays sampled vector queries against pinned dataset versions and reports recall@k."""
+    """Replays sampled vector, text, and hybrid queries against pinned dataset versions and reports retrieval quality.
+
+    Each sample is scored with recall@k, nDCG@k, and MRR against an exact reference computed at the recorded dataset
+    version: brute-force nearest neighbors for vector legs and exact Okapi BM25 for text legs, fused with the recorded
+    strategy for hybrid samples.
+    """
 
     def __init__(self, config: RecallJobConfig) -> None:
         """Initialize the job.
@@ -1224,12 +2281,195 @@ class RecallAuditJob:
         """
         self.config: RecallJobConfig = config
 
-    def run(self, spark: SparkSession, source: SpanSource, from_ms: int, to_ms: int) -> RecallReport:
-        """Fetch, parse, score, aggregate, and report one window of recall samples.
+    def classify_groups(
+        self, spark: SparkSession, items: list[tuple[str, int, list[RecallSample]]]
+    ) -> tuple[list[tuple[str, int, list[RecallSample]]], list[tuple[str, int, list[RecallSample], bool, int]]]:
+        """Split ``(uri, version)`` groups into the packed small tier and the per-fragment large tier.
 
-        The driver fetches and parses the spans and groups samples by ``(dataset_uri, dataset_version)``. Executors do
-        the heavy work: each Spark task opens one group's dataset at the recorded version and brute-force scores its
-        samples. The driver aggregates, logs the table, and emits the per-RPC-bucket gauges.
+        One distributed probe job opens each group's dataset at the recorded version, reads its fragment count, and
+        records whether it is scorable and whether the version drifted, so the driver never opens a dataset itself.
+        Groups whose dataset is missing, lacks the id or vector column, or has at most
+        ``large_group_fragment_threshold`` fragments go to the small tier, where the missing-dataset and missing-column
+        cases are handled identically by :func:`score_version_group`. Larger scorable groups go to the large tier with
+        their fragment count and drift flag carried forward.
+
+        Args:
+            spark: Active Spark session.
+            items: The ``(uri, version, samples)`` groups to classify.
+
+        Returns:
+            ``(small, large)`` where small items are ``(uri, version, samples)`` and large items are
+            ``(uri, version, samples, version_drift, fragments)``.
+        """
+        config: RecallJobConfig = self.config
+        storage_options: dict[str, Any] | None = config.storage_options
+        threshold: int = config.large_group_fragment_threshold
+        id_column: str = config.id_column
+        vector_column: str = config.vector_column
+        keys: list[tuple[str, int]] = [(uri, version) for uri, version, _ in items]
+
+        def probe(key: tuple[str, int]) -> tuple[int, bool, bool]:
+            """Probe one group's dataset size, scorability, and version drift on an executor.
+
+            Args:
+                key: The ``(uri, version)`` group key.
+
+            Returns:
+                ``(fragments, scorable, version_drift)`` where ``fragments`` is -1 when the dataset cannot be opened.
+            """
+            uri, version = key
+            dataset, drift = resolve_dataset(uri, version, storage_options)
+            if dataset is None:
+                return -1, False, False
+            columns: frozenset[str] = frozenset(dataset.schema.names)
+            scorable: bool = id_column in columns and vector_column in columns
+            return len(dataset.get_fragments()), scorable, drift
+
+        slices: int = max(1, min(config.small_tier_slices, len(keys)))
+        probes: list[tuple[int, bool, bool]] = spark.sparkContext.parallelize(keys, slices).map(probe).collect()
+        small: list[tuple[str, int, list[RecallSample]]] = []
+        large: list[tuple[str, int, list[RecallSample], bool, int]] = []
+        for (uri, version, samples), (fragments, scorable, drift) in zip(items, probes, strict=True):
+            if scorable and fragments > threshold:
+                large.append((uri, version, samples, drift, fragments))
+            else:
+                small.append((uri, version, samples))
+        return small, large
+
+    def run_small_tier(
+        self, spark: SparkSession, items: list[tuple[str, int, list[RecallSample]]], telemetry: Telemetry
+    ) -> list[SampleScore]:
+        """Score many small groups in one batched Spark job, packing several groups per task.
+
+        Fewer slices than groups means one task scores many small datasets end-to-end with the unchanged
+        :func:`score_version_group`, amortizing task scheduling and cold opens across the power-law tail.
+
+        Args:
+            spark: Active Spark session.
+            items: The small-tier ``(uri, version, samples)`` groups.
+            telemetry: Driver telemetry facade.
+
+        Returns:
+            One score per sample across the small groups.
+        """
+        config: RecallJobConfig = self.config
+
+        def score_group(item: tuple[str, int, list[RecallSample]]) -> list[SampleScore]:
+            """Score one version group on an executor.
+
+            Args:
+                item: The ``(uri, version, samples)`` group.
+
+            Returns:
+                One score per sample in the group.
+            """
+            return score_version_group(item[0], item[1], item[2], config)
+
+        slices: int = max(1, min(config.small_tier_slices, len(items)))
+        with telemetry.timed("recall.small_tier_ms"):
+            collected: list[list[SampleScore]] = (
+                spark.sparkContext.parallelize(items, slices).map(score_group).collect()
+            )
+        telemetry.gauge("recall.small_groups", len(items))
+        return [score for group in collected for score in group]
+
+    def run_large_tier(
+        self, spark: SparkSession, items: list[tuple[str, int, list[RecallSample], bool, int]], telemetry: Telemetry
+    ) -> list[SampleScore]:
+        """Score large groups by fanning the vector brute force out per fragment and reducing exactly on the driver.
+
+        One Spark job computes a partial vector top-k per ``(group, fragment)`` for every vector and hybrid sample, and
+        the driver reduces the partials per sample with the same stable merge the single-stream scan uses, so the
+        reduced top-k is bit-identical to the whole-dataset brute force. A second Spark job computes the whole-dataset
+        BM25 leg for text and hybrid samples, whose corpus-global statistics cannot be sharded. The driver then grades
+        vector samples from the reduced leg, text samples from the BM25 leg, and hybrid samples from the fusion of both.
+
+        Args:
+            spark: Active Spark session.
+            items: The large-tier ``(uri, version, samples, version_drift, fragments)`` groups.
+            telemetry: Driver telemetry facade.
+
+        Returns:
+            One score per sample across the large groups.
+        """
+        config: RecallJobConfig = self.config
+        telemetry.gauge("recall.large_groups", len(items))
+        vector_work: list[tuple[int, str, int, int, list[RecallSample]]] = []
+        text_work: list[tuple[int, str, int, list[RecallSample]]] = []
+        for index, (uri, version, samples, drift, fragments) in enumerate(items):
+            del drift
+            vector_samples: list[RecallSample] = vector_leg_samples(samples)
+            if vector_samples:
+                vector_work.extend(
+                    (index, uri, version, fragment_index, vector_samples) for fragment_index in range(fragments)
+                )
+            text_samples: list[RecallSample] = text_leg_samples(samples)
+            if text_samples:
+                text_work.append((index, uri, version, text_samples))
+
+        def vector_task(
+            work: tuple[int, str, int, int, list[RecallSample]],
+        ) -> tuple[int, int, dict[str, dict[str, Any]]]:
+            """Compute one fragment's partial vector top-k for a large group on an executor.
+
+            Args:
+                work: The ``(group_index, uri, version, fragment_index, samples)`` unit.
+
+            Returns:
+                ``(group_index, fragment_index, partials)`` for the driver reduce.
+            """
+            return work[0], work[3], fragment_vector_partials(work[1], work[2], work[3], work[4], config)
+
+        def text_task(work: tuple[int, str, int, list[RecallSample]]) -> tuple[int, dict[str, dict[str, Any]]]:
+            """Compute the whole-dataset BM25 legs for a large group on an executor.
+
+            Args:
+                work: The ``(group_index, uri, version, samples)`` unit.
+
+            Returns:
+                ``(group_index, legs)`` for the driver grade.
+            """
+            return work[0], whole_dataset_text_legs(work[1], work[2], work[3], config)
+
+        with telemetry.timed("recall.large_tier_ms"):
+            vector_results: list[tuple[int, int, dict[str, dict[str, Any]]]] = []
+            if vector_work:
+                vector_slices: int = max(1, min(config.large_tier_slices, len(vector_work)))
+                vector_results = spark.sparkContext.parallelize(vector_work, vector_slices).map(vector_task).collect()
+            text_results: list[tuple[int, dict[str, dict[str, Any]]]] = []
+            if text_work:
+                text_slices: int = max(1, min(config.large_tier_slices, len(text_work)))
+                text_results = spark.sparkContext.parallelize(text_work, text_slices).map(text_task).collect()
+
+        partials_by_group: dict[int, dict[str, list[tuple[int, dict[str, Any]]]]] = {}
+        for group_index, fragment_index, partials in vector_results:
+            per_sample: dict[str, list[tuple[int, dict[str, Any]]]] = partials_by_group.setdefault(group_index, {})
+            for sample_id, payload in partials.items():
+                per_sample.setdefault(sample_id, []).append((fragment_index, payload))
+        text_by_group: dict[int, dict[str, dict[str, Any]]] = {index: legs for index, legs in text_results}
+
+        telemetry.gauge("recall.large_group_fragments", len(vector_work))
+        scores: list[SampleScore] = []
+        for index, item in enumerate(items):
+            samples: list[RecallSample] = item[2]
+            drift: bool = item[3]
+            vector_legs: dict[str, dict[str, Any]] = {}
+            for sample in vector_leg_samples(samples):
+                fragment_partials: list[tuple[int, dict[str, Any]]] = partials_by_group.get(index, {}).get(
+                    sample.sample_id, []
+                )
+                vector_legs[sample.sample_id] = reduce_vector_legs(sample, fragment_partials)
+            text_legs: dict[str, dict[str, Any]] = text_by_group.get(index, {})
+            scores.extend(combine_large_group_scores(samples, drift, vector_legs, text_legs))
+        return scores
+
+    def run(self, spark: SparkSession, source: SpanSource, from_ms: int, to_ms: int) -> RecallReport:
+        """Fetch, parse, score, aggregate, and report one window of recall samples with two-tier scoring.
+
+        The driver fetches and parses the spans and groups samples by ``(dataset_uri, dataset_version)``. A probe job
+        classifies the groups by fragment count: the tail of tiny groups is packed into the small tier where one task
+        scores many datasets, and big groups go to the large tier where the vector brute force fans out per fragment
+        and reduces exactly on the driver. The driver aggregates, logs the table, and emits the per-bucket gauges.
 
         Args:
             spark: Active Spark session.
@@ -1252,25 +2492,16 @@ class RecallAuditJob:
             items: list[tuple[str, int, list[RecallSample]]] = [
                 (uri, version, group) for (uri, version), group in groups.items()
             ]
-
-            def score_group(item: tuple[str, int, list[RecallSample]]) -> list[SampleScore]:
-                """Score one version group on an executor.
-
-                Args:
-                    item: The ``(uri, version, samples)`` group.
-
-                Returns:
-                    One score per sample in the group.
-                """
-                return score_version_group(item[0], item[1], item[2], config)
-
             scores: list[SampleScore] = []
             if items:
+                small, large = self.classify_groups(spark, items)
+                run_span.set_tag("small_groups", len(small))
+                run_span.set_tag("large_groups", len(large))
                 with telemetry.timed("recall.score_ms"):
-                    collected: list[list[SampleScore]] = (
-                        spark.sparkContext.parallelize(items, len(items)).map(score_group).collect()
-                    )
-                scores = [score for group in collected for score in group]
+                    if small:
+                        scores.extend(self.run_small_tier(spark, small, telemetry))
+                    if large:
+                        scores.extend(self.run_large_tier(spark, large, telemetry))
             report: RecallReport = RecallReport(rows=aggregate_scores(scores), scores=scores, parse_skips=parse_skips)
             logger.info("recall audit results:\n%s", format_report(report))
             emit_recall_metrics(telemetry, report.rows)

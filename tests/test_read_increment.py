@@ -18,7 +18,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import lance_etl.etl as etl_module
+import lance_etl.etl.job as etl_module
 from lance_etl.etl import ETLConfig, IcebergToLanceETL, snapshot_id_bounds
 from lance_etl.telemetry import TelemetryConfig
 

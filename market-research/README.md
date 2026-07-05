@@ -17,8 +17,61 @@ All lance `path:line` citations were spot-verified against the read-only checkou
   coexistence strategy for ingest plus compact plus index.
 - [optimization-recommendations.md](optimization-recommendations.md) — every compaction, indexing, and
   maintenance optimization with evidence, risk, and verdict, split into apply-now versus deferred.
+- [trace-events-and-distributed-writes.md](trace-events-and-distributed-writes.md) — commit and observability
+  internals behind the distributed write and index paths.
+- [use-cases.md](use-cases.md) — round-2 survey of who runs Lance in production and for what, organized by
+  use-case family, each entry with sources, verification status, and a relevance-to-our-shape line.
+- [production-techniques.md](production-techniques.md) — round-2 techniques catalog (object store and
+  multi-writer, lifecycle, ecosystem) with guide URL plus checkout path:line evidence, a maturity verdict, and
+  an apply-to-lance-etl recommendation per technique, plus an appendix of unverified claims.
+- [rag-usecases.md](rag-usecases.md) — RAG-focused survey of how teams run Lance/LanceDB as the retrieval store
+  in production RAG and agent-memory systems, organized by five angles (architecture and freshness, retrieval
+  quality with hybrid plus rerank plus multivector, eval and observability, scale and multitenancy, named cases),
+  each finding tagged VERIFIED-CHECKOUT / VERIFIED-DOCS / BLOG with a relevance-to-lance-etl line, a ranked
+  gaps-and-candidate-features section (rerank hook, weighted fusion, nDCG in the recall job), and an
+  unverified-claims appendix.
 
-## Top 10 takeaways
+## Round 2 takeaways
+
+Production-ready techniques surfaced in round 2, ranked by what we should adopt. See production-techniques.md
+for evidence and the full verdict per item.
+
+1. Enable V2 manifest paths fleet-wide (yes-now). For 30,000 datasets in one bucket, `enable_v2_manifest_paths`
+   turns every dataset open from O(version_count) LIST requests into one LIST (or a HEAD with the version-hint
+   file). UUID fragment names already self-distribute across S3 partitions, so no prefix sharding is needed.
+
+2. Adopt tag-based blue/green serving (yes-now). Keep a `prod` tag per dataset, validate the freshly
+   ingested-plus-indexed version, then `tags.update("prod", new_version)` for an O(1) atomic cutover. The gRPC
+   service opens `version="prod"`, and tagged versions are exempt from cleanup, protecting the live snapshot.
+
+3. Correct the cleanup horizon understanding (yes-now). The low-level `cleanup_old_versions` default is 14
+   days, not 7 (`dataset.py:2934-2936`). Keep the horizon longer than the longest head-org job, set
+   `delete_rate_limit` on the fleet to dodge S3 503s, never use older_than=0 or delete_unverified with
+   concurrent writers, and tag reproducibility versions.
+
+4. Drive incremental orchestration with the CDF API (yes-now). `Dataset.delta()` exposes inserted/updated rows
+   per version in pylance, so Airflow/Dagster can materialize only changed rows since the last run instead of
+   full scans. Confirms our DAG should schedule compute, not do row-level work in operators (rule #5).
+
+5. Tune the search service for S3 throughput (yes-now, benchmark first). Raise LANCE_IO_THREADS toward 128-256
+   with proportionally larger io_buffer_size in the Rust prewarm and disk_cache paths, and adopt
+   `timeout: 120s` for large-row reads. The AIMD limiter caps at 5000 req/s per process, validate under Datadog
+   for a fleet running ingest plus compaction plus indexing simultaneously.
+
+6. Conditional-put is the default S3 commit handler (yes-now, posture confirmation). On modern S3 our three
+   concurrent jobs need no DynamoDB. Reserve `s3+ddb://` only for older S3-compatible stores lacking conditional
+   put, and remember S3 CRR does not replicate the DynamoDB commit store.
+
+7. Stable row ids plus the Fragment Reuse Index are the structural endgame (later). New datasets should set
+   `enable_stable_row_ids` so future compaction needs no index remap, removing most compact-vs-index contention.
+   Blocked on migrating 30K datasets and on the distributed `Compaction.commit` binding that still discards
+   `defer_index_remap` (`python/src/dataset/optimize.rs:567`).
+
+8. WeRide and Harvey are our two closest production analogues (validation). WeRide's weekly/monthly scheduled
+   re-indexing over growing sensor embeddings maps to our compaction-plus-index DAG cadence, and Harvey's
+   sub-2-second P50 metadata-filtered search on 15 M rows validates the typed Filter AST direction (rule #7).
+
+## Top 10 takeaways (round 1)
 
 1. Index builds fully commute with ingestion. CreateIndex is compatible with Append, Update, and Delete in the
    live conflict checker (`conflict_resolver.rs:499, 537-539`), so segment-API builds and incremental

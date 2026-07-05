@@ -1,8 +1,8 @@
 """Proto-shape unit tests for the benchmark gRPC request construction, without a server.
 
-Generates the Python stubs from the repository proto once per module and asserts that every request the search phase
-builds carries the final surface: a ``DatasetTarget`` (org, fixed tenant, fixed namespace, no date range) on all five
-rpcs, the ``Prewarm`` and ``Clusters`` rpcs on the service descriptor, and the protojson body ghz replays.
+Generates the Python stubs from the single repository proto once per module and asserts that every request the search
+phase builds carries the final surface: a ``DatasetTarget`` (org, fixed tenant, fixed namespace, no date range) on all
+five rpcs, the ``Prewarm`` and ``Clusters`` rpcs on the service descriptor, and the protojson body ghz replays.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ def stubs(tmp_path_factory: pytest.TempPathFactory) -> tuple[ModuleType, ModuleT
         tmp_path_factory: The pytest temporary-directory factory.
 
     Returns:
-        The ``search_pb2`` and ``search_pb2_grpc`` modules.
+        The ``lance_etl_pb2`` and ``lance_etl_pb2_grpc`` modules.
     """
     gen_dir: Path = tmp_path_factory.mktemp("grpc_gen")
     return load_stubs(generate_stubs(gen_dir))
@@ -43,7 +43,7 @@ def pb2(stubs: tuple[ModuleType, ModuleType]) -> ModuleType:
         stubs: The generated stub modules.
 
     Returns:
-        The ``search_pb2`` module.
+        The ``lance_etl_pb2`` module.
     """
     return stubs[0]
 
@@ -73,10 +73,6 @@ class TestDatasetTarget:
         assert target.tenant_id == "tenant0"
         assert target.namespace == "ns"
 
-    def test_no_date_range(self, pb2: ModuleType) -> None:
-        """No date_range is set: benchmark datasets are not date-partitioned."""
-        assert not dataset_target(pb2, "org0").HasField("date_range")
-
     def test_overrides(self, pb2: ModuleType) -> None:
         """Tenant and namespace can be overridden explicitly."""
         target: Any = dataset_target(pb2, "org0", tenant_id="t9", namespace="other")
@@ -99,7 +95,7 @@ class TestSearchRequests:
         assert list(request.query.projection) == ["vector_id"]
 
     def test_vector_query_optionals_left_unset(self, pb2: ModuleType) -> None:
-        """nprobes and refine_factor stay absent when not requested."""
+        """Nprobes and refine_factor stay absent when not requested."""
         query: Any = vector_query(pb2, np.asarray([0.0], dtype=np.float32), 1, None, None)
         assert not query.HasField("nprobes")
         assert not query.HasField("refine_factor")

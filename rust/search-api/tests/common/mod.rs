@@ -1,5 +1,10 @@
-//! Shared helpers for the disk-cache integration tests: a tiny indexed dataset builder and a
-//! counting object-store wrapper that records which reads reach the real store.
+//! Shared helpers for the integration tests: a tiny indexed dataset builder and a counting
+//! object-store wrapper that records which reads reach the real store.
+//!
+//! Each test binary that includes this module uses only a subset of the helpers (for example the
+//! blue-green tests need the dataset builder and config but not the counting store), so the module
+//! allows dead code rather than forcing every binary to touch every helper.
+#![allow(dead_code)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -236,16 +241,99 @@ pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) 
         cache_dir: cache_dir.to_path_buf(),
         disk_index_cache_bytes: 1024 * 1024 * 1024,
         disk_store_cache_bytes: 1024 * 1024 * 1024,
-        disk_cache_ttl_secs: 3600,
-        store_cache_max_range_bytes: 4 * 1024 * 1024,
-        disk_cache_sweep_secs: 300,
-        disk_cache_disabled: false,
+        cache_backend: search_api::config::CacheBackendKind::Disk,
+        redis_url: None,
+        redis_namespace: search_api::config::DEFAULT_REDIS_NAMESPACE.to_string(),
         prewarm_concurrency: 4,
-        fanout_concurrency: 8,
-        id_column: "vector_id".to_string(),
         statsd_addr: "127.0.0.1:8125".to_string(),
         telemetry_disabled: true,
         recall_sample_rate: 0.0,
+        io_concurrency: search_api::config::DEFAULT_IO_CONCURRENCY,
+        serve_by_tag: search_api::config::DEFAULT_SERVE_BY_TAG,
+        serve_tag: search_api::config::DEFAULT_SERVE_TAG.to_string(),
+        serve_tag_ttl_secs: search_api::config::DEFAULT_SERVE_TAG_TTL_SECS,
+        event_timestamp_column: search_api::config::DEFAULT_EVENT_TIMESTAMP_COLUMN.to_string(),
+        default_minimum_nprobes: search_api::config::DEFAULT_MINIMUM_NPROBES,
+        default_maximum_nprobes: search_api::config::DEFAULT_MAXIMUM_NPROBES,
+        nprobes_ceiling: search_api::config::DEFAULT_NPROBES_CEILING,
+        default_refine_factor: search_api::config::DEFAULT_REFINE_FACTOR,
+        fast_search_default: search_api::config::DEFAULT_FAST_SEARCH,
+        request_timeout_ms: search_api::config::DEFAULT_REQUEST_TIMEOUT_MS,
+        max_concurrent_streams: search_api::config::DEFAULT_MAX_CONCURRENT_STREAMS,
+        concurrency_limit_per_connection: search_api::config::DEFAULT_CONCURRENCY_LIMIT_PER_CONNECTION,
+        prewarm_targets_path: None,
+    }
+}
+
+/// Like [`test_config`] but selecting the Redis cache backend at the given URL.
+pub fn redis_test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path, redis_url: &str) -> Config {
+    let mut config = test_config(dataset_root, cache_dir);
+    config.cache_backend = search_api::config::CacheBackendKind::Redis;
+    config.redis_url = Some(redis_url.to_string());
+    config
+}
+
+/// A locally spawned `redis-server` child on a free port, killed on drop.
+pub struct RedisServerGuard {
+    child: std::process::Child,
+    /// The connection URL of the spawned server.
+    pub url: String,
+}
+
+impl RedisServerGuard {
+    /// Spawns a throwaway `redis-server` on a free localhost port and waits for it to answer
+    /// `PING`. Returns `None` (after an explanatory eprintln) when the binary is not installed,
+    /// so redis-backed tests skip gracefully on machines without Redis.
+    pub async fn spawn() -> Option<Self> {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+            listener.local_addr().ok()?.port()
+        };
+        let child = match std::process::Command::new("redis-server")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--save")
+            .arg("")
+            .arg("--appendonly")
+            .arg("no")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => {
+                eprintln!("redis-server binary not found, skipping redis cache test");
+                return None;
+            }
+        };
+        let url = format!("redis://127.0.0.1:{port}");
+        let guard = Self { child, url };
+        for _ in 0..50 {
+            if let Ok(client) = redis::Client::open(guard.url.as_str())
+                && let Ok(mut conn) = client.get_multiplexed_async_connection().await
+                && redis::cmd("PING").query_async::<String>(&mut conn).await.is_ok()
+            {
+                return Some(guard);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        eprintln!("spawned redis-server did not answer PING in time, skipping redis cache test");
+        None
+    }
+}
+
+impl RedisServerGuard {
+    /// Kills the server immediately, simulating a mid-run Redis outage.
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for RedisServerGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

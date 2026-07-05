@@ -6,14 +6,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 /// Version of our on-disk cache schema. Bump on any layout or format change.
-pub const CACHE_SCHEMA_VERSION: u32 = 1;
+///
+/// v2 wraps every entry payload in a checksummed frame (see [`frame_bytes`]) so torn writes and
+/// bit rot are detected on read instead of being served to lance readers verbatim.
+pub const CACHE_SCHEMA_VERSION: u32 = 2;
 
-/// Lance crate version baked into the stamp. Bump together with the `lance` path dependency
-/// because the cache codec format is explicitly unstable across lance releases.
-pub const LANCE_CACHE_STAMP: &str = "8.0.0-beta.6";
+/// Lance crate version baked into the stamp. Bump together with the `lance` dependency in
+/// `Cargo.toml` because the cache codec format is explicitly unstable across lance releases.
+pub const LANCE_CACHE_STAMP: &str = "8.0.0";
+
+/// Magic prefix of a framed cache entry, versioned with the frame layout.
+const FRAME_MAGIC: &[u8; 4] = b"LEC2";
+
+/// Bytes a frame adds ahead of the payload: the magic plus a 32-byte blake3 checksum.
+pub const FRAME_OVERHEAD: usize = 4 + 32;
 
 /// Substring marking in-progress write files which readers must ignore and sweeps may delete.
 const TMP_MARKER: &str = ".tmp-";
+
+/// File name of the per-object `ObjectMeta` sidecar written by the store cache.
+///
+/// Sidecars are excluded from residency accounting and from the sweep's eviction set, so
+/// counting them in `dir_stats` would make the in-process gauges diverge from the on-disk
+/// reality. Lone sidecars are reclaimed by `prune_empty_dirs`.
+pub const META_FILE: &str = "meta.json";
 
 /// Returns the stamp directory name combining our schema version and the lance version.
 pub fn stamp_dir_name() -> String {
@@ -38,6 +54,30 @@ pub fn prepare_cache_root(cache_dir: &Path) -> std::io::Result<PathBuf> {
         }
     }
     Ok(root)
+}
+
+/// Wraps a payload in the checksummed on-disk frame: magic, blake3 of the payload, payload.
+pub fn frame_bytes(payload: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(FRAME_OVERHEAD + payload.len());
+    framed.extend_from_slice(FRAME_MAGIC);
+    framed.extend_from_slice(blake3::hash(payload).as_bytes());
+    framed.extend_from_slice(payload);
+    framed
+}
+
+/// Verifies and strips the frame, returning the payload. `None` means the entry is corrupt:
+/// too short, wrong magic (including pre-v2 unframed files), or a checksum mismatch from a torn
+/// write or bit rot. Callers treat `None` as a cache miss and delete the file.
+pub fn unframe_bytes(buf: Vec<u8>) -> Option<bytes::Bytes> {
+    if buf.len() < FRAME_OVERHEAD || &buf[..4] != FRAME_MAGIC {
+        return None;
+    }
+    let expected: [u8; 32] = buf[4..FRAME_OVERHEAD].try_into().ok()?;
+    let payload = bytes::Bytes::from(buf).slice(FRAME_OVERHEAD..);
+    if blake3::hash(&payload).as_bytes() != &expected {
+        return None;
+    }
+    Some(payload)
 }
 
 /// Hashes `input` with blake3 and returns the first `hex_len` hex characters.
@@ -70,13 +110,29 @@ pub async fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     tokio::fs::rename(&tmp, path).await
 }
 
-/// Decrements an atomic residency gauge without underflowing past zero.
+/// Decrements an atomic residency gauge, saturating at zero.
 ///
-/// The load-then-sub pair is not one transaction: under concurrent updates the gauge may drift
-/// low, which only makes the janitor briefly under-evict. The sweep reconciles any residual
-/// drift.
+/// Uses a single `fetch_update` so the read-and-subtract is one atomic transaction. A plain
+/// load-then-`fetch_sub` pair has a TOCTOU window: concurrent decrements can each clamp against the
+/// same stale snapshot and drive the gauge below zero, wrapping it near `u64::MAX`. The saturating
+/// update closes that window entirely.
 pub fn gauge_sub(gauge: &AtomicU64, amount: u64) {
-    gauge.fetch_sub(amount.min(gauge.load(Ordering::Relaxed)), Ordering::Relaxed);
+    let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(amount))
+    });
+}
+
+/// Removes one cache directory and decrements both residency gauges by its contents.
+///
+/// Stats the directory first (the size and entry count it holds), removes it, then subtracts both
+/// figures from the gauges with the saturating [`gauge_sub`]. Shared by the index tier's
+/// prefix invalidation and the store tier's per-object invalidation, which previously each
+/// inlined the same stat-remove-decrement sequence.
+pub async fn remove_dir_accounted(dir: &Path, bytes_gauge: &AtomicU64, entries_gauge: &AtomicU64) {
+    let (bytes, entries) = dir_stats(dir);
+    let _ = tokio::fs::remove_dir_all(dir).await;
+    gauge_sub(bytes_gauge, bytes);
+    gauge_sub(entries_gauge, entries);
 }
 
 /// Best-effort mtime refresh so the sweep's LRU-by-mtime approximation tracks disk hits.
@@ -96,12 +152,19 @@ fn collect_files(root: &Path, files: &mut Vec<(PathBuf, u64, SystemTime)>) {
         let path = entry.path();
         if path.is_dir() {
             collect_files(&path, files);
-        } else if path
+            continue;
+        }
+        if path
             .file_name()
             .is_some_and(|name| name.to_string_lossy().contains(TMP_MARKER))
         {
             let _ = std::fs::remove_file(&path);
-        } else if let Ok(meta) = entry.metadata() {
+            continue;
+        }
+        if path.file_name().is_some_and(|name| name == META_FILE) {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
             let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             files.push((path, meta.len(), mtime));
         }
@@ -173,6 +236,10 @@ pub fn sweep_tier(
 }
 
 /// Removes empty directories below `root` (and `root` itself when `include_root` is set).
+///
+/// A directory whose only remaining files are `META_FILE` sidecars counts as empty: its data
+/// entries have all been evicted, so the orphaned sidecars are deleted along with the directory.
+/// This keeps sidecars from accumulating now that the sweep no longer evicts them directly.
 fn prune_empty_dirs(root: &Path, include_root: bool) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
@@ -183,13 +250,23 @@ fn prune_empty_dirs(root: &Path, include_root: bool) {
             prune_empty_dirs(&path, true);
         }
     }
-    if include_root
-        && std::fs::read_dir(root)
-            .map(|mut it| it.next().is_none())
-            .unwrap_or(false)
-    {
-        let _ = std::fs::remove_dir(root);
+    if include_root && dir_holds_only_sidecars(root) {
+        let _ = std::fs::remove_dir_all(root);
     }
+}
+
+/// Reports whether `root` contains nothing but `META_FILE` sidecars (and so holds no live entry).
+fn dir_holds_only_sidecars(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() || path.file_name().is_none_or(|name| name != META_FILE) {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -245,6 +322,27 @@ mod tests {
         assert_eq!(stats.ttl_evicted, 1);
         assert_eq!(stats.size_evicted, 1);
         assert_eq!(bytes.load(Ordering::Relaxed), 64);
+    }
+
+    #[test]
+    fn frame_round_trip_and_corruption_detection() {
+        let payload = b"index page bytes".to_vec();
+        let framed = frame_bytes(&payload);
+        assert_eq!(framed.len(), FRAME_OVERHEAD + payload.len());
+        assert_eq!(unframe_bytes(framed.clone()).unwrap().as_ref(), payload.as_slice());
+
+        let mut flipped = framed.clone();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 0xFF;
+        assert!(unframe_bytes(flipped).is_none(), "bit flip must be detected");
+
+        let truncated = framed[..framed.len() - 1].to_vec();
+        assert!(unframe_bytes(truncated).is_none(), "torn write must be detected");
+
+        assert!(unframe_bytes(b"raw pre-v2 content".to_vec()).is_none());
+        assert!(unframe_bytes(Vec::new()).is_none());
+        let empty = frame_bytes(b"");
+        assert_eq!(unframe_bytes(empty).unwrap().len(), 0, "empty payload is representable");
     }
 
     #[test]

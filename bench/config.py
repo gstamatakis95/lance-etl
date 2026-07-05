@@ -16,9 +16,10 @@ from typing import Any
 PACKAGE_DIR: Path = Path(__file__).resolve().parent
 REPO_ROOT: Path = PACKAGE_DIR.parent
 DEFAULT_WORKSPACE: Path = PACKAGE_DIR / "workspace"
+DEFAULT_CORPUS_ROOT: Path = PACKAGE_DIR / "corpora"
 DEFAULT_RESULTS_ROOT: Path = PACKAGE_DIR / "results"
 DEFAULT_ICEBERG_PACKAGE: str = "org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0"
-PROTO_PATH: Path = REPO_ROOT / "rust" / "search-api" / "proto" / "lance_etl" / "search" / "v1" / "search.proto"
+PROTO_PATH: Path = REPO_ROOT / "rust" / "search-api" / "proto" / "lance_etl" / "v1" / "lance_etl.proto"
 SIFT_DIM: int = 128
 SIFT_BASE_COUNT: int = 1_000_000
 SIFT_QUERY_COUNT: int = 10_000
@@ -26,7 +27,18 @@ SIFT_GT_DEPTH: int = 100
 TENANT_ID: str = "tenant0"
 NAMESPACE: str = "ns"
 SIFT_FILE_NAMES: tuple[str, str, str] = ("sift_base.fvecs", "sift_query.fvecs", "sift_groundtruth.ivecs")
-SUBCOMMANDS: tuple[str, ...] = ("download", "prepare", "ingest", "index", "compact", "search", "report", "all")
+SUBCOMMANDS: tuple[str, ...] = (
+    "download",
+    "prepare",
+    "ingest",
+    "index",
+    "compact",
+    "search",
+    "report",
+    "all",
+    "e2e",
+    "experiment",
+)
 PHASE_NAMES: tuple[str, ...] = ("download", "prepare", "ingest", "index", "compact", "search", "report")
 
 
@@ -37,6 +49,27 @@ def default_run_id() -> str:
         A UTC timestamp string usable as a directory name.
     """
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def parse_env_pairs(pairs: list[str] | None) -> dict[str, str]:
+    """Parse repeatable ``KEY=VALUE`` environment overrides into a dict.
+
+    Args:
+        pairs: The raw flag values, or ``None`` when the flag was never given.
+
+    Returns:
+        The parsed environment mapping, empty when no pairs were given.
+
+    Raises:
+        ValueError: If a pair carries no ``=`` separator or an empty key.
+    """
+    env: dict[str, str] = {}
+    for pair in pairs or []:
+        key, separator, value = pair.partition("=")
+        if not separator or not key:
+            raise ValueError(f"--server-env expects KEY=VALUE, got {pair!r}")
+        env[key] = value
+    return env
 
 
 def parse_int_list(text: str) -> list[int]:
@@ -76,13 +109,14 @@ class BenchConfig:
     Attributes:
         command: The subcommand being executed.
         dataset: Name of the registered dataset adapter driving the run. Defaults to the canonical SIFT1M corpus.
-        workspace: Directory holding downloaded data, prepared artifacts, the Iceberg warehouse, and Lance datasets.
+        workspace: Directory holding prepared artifacts, the Iceberg warehouse, and Lance datasets.
+        corpus_root: Shared corpus cache directory; downloads land here once and are reused across workspaces.
         results_root: Directory under which per-run result directories are created.
         run_id: Identifier of the current run. One run directory aggregates every phase's artifacts.
         limit: Number of base vectors to benchmark. The full corpus is 1M.
         tenants: Number of org datasets the vectors are split into round-robin.
         seed: Master seed for k-means sampling, vocabulary, and text generation.
-        num_clusters: Coarse k-means cluster count driving the synthetic text vocabularies.
+        num_clusters: Coarse k-means cluster count driving the cluster-seeded text vocabularies.
         words_per_cluster: Vocabulary size per cluster.
         common_words: Size of the shared common-word pool mixed into every document.
         words_per_text: Cluster-specific words per document.
@@ -90,7 +124,7 @@ class BenchConfig:
         batches: Sequential ETL merge batches during ingest. Values above 1 create extra fragments for compaction.
         etl_partitions: Shuffle partition count handed to the ETL job.
         ivf_partitions: Explicit IVF partition count. ``None`` uses the indexer's size-aware policy.
-        num_shards: Parallel segment builders per dataset during indexing.
+        num_shards: Fragments covered by one segment-build task during indexing.
         vector_row_floor: Row floor below which the vector index is skipped. Lowered from the production default so
             small ``--limit`` runs still build an index.
         fts_with_position: Store token positions in the inverted index.
@@ -105,7 +139,7 @@ class BenchConfig:
         refine_factors: Refine-factor sweep values. ``None`` disables re-ranking.
         search_k: Neighbors requested per query. Must cover the deepest recall cut-off.
         max_queries: Cap on query vectors per sweep point. ``None`` sends all 10k.
-        fts_query_count: Synthetic full-text queries in the FTS leg.
+        fts_query_count: Deterministic full-text queries drawn from cluster vocabularies in the FTS leg.
         hybrid_query_count: Queries in the hybrid (vector + text, RRF) leg.
         concurrency: ghz concurrency levels for the load mode.
         load_duration: ghz test duration per concurrency level.
@@ -114,11 +148,28 @@ class BenchConfig:
         sha256: Optional pinned checksum for the downloaded sift archive.
         force: Rebuild prepared artifacts even when a manifest already exists.
         warmup_queries: Queries issued at the maximum nprobes before the timed sweep. Set to 0 to skip warmup.
+        no_text: When True, omit the ``texts`` column and skip FTS/hybrid index and search legs entirely.
+        capture_telemetry: When True, start the local DogStatsD and OTLP capture listeners for the duration of the
+            run and write all telemetry to ``{workspace}/telemetry/``.
+        statsd_port: UDP port for the local DogStatsD capture listener (default 19125, avoids clash with a real agent
+            on 8125).
+        otlp_port: gRPC port for the local OTLP trace capture receiver (default 14317, avoids clash with a real agent
+            on 4317).
+        server_bin: Explicit path of the search-api binary the experiment spawns. ``None`` resolves the release
+            build then the debug build.
+        build_server: When True, run ``cargo build --release`` for search-api before spawning it.
+        spawn_server: When True (the default) the experiment spawns and owns a server. Disable to measure against
+            an externally managed server at ``endpoint``.
+        server_env: Extra environment variables for the spawned server, from repeatable ``--server-env KEY=VALUE``
+            flags. This is how an iteration varies server-side knobs such as the cache backend or cache budgets.
+        baseline: Run id of a previous experiment whose ``metrics.json`` is diffed against this run's headline
+            numbers.
     """
 
     command: str
     dataset: str = "sift1m"
     workspace: Path = DEFAULT_WORKSPACE
+    corpus_root: Path = DEFAULT_CORPUS_ROOT
     results_root: Path = DEFAULT_RESULTS_ROOT
     run_id: str = field(default_factory=default_run_id)
     limit: int = SIFT_BASE_COUNT
@@ -155,6 +206,15 @@ class BenchConfig:
     sha256: str | None = None
     force: bool = False
     warmup_queries: int = 100
+    no_text: bool = False
+    capture_telemetry: bool = False
+    statsd_port: int = 19125
+    otlp_port: int = 14317
+    server_bin: str | None = None
+    build_server: bool = False
+    spawn_server: bool = True
+    server_env: dict[str, str] = field(default_factory=dict)
+    baseline: str | None = None
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> BenchConfig:
@@ -167,12 +227,19 @@ class BenchConfig:
             The populated configuration.
         """
         values: dict[str, Any] = {}
+        nullable_fields: frozenset[str] = frozenset(
+            {"ivf_partitions", "compact_target_rows", "max_queries", "sha256", "statsd_port", "otlp_port"}
+        )
+        values["server_env"] = parse_env_pairs(getattr(args, "server_env", None))
         for item in fields(cls):
+            if item.name == "server_env":
+                continue
             if hasattr(args, item.name):
                 value: Any = getattr(args, item.name)
-                if value is not None or item.name in ("ivf_partitions", "compact_target_rows", "max_queries", "sha256"):
+                if value is not None or item.name in nullable_fields:
                     values[item.name] = value
         values["workspace"] = Path(args.workspace).resolve()
+        values["corpus_root"] = Path(args.corpus_root).resolve()
         values["results_root"] = Path(args.results_root).resolve()
         return cls(**values)
 
@@ -204,12 +271,15 @@ class BenchConfig:
         """Return the cache key identifying one prepared corpus shape.
 
         The default ``sift1m`` dataset keeps its historical un-prefixed key. Other datasets are prefixed with their
-        adapter name so prepared artifacts never collide across datasets.
+        adapter name so prepared artifacts never collide across datasets. When ``no_text`` is set the key carries a
+        ``-notext`` suffix so text and no-text artifacts never collide.
 
         Returns:
             A key derived from the dataset and the fields that change the corpus or ground truth.
         """
         shape: str = f"n{self.limit}-t{self.tenants}-s{self.seed}-c{self.num_clusters}"
+        if self.no_text:
+            shape = f"{shape}-notext"
         if self.dataset == "sift1m":
             return shape
         return f"{self.dataset}-{shape}"
@@ -247,6 +317,14 @@ class BenchConfig:
         base: str = str(self.lance_root())
         return [f"{base}/{org}/{TENANT_ID}/{NAMESPACE}.lance" for org in self.org_ids()]
 
+    def telemetry_dir(self) -> Path:
+        """Return the directory under which all telemetry capture files are written.
+
+        Returns:
+            The ``workspace/telemetry`` directory.
+        """
+        return self.workspace / "telemetry"
+
 
 def add_flags(parser: argparse.ArgumentParser) -> None:
     """Add the full benchmark flag set to a subcommand parser.
@@ -256,6 +334,13 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
     """
     parser.add_argument("--dataset", default="sift1m", help="Registered dataset adapter name; default sift1m")
     parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
+    parser.add_argument(
+        "--corpus-root",
+        type=Path,
+        default=DEFAULT_CORPUS_ROOT,
+        dest="corpus_root",
+        help="Shared corpus cache; downloads land here once and are reused across workspaces",
+    )
     parser.add_argument("--results-root", type=Path, default=DEFAULT_RESULTS_ROOT)
     parser.add_argument("--run-id", dest="run_id", default=None)
     parser.add_argument("--limit", type=int, default=SIFT_BASE_COUNT, help="Base vectors to benchmark; default 1M")
@@ -294,6 +379,61 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--sha256", default=None, help="Pinned sha256 of sift.tar.gz")
     parser.add_argument("--force", action="store_true", help="Rebuild prepared artifacts")
     parser.add_argument("--warmup-queries", type=int, default=100, help="Warmup queries before timed sweep; 0 skips")
+    parser.add_argument(
+        "--no-text",
+        dest="no_text",
+        action="store_true",
+        help="Omit text column and skip FTS/hybrid legs; required for pure-vector corpora",
+    )
+    parser.add_argument(
+        "--capture-telemetry",
+        dest="capture_telemetry",
+        action="store_true",
+        help="Start local DogStatsD and OTLP capture listeners for the run duration",
+    )
+    parser.add_argument(
+        "--statsd-port",
+        dest="statsd_port",
+        type=int,
+        default=19125,
+        help="UDP port for the local DogStatsD capture listener (default 19125)",
+    )
+    parser.add_argument(
+        "--server-bin",
+        default=None,
+        help="Path to the search-api binary the experiment spawns (default: release then debug build)",
+    )
+    parser.add_argument(
+        "--build-server",
+        dest="build_server",
+        action="store_true",
+        help="Run cargo build --release for search-api before spawning it",
+    )
+    parser.add_argument(
+        "--no-spawn-server",
+        dest="spawn_server",
+        action="store_false",
+        help="Do not spawn a server; use the externally managed one at --endpoint",
+    )
+    parser.add_argument(
+        "--server-env",
+        action="append",
+        default=None,
+        metavar="KEY=VALUE",
+        help="Extra environment for the spawned server, repeatable (e.g. SEARCH_API_CACHE_BACKEND=redis)",
+    )
+    parser.add_argument(
+        "--baseline",
+        default=None,
+        help="Run id of a previous experiment to print a metrics delta against",
+    )
+    parser.add_argument(
+        "--otlp-port",
+        dest="otlp_port",
+        type=int,
+        default=14317,
+        help="gRPC port for the local OTLP trace capture receiver (default 14317)",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -307,13 +447,15 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     help_texts: dict[str, str] = {
         "download": "Fetch and verify the SIFT1M corpus",
-        "prepare": "Write the Iceberg source table, synthetic text, and ground truth",
+        "prepare": "Write the Iceberg source table, cluster-seeded text corpus, and ground truth",
         "ingest": "Run the real Iceberg-to-Lance ETL into per-tenant datasets",
         "index": "Build IVF_RQ, BTREE, BITMAP, and INVERTED indices with LanceIndexer",
-        "compact": "Compact the datasets with LanceCompactor and record fragment counts",
+        "compact": "Compact the datasets with MaintenanceJob and record fragment counts",
         "search": "Run recall, FTS, hybrid, and ghz load modes against the gRPC server",
         "report": "Aggregate run artifacts into summary.md, results.csv, and pareto.png",
         "all": "Run the full chain: download, prepare, ingest, index, compact, search, report",
+        "e2e": "Batch-major e2e: per-batch ETL+index+compact+tag, historical-tag verification, optional gRPC legs",
+        "experiment": "One agent iteration: prepare if needed, spawn the server, e2e, sizes, sweep, metrics.json",
     }
     for name in SUBCOMMANDS:
         sub: argparse.ArgumentParser = subparsers.add_parser(name, help=help_texts[name])

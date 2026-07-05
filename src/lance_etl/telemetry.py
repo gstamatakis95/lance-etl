@@ -7,9 +7,7 @@ events into Datadog. Telemetry clients are created per process via :meth:`Teleme
 Lance emits structured trace events (file audits, dataset events, object-store throttling, index I/O, and execution
 stats) through a non-blocking callback that :func:`attach_lance_event_bridge` registers. The bridge turns those events
 into Datadog counters, gauges, and distributions and forwards them as logs. The bridge attaches automatically the first
-time :meth:`Telemetry.create` runs in a process, so driver and executors both report Lance internals. The performance
-tuning that the Lance guide describes (compute and I/O thread pools, the scan read-ahead buffer, log and trace levels)
-is applied through :class:`LanceRuntimeConfig` and :func:`apply_lance_runtime`.
+time :meth:`Telemetry.create` runs in a process, so driver and executors both report Lance internals.
 
 Assumes a Datadog Agent reachable from every node for DogStatsD on the configured host and port. The ddtrace, datadog,
 and lance imports use version and availability fallbacks. Adjust the import block if installed versions differ.
@@ -18,12 +16,12 @@ and lance imports use version and availability fallbacks. Adjust the import bloc
 from __future__ import annotations
 
 import logging
-import os
 import random
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 
 from datadog.dogstatsd import DogStatsd
@@ -40,9 +38,38 @@ except ImportError:
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+DEFAULT_CONFLICT_RETRIES: int = 10
+"""Conflict-retry budget for the ETL ``merge_insert`` / ``delete`` commit loop.
+
+Mirrors Lance's own ``merge_insert`` ``conflict_retries`` so the strictly-additive Python wrapper never thins the
+inner budget. Shared by :class:`lance_etl.etl.ETLConfig` rather than duplicated as a literal.
+"""
+
+DEFAULT_RETRY_TIMEOUT: timedelta = timedelta(seconds=120)
+"""Total time budget for ETL conflict retries.
+
+Raised above the 30-second Lance default to give headroom on hot multi-tenant datasets.
+"""
+
+DEFAULT_COMMIT_RETRIES: int = 20
+"""Conflict-retry budget for index and compaction commits.
+
+This is the single home for the budget that was duplicated across :class:`lance_etl.indexing.IndexJobConfig` and
+:class:`lance_etl.maintenance.MaintenanceConfig`. It sizes the only retry layer the binding-less segment-index and
+distributed-compaction commits have.
+"""
+
+DEFAULT_LARGE_COMMIT_RETRIES: int = 2
+"""Retry budget around the fleet compaction ``Compaction.commit`` call.
+
+Kept small because the commit pins its conflict scan to the plan version, so a semantic conflict re-fails
+deterministically and only the raw manifest-write race benefits from a retry.
+"""
+
 EXECUTION_DISTRIBUTION_KEYS: tuple[str, ...] = (
     "output_rows",
     "iops",
+    "requests",
     "bytes_read",
     "indices_loaded",
     "parts_loaded",
@@ -107,62 +134,6 @@ class TelemetryConfig:
     constant_tags: list[str] = field(default_factory=list)
 
 
-@dataclass
-class LanceRuntimeConfig:
-    """Lance runtime tuning drawn from the Lance performance guide.
-
-    The thread-pool and buffer settings must be in the environment before Lance initializes its pools, so on Spark they
-    belong in the executor environment rather than being set inside a task. :func:`apply_lance_runtime` sets them on the
-    current process for the driver, and returns the variables it set so the caller can mirror them onto executors.
-
-    Attributes:
-        cpu_threads: Value for ``LANCE_CPU_THREADS``. Set this below the executor core count when several tasks share
-            an executor to avoid compute oversubscription.
-        io_threads: Value for ``LANCE_IO_THREADS``. Cloud stores often need 128 or 256 to saturate bandwidth.
-        io_buffer_size_bytes: Value for ``LANCE_DEFAULT_IO_BUFFER_SIZE``. Raise it alongside the I/O thread count.
-        lance_log: Value for ``LANCE_LOG`` controlling log filtering by level and target.
-        lance_tracing: Value for ``LANCE_TRACING`` controlling the trace level the event bridge observes. The key events
-            are emitted at ``info``.
-    """
-
-    cpu_threads: int | None = None
-    io_threads: int | None = None
-    io_buffer_size_bytes: int | None = None
-    lance_log: str | None = None
-    lance_tracing: str | None = None
-
-    def as_env(self) -> dict[str, str]:
-        """Return the environment variables for the set fields.
-
-        Returns:
-            A mapping of Lance environment variable names to string values,
-            containing only the fields that are set.
-        """
-        candidates: list[tuple[str, int | str | None]] = [
-            ("LANCE_CPU_THREADS", self.cpu_threads),
-            ("LANCE_IO_THREADS", self.io_threads),
-            ("LANCE_DEFAULT_IO_BUFFER_SIZE", self.io_buffer_size_bytes),
-            ("LANCE_LOG", self.lance_log),
-            ("LANCE_TRACING", self.lance_tracing),
-        ]
-        return {name: str(value) for name, value in candidates if value is not None}
-
-
-def apply_lance_runtime(config: LanceRuntimeConfig) -> dict[str, str]:
-    """Apply Lance runtime tuning to the current process environment.
-
-    Args:
-        config: The runtime tuning to apply.
-
-    Returns:
-        The environment variables that were set, for mirroring onto executors.
-    """
-    variables: dict[str, str] = config.as_env()
-    for name, value in variables.items():
-        os.environ[name] = value
-    return variables
-
-
 def commit_with_retries(
     action: Callable[[], Any],
     retries: int,
@@ -175,6 +146,23 @@ def commit_with_retries(
     retry sleeps a uniformly random duration in ``[0, backoff_seconds * 2**attempt)`` (capped at 64 units), so
     concurrent committers on one dataset randomize apart instead of colliding on every slot. Conflicts are detected
     with :func:`is_commit_conflict_error`, which matches retryable markers only and lets hard conflicts propagate.
+
+    Layering against Lance's own inner retry loop. Lance's ``merge_insert`` and ``delete`` already wrap the
+    execute-then-commit cycle in ``execute_with_retry`` (``rust/lance/src/dataset/write/retry.rs:75-130``), whose
+    ``RetryConfig`` defaults to ``max_retries=10`` and ``retry_timeout=30s``
+    (``retry.rs:23-30``; ``merge_insert.rs:464-465`` and ``delete.rs:134-135``). That inner loop retries only
+    ``Error::RetryableCommitConflict``, calling ``checkout_latest`` before each attempt, and on exhaustion converts the
+    failure to ``Error::TooMuchWriteContention`` ("Too many concurrent writers", ``retry.rs:99-103,126-129``) rather
+    than re-surfacing the conflict. ``TooMuchWriteContention`` is deliberately excluded from
+    :data:`COMMIT_CONFLICT_MARKERS`, so this wrapper does NOT re-retry an exhausted inner loop and the two layers never
+    stack on the same conflict. What this wrapper adds is strictly complementary: it catches the non-retryable
+    ``Error::CommitConflict`` variant (``rust/lance-core/src/error.rs:96-97``) that the inner loop returns straight
+    through (``retry.rs:122``), and it covers operations that have no inner retry loop at all (the distributed
+    ``Compaction.commit`` / segment-index commits), re-reading the dataset in ``action`` so each attempt rebases. It
+    also supplies the conflict count Lance never surfaces through the pylance stats dict. The ETL budget (10) mirrors
+    the merge-insert ``conflict_retries``; the compaction budget (20) sizes the only retry layer that path has. Both are
+    correct as-is: shrinking them would thin the only coverage for ``CommitConflict`` and the binding-less compaction
+    commits, and growing them would not help because the inner loop already owns ``RetryableCommitConflict`` exhaustion.
 
     Args:
         action: The commit to attempt, returning any result.
@@ -201,6 +189,52 @@ def commit_with_retries(
             time.sleep(random.uniform(0.0, backoff_seconds * (2 ** min(attempt, 6))))
     assert last_exc is not None
     raise last_exc
+
+
+def emit_execution_metrics(telemetry: Telemetry, args: dict[str, str], base_tags: list[str]) -> None:
+    """Emit the numeric execution-stats distributions carried by one ``execution`` event.
+
+    Args:
+        telemetry: The telemetry facade used to emit metrics.
+        args: The event's string arguments.
+        base_tags: Tags shared by every metric emitted for this event.
+    """
+    for key in EXECUTION_DISTRIBUTION_KEYS:
+        raw: str | None = args.get(key)
+        if raw is None:
+            continue
+        try:
+            telemetry.distribution(f"lance.execution.{key}", float(raw), tags=base_tags)
+        except ValueError:
+            continue
+
+
+def emit_throttle_metrics(telemetry: Telemetry, args: dict[str, str], base_tags: list[str]) -> None:
+    """Emit the rate gauges and error counter carried by one object-store ``throttle`` event.
+
+    Args:
+        telemetry: The telemetry facade used to emit metrics.
+        args: The event's string arguments.
+        base_tags: Tags shared by every metric emitted for this event.
+    """
+    for key in THROTTLE_GAUGE_KEYS:
+        raw: str | None = args.get(key)
+        if raw is None:
+            continue
+        try:
+            telemetry.gauge(f"lance.throttle.{key}", float(raw), tags=base_tags)
+        except ValueError:
+            continue
+    if args.get("error"):
+        telemetry.incr("lance.throttle.error", tags=base_tags)
+        logger.warning("lance object store throttle: %s", args)
+
+
+EVENT_METRIC_EMITTERS: dict[str, Callable[[Telemetry, dict[str, str], list[str]], None]] = {
+    "execution": emit_execution_metrics,
+    "throttle": emit_throttle_metrics,
+}
+"""Per-event-type metric emitters keyed by the short event name."""
 
 
 def build_lance_event_callback(telemetry: Telemetry) -> object:
@@ -233,30 +267,12 @@ def build_lance_event_callback(telemetry: Telemetry) -> object:
             if value:
                 telemetry.incr(f"lance.{short}", tags=base_tags + [f"{key}:{value}"])
 
-        if short == "execution":
-            for key in EXECUTION_DISTRIBUTION_KEYS:
-                raw: str | None = args.get(key)
-                if raw is not None:
-                    try:
-                        telemetry.distribution(f"lance.execution.{key}", float(raw), tags=base_tags)
-                    except ValueError:
-                        continue
-        elif short == "throttle":
-            for key in THROTTLE_GAUGE_KEYS:
-                raw = args.get(key)
-                if raw is not None:
-                    try:
-                        telemetry.gauge(f"lance.throttle.{key}", float(raw), tags=base_tags)
-                    except ValueError:
-                        continue
-            if args.get("error"):
-                telemetry.incr("lance.throttle.error", tags=base_tags)
-                logger.warning("lance object store throttle: %s", args)
+        emitter: Callable[[Telemetry, dict[str, str], list[str]], None] | None = EVENT_METRIC_EMITTERS.get(short)
+        if emitter is not None:
+            emitter(telemetry, args, base_tags)
 
-        if short in HIGH_VOLUME_EVENTS:
-            logger.debug("lance event target=%s args=%s", target, args)
-        else:
-            logger.info("lance event target=%s args=%s", target, args)
+        level: int = logging.DEBUG if short in HIGH_VOLUME_EVENTS else logging.INFO
+        logger.log(level, "lance event target=%s args=%s", target, args)
 
     return on_event
 

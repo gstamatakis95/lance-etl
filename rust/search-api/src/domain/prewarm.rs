@@ -3,11 +3,14 @@
 use std::time::Duration;
 
 use crate::domain::error::SearchError;
+use crate::domain::target::{DatasetRef, DatasetTarget};
 
 /// What a prewarm call should pull into the local caches.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PrewarmSpec {
-    /// Warm dataset metadata (manifest, transaction, index listing). Implied by warming any index.
+    /// Warm dataset metadata (manifest, transaction, index listing). Implied by warming any index,
+    /// since opening the dataset warms its metadata. When false and no indexes are requested, the
+    /// prewarm is a no-op that never opens the dataset.
     pub metadata: bool,
     /// Warm all indexes of the dataset. Ignored when `index_names` is non-empty.
     pub all_indexes: bool,
@@ -21,6 +24,15 @@ impl PrewarmSpec {
     /// Returns true when the spec asks for any index warming at all.
     pub fn wants_indexes(&self) -> bool {
         self.all_indexes || !self.index_names.is_empty()
+    }
+
+    /// Returns true when the spec asks for no work at all.
+    ///
+    /// Opening the dataset always warms its metadata as a side effect, so `metadata = false` with
+    /// no index targets is the only spec that warrants skipping the dataset open entirely. The
+    /// prewarm implementation short-circuits such a spec into an empty report.
+    pub fn is_noop(&self) -> bool {
+        !self.metadata && !self.wants_indexes()
     }
 
     /// Resolves the index names to warm against the names available in the dataset.
@@ -69,18 +81,25 @@ pub struct PrewarmReport {
     pub total_duration: Duration,
     /// Approximate bytes resident in the shared index cache after the call.
     pub index_cache_size_bytes: u64,
+    /// The concrete committed version id that was warmed. With a tag target this is the version
+    /// the tag resolved to at warm time, so a caller can confirm the green version is warm before
+    /// flipping the serve tag onto it.
+    pub resolved_version: u64,
 }
 
 /// Cache prewarming abstraction. Transports stay generic over this trait next to `SearchBackend`.
 pub trait Prewarmer: Send + Sync + 'static {
     /// Warms the targeted dataset's caches and reports what was loaded.
     ///
-    /// The target must address exactly one dataset: a date range, when present, has to cover a
-    /// single day.
+    /// `reference` selects which committed version to warm: [`DatasetRef::Latest`] (the default
+    /// for clients that send no version), an explicit [`DatasetRef::Version`], or a
+    /// [`DatasetRef::Tag`] resolved at warm time. Pinning a version is what lets an operator warm
+    /// a green build into every replica before flipping the serve tag onto it.
     fn prewarm(
         &self,
-        target: &crate::domain::target::DatasetTarget,
+        target: &DatasetTarget,
         spec: PrewarmSpec,
+        reference: DatasetRef,
     ) -> impl Future<Output = Result<PrewarmReport, SearchError>> + Send;
 }
 
@@ -123,5 +142,22 @@ mod tests {
         };
         assert!(!spec.wants_indexes());
         assert!(spec.resolve_targets(&names(&["a"])).is_empty());
+        assert!(!spec.is_noop());
+    }
+
+    #[test]
+    fn empty_spec_is_a_noop() {
+        let spec = PrewarmSpec::default();
+        assert!(spec.is_noop());
+    }
+
+    #[test]
+    fn index_spec_without_metadata_is_not_a_noop() {
+        let spec = PrewarmSpec {
+            metadata: false,
+            index_names: names(&["a"]),
+            ..Default::default()
+        };
+        assert!(!spec.is_noop());
     }
 }

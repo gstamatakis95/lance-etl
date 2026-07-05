@@ -7,13 +7,13 @@ driver-side merge, then commit, asserting the index is listed and queryable afte
 from __future__ import annotations
 
 import json
-import pickle
 import uuid
 from pathlib import Path
 
 import lance
+import pyarrow as pa
 import pytest
-from conftest import make_vector_table, write_fragmented_dataset
+from conftest import FakeSpark, make_vector_table, write_fragmented_dataset
 from lance.dataset import Index
 
 from lance_etl.indexing import (
@@ -22,12 +22,16 @@ from lance_etl.indexing import (
     FtsIndexHandler,
     IndexHandler,
     IndexJobConfig,
+    LanceIndexer,
     VectorIndexHandler,
+    bootstrap_vector_index,
+    centroids_from_ipc,
     commit_segments,
-    index_dataset_locally,
     lance_field_id,
+    load_vector_config,
     serialize_segment,
     split_evenly,
+    vector_config_key,
 )
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
@@ -59,7 +63,7 @@ def index_config() -> IndexJobConfig:
     """
     return IndexJobConfig(
         telemetry=TelemetryConfig(),
-        vector_column="vector",
+        vector_columns=["vector"],
         num_partitions=4,
         vector_min_rows=1,
         scalar_columns=["id"],
@@ -70,21 +74,17 @@ def index_config() -> IndexJobConfig:
     )
 
 
-def test_handler_build_segment_is_picklable() -> None:
-    """The bound ``build_segment`` captured by the Spark closure pickles cleanly.
+def append_fragment(uri: str, rows: int, start_id: int) -> None:
+    """Append one new fragment of rows to a dataset.
 
-    ``IndexHandler.build`` ships the bound method (and through it the handler instance) to executors inside the closure,
-    so each segment-building handler must round-trip through pickle.
+    Args:
+        uri: The dataset URI.
+        rows: How many rows to append.
+        start_id: The first id value of the appended range.
     """
-    config: IndexJobConfig = index_config()
-    handlers: list[IndexHandler] = [
-        VectorIndexHandler(config, "vector", "vector_idx"),
-        BTreeIndexHandler(config, "id", "id_idx"),
-        BitmapIndexHandler(config, "category", "category_idx"),
-    ]
-    for handler in handlers:
-        restored: object = pickle.loads(pickle.dumps(handler.build_segment))
-        assert callable(restored)
+    table: pa.Table = make_vector_table(rows=rows, dim=DIM, seed=start_id)
+    reindexed: pa.Table = table.set_column(0, "id", pa.array(range(start_id, start_id + rows), pa.int64()))
+    lance.write_dataset(reindexed, uri, mode="append")
 
 
 def fragment_ids_of(uri: str) -> list[int]:
@@ -208,58 +208,71 @@ def index_coverage(uri: str, index_name: str) -> set[int]:
 
 
 def test_vector_segment_path_end_to_end(dataset_uri: str, telemetry: Telemetry) -> None:
-    """IVF_RQ: train, per-shard uncommitted build, merge, commit, then query."""
+    """IVF_RQ: streaming bootstrap, then incremental per-shard build, merge, commit, and query."""
     config: IndexJobConfig = index_config()
-    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    stats: dict[str, object] = bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
+    assert stats["segments"] == 1
+    assert stats["num_partitions"] == 4
+    cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
+    assert cfg is not None
+    json.loads(cfg["rabitq_model"])
+    assert cfg["rows_at_train"] == ROWS
+
+    append_fragment(dataset_uri, ROWS_PER_FRAGMENT, ROWS)
     dataset: lance.LanceDataset = lance.dataset(dataset_uri)
-    handler.validate(dataset)
+    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    new_targets: list[int] = handler.target_fragments(dataset)
+    assert len(new_targets) == 1
     artifacts: object | None = handler.prepare(dataset, dataset_uri, telemetry)
-    assert artifacts is not None
-    centroids_bytes, rabitq_model, num_bits, num_partitions = artifacts
-    assert isinstance(centroids_bytes, bytes)
-    assert isinstance(rabitq_model, str)
-    json.loads(rabitq_model)
-    assert num_bits == 1
-    assert num_partitions == 4
-    version: int = dataset.version
+    assert handler.reused_artifacts is True
     documents: list[str] = []
-    for group in split_evenly(fragment_ids_of(dataset_uri), 2):
-        shard_dataset: lance.LanceDataset = lance.dataset(dataset_uri, version=version)
-        segment: Index = handler.build_segment(shard_dataset, group, artifacts)
+    for group in split_evenly(new_targets, 2):
+        segment: Index = handler.build_segment(lance.dataset(dataset_uri, version=dataset.version), group, artifacts)
         documents.append(serialize_segment(segment))
-    assert len(documents) == 2
     commit_segments(dataset_uri, documents, "vector", "vector_idx", True, config, telemetry)
 
     committed: lance.LanceDataset = lance.dataset(dataset_uri)
     indices: list[dict[str, object]] = committed.list_indices()
-    assert [(item["name"], item["type"]) for item in indices] == [("vector_idx", "IVF_RQ")]
+    assert {(item["name"], item["type"]) for item in indices} == {("vector_idx", "IVF_RQ")}
+    assert len(indices) == 2, "bootstrap delta plus one incremental delta"
     assert index_coverage(dataset_uri, "vector_idx") == set(fragment_ids_of(dataset_uri))
     result = committed.to_table(nearest={"column": "vector", "q": [0.5] * DIM, "k": 5})
     assert result.num_rows == 5
 
 
 def test_vector_segment_path_reuses_artifacts(dataset_uri: str, telemetry: Telemetry) -> None:
-    """A second prepare adopts the persisted centroids and the identical rotation.
+    """Every prepare reads centroids from the committed index and the rotation from the dataset config.
 
-    Returning the same ``rabitq_model`` string from the sidecar is what keeps independently built segments mergeable
-    across runs, so the shared-rotation invariant is pinned here alongside the centroid bytes.
+    Centroids are recovered via ``get_ivf_model`` and IPC-serialized, so the round-trip is checked by
+    array equality through ``centroids_from_ipc``. The ``rabitq_model`` string must match the streaming
+    bootstrap's stored rotation so segments stay mergeable across runs. No ``.artifacts`` directory is
+    created.
+
+    Args:
+        dataset_uri: URI of the pre-built test dataset.
+        telemetry: The telemetry facade fixture.
     """
     config: IndexJobConfig = index_config()
-    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
-    first: object | None = handler.prepare(dataset, dataset_uri, telemetry)
-    assert handler.reused_artifacts is False
+    bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
+    cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
+    assert cfg is not None
+    assert "rabitq_model" in cfg
+
+    first_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    first: object | None = first_handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
+    assert first_handler.reused_artifacts is True
+
     second_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    second: object | None = second_handler.prepare(dataset, dataset_uri, telemetry)
+    second: object | None = second_handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
     assert second_handler.reused_artifacts is True
-    assert second[0] == first[0]
-    assert second[1] == first[1]
+
+    assert centroids_from_ipc(first[0]).equals(centroids_from_ipc(second[0]))
+    assert second[1] == first[1] == cfg["rabitq_model"]
     assert second[2] == first[2]
     assert second[3] == first[3]
-    manifest_path: Path = Path(f"{dataset_uri}.artifacts") / "vector" / "manifest.json"
-    manifest: dict[str, object] = json.loads(manifest_path.read_text())
-    assert "rabitq_model" in manifest
-    assert manifest["rabitq_model"] == first[1]
+
+    assert vector_config_key("vector") in lance.dataset(dataset_uri).config()
+    assert not Path(f"{dataset_uri}.artifacts").exists()
 
 
 def test_btree_segment_path_end_to_end(dataset_uri: str, telemetry: Telemetry) -> None:
@@ -282,15 +295,18 @@ def test_btree_segment_path_end_to_end(dataset_uri: str, telemetry: Telemetry) -
 
 
 def test_bitmap_segment_path_end_to_end(dataset_uri: str, telemetry: Telemetry) -> None:
-    """BITMAP: per-shard uncommitted build, driver merge to one segment, then filter."""
+    """BITMAP: per-shard uncommitted build, unmerged commit like BTREE, then filter."""
     config: IndexJobConfig = index_config()
     handler: BitmapIndexHandler = BitmapIndexHandler(config, "category", "category_bitmap_idx")
-    assert handler.merges() is True
+    assert handler.merges() is False
     run_segment_path(dataset_uri, handler, shards=2, telemetry=telemetry)
     assert "category_bitmap_idx" in listed_index_names(dataset_uri)
     segments: list[object] = index_segments(dataset_uri, "category_bitmap_idx")
-    assert len(segments) == 1
-    assert set(segments[0].fragment_ids) == set(fragment_ids_of(dataset_uri))
+    assert len(segments) == 2
+    covered: set[int] = set()
+    for segment in segments:
+        covered.update(segment.fragment_ids)
+    assert covered == set(fragment_ids_of(dataset_uri))
     dataset: lance.LanceDataset = lance.dataset(dataset_uri)
     assert dataset.to_table(filter="category = 'cat1'").num_rows == ROWS // 4
     plan: str = dataset.scanner(filter="category = 'cat1'").explain_plan(True)
@@ -316,6 +332,9 @@ def test_scalar_fragment_sharding_requires_segment_api(dataset_uri: str) -> None
     Pins updated-main behavior so a regression back to per-shard ``create_scalar_index(index_uuid=, fragment_ids=)`` for
     BTREE or BITMAP is caught immediately: those types must go through ``create_index_uncommitted`` without a
     caller-supplied ``index_uuid``.
+
+    Args:
+        dataset_uri: URI of the pre-built test dataset.
     """
     dataset: lance.LanceDataset = lance.dataset(dataset_uri)
     first_fragment: int = dataset.get_fragments()[0].fragment_id
@@ -331,13 +350,63 @@ def test_scalar_fragment_sharding_requires_segment_api(dataset_uri: str) -> None
         )
 
 
-def test_index_dataset_locally_builds_all_types(dataset_uri: str) -> None:
-    """The tier-A executor task builds every configured index in one process."""
+def test_unified_run_builds_fts_end_to_end(dataset_uri: str) -> None:
+    """The unified fleet run builds a BM25 inverted index end-to-end through all phases.
+
+    Exercises plan (shard specs), the flat build job (per-fragment INVERTED builds under one
+    shared index id), the commit fan-out (metadata merge plus publish), and the delta bound,
+    all through the production phase functions driven by the in-process Spark fake.
+
+    Args:
+        dataset_uri: URI of the pre-built test dataset.
+    """
+    config: IndexJobConfig = IndexJobConfig(
+        telemetry=TelemetryConfig(),
+        text_columns=["text"],
+        fragments_per_index_task=1,
+        commit_retries=5,
+        commit_backoff_seconds=0.0,
+    )
+    results: list[dict[str, object]] = LanceIndexer(config).run(FakeSpark(), [dataset_uri])
+    assert "text_fts_idx" in listed_index_names(dataset_uri)
+    by_index: dict[str, dict[str, object]] = {item["index"]: item for item in results[0]["indexes"]}
+    assert by_index["text_fts_idx"]["segments"] == len(fragment_ids_of(dataset_uri))
+    expected: int = sum(1 for i in range(ROWS) if i % 10 == 2)
+    assert lance.dataset(dataset_uri).to_table(full_text_query="word2").num_rows == expected
+
+
+def test_unified_run_discovers_columns_from_roles(dataset_uri: str) -> None:
+    """With no explicit columns configured, the run derives BTREE and FTS targets from role metadata.
+
+    Every ``scalar`` role column gets a BTREE index and every ``text`` role column gets a BM25
+    INVERTED index (ADR 0029), both built through the distributed segment paths.
+
+    Args:
+        dataset_uri: URI of the pre-built test dataset.
+    """
+    lance.dataset(dataset_uri).update_config({"lance-etl.columns": '{"text": "text", "id": "scalar"}'})
+    config: IndexJobConfig = IndexJobConfig(
+        telemetry=TelemetryConfig(),
+        fragments_per_index_task=2,
+        commit_retries=5,
+        commit_backoff_seconds=0.0,
+    )
+    results: list[dict[str, object]] = LanceIndexer(config).run(FakeSpark(), [dataset_uri])
+    names: set[str] = set(listed_index_names(dataset_uri))
+    assert {"id_idx", "text_fts_idx"} <= names
+    built: set[str] = {item["index"] for item in results[0]["indexes"]}
+    assert built == {"id_idx", "text_fts_idx"}
+    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
+    assert dataset.to_table(filter="id = 7").num_rows == 1
+
+
+def test_unified_run_builds_all_types(dataset_uri: str) -> None:
+    """One unified fleet run builds every configured index through the segment APIs."""
     config: IndexJobConfig = index_config()
-    result: dict[str, object] = index_dataset_locally(dataset_uri, config)
+    results: list[dict[str, object]] = LanceIndexer(config).run(FakeSpark(), [dataset_uri])
     names: list[str] = listed_index_names(dataset_uri)
     assert {"vector_idx", "id_idx", "category_bitmap_idx", "text_fts_idx"} <= set(names)
-    by_index: dict[str, dict[str, object]] = {item["index"]: item for item in result["indexes"]}
+    by_index: dict[str, dict[str, object]] = {item["index"]: item for item in results[0]["indexes"]}
     assert by_index["vector_idx"]["num_partitions"] == 4
     dataset: lance.LanceDataset = lance.dataset(dataset_uri)
     assert dataset.to_table(nearest={"column": "vector", "q": [0.5] * DIM, "k": 3}).num_rows == 3

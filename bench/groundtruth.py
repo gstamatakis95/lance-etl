@@ -11,18 +11,20 @@ from collections.abc import Sequence
 import numpy as np
 
 
-def brute_force_topk(
+def brute_force_topk_scored(
     base: np.ndarray,
     base_ids: np.ndarray,
     queries: np.ndarray,
     k: int,
     base_chunk: int = 100_000,
     query_chunk: int = 1_024,
-) -> np.ndarray:
-    """Compute the exact k nearest base vectors per query under L2 distance.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute the exact k nearest base vectors per query with their L2 distances.
 
     Distances are expanded as ``|q|^2 - 2 q.b + |b|^2`` over query and base chunks so memory stays bounded. Per-chunk
-    candidates are merged into a running top-k and fully sorted at the end.
+    candidates are merged into a running top-k and fully sorted at the end. Returning the distances alongside the ids
+    lets per-slice partials from independent Spark tasks be reduced into an exact global top-k with
+    :func:`merge_topk_partials`.
 
     Args:
         base: The ``(rows, dim)`` base vectors.
@@ -33,13 +35,14 @@ def brute_force_topk(
         query_chunk: Queries per distance chunk.
 
     Returns:
-        An int64 ``(num_queries, k)`` array of global ids ordered nearest first.
+        An int64 ``(num_queries, k)`` array of global ids ordered nearest first, and the aligned float32 distances.
     """
     base32: np.ndarray = np.asarray(base, dtype=np.float32)
     queries32: np.ndarray = np.asarray(queries, dtype=np.float32)
     ids: np.ndarray = np.asarray(base_ids, dtype=np.int64)
     depth: int = min(k, len(base32))
-    output: np.ndarray = np.empty((len(queries32), depth), dtype=np.int64)
+    output_ids: np.ndarray = np.empty((len(queries32), depth), dtype=np.int64)
+    output_distances: np.ndarray = np.empty((len(queries32), depth), dtype=np.float32)
     for query_start in range(0, len(queries32), query_chunk):
         block: np.ndarray = queries32[query_start : query_start + query_chunk]
         block_norms: np.ndarray = np.sum(block * block, axis=1)
@@ -59,8 +62,61 @@ def brute_force_topk(
             best_distances = np.take_along_axis(merged_distances, keep, axis=1)
             best_ids = np.take_along_axis(merged_ids, keep, axis=1)
         order: np.ndarray = np.argsort(best_distances, axis=1, kind="stable")
-        output[query_start : query_start + len(block)] = np.take_along_axis(best_ids, order, axis=1)
-    return output
+        output_ids[query_start : query_start + len(block)] = np.take_along_axis(best_ids, order, axis=1)
+        output_distances[query_start : query_start + len(block)] = np.take_along_axis(best_distances, order, axis=1)
+    return output_ids, output_distances
+
+
+def brute_force_topk(
+    base: np.ndarray,
+    base_ids: np.ndarray,
+    queries: np.ndarray,
+    k: int,
+    base_chunk: int = 100_000,
+    query_chunk: int = 1_024,
+) -> np.ndarray:
+    """Compute the exact k nearest base vectors per query under L2 distance.
+
+    Thin id-only wrapper over :func:`brute_force_topk_scored`.
+
+    Args:
+        base: The ``(rows, dim)`` base vectors.
+        base_ids: Global id per base row, returned in the result.
+        queries: The ``(num_queries, dim)`` query vectors.
+        k: Neighbors per query. Clamped to the base size.
+        base_chunk: Base rows per distance chunk.
+        query_chunk: Queries per distance chunk.
+
+    Returns:
+        An int64 ``(num_queries, k)`` array of global ids ordered nearest first.
+    """
+    output_ids, unused_distances = brute_force_topk_scored(base, base_ids, queries, k, base_chunk, query_chunk)
+    return output_ids
+
+
+def merge_topk_partials(partials: list[tuple[np.ndarray, np.ndarray]], k: int) -> np.ndarray:
+    """Reduce per-slice partial top-k results into one exact global top-k.
+
+    Concatenates the partial candidates along the neighbor axis (ragged widths are fine — only the query axis must
+    match) and fully orders every candidate by ``(distance, id)`` before taking the first ``k``. Breaking distance
+    ties by global id makes the merged result independent of slice count and slice order, so re-running prepare with
+    a different ``rows_per_slice`` selects the same ground-truth ids among equal-distance candidates. Residual
+    caveat: candidates that tie exactly at a slice's internal top-k boundary are chosen inside
+    :func:`brute_force_topk_scored` before this merge sees them, so like any top-k ground truth, sets of exactly
+    equal-distance neighbors beyond the per-slice depth may still differ.
+
+    Args:
+        partials: ``(ids, distances)`` pairs from :func:`brute_force_topk_scored`, each ``(num_queries, <=k)``.
+        k: Neighbors per query. Clamped to the total candidate count.
+
+    Returns:
+        An int64 ``(num_queries, k)`` array of global ids ordered nearest first, ties broken by ascending id.
+    """
+    all_ids: np.ndarray = np.concatenate([ids for ids, distances in partials], axis=1)
+    all_distances: np.ndarray = np.concatenate([distances for ids, distances in partials], axis=1)
+    depth: int = min(k, all_ids.shape[1])
+    order: np.ndarray = np.lexsort((all_ids, all_distances))[:, :depth]
+    return np.take_along_axis(all_ids, order, axis=1)
 
 
 def recall_at(expected: np.ndarray, retrieved: Sequence[np.ndarray] | np.ndarray, k: int) -> float:

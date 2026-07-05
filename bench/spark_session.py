@@ -28,11 +28,24 @@ def bench_telemetry_config() -> TelemetryConfig:
     """Build the offline-safe telemetry configuration for benchmark jobs.
 
     DogStatsD sends are fire-and-forget UDP so no agent is required in the benchmark environment.
+    When ``--capture-telemetry`` is active, :class:`~bench.telemetry_capture.TelemetryCapture`
+    sets ``LANCE_BENCH_STATSD_HOST`` and ``LANCE_BENCH_STATSD_PORT`` in the process environment
+    before any Spark session is created.  This function reads those variables so that both the
+    driver process and every Spark executor (which inherit the driver environment) direct their
+    DogStatsD packets to the local capture listener instead of the default loopback port 8125.
 
     Returns:
-        A ``TelemetryConfig`` tagged for the bench service and environment.
+        A ``TelemetryConfig`` tagged for the bench service and environment, with the statsd
+        host and port resolved from ``LANCE_BENCH_STATSD_HOST`` / ``LANCE_BENCH_STATSD_PORT``
+        when present, otherwise defaulting to ``localhost:8125``.
     """
-    return TelemetryConfig(service="lance-bench", env="bench")
+    host: str = os.environ.get("LANCE_BENCH_STATSD_HOST", "localhost")
+    port_str: str = os.environ.get("LANCE_BENCH_STATSD_PORT", "8125")
+    try:
+        port: int = int(port_str)
+    except ValueError:
+        port = 8125
+    return TelemetryConfig(service="lance-bench", env="bench", statsd_host=host, statsd_port=port)
 
 
 def build_spark(config: BenchConfig, app_name: str) -> SparkSession:

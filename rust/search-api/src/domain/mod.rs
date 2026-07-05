@@ -4,12 +4,13 @@
 //! and backends can be wired in without touching it.
 //!
 //! Submodules:
-//! - [`target`]: dataset addressing (org/tenant/namespace plus the optional day range).
+//! - [`target`]: dataset addressing (org/tenant/namespace).
 //! - [`query`]: vector, full-text, and hybrid request/result types.
 //! - [`filter`]: the typed predicate AST replacing raw SQL strings.
-//! - [`fusion`]: hybrid leg fusion strategies (RRF).
-//! - [`merge`]: dedup-by-id merging of date-range fan-out legs.
+//! - [`fusion`]: hybrid leg fusion strategies (RRF and weighted score fusion).
 //! - [`backend`]: the [`SearchBackend`] trait every engine implements.
+//! - [`intake`]: record-write types and the [`RecordSink`] write seam.
+//! - [`rerank`]: post-fusion reranking types and the [`Reranker`] trait.
 //! - [`prewarm`]: cache prewarming types and the [`Prewarmer`] trait.
 //! - [`clusters`]: IVF centroid introspection types and the [`ClusterReader`] trait.
 //! - [`error`]: the single domain error type shared below the transport.
@@ -19,9 +20,10 @@ pub mod clusters;
 pub mod error;
 pub mod filter;
 pub mod fusion;
-pub mod merge;
+pub mod intake;
 pub mod prewarm;
 pub mod query;
+pub mod rerank;
 pub mod target;
 
 pub use backend::SearchBackend;
@@ -29,10 +31,11 @@ pub use clusters::{ClusterReader, ClusterReport, ClusterSpec};
 pub use error::SearchError;
 pub use filter::{CompareOp, Filter, Literal};
 pub use fusion::FusionSpec;
-pub use merge::{MergeOutcome, ScoreOrder, merge_hits};
+pub use intake::{IntakeBatch, IntakeError, IntakeReport, Record, RecordSink, RecordWrite, StdoutSink, WriteOp};
 pub use prewarm::{PrewarmReport, PrewarmSpec, PrewarmedIndex, Prewarmer};
 pub use query::{
-    DistanceKind, FilterMode, FusedHit, Fuzziness, Hit, HybridQuery, MatchSpec, PhraseSpec, TextOperator, TextQuery,
-    TextQueryNode, VectorQuery, VectorSearchOutcome,
+    DistanceKind, FilterMode, FusedHit, Fuzziness, Hit, HybridQuery, HybridSearchOutcome, MatchSpec, PhraseSpec,
+    TextOperator, TextQuery, TextQueryNode, TextSearchOutcome, TimeRange, VectorQuery, VectorSearchOutcome,
 };
-pub use target::{DatasetTarget, DateRange, MAX_DATE_RANGE_DAYS};
+pub use rerank::{IdentityReranker, RerankRequest, RerankSpec, Reranker};
+pub use target::{DatasetRef, DatasetTarget};

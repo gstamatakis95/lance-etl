@@ -36,6 +36,25 @@ impl Rpc {
     }
 }
 
+/// Intake RPC names used as the `rpc` metric tag on `intake.*` metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntakeRpc {
+    /// `IntakeService/Write`.
+    Write,
+    /// `IntakeService/WriteStream`.
+    WriteStream,
+}
+
+impl IntakeRpc {
+    /// Tag value for this RPC.
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::WriteStream => "write_stream",
+        }
+    }
+}
+
 /// Cache identities used as the `cache` metric tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheName {
@@ -65,6 +84,8 @@ pub enum Tier {
     Memory,
     /// Local-disk tier.
     Disk,
+    /// Remote shared tier (the Redis backend).
+    Remote,
 }
 
 impl Tier {
@@ -73,6 +94,35 @@ impl Tier {
         match self {
             Self::Memory => "memory",
             Self::Disk => "disk",
+            Self::Remote => "remote",
+        }
+    }
+}
+
+/// Persistent-store operations used as the `op` tag on backend error counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreOp {
+    /// A read of one entry (or entry pair).
+    Get,
+    /// A write of one entry.
+    Put,
+    /// A removal of one entry or one dir.
+    Remove,
+    /// A whole-tier clear.
+    Clear,
+    /// A prefix-registry read or write.
+    Registry,
+}
+
+impl StoreOp {
+    /// Tag value for this operation.
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Put => "put",
+            Self::Remove => "remove",
+            Self::Clear => "clear",
+            Self::Registry => "registry",
         }
     }
 }
@@ -143,33 +193,182 @@ impl PrewarmIndexKind {
     }
 }
 
-/// Search leg families used as the `leg` metric tag on fan-out timings.
+/// Lance IO-event kinds used as the `io_type` metric tag on `lance.io_events`.
+///
+/// Mirrors the fixed `lance::io_events` enum from the Lance checkout
+/// (`lance_core::utils::tracing::IO_TYPE_*`). Low cardinality: six fixed variants, no ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FanoutLeg {
-    /// Nearest-neighbor leg.
-    Vector,
-    /// Full-text leg.
-    Text,
-    /// Combined vector + text leg of one hybrid fan-out.
-    Hybrid,
+pub enum LanceIoType {
+    /// A scalar (BTree/bitmap/inverted/ngram) index was opened.
+    OpenScalarIndex,
+    /// A vector (IVF/HNSW) index was opened.
+    OpenVectorIndex,
+    /// The fragment-reuse system index was opened.
+    OpenFragReuseIndex,
+    /// The memory-WAL system index was opened.
+    OpenMemWalIndex,
+    /// A vector index partition was loaded from storage.
+    LoadVectorPart,
+    /// A scalar index partition was loaded from storage.
+    LoadScalarPart,
 }
 
-impl FanoutLeg {
-    /// Tag value for this leg.
+impl LanceIoType {
+    /// Tag value for this IO type.
     pub fn as_tag(self) -> &'static str {
         match self {
-            Self::Vector => "vector",
-            Self::Text => "text",
-            Self::Hybrid => "hybrid",
+            Self::OpenScalarIndex => "open_scalar_index",
+            Self::OpenVectorIndex => "open_vector_index",
+            Self::OpenFragReuseIndex => "open_frag_reuse_index",
+            Self::OpenMemWalIndex => "open_mem_wal_index",
+            Self::LoadVectorPart => "load_vector_part",
+            Self::LoadScalarPart => "load_scalar_part",
+        }
+    }
+
+    /// Parses the Lance `type` field of a `lance::io_events` event into this enum.
+    pub fn from_lance(value: &str) -> Option<Self> {
+        match value {
+            "open_scalar_index" => Some(Self::OpenScalarIndex),
+            "open_vector_index" => Some(Self::OpenVectorIndex),
+            "open_frag_reuse_index" => Some(Self::OpenFragReuseIndex),
+            "open_mem_wal_index" => Some(Self::OpenMemWalIndex),
+            "load_vector_part" => Some(Self::LoadVectorPart),
+            "load_scalar_part" => Some(Self::LoadScalarPart),
+            _ => None,
+        }
+    }
+}
+
+/// Lance dataset-lifecycle events used as the `event` metric tag on `lance.dataset_events`.
+///
+/// Mirrors the fixed `lance::dataset_events` enum from the Lance checkout
+/// (`lance_core::utils::tracing::DATASET_*_EVENT`). `loading` fires on dataset open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatasetEvent {
+    /// A dataset version was opened (loaded).
+    Loading,
+    /// A write transaction is in progress.
+    Writing,
+    /// A transaction was committed.
+    Committed,
+    /// A column is being dropped.
+    DroppingColumn,
+    /// Rows are being deleted.
+    Deleting,
+    /// Fragments are being compacted.
+    Compacting,
+    /// Old versions are being cleaned up.
+    Cleaning,
+}
+
+impl DatasetEvent {
+    /// Tag value for this event.
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            Self::Loading => "loading",
+            Self::Writing => "writing",
+            Self::Committed => "committed",
+            Self::DroppingColumn => "dropping_column",
+            Self::Deleting => "deleting",
+            Self::Compacting => "compacting",
+            Self::Cleaning => "cleaning",
+        }
+    }
+
+    /// Parses the Lance `event` field of a `lance::dataset_events` event into this enum.
+    pub fn from_lance(value: &str) -> Option<Self> {
+        match value {
+            "loading" => Some(Self::Loading),
+            "writing" => Some(Self::Writing),
+            "committed" => Some(Self::Committed),
+            "dropping_column" => Some(Self::DroppingColumn),
+            "deleting" => Some(Self::Deleting),
+            "compacting" => Some(Self::Compacting),
+            "cleaning" => Some(Self::Cleaning),
+            _ => None,
+        }
+    }
+}
+
+/// Lance file-audit modes used as the `mode` metric tag on `lance.file_audit`.
+///
+/// Mirrors `lance_core::utils::tracing::AUDIT_MODE_*` from the Lance checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileAuditMode {
+    /// A file was created.
+    Create,
+    /// A file was deleted after verification.
+    Delete,
+    /// A file was deleted without verification.
+    DeleteUnverified,
+}
+
+impl FileAuditMode {
+    /// Tag value for this mode.
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Delete => "delete",
+            Self::DeleteUnverified => "delete_unverified",
+        }
+    }
+
+    /// Parses the Lance `mode` field of a `lance::file_audit` event into this enum.
+    pub fn from_lance(value: &str) -> Option<Self> {
+        match value {
+            "create" => Some(Self::Create),
+            "delete" => Some(Self::Delete),
+            "delete_unverified" => Some(Self::DeleteUnverified),
+            _ => None,
+        }
+    }
+}
+
+/// Lance file-audit file kinds used as the `type` metric tag on `lance.file_audit`.
+///
+/// Mirrors `lance_core::utils::tracing::AUDIT_TYPE_*` from the Lance checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileAuditType {
+    /// A manifest file.
+    Manifest,
+    /// An index file.
+    Index,
+    /// A data file.
+    Data,
+    /// A deletion file.
+    Deletion,
+}
+
+impl FileAuditType {
+    /// Tag value for this file type.
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            Self::Manifest => "manifest",
+            Self::Index => "index",
+            Self::Data => "data",
+            Self::Deletion => "deletion",
+        }
+    }
+
+    /// Parses the Lance `type` field of a `lance::file_audit` event into this enum.
+    pub fn from_lance(value: &str) -> Option<Self> {
+        match value {
+            "manifest" => Some(Self::Manifest),
+            "index" => Some(Self::Index),
+            "data" => Some(Self::Data),
+            "deletion" => Some(Self::Deletion),
+            _ => None,
         }
     }
 }
 
 /// Typed facade over the DogStatsD client so call sites cannot invent metric names or tags.
 ///
-/// Tag policy: only `rpc`, `status`, `cold`, `cache`, `tier`, `outcome`, `reason`, `kind`,
-/// `leg`, and `filtered` — `org_id` never appears on metrics (30k orgs would explode the
-/// timeseries count). Org-level visibility comes from traces and logs.
+/// Tag policy: only `rpc`, `status`, `cold`, `cache`, `tier`, `outcome`, `op`, `reason`,
+/// `kind`, `filtered`, `warmed`, and `changed` — `org_id`/`tenant_id`/`version` never appear on
+/// metrics (30k orgs would explode the timeseries count). Org-, tenant-, and version-level detail
+/// lives on traces and logs instead.
 pub struct Metrics {
     client: StatsdClient,
 }
@@ -238,6 +437,75 @@ impl Metrics {
         }
     }
 
+    /// Per-query object-store execution stats from one Lance scan, tagged by `rpc`.
+    ///
+    /// Values come from Lance's execution-stats callback (`ExecutionSummaryCounts`): `iops` is the
+    /// number of I/O operations after coalescing, `bytes_read` the bytes pulled from storage, and
+    /// `parts_loaded` the number of index partitions loaded. Emitted as distributions so the
+    /// per-query spread is preserved. No `org`/`tenant` tags: cardinality lives in traces.
+    pub fn query_execution_stats(&self, rpc: Rpc, iops: u64, bytes_read: u64, parts_loaded: u64) {
+        self.client
+            .distribution_with_tags("query.iops", iops)
+            .with_tag("rpc", rpc.as_tag())
+            .send();
+        self.client
+            .distribution_with_tags("query.bytes_read", bytes_read)
+            .with_tag("rpc", rpc.as_tag())
+            .send();
+        self.client
+            .distribution_with_tags("query.parts_loaded", parts_loaded)
+            .with_tag("rpc", rpc.as_tag())
+            .send();
+    }
+
+    /// One Lance object-store throttle event from the AIMD rate limiter.
+    ///
+    /// `errored` counts a throttle error against `throttle.errors`. `new_rate`, when present,
+    /// records the limiter's freshly reduced fill rate (requests per second) as the
+    /// `throttle.new_rate` gauge. Both are untagged: throttle pressure is a per-process signal.
+    pub fn throttle_event(&self, errored: bool, new_rate: Option<f64>) {
+        if errored {
+            self.client.count_with_tags("throttle.errors", 1).send();
+        }
+        if let Some(rate) = new_rate {
+            self.client.gauge_with_tags("throttle.new_rate", rate).send();
+        }
+    }
+
+    /// One Lance `io_events` event, counting an index open or partition load tagged by `io_type`.
+    ///
+    /// Sourced from Lance's `lance::io_events` tracing target. Counts only, tagged by the fixed
+    /// IO-type enum: no uri, org, or tenant ever appears on the tag.
+    pub fn lance_io_event(&self, io_type: LanceIoType) {
+        self.client
+            .count_with_tags("lance.io_events", 1)
+            .with_tag("io_type", io_type.as_tag())
+            .send();
+    }
+
+    /// One Lance `dataset_events` event, counting a dataset-lifecycle transition tagged by `event`.
+    ///
+    /// Sourced from Lance's `lance::dataset_events` tracing target. `event:loading` counts a
+    /// dataset open. Counts only, tagged by the fixed lifecycle enum: no uri or tenant on the tag.
+    pub fn lance_dataset_event(&self, event: DatasetEvent) {
+        self.client
+            .count_with_tags("lance.dataset_events", 1)
+            .with_tag("event", event.as_tag())
+            .send();
+    }
+
+    /// One Lance `file_audit` event, counting a file create/delete tagged by `mode` and `type`.
+    ///
+    /// Sourced from Lance's `lance::file_audit` tracing target. Counts only, tagged by the fixed
+    /// mode and file-type enums: the audited path never appears on the tag.
+    pub fn lance_file_audit(&self, mode: FileAuditMode, file_type: FileAuditType) {
+        self.client
+            .count_with_tags("lance.file_audit", 1)
+            .with_tag("mode", mode.as_tag())
+            .with_tag("type", file_type.as_tag())
+            .send();
+    }
+
     /// Latency of one dataset resolution. `cold` marks resolutions that actually opened the
     /// dataset instead of hitting the handle cache.
     pub fn dataset_open(&self, cold: bool, duration: Duration) {
@@ -247,9 +515,53 @@ impl Metrics {
             .send();
     }
 
-    /// Current size of the open-dataset-handle LRU.
+    /// Current entry count of the open-dataset-handle LRU.
     pub fn dataset_handles(&self, entries: u64) {
         self.client.gauge_with_tags("cache.handles.entries", entries).send();
+    }
+
+    /// Current total weighted size of the open-dataset-handle LRU.
+    ///
+    /// The handle cache is bounded by total weight (clamped open fragment count per handle) rather
+    /// than a flat count, so this gauge tracks budget utilization against the configured weighted
+    /// capacity. Low cardinality: no org/tenant tags.
+    pub fn dataset_handles_weighted(&self, weighted_size: u64) {
+        self.client
+            .gauge_with_tags("cache.handles.weighted_size", weighted_size)
+            .send();
+    }
+
+    /// One serving cold open, tagged by whether the opened version had already been prewarmed on
+    /// this replica.
+    ///
+    /// `warmed:false` is the flip-without-prewarm signal: serving reached a version that prewarm
+    /// has not warmed, so the first queries on it pay the cold-cache cost. A healthy blue-green
+    /// rollout keeps this at `warmed:true`. No version tag (cardinality lives on the span).
+    pub fn serve_cold_open(&self, warmed: bool) {
+        self.client
+            .count_with_tags("serve.cold_open", 1)
+            .with_tag("warmed", if warmed { "true" } else { "false" })
+            .send();
+    }
+
+    /// One serve-tag re-resolution after the TTL lapsed, tagged by whether the resolved version
+    /// changed from the previous resolution.
+    ///
+    /// `changed:true` marks the moment a replica observes a tag flip, so the spread of these
+    /// across the fleet is the flip-propagation latency.
+    pub fn serve_tag_resolved(&self, changed: bool) {
+        self.client
+            .count_with_tags("serve.tag_resolved", 1)
+            .with_tag("changed", if changed { "true" } else { "false" })
+            .send();
+    }
+
+    /// The most recently prewarmed committed version on this process (last writer wins).
+    ///
+    /// A process-wide gauge (no per-dataset tag, to stay low-cardinality) that, read together
+    /// with the served version on traces, shows whether prewarm is keeping pace with the tag.
+    pub fn prewarm_last_version(&self, version: u64) {
+        self.client.gauge_with_tags("prewarm.last_version", version).send();
     }
 
     /// One cache lookup outcome.
@@ -262,12 +574,24 @@ impl Metrics {
             .send();
     }
 
-    /// Bytes persisted to a disk tier by one insert.
-    pub fn cache_insert_bytes(&self, cache: CacheName, bytes: u64) {
+    /// Bytes persisted to one persistent tier by one insert.
+    pub fn cache_insert_bytes(&self, cache: CacheName, tier: Tier, bytes: u64) {
         self.client
             .count_with_tags("cache.insert_bytes", bytes as i64)
             .with_tag("cache", cache.as_tag())
-            .with_tag("tier", Tier::Disk.as_tag())
+            .with_tag("tier", tier.as_tag())
+            .send();
+    }
+
+    /// One persistent-backend operation that failed and degraded to a miss or a dropped write.
+    ///
+    /// Emitted by the Redis store on every errored round trip. A sustained non-zero rate means
+    /// the cache server is unreachable or overloaded while searches keep succeeding memory-only.
+    pub fn cache_backend_error(&self, cache: CacheName, op: StoreOp) {
+        self.client
+            .count_with_tags("cache.backend_errors", 1)
+            .with_tag("cache", cache.as_tag())
+            .with_tag("op", op.as_tag())
             .send();
     }
 
@@ -279,6 +603,24 @@ impl Metrics {
             .send();
         self.client
             .gauge_with_tags("cache.disk.entries", entries)
+            .with_tag("cache", cache.as_tag())
+            .send();
+    }
+
+    /// One completed janitor sweep of one tier: wall-clock duration plus the total entries
+    /// removed (TTL + budget evictions combined).
+    ///
+    /// The duration distribution tracks the cost of the directory walk the sweep performs over the
+    /// tier. On a large fleet a climbing sweep duration is the early signal that a tier's on-disk
+    /// entry count is outgrowing what a periodic full walk can service cheaply. Tagged by `cache`
+    /// only: no per-dataset or per-key dimension.
+    pub fn cache_sweep(&self, cache: CacheName, duration: Duration, removed: u64) {
+        self.client
+            .distribution_with_tags("cache.sweep.duration_ms", millis(duration))
+            .with_tag("cache", cache.as_tag())
+            .send();
+        self.client
+            .distribution_with_tags("cache.sweep.removed", removed)
             .with_tag("cache", cache.as_tag())
             .send();
     }
@@ -331,38 +673,28 @@ impl Metrics {
         self.client.distribution_with_tags("prewarm.warmed_bytes", bytes).send();
     }
 
-    /// Width of one date-range fan-out: how many per-day datasets actually served the query.
-    pub fn fanout_legs(&self, leg: FanoutLeg, legs: u64) {
-        self.client
-            .distribution_with_tags("fanout.legs", legs)
-            .with_tag("leg", leg.as_tag())
-            .send();
-    }
-
-    /// Latency of one per-day leg of a fan-out search.
-    pub fn fanout_leg_duration(&self, leg: FanoutLeg, duration: Duration) {
-        self.client
-            .distribution_with_tags("fanout.leg.duration_ms", millis(duration))
-            .with_tag("leg", leg.as_tag())
-            .send();
-    }
-
-    /// Duplicate hits folded into a surviving hit by the dedup merge of one fan-out search.
-    pub fn fanout_dedup_dropped(&self, leg: FanoutLeg, count: u64) {
-        if count == 0 {
-            return;
-        }
-        self.client
-            .count_with_tags("fanout.dedup.dropped", count as i64)
-            .with_tag("leg", leg.as_tag())
-            .send();
-    }
-
-    /// One vector search captured for recall scoring, tagged by whether it carried a filter.
-    pub fn recall_sample(&self, filtered: bool) {
+    /// One search captured for recall scoring, tagged by query type and whether it carried a
+    /// filter. `query_type` is one of `vector`, `text`, or `hybrid` (low cardinality).
+    pub fn recall_sample(&self, query_type: &'static str, filtered: bool) {
         self.client
             .count_with_tags("recall.samples", 1)
+            .with_tag("query_type", query_type)
             .with_tag("filtered", if filtered { "true" } else { "false" })
+            .send();
+    }
+
+    /// One post-fusion reranking pass: candidate count and duration tagged by `rpc`.
+    ///
+    /// `candidates` is the number of hits fed to the reranker before any truncation. Emitted only
+    /// when a request carries a rerank spec, so the default identity path stays metric-free.
+    pub fn rerank(&self, rpc: Rpc, candidates: u64, duration: Duration) {
+        self.client
+            .distribution_with_tags("rerank.duration_ms", millis(duration))
+            .with_tag("rpc", rpc.as_tag())
+            .send();
+        self.client
+            .distribution_with_tags("rerank.candidates", candidates)
+            .with_tag("rpc", rpc.as_tag())
             .send();
     }
 
@@ -376,6 +708,50 @@ impl Metrics {
     /// Number of centroids returned by one Clusters call.
     pub fn clusters_centroids(&self, count: u64) {
         self.client.distribution_with_tags("clusters.centroids", count).send();
+    }
+
+    /// One finished intake RPC: request count and latency distribution tagged by `rpc` and
+    /// `status`, plus an error count for non-`ok` statuses. Mirrors [`Metrics::rpc`].
+    pub fn intake_rpc(&self, rpc: IntakeRpc, status: &'static str, duration: Duration) {
+        self.client
+            .count_with_tags("intake.requests", 1)
+            .with_tag("rpc", rpc.as_tag())
+            .with_tag("status", status)
+            .send();
+        self.client
+            .distribution_with_tags("intake.duration_ms", millis(duration))
+            .with_tag("rpc", rpc.as_tag())
+            .with_tag("status", status)
+            .send();
+        if status != "ok" {
+            self.client
+                .count_with_tags("intake.errors", 1)
+                .with_tag("rpc", rpc.as_tag())
+                .with_tag("status", status)
+                .send();
+        }
+    }
+
+    /// Per-batch intake outcome tagged by `rpc`: the batch size distribution plus upsert, delete,
+    /// and reject counts. Zero counts are skipped to keep the timeseries quiet. No org/tenant tags:
+    /// per-tenant detail lives on the span.
+    pub fn intake_batch(&self, rpc: IntakeRpc, upserts: u64, deletes: u64, rejected: u64, batch_size: u64) {
+        self.client
+            .distribution_with_tags("intake.batch_size", batch_size)
+            .with_tag("rpc", rpc.as_tag())
+            .send();
+        for (name, count) in [
+            ("intake.upserts", upserts),
+            ("intake.deletes", deletes),
+            ("intake.rejected", rejected),
+        ] {
+            if count > 0 {
+                self.client
+                    .count_with_tags(name, count as i64)
+                    .with_tag("rpc", rpc.as_tag())
+                    .send();
+            }
+        }
     }
 }
 
@@ -431,8 +807,8 @@ mod tests {
         metrics.rpc(Rpc::VectorSearch, "ok", Duration::from_millis(3));
         metrics.cache_lookup(CacheName::Index, Tier::Disk, true);
         metrics.cache_disk_gauges(CacheName::Store, 10, 2);
+        metrics.cache_sweep(CacheName::Index, Duration::from_millis(7), 4);
         metrics.prewarm(PrewarmStatus::Partial, Duration::from_millis(5));
-        metrics.fanout_legs(FanoutLeg::Vector, 3);
         metrics.clusters_read(Duration::from_millis(2));
     }
 
@@ -476,12 +852,15 @@ mod tests {
     fn cache_and_prewarm_metrics_render_expected_tags() {
         let (metrics, drain) = spy_metrics();
         metrics.cache_lookup(CacheName::Index, Tier::Memory, false);
-        metrics.cache_insert_bytes(CacheName::Store, 256);
+        metrics.cache_insert_bytes(CacheName::Store, Tier::Disk, 256);
+        metrics.cache_backend_error(CacheName::Index, StoreOp::Put);
         metrics.cache_evictions(CacheName::Index, EvictionReason::Ttl, 3);
         metrics.cache_evictions(CacheName::Index, EvictionReason::Size, 0);
+        metrics.cache_sweep(CacheName::Store, Duration::from_millis(11), 5);
         metrics.cache_serialize_error(CacheName::Index);
         metrics.dataset_open(true, Duration::from_millis(40));
         metrics.dataset_handles(7);
+        metrics.dataset_handles_weighted(42);
         metrics.prewarm_index(PrewarmIndexKind::Fts, Duration::from_millis(8));
         metrics.prewarm_indexes_warmed(2);
         metrics.prewarm_warmed_bytes(1024);
@@ -492,10 +871,14 @@ mod tests {
                 vec!["cache:index", "tier:memory", "outcome:miss"],
             ),
             ("search_api.cache.insert_bytes:256|c", vec!["cache:store", "tier:disk"]),
+            ("search_api.cache.backend_errors:1|c", vec!["cache:index", "op:put"]),
             ("search_api.cache.evictions:3|c", vec!["cache:index", "reason:ttl"]),
+            ("search_api.cache.sweep.duration_ms:11|d", vec!["cache:store"]),
+            ("search_api.cache.sweep.removed:5|d", vec!["cache:store"]),
             ("search_api.cache.serialize_errors:1|c", vec!["cache:index"]),
             ("search_api.dataset.open.duration_ms:40|d", vec!["cold:true"]),
             ("search_api.cache.handles.entries:7|g", vec![]),
+            ("search_api.cache.handles.weighted_size:42|g", vec![]),
             ("search_api.prewarm.index.duration_ms:8|d", vec!["kind:fts"]),
             ("search_api.prewarm.indexes_warmed:2|c", vec![]),
             ("search_api.prewarm.warmed_bytes:1024|d", vec![]),
@@ -517,39 +900,158 @@ mod tests {
     #[test]
     fn recall_sample_metric_renders_expected_tags() {
         let (metrics, drain) = spy_metrics();
-        metrics.recall_sample(true);
-        metrics.recall_sample(false);
+        metrics.recall_sample("vector", true);
+        metrics.recall_sample("text", false);
+        metrics.recall_sample("hybrid", false);
         let lines = drain();
         assert!(
             lines
                 .iter()
-                .any(|line| line.starts_with("search_api.recall.samples:1|c") && line.contains("filtered:true")),
-            "missing filtered sample count: {lines:?}"
+                .any(|line| line.starts_with("search_api.recall.samples:1|c")
+                    && line.contains("query_type:vector")
+                    && line.contains("filtered:true")),
+            "missing filtered vector sample count: {lines:?}"
         );
         assert!(
             lines
                 .iter()
-                .any(|line| line.starts_with("search_api.recall.samples:1|c") && line.contains("filtered:false")),
-            "missing unfiltered sample count: {lines:?}"
+                .any(|line| line.starts_with("search_api.recall.samples:1|c")
+                    && line.contains("query_type:text")
+                    && line.contains("filtered:false")),
+            "missing text sample count: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("search_api.recall.samples:1|c") && line.contains("query_type:hybrid")),
+            "missing hybrid sample count: {lines:?}"
         );
     }
 
     #[test]
-    fn fanout_and_clusters_metrics_render_expected_tags() {
+    fn rerank_metric_renders_candidates_and_duration_tagged_by_rpc() {
         let (metrics, drain) = spy_metrics();
-        metrics.fanout_legs(FanoutLeg::Vector, 3);
-        metrics.fanout_leg_duration(FanoutLeg::Hybrid, Duration::from_millis(6));
-        metrics.fanout_dedup_dropped(FanoutLeg::Text, 4);
-        metrics.fanout_dedup_dropped(FanoutLeg::Text, 0);
+        metrics.rerank(Rpc::HybridSearch, 7, Duration::from_millis(4));
+        let lines = drain();
+        let expect = [
+            ("search_api.rerank.duration_ms:4|d", "rpc:hybrid_search"),
+            ("search_api.rerank.candidates:7|d", "rpc:hybrid_search"),
+        ];
+        for (head, tag) in expect {
+            assert!(
+                lines.iter().any(|line| line.starts_with(head) && line.contains(tag)),
+                "missing {head} with {tag} in {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clusters_metrics_render_expected_tags() {
+        let (metrics, drain) = spy_metrics();
         metrics.clusters_read(Duration::from_millis(9));
         metrics.clusters_centroids(256);
         let lines = drain();
         let expect = [
-            ("search_api.fanout.legs:3|d", vec!["leg:vector"]),
-            ("search_api.fanout.leg.duration_ms:6|d", vec!["leg:hybrid"]),
-            ("search_api.fanout.dedup.dropped:4|c", vec!["leg:text"]),
-            ("search_api.clusters.read.duration_ms:9|d", vec![]),
-            ("search_api.clusters.centroids:256|d", vec![]),
+            "search_api.clusters.read.duration_ms:9|d",
+            "search_api.clusters.centroids:256|d",
+        ];
+        for head in expect {
+            assert!(
+                lines.iter().any(|line| line.starts_with(head)),
+                "missing {head} in {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_execution_stats_render_three_distributions_tagged_by_rpc() {
+        let (metrics, drain) = spy_metrics();
+        metrics.query_execution_stats(Rpc::VectorSearch, 7, 4096, 3);
+        let lines = drain();
+        let expect = [
+            ("search_api.query.iops:7|d", "rpc:vector_search"),
+            ("search_api.query.bytes_read:4096|d", "rpc:vector_search"),
+            ("search_api.query.parts_loaded:3|d", "rpc:vector_search"),
+        ];
+        for (head, tag) in expect {
+            assert!(
+                lines.iter().any(|line| line.starts_with(head) && line.contains(tag)),
+                "missing {head} with {tag} in {lines:?}"
+            );
+        }
+        assert!(
+            !lines.iter().any(|line| line.contains("org")),
+            "execution stats must never carry org/tenant tags: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn throttle_event_emits_error_counter_and_rate_gauge() {
+        let (metrics, drain) = spy_metrics();
+        metrics.throttle_event(true, Some(12.5));
+        let lines = drain();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("search_api.throttle.errors:1|c")),
+            "missing throttle error counter: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("search_api.throttle.new_rate:12.5|g")),
+            "missing throttle rate gauge: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn blue_green_metrics_render_expected_names_and_tags() {
+        let (metrics, drain) = spy_metrics();
+        metrics.serve_cold_open(true);
+        metrics.serve_cold_open(false);
+        metrics.serve_tag_resolved(true);
+        metrics.serve_tag_resolved(false);
+        metrics.prewarm_last_version(42);
+        let lines = drain();
+        let expect = [
+            ("search_api.serve.cold_open:1|c", "warmed:true"),
+            ("search_api.serve.cold_open:1|c", "warmed:false"),
+            ("search_api.serve.tag_resolved:1|c", "changed:true"),
+            ("search_api.serve.tag_resolved:1|c", "changed:false"),
+            ("search_api.prewarm.last_version:42|g", ""),
+        ];
+        for (head, tag) in expect {
+            assert!(
+                lines.iter().any(|line| line.starts_with(head) && line.contains(tag)),
+                "missing {head} with {tag} in {lines:?}"
+            );
+        }
+        assert!(
+            !lines.iter().any(|line| line.contains("org")),
+            "blue-green metrics must never carry org/version tags: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn throttle_event_without_error_or_rate_emits_nothing() {
+        let (metrics, drain) = spy_metrics();
+        metrics.throttle_event(false, None);
+        assert!(drain().is_empty(), "no throttle signal must produce no metrics");
+    }
+
+    #[test]
+    fn intake_metrics_render_expected_names_and_tags() {
+        let (metrics, drain) = spy_metrics();
+        metrics.intake_rpc(IntakeRpc::Write, "ok", Duration::from_millis(6));
+        metrics.intake_batch(IntakeRpc::Write, 3, 1, 2, 6);
+        let lines = drain();
+        let expect = [
+            ("search_api.intake.requests:1|c", vec!["rpc:write", "status:ok"]),
+            ("search_api.intake.duration_ms:6|d", vec!["rpc:write"]),
+            ("search_api.intake.batch_size:6|d", vec!["rpc:write"]),
+            ("search_api.intake.upserts:3|c", vec!["rpc:write"]),
+            ("search_api.intake.deletes:1|c", vec!["rpc:write"]),
+            ("search_api.intake.rejected:2|c", vec!["rpc:write"]),
         ];
         for (head, tags) in expect {
             assert!(
@@ -559,14 +1061,84 @@ mod tests {
                 "missing {head} with {tags:?} in {lines:?}"
             );
         }
-        assert_eq!(
+        assert!(
+            !lines.iter().any(|line| line.contains("intake.errors")),
+            "ok status must not count as an error: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("org")),
+            "intake metrics must never carry org/tenant tags: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn intake_errors_and_zero_counts_behave_like_the_search_path() {
+        let (metrics, drain) = spy_metrics();
+        metrics.intake_rpc(IntakeRpc::WriteStream, "invalid_argument", Duration::from_millis(1));
+        metrics.intake_batch(IntakeRpc::WriteStream, 0, 0, 0, 0);
+        let lines = drain();
+        assert!(
+            lines.iter().any(
+                |line| line.starts_with("search_api.intake.errors:1|c") && line.contains("status:invalid_argument")
+            ),
+            "missing intake error counter: {lines:?}"
+        );
+        assert!(
             lines
                 .iter()
-                .filter(|line| line.contains("fanout.dedup.dropped"))
-                .count(),
-            1,
-            "zero-count dedup drops must not be emitted: {lines:?}"
+                .any(|line| line.starts_with("search_api.intake.batch_size:0|d") && line.contains("rpc:write_stream")),
+            "batch size must always be emitted: {lines:?}"
         );
+        assert!(
+            !lines.iter().any(|line| line.contains("intake.upserts")),
+            "zero upsert counts must not be emitted: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn lance_event_metrics_render_expected_names_and_tags() {
+        let (metrics, drain) = spy_metrics();
+        metrics.lance_io_event(LanceIoType::OpenVectorIndex);
+        metrics.lance_dataset_event(DatasetEvent::Loading);
+        metrics.lance_file_audit(FileAuditMode::Create, FileAuditType::Manifest);
+        let lines = drain();
+        let expect = [
+            ("search_api.lance.io_events:1|c", vec!["io_type:open_vector_index"]),
+            ("search_api.lance.dataset_events:1|c", vec!["event:loading"]),
+            ("search_api.lance.file_audit:1|c", vec!["mode:create", "type:manifest"]),
+        ];
+        for (head, tags) in expect {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.starts_with(head) && tags.iter().all(|tag| line.contains(tag))),
+                "missing {head} with {tags:?} in {lines:?}"
+            );
+        }
+        assert!(
+            !lines.iter().any(|line| line.contains("org")),
+            "lance event metrics must never carry org/tenant tags: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn lance_event_tag_enums_parse_and_render_round_trip() {
+        assert_eq!(
+            LanceIoType::from_lance("load_scalar_part"),
+            Some(LanceIoType::LoadScalarPart)
+        );
+        assert_eq!(LanceIoType::from_lance("nope"), None);
+        assert_eq!(DatasetEvent::from_lance("committed"), Some(DatasetEvent::Committed));
+        assert_eq!(DatasetEvent::from_lance("nope"), None);
+        assert_eq!(
+            FileAuditMode::from_lance("delete_unverified"),
+            Some(FileAuditMode::DeleteUnverified)
+        );
+        assert_eq!(FileAuditType::from_lance("deletion"), Some(FileAuditType::Deletion));
+        assert_eq!(LanceIoType::OpenScalarIndex.as_tag(), "open_scalar_index");
+        assert_eq!(DatasetEvent::DroppingColumn.as_tag(), "dropping_column");
+        assert_eq!(FileAuditMode::Create.as_tag(), "create");
+        assert_eq!(FileAuditType::Data.as_tag(), "data");
     }
 
     #[test]
@@ -574,11 +1146,12 @@ mod tests {
         assert_eq!(Rpc::VectorSearch.as_tag(), "vector_search");
         assert_eq!(Rpc::Prewarm.as_tag(), "prewarm");
         assert_eq!(Rpc::Clusters.as_tag(), "clusters");
+        assert_eq!(IntakeRpc::Write.as_tag(), "write");
+        assert_eq!(IntakeRpc::WriteStream.as_tag(), "write_stream");
         assert_eq!(CacheName::Handles.as_tag(), "handles");
         assert_eq!(Tier::Disk.as_tag(), "disk");
         assert_eq!(EvictionReason::Corrupt.as_tag(), "corrupt");
         assert_eq!(PrewarmStatus::Partial.as_tag(), "partial");
         assert_eq!(PrewarmIndexKind::Scalar.as_tag(), "scalar");
-        assert_eq!(FanoutLeg::Hybrid.as_tag(), "hybrid");
     }
 }

@@ -8,7 +8,6 @@ index work from being published after a concurrent compaction.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import lance
@@ -18,20 +17,25 @@ from conftest import make_vector_table, write_fragmented_dataset
 from lance.dataset import Index
 from lance.optimize import Compaction
 
-from lance_etl.compaction import CompactionConfig
 from lance_etl.indexing import (
     BTreeIndexHandler,
     FtsIndexHandler,
     IndexJobConfig,
     VectorIndexHandler,
+    bootstrap_vector_index,
     commit_segments,
-    index_dataset_locally,
     index_delta_count,
+    load_vector_config,
     merge_index_deltas,
     optimize_existing_index,
+    plan_dataset_indexes,
+    publish_fts_index,
     serialize_segment,
     split_evenly,
+    vector_config_key,
+    write_vector_config,
 )
+from lance_etl.maintenance import MaintenanceConfig
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 ROWS: int = 2048
@@ -54,6 +58,27 @@ def dataset_uri(tmp_path: Path) -> str:
     return uri
 
 
+def vector_only_config(**overrides: object) -> IndexJobConfig:
+    """Build an explicit vector-only indexing configuration for plan-phase assertions.
+
+    Args:
+        overrides: Field overrides applied on top of the test defaults.
+
+    Returns:
+        The indexing configuration targeting only the ``vector`` column.
+    """
+    base: dict[str, object] = {
+        "telemetry": TelemetryConfig(),
+        "vector_columns": ["vector"],
+        "num_partitions": 4,
+        "vector_min_rows": 10,
+        "commit_retries": 5,
+        "commit_backoff_seconds": 0.0,
+    }
+    base.update(overrides)
+    return IndexJobConfig(**base)
+
+
 def maintenance_config(**overrides: object) -> IndexJobConfig:
     """Build the indexing configuration used by the maintenance tests.
 
@@ -65,7 +90,7 @@ def maintenance_config(**overrides: object) -> IndexJobConfig:
     """
     base: dict[str, object] = {
         "telemetry": TelemetryConfig(),
-        "vector_column": "vector",
+        "vector_columns": ["vector"],
         "num_partitions": 4,
         "vector_min_rows": 1,
         "scalar_columns": ["id"],
@@ -139,28 +164,47 @@ def build_btree_segments(uri: str, config: IndexJobConfig, telemetry: Telemetry,
     commit_segments(uri, documents, "id", "id_idx", False, config, telemetry)
 
 
-def test_index_dataset_locally_second_run_maintains(dataset_uri: str) -> None:
-    """A second small-tier run maintains existing indices instead of rebuilding."""
-    config: IndexJobConfig = maintenance_config()
-    first: dict[str, object] = index_dataset_locally(dataset_uri, config)
-    assert all("maintained" not in entry for entry in first["indexes"])
-    second: dict[str, object] = index_dataset_locally(dataset_uri, config)
-    by_index: dict[str, dict[str, object]] = {entry["index"]: entry for entry in second["indexes"]}
-    assert by_index["vector_idx"]["maintained"] is True
-    assert by_index["id_idx"]["maintained"] is True
-    assert by_index["category_bitmap_idx"]["maintained"] is True
-    assert by_index["text_fts_idx"]["maintained"] is True
+def test_plan_skips_when_all_indices_current(dataset_uri: str, telemetry: Telemetry) -> None:
+    """The plan phase is a no-op when every targeted index exists with full coverage.
+
+    The ``index_skip_reason`` pre-flight guard returns ``"all indices current"`` when every index
+    exists and has zero unindexed fragments, so the plan exits early with no build specs rather
+    than issuing redundant maintenance work. The dataset remains fully queryable.
+
+    Args:
+        dataset_uri: URI of the pre-built test dataset.
+        telemetry: The telemetry facade fixture.
+    """
+    config: IndexJobConfig = IndexJobConfig(
+        telemetry=TelemetryConfig(), scalar_columns=["id"], text_columns=["text"], commit_backoff_seconds=0.0
+    )
     dataset: lance.LanceDataset = lance.dataset(dataset_uri)
-    assert dataset.to_table(nearest={"column": "vector", "q": [0.5] * DIM, "k": 3}).num_rows == 3
-    assert dataset.to_table(filter="id = 7").num_rows == 1
+    dataset.create_scalar_index("id", "BTREE", name="id_idx")
+    lance.dataset(dataset_uri).create_scalar_index("text", "INVERTED", name="text_fts_idx")
+
+    plan: dict[str, object] = plan_dataset_indexes(dataset_uri, config, telemetry)
+    assert plan.get("skipped") == "all indices current"
+    refreshed: lance.LanceDataset = lance.dataset(dataset_uri)
+    assert refreshed.to_table(filter="id = 7").num_rows == 1
 
 
-def test_index_dataset_locally_rebuild_flag_forces_rebuild(dataset_uri: str) -> None:
-    """The rebuild flag keeps the create path even when indices exist."""
-    config: IndexJobConfig = maintenance_config()
-    index_dataset_locally(dataset_uri, config)
-    rebuilt: dict[str, object] = index_dataset_locally(dataset_uri, maintenance_config(rebuild=True))
-    assert all("maintained" not in entry for entry in rebuilt["indexes"])
+def test_plan_rebuild_flag_forces_specs(dataset_uri: str, telemetry: Telemetry) -> None:
+    """The rebuild flag plans fresh build specs even when every index exists and is current."""
+    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
+    dataset.create_scalar_index("id", "BTREE", name="id_idx")
+    lance.dataset(dataset_uri).create_scalar_index("text", "INVERTED", name="text_fts_idx")
+
+    rebuild_config: IndexJobConfig = IndexJobConfig(
+        telemetry=TelemetryConfig(),
+        scalar_columns=["id"],
+        text_columns=["text"],
+        rebuild=True,
+        commit_backoff_seconds=0.0,
+    )
+    plan: dict[str, object] = plan_dataset_indexes(dataset_uri, rebuild_config, telemetry)
+    assert "skipped" not in plan
+    assert {spec["index_name"] for spec in plan["specs"]} == {"id_idx", "text_fts_idx"}
+    assert all(spec["shards"] for spec in plan["specs"])
 
 
 def test_optimize_existing_index_covers_new_fragments(dataset_uri: str, telemetry: Telemetry) -> None:
@@ -184,79 +228,80 @@ def test_merge_index_deltas_bounds_accumulation(dataset_uri: str, telemetry: Tel
     assert lance.dataset(dataset_uri).to_table(filter="id = 7").num_rows == 1
 
 
-def manifest_path_of(uri: str) -> Path:
-    """Return the local-fs path of the vector artifact manifest.
-
-    Args:
-        uri: The dataset URI.
-
-    Returns:
-        The manifest path.
-    """
-    return Path(f"{uri}.artifacts") / "vector" / "manifest.json"
-
-
-def test_prepare_records_rows_at_train(dataset_uri: str, telemetry: Telemetry) -> None:
-    """Training persists the row count the centroids were trained on."""
+def test_bootstrap_records_rows_at_train(dataset_uri: str, telemetry: Telemetry) -> None:
+    """The streaming bootstrap persists the trained row count in the dataset config."""
     config: IndexJobConfig = maintenance_config()
-    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
-    manifest: dict[str, object] = json.loads(manifest_path_of(dataset_uri).read_text())
-    assert manifest["rows_at_train"] == ROWS
+    bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
+    cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
+    assert cfg is not None
+    assert cfg["rows_at_train"] == ROWS
 
 
-def test_growth_trigger_retrains_and_targets_all_fragments(dataset_uri: str, telemetry: Telemetry) -> None:
-    """Rows growing past the factor force a retrain and a full-fragment rebuild."""
+def test_growth_trigger_plans_bootstrap_and_retrain_refreshes_config(dataset_uri: str, telemetry: Telemetry) -> None:
+    """Rows growing past the factor route the index back to a streaming bootstrap that refreshes the config."""
     config: IndexJobConfig = maintenance_config()
-    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
-    artifacts: object | None = handler.prepare(dataset, dataset_uri, telemetry)
-    version: int = dataset.version
-    documents: list[str] = []
-    for group in split_evenly(fragment_ids_of(dataset_uri), 2):
-        segment: Index = handler.build_segment(lance.dataset(dataset_uri, version=version), group, artifacts)
-        documents.append(serialize_segment(segment))
-    commit_segments(dataset_uri, documents, "vector", "vector_idx", True, config, telemetry)
+    bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
 
     covered_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
     assert covered_handler.target_fragments(lance.dataset(dataset_uri)) == []
 
-    manifest_file: Path = manifest_path_of(dataset_uri)
-    manifest: dict[str, object] = json.loads(manifest_file.read_text())
-    manifest["rows_at_train"] = ROWS // 8
-    manifest_file.write_text(json.dumps(manifest))
+    cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
+    assert cfg is not None
+    patched_cfg: dict[str, object] = dict(cfg)
+    patched_cfg["rows_at_train"] = ROWS // 8
+    write_vector_config(dataset_uri, "vector", patched_cfg, config, telemetry)
 
-    retrain_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    current: lance.LanceDataset = lance.dataset(dataset_uri)
-    assert retrain_handler.target_fragments(current) == fragment_ids_of(dataset_uri)
-    retrain_handler.prepare(current, dataset_uri, telemetry)
-    assert retrain_handler.reused_artifacts is False
-    refreshed: dict[str, object] = json.loads(manifest_file.read_text())
-    assert refreshed["rows_at_train"] == ROWS
+    plan: dict[str, object] = plan_dataset_indexes(dataset_uri, vector_only_config(), telemetry)
+    vector_spec: dict[str, object] = next(spec for spec in plan["specs"] if spec["index_name"] == "vector_idx")
+    assert vector_spec["mode"] == "bootstrap"
+
+    bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
+    refreshed_cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
+    assert refreshed_cfg is not None
+    assert refreshed_cfg["rows_at_train"] == ROWS
+
+    healthy_plan: dict[str, object] = plan_dataset_indexes(dataset_uri, vector_only_config(), telemetry)
+    assert all(spec["mode"] != "bootstrap" for spec in healthy_plan.get("specs", []))
 
 
-def test_manifest_without_rows_at_train_retrains_once(dataset_uri: str, telemetry: Telemetry) -> None:
-    """A manifest predating the retrain trigger retrains once to record the field."""
+def test_manifest_without_rows_at_train_plans_bootstrap(dataset_uri: str, telemetry: Telemetry) -> None:
+    """A config predating the retrain trigger routes the index to one refreshing bootstrap."""
     config: IndexJobConfig = maintenance_config()
-    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
-    manifest_file: Path = manifest_path_of(dataset_uri)
-    manifest: dict[str, object] = json.loads(manifest_file.read_text())
-    del manifest["rows_at_train"]
-    manifest_file.write_text(json.dumps(manifest))
-    second: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    second.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
-    assert second.reused_artifacts is False
-    assert json.loads(manifest_file.read_text())["rows_at_train"] == ROWS
+    bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
+    cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
+    assert cfg is not None
+    patched_cfg: dict[str, object] = {k: v for k, v in cfg.items() if k != "rows_at_train"}
+    write_vector_config(dataset_uri, "vector", patched_cfg, config, telemetry)
+
+    plan: dict[str, object] = plan_dataset_indexes(dataset_uri, vector_only_config(), telemetry)
+    vector_spec: dict[str, object] = next(spec for spec in plan["specs"] if spec["index_name"] == "vector_idx")
+    assert vector_spec["mode"] == "bootstrap"
+
+    bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
+    refreshed_cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
+    assert refreshed_cfg is not None
+    assert refreshed_cfg["rows_at_train"] == ROWS
 
 
 def test_within_growth_factor_reuses_artifacts(dataset_uri: str, telemetry: Telemetry) -> None:
     """Artifacts keep being reused while rows stay within the growth factor."""
     config: IndexJobConfig = maintenance_config()
-    VectorIndexHandler(config, "vector", "vector_idx").prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
+    bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
     second: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
     second.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
     assert second.reused_artifacts is True
+
+    plan: dict[str, object] = plan_dataset_indexes(dataset_uri, vector_only_config(), telemetry)
+    assert all(spec["mode"] != "bootstrap" for spec in plan.get("specs", []))
+
+
+def test_vector_config_key_is_stored_in_dataset(dataset_uri: str, telemetry: Telemetry) -> None:
+    """After the bootstrap, the vector config key is present in the dataset config KV with no sidecar directory."""
+    config: IndexJobConfig = maintenance_config()
+    bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
+    stored: dict[str, str] = lance.dataset(dataset_uri).config()
+    assert vector_config_key("vector") in stored
+    assert not Path(f"{dataset_uri}.artifacts").exists()
 
 
 def test_fts_maintainable_gates(dataset_uri: str) -> None:
@@ -289,12 +334,11 @@ def compact_fragments(uri: str, max_source_fragments: int | None, target_rows_pe
             oldest-first, so partial compaction needs a target small enough to split the plan into tasks within it.
         target_rows_per_fragment: Desired rows per compacted fragment, controlling task sizes.
     """
-    config: CompactionConfig = CompactionConfig(
+    config: MaintenanceConfig = MaintenanceConfig(
         telemetry=TelemetryConfig(),
         target_rows_per_fragment=target_rows_per_fragment,
         max_source_fragments=max_source_fragments,
         num_threads=1,
-        run_cleanup=False,
     )
     Compaction.execute(lance.dataset(uri), config.execute_options())
 
@@ -334,8 +378,60 @@ def test_commit_segments_keeps_fresh_segments(dataset_uri: str, telemetry: Telem
 def test_fts_commit_index_raises_on_missing_fragments(dataset_uri: str, telemetry: Telemetry) -> None:
     """The inverted-index publish refuses coverage of fragments that no longer exist."""
     config: IndexJobConfig = maintenance_config()
-    handler: FtsIndexHandler = FtsIndexHandler(config, "text", "text_fts_idx")
-    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
     stale_ids: list[int] = [*fragment_ids_of(dataset_uri), 9999]
     with pytest.raises(ValueError, match="no longer exist"):
-        handler.commit_index(dataset_uri, dataset, "00000000-0000-0000-0000-000000000000", stale_ids, telemetry)
+        publish_fts_index(
+            dataset_uri, "text", "text_fts_idx", "00000000-0000-0000-0000-000000000000", stale_ids, config, telemetry
+        )
+
+
+def test_artifact_less_index_plans_bootstrap(dataset_uri: str, telemetry: Telemetry) -> None:
+    """An index built outside the pipeline (no stored config) routes to a streaming bootstrap.
+
+    A plain ``create_index`` (as pre-unification deployments produced) mints its own model and
+    writes no config KV. Appending segments built from fresh artifacts would put deltas on
+    mismatched models, so the plan phase replaces the whole index with a bootstrap instead.
+
+    Args:
+        dataset_uri: URI of the pre-built test dataset.
+        telemetry: The telemetry facade fixture.
+    """
+    config: IndexJobConfig = maintenance_config()
+    lance.dataset(dataset_uri).create_index(
+        "vector", "IVF_RQ", name="vector_idx", replace=True, num_partitions=4, num_bits=1
+    )
+    assert load_vector_config(lance.dataset(dataset_uri), "vector") is None
+
+    append_fragment(dataset_uri, rows=ROWS_PER_FRAGMENT, start_id=ROWS)
+    plan: dict[str, object] = plan_dataset_indexes(dataset_uri, vector_only_config(), telemetry)
+    vector_spec: dict[str, object] = next(spec for spec in plan["specs"] if spec["index_name"] == "vector_idx")
+    assert vector_spec["mode"] == "bootstrap"
+
+    bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
+    refreshed: lance.LanceDataset = lance.dataset(dataset_uri)
+    assert index_delta_count(refreshed, "vector_idx") == 1
+    assert load_vector_config(refreshed, "vector") is not None
+    fresh_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    assert fresh_handler.target_fragments(refreshed) == []
+
+
+def test_config_without_committed_index_plans_bootstrap(dataset_uri: str, telemetry: Telemetry) -> None:
+    """A stored config without a committed index routes to a bootstrap, and prepare refuses to reuse it."""
+    config: IndexJobConfig = maintenance_config()
+    write_vector_config(
+        dataset_uri,
+        "vector",
+        {"rows_at_train": ROWS, "dimension": DIM, "metric": config.metric, "num_bits": 1, "rabitq_model": "{}"},
+        config,
+        telemetry,
+    )
+    names: set[str] = {description.name for description in lance.dataset(dataset_uri).describe_indices()}
+    assert "vector_idx" not in names
+
+    plan: dict[str, object] = plan_dataset_indexes(dataset_uri, vector_only_config(), telemetry)
+    vector_spec: dict[str, object] = next(spec for spec in plan["specs"] if spec["index_name"] == "vector_idx")
+    assert vector_spec["mode"] == "bootstrap"
+
+    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    with pytest.raises(RuntimeError, match="not reusable"):
+        handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)

@@ -10,17 +10,20 @@ use std::sync::Arc;
 use common::{
     CountingWrapper, ReadCounts, TEST_DATASET_PATH, bin_file_count, build_indexed_dataset, test_config, test_target,
 };
-use search_api::domain::{PrewarmSpec, Prewarmer, SearchBackend, TextQuery, VectorQuery};
+use search_api::domain::{DatasetRef, PrewarmSpec, Prewarmer, SearchBackend, TextQuery, VectorQuery};
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
 use tempfile::TempDir;
 
 /// Builds a backend over a fresh provider with its own counting wrapper.
-fn build_backend(config: &search_api::config::Config) -> (LanceSearchBackend<CachingDatasetProvider>, Arc<ReadCounts>) {
+async fn build_backend(
+    config: &search_api::config::Config,
+) -> (LanceSearchBackend<CachingDatasetProvider>, Arc<ReadCounts>) {
     let counts = Arc::new(ReadCounts::default());
     let provider = CachingDatasetProvider::with_inner_store_wrapper(
         config,
         Some(Arc::new(CountingWrapper { counts: counts.clone() })),
-    );
+    )
+    .await;
     (LanceSearchBackend::new(provider), counts)
 }
 
@@ -41,7 +44,7 @@ async fn cold_process_serves_searches_from_disk_caches() {
     build_indexed_dataset(&uri).await;
     let config = test_config(data_tmp.path(), cache_tmp.path());
 
-    let (backend_a, counts_a) = build_backend(&config);
+    let (backend_a, counts_a) = build_backend(&config).await;
     let report = backend_a
         .prewarm(
             &test_target(),
@@ -51,6 +54,7 @@ async fn cold_process_serves_searches_from_disk_caches() {
                 index_names: vec![],
                 fts_with_position: true,
             },
+            DatasetRef::Latest,
         )
         .await
         .unwrap();
@@ -61,7 +65,8 @@ async fn cold_process_serves_searches_from_disk_caches() {
     let hits = backend_a
         .text_search(&test_target(), TextQuery::simple("lemon", 3))
         .await
-        .unwrap();
+        .unwrap()
+        .hits;
     assert_eq!(hits.len(), 1);
     let hits = backend_a
         .vector_search(&test_target(), vector_query())
@@ -86,11 +91,12 @@ async fn cold_process_serves_searches_from_disk_caches() {
 
     drop(backend_a);
 
-    let (backend_b, counts_b) = build_backend(&config);
+    let (backend_b, counts_b) = build_backend(&config).await;
     let hits = backend_b
         .text_search(&test_target(), TextQuery::simple("lemon", 3))
         .await
-        .unwrap();
+        .unwrap()
+        .hits;
     assert_eq!(hits.len(), 1);
     let (indices_b, manifests_b, _) = counts_b.snapshot();
     assert_eq!(
@@ -122,9 +128,9 @@ async fn tiny_budget_sweep_keeps_cache_within_bounds_and_searches_correct() {
     config.disk_index_cache_bytes = 4096;
     config.disk_store_cache_bytes = 4096;
 
-    let provider = CachingDatasetProvider::new(&config);
+    let provider = CachingDatasetProvider::new(&config).await;
     let janitor = provider.janitor(&config).expect("disk caches enabled");
-    let index_cache = provider.disk_index_cache().unwrap().clone();
+    let index_cache = provider.index_cache().unwrap().clone();
     let store_cache = provider.store_cache().unwrap().clone();
     let backend = LanceSearchBackend::new(provider);
     backend
@@ -136,13 +142,14 @@ async fn tiny_budget_sweep_keeps_cache_within_bounds_and_searches_correct() {
                 index_names: vec![],
                 fts_with_position: true,
             },
+            DatasetRef::Latest,
         )
         .await
         .unwrap();
 
     janitor.sweep_once().await;
     assert!(
-        index_cache.disk_size_bytes() <= config.disk_index_cache_bytes,
+        index_cache.persisted_size_bytes() <= config.disk_index_cache_bytes,
         "index tier must respect its byte budget after a sweep"
     );
     assert!(
@@ -153,7 +160,8 @@ async fn tiny_budget_sweep_keeps_cache_within_bounds_and_searches_correct() {
     let hits = backend
         .text_search(&test_target(), TextQuery::simple("lemon", 3))
         .await
-        .unwrap();
+        .unwrap()
+        .hits;
     assert_eq!(
         hits.len(),
         1,

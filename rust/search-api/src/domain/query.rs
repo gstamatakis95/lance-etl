@@ -1,9 +1,16 @@
 //! Domain request and result types for vector, full-text, and hybrid search.
+//!
+//! The full-text query tree ([`TextQueryNode`] and its leaf specs) carries a serde serialization
+//! that is part of the recall-capture contract: the `recall.text_query` span attribute holds
+//! exactly this JSON and the offline recall job parses it. Enums use external tagging with
+//! `snake_case` variant names, mirroring [`crate::domain::filter`].
 
+use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::domain::filter::Filter;
 use crate::domain::fusion::FusionSpec;
+use crate::domain::target::DatasetRef;
 
 /// Distance metric for nearest-neighbor search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +23,25 @@ pub enum DistanceKind {
     Dot,
     /// Hamming distance for binary vectors.
     Hamming,
+}
+
+/// An event-time window in epoch milliseconds, always applied to the event-timestamp column.
+///
+/// The window is start-inclusive and end-exclusive. Either bound may be `None` to leave that side
+/// unbounded. A backend translates it into a typed range predicate on its event-timestamp column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TimeRange {
+    /// Inclusive lower bound in epoch milliseconds. `None` leaves the window open on the low side.
+    pub start_ms: Option<i64>,
+    /// Exclusive upper bound in epoch milliseconds. `None` leaves the window open on the high side.
+    pub end_ms: Option<i64>,
+}
+
+impl TimeRange {
+    /// Returns true when at least one bound is set, so the window restricts the scan.
+    pub fn is_bounded(&self) -> bool {
+        self.start_ms.is_some() || self.end_ms.is_some()
+    }
 }
 
 /// Whether a filter runs before or after the index search.
@@ -49,24 +75,37 @@ pub struct VectorQuery {
     pub refine_factor: Option<u32>,
     /// HNSW ef-search parameter.
     pub ef: Option<usize>,
-    /// Search only indexed data (weak consistency, lower latency).
-    pub fast_search: bool,
+    /// Search only indexed data, skipping fragments added after the last index build (weak
+    /// consistency, lower latency). `Some(true)` forces fast search on; `Some(false)` forces it
+    /// off (needed for read-after-write freshness guarantees); `None` lets the server apply its
+    /// configured default, gated on whether the dataset has a vector index for the queried column.
+    pub fast_search: Option<bool>,
     /// Skip the vector index and do a flat (exact) scan.
     pub bypass_vector_index: bool,
     /// Optional typed predicate applied to the search.
     pub filter: Option<Filter>,
     /// Whether the filter runs before or after the index search.
     pub filter_mode: FilterMode,
+    /// Optional event-time window applied to the backend's event-timestamp column, ANDed with
+    /// `filter`. `None` searches all event times.
+    pub time_range: Option<TimeRange>,
     /// Columns to return. Empty selects all non-vector columns.
     pub projection: Vec<String>,
-    /// Include the stable row id in each returned row.
+    /// Include the physical `_rowid` row-address column in each returned row. It changes across compaction and is
+    /// valid only for the duration of the request.
     pub with_row_id: bool,
     /// Number of leading hits to skip.
     pub offset: Option<usize>,
+    /// Which committed version of the dataset to open for this query. Defaults to
+    /// [`DatasetRef::Serve`], which follows the provider's configured serve policy (the serve tag
+    /// when enabled, otherwise the latest committed version). Setting an explicit version id or tag
+    /// name pins the search to that snapshot without affecting other in-flight requests.
+    pub reference: DatasetRef,
 }
 
 /// How match-query terms combine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TextOperator {
     /// At least one term must match.
     #[default]
@@ -76,7 +115,8 @@ pub enum TextOperator {
 }
 
 /// Fuzzy-matching behavior for a match query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Fuzziness {
     /// Exact term matching (edit distance 0).
     #[default]
@@ -88,7 +128,7 @@ pub enum Fuzziness {
 }
 
 /// Terms query against one column.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MatchSpec {
     /// Query terms, tokenized by the index tokenizer.
     pub terms: String,
@@ -122,7 +162,7 @@ impl MatchSpec {
 }
 
 /// Exact phrase query. The index must store positions.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PhraseSpec {
     /// Phrase terms in order.
     pub terms: String,
@@ -133,7 +173,8 @@ pub struct PhraseSpec {
 }
 
 /// Full-text query node tree.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TextQueryNode {
     /// Terms matching with OR/AND semantics and optional fuzziness.
     Match(MatchSpec),
@@ -185,12 +226,28 @@ pub struct TextQuery {
     pub filter: Option<Filter>,
     /// Whether the filter runs before or after the index search.
     pub filter_mode: FilterMode,
+    /// Optional event-time window applied to the backend's event-timestamp column, ANDed with
+    /// `filter`. `None` searches all event times.
+    pub time_range: Option<TimeRange>,
     /// Columns to return. Empty selects all non-vector columns.
     pub projection: Vec<String>,
-    /// Include the stable row id in each returned row.
+    /// Include the physical `_rowid` row-address column in each returned row. It changes across compaction and is
+    /// valid only for the duration of the request.
     pub with_row_id: bool,
     /// Number of leading hits to skip.
     pub offset: Option<usize>,
+    /// Search only indexed (INVERTED) data, skipping fragments appended after the last FTS index
+    /// build. `Some(true)` forces fast search on; `Some(false)` forces it off; `None` lets the
+    /// server apply its configured default, gated on whether the dataset has an FTS index for the
+    /// queried column. Fragments appended after the last index build are silently excluded when
+    /// `true` — callers that need read-after-write freshness must set `Some(false)` or leave it
+    /// `None` on datasets where the server default is off.
+    pub fast_search: Option<bool>,
+    /// Which committed version of the dataset to open for this query. Defaults to
+    /// [`DatasetRef::Serve`], which follows the provider's configured serve policy (the serve tag
+    /// when enabled, otherwise the latest committed version). Setting an explicit version id or tag
+    /// name pins the search to that snapshot without affecting other in-flight requests.
+    pub reference: DatasetRef,
 }
 
 impl TextQuery {
@@ -203,10 +260,33 @@ impl TextQuery {
             wand_factor: None,
             filter: None,
             filter_mode: FilterMode::default(),
+            time_range: None,
             projection: Vec::new(),
             with_row_id: false,
             offset: None,
+            fast_search: None,
+            reference: DatasetRef::default(),
         }
+    }
+
+    /// Returns a representative query string for reranking context, when one can be extracted.
+    ///
+    /// Walks the node tree to the first leaf carrying terms (a match, phrase, multi-match, or the
+    /// positive side of a boost / the first should-or-must clause of a boolean). `None` when no
+    /// leaf carries terms.
+    pub fn rerank_text(&self) -> Option<String> {
+        node_terms(&self.node).map(str::to_string)
+    }
+}
+
+/// Extracts the leading terms of a query node for reranking context.
+fn node_terms(node: &TextQueryNode) -> Option<&str> {
+    match node {
+        TextQueryNode::Match(spec) => Some(spec.terms.as_str()),
+        TextQueryNode::Phrase(spec) => Some(spec.terms.as_str()),
+        TextQueryNode::MultiMatch { terms, .. } => Some(terms.as_str()),
+        TextQueryNode::Boost { positive, .. } => node_terms(positive),
+        TextQueryNode::Boolean { should, must, .. } => should.iter().chain(must).find_map(node_terms),
     }
 }
 
@@ -221,6 +301,12 @@ pub struct HybridQuery {
     pub k: usize,
     /// Fusion strategy for merging the legs.
     pub fusion: FusionSpec,
+    /// Which committed version of the dataset to open for both legs. Defaults to
+    /// [`DatasetRef::Serve`], which follows the provider's configured serve policy (the serve tag
+    /// when enabled, otherwise the latest committed version). Both legs are always opened at the
+    /// same resolved version so fusion dedup is consistent. Setting an explicit version id or tag
+    /// name pins the search to that snapshot without affecting other in-flight requests.
+    pub reference: DatasetRef,
 }
 
 /// The result of one vector search: ranked hits plus dataset provenance for recall capture.
@@ -228,15 +314,36 @@ pub struct HybridQuery {
 pub struct VectorSearchOutcome {
     /// Hits ordered nearest-first.
     pub hits: Vec<Hit>,
-    /// The committed version of the Lance dataset that served the query. `None` for date-range
-    /// fan-out, where several per-day datasets (each with its own version) contribute.
+    /// The committed version of the Lance dataset that served the query. `None` when the
+    /// serving version was not recorded.
+    pub dataset_version: Option<u64>,
+}
+
+/// The result of one full-text search: ranked hits plus dataset provenance for recall capture.
+#[derive(Debug, Clone, Default)]
+pub struct TextSearchOutcome {
+    /// Hits ordered best-first.
+    pub hits: Vec<Hit>,
+    /// The committed version of the Lance dataset that served the query. `None` when the
+    /// serving version was not recorded.
+    pub dataset_version: Option<u64>,
+}
+
+/// The result of one hybrid search: fused hits plus dataset provenance for recall capture.
+#[derive(Debug, Clone, Default)]
+pub struct HybridSearchOutcome {
+    /// Fused hits ordered best-first.
+    pub hits: Vec<FusedHit>,
+    /// The committed version of the Lance dataset that served the query. `None` when the
+    /// serving version was not recorded.
     pub dataset_version: Option<u64>,
 }
 
 /// One ranked hit from a single search leg.
 #[derive(Debug, Clone)]
 pub struct Hit {
-    /// Stable row id of the hit.
+    /// Physical Lance row address (`_rowid`). Valid only for the duration of this request — changes across
+    /// compaction and across dataset opens. Used internally for within-dataset cross-leg fusion dedup only.
     pub row_id: u64,
     /// Leg-specific score: distance for vector legs, BM25 score for text legs.
     pub score: f64,
@@ -247,7 +354,8 @@ pub struct Hit {
 /// One fused hit produced by a [`crate::domain::fusion::Fusion`] strategy.
 #[derive(Debug, Clone)]
 pub struct FusedHit {
-    /// Stable row id of the hit.
+    /// Physical Lance row address (`_rowid`). Valid only for the duration of this request — changes across
+    /// compaction and across dataset opens. Used internally for within-dataset cross-leg fusion dedup only.
     pub row_id: u64,
     /// Fused score (larger is better).
     pub score: f64,

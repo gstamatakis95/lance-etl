@@ -7,17 +7,17 @@ with no Spark involved:
   configuration production uses, mixing fresh inserts, updates of existing keys, and deletes of a known subset.
   The expected terminal state is tracked exactly in memory as ``{key_index: last_upsert_round}``.
 - A COMPACTOR thread sweeps every dataset, compacting whenever the fragment count exceeds a small threshold. The
-  head dataset uses the tier-B plan/execute/commit triad with the production re-plan-on-conflict loop
-  (:meth:`lance_etl.compaction.LanceCompactor.commit_rewrites` plus re-plan, mirroring ``compact_one``), and the
-  tail datasets use :func:`lance_etl.compaction.compact_small_dataset`. Version cleanup runs only at the end,
-  through :func:`lance_etl.compaction.cleanup_dataset` with the default retention horizon, so concurrent readers
+  head dataset uses the plan/execute/commit cycle with the production re-plan-on-conflict loop
+  (:func:`lance_etl.maintenance.commit_one_dataset` plus re-plan, mirroring ``MaintenanceJob.run``), and the
+  tail datasets use the in-process ``compact_dataset_inline`` test helper. Version cleanup runs only at the end,
+  through :func:`lance_etl.maintenance.cleanup_dataset` with the default retention horizon, so concurrent readers
   pinned to older versions are never broken mid-run.
 - An INDEXER thread loops incremental maintenance. The head dataset uses the real segment-API paths: vector IVF_RQ
   and BTREE increments through ``create_index_uncommitted`` plus :func:`lance_etl.indexing.commit_segments` (which
   drops stale segments after a concurrent rewrite), the inverted index through the shared-uuid metadata-merge path
   published by :meth:`lance_etl.indexing.FtsIndexHandler.commit_index`, and delta bounding through
-  :func:`lance_etl.indexing.merge_index_deltas`. Tail datasets run the production small-tier
-  :func:`lance_etl.indexing.index_dataset_locally` build-then-maintain path. Every commit goes through
+  :func:`lance_etl.indexing.merge_index_deltas`. Tail datasets run the production unified
+  plan-build-commit functions fully in process. Every commit goes through
   :func:`lance_etl.telemetry.commit_with_retries`.
 
 The fleet is the 30,000-org shape in miniature: one head-org-sized dataset (about 200k keys, dim 16) plus a
@@ -47,16 +47,11 @@ and the large-tier segment path could never extend coverage. ``replace`` is cons
 bypass and existing deltas are preserved. Fixed in :class:`VectorIndexHandler`, :class:`BTreeIndexHandler`, and
 :class:`BitmapIndexHandler`.
 
-SECOND REAL BUG FOUND AND MITIGATED by this test: on the pinned lance build, compaction's inline eager index
-remap silently corrupts IVF_RQ indexes. Measured here: a clean index with 40/40 exact top-1 recall drops to
-22/40 after one ``Compaction.execute`` rewrote its covered fragments, while ``num_unindexed_fragments`` stays 0
-and ``num_indexed_rows`` stays exact, so no maintenance trigger ever fires. Deferred remap is also broken (vector
-queries fail with a missing fragment-id error, the caveat recorded in ``compaction.py``), and the corruption
-reproduces identically for ``create_index``-built indexes, so it is upstream, not a segment-flow artifact. BTREE
-and FTS remaps measured sound (40/40 after the same rewrite). Mitigation in
-:meth:`VectorIndexHandler.remap_requires_rebuild`: the artifact sidecar records the live fragment ids covered at
-each build, and a later pass finding any of them gone forces a full segment rebuild from the intact row data,
-reusing the trained centroids and rotation.
+SECOND BUG RESOLVED: the IVF_RQ inline-remap corruption described in earlier findings is fixed on the lance
+branch ``fix/ivf-rq-remap-corruption``. The corruption-containment machinery
+(``covered_fragment_ids``, ``remap_requires_rebuild``, ``record_coverage``, ``index_holds_dead_fragments``,
+``drop_stale_index``) has been deleted from the indexing layer. Deploy order: rebuild pylance from the fix
+branch before enabling this code on a production fleet.
 
 Convergence finding (Lance behavior, not a repository bug): the compaction planner never bins fragments whose
 covering index sets differ (``rust/lance/src/dataset/optimize.rs:662-694``) and every index delta carries its own
@@ -78,13 +73,15 @@ from collections import Counter
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import lance
 import pyarrow as pa
 import pytest
+from conftest import compact_dataset_inline
 from lance.optimize import Compaction, CompactionTask
 
-from lance_etl.compaction import CompactionConfig, LanceCompactor, cleanup_dataset, compact_small_dataset
+import lance_etl.indexing.segments as indexing_segments
 from lance_etl.etl import ETLConfig, apply_merge, dataset_uri
 from lance_etl.indexing import (
     BTreeIndexHandler,
@@ -92,17 +89,25 @@ from lance_etl.indexing import (
     IndexHandler,
     IndexJobConfig,
     VectorIndexHandler,
-    commit_segments,
+    bootstrap_vector_index,
+    build_one_shard,
+    commit_one_index,
     fts_index_name,
-    index_dataset_locally,
     index_delta_count,
+    is_stale_fragment_error,
     merge_index_deltas,
     optimize_existing_index,
+    plan_dataset_indexes,
+    publish_fts_index,
+    resolve_vector_artifacts,
     scalar_index_name,
     serialize_segment,
+    shard_count,
     split_evenly,
+    vector_index_name,
 )
-from lance_etl.telemetry import Telemetry, TelemetryConfig, is_commit_conflict_error
+from lance_etl.maintenance import MaintenanceConfig, cleanup_dataset, commit_one_dataset
+from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 pytestmark = pytest.mark.integration
 
@@ -311,29 +316,29 @@ def run_ingester(
         time.sleep(pause_seconds)
 
 
-def compact_head_with_replan(uri: str, compactor: LanceCompactor, telemetry: Telemetry) -> str:
-    """Run one tier-B plan/execute/commit cycle with the production re-plan loop.
+def compact_head_with_replan(uri: str, config: MaintenanceConfig, telemetry: Telemetry) -> str:
+    """Run the production plan/execute/commit cycle in process with the re-plan loop.
 
-    Mirrors :meth:`LanceCompactor.compact_one` without Spark: the rewrite tasks execute in process and the commit
-    goes through :meth:`LanceCompactor.commit_rewrites` with its deliberately small manifest-race budget. A
-    semantic commit conflict triggers a re-plan at the latest version instead of a re-commit, up to the configured
-    ``replan_budget``, after which the dataset is skipped for this sweep.
+    Mirrors :meth:`MaintenanceJob.run` for one dataset without Spark: the rewrite tasks execute
+    in process and the commit goes through the production :func:`commit_one_dataset` with its
+    deliberately small manifest-race budget. A semantic commit conflict triggers a re-plan at
+    the latest version instead of a re-commit, up to the configured ``replan_budget``, after
+    which the dataset is skipped for this sweep.
 
     Args:
         uri: Dataset URI.
-        compactor: The compactor carrying the tier-B configuration.
+        config: The compaction configuration.
         telemetry: Telemetry facade shared by the actors.
 
     Returns:
         ``"noop"`` when nothing needed compacting, ``"committed"`` on success, or ``"skipped"`` when every
         re-plan cycle conflicted.
     """
-    config: CompactionConfig = compactor.config
     cycles: int = 0
     while cycles < config.replan_budget:
         cycles += 1
         dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-        plan = Compaction.plan(dataset, options=config.plan_options())
+        plan = Compaction.plan(dataset, options=config.execute_options())
         task_jsons: list[str] = [task.json() for task in plan.tasks]
         if not task_jsons:
             return "noop"
@@ -341,13 +346,9 @@ def compact_head_with_replan(uri: str, compactor: LanceCompactor, telemetry: Tel
         for task_json in task_jsons:
             shard: lance.LanceDataset = lance.dataset(uri, version=plan.read_version)
             rewrites.append(CompactionTask.from_json(task_json).execute(shard).json())
-        try:
-            compactor.commit_rewrites(uri, rewrites, telemetry)
+        outcome: dict[str, object] = commit_one_dataset(uri, rewrites, config, telemetry)
+        if not outcome.get("conflict"):
             return "committed"
-        except (OSError, RuntimeError) as exc:
-            if not is_commit_conflict_error(exc):
-                raise
-            telemetry.incr("dataset.replanned")
     telemetry.incr("dataset.hot_skipped")
     return "skipped"
 
@@ -355,8 +356,8 @@ def compact_head_with_replan(uri: str, compactor: LanceCompactor, telemetry: Tel
 def run_compactor_loop(
     head_uri: str,
     tail_uris: list[str],
-    head_compactor: LanceCompactor,
-    tail_config: CompactionConfig,
+    head_config: MaintenanceConfig,
+    tail_config: MaintenanceConfig,
     telemetry: Telemetry,
     stop: threading.Event,
 ) -> None:
@@ -366,29 +367,32 @@ def run_compactor_loop(
     committers pinned to older versions keep their transaction files for the whole run.
 
     Args:
-        head_uri: The head dataset URI, compacted through the tier-B triad.
-        tail_uris: Tail dataset URIs, compacted with the small-tier helper.
-        head_compactor: The compactor carrying the tier-B configuration.
-        tail_config: Small-tier compaction configuration with cleanup disabled.
+        head_uri: The head dataset URI, compacted through the plan/execute/commit cycle.
+        tail_uris: Tail dataset URIs, compacted with the in-process helper.
+        head_config: The head dataset's compaction configuration.
+        tail_config: Tail compaction configuration with cleanup disabled.
         telemetry: Telemetry facade shared by the actors.
         stop: Set when ingestion finished and the loop should exit.
     """
     while not stop.is_set():
         if fragment_count(head_uri) > HEAD_COMPACT_FRAGMENT_THRESHOLD:
-            compact_head_with_replan(head_uri, head_compactor, telemetry)
+            compact_head_with_replan(head_uri, head_config, telemetry)
         for uri in tail_uris:
             if fragment_count(uri) > TAIL_COMPACT_FRAGMENT_THRESHOLD:
-                compact_small_dataset(uri, tail_config, telemetry)
+                compact_dataset_inline(uri, tail_config, telemetry)
         time.sleep(COMPACTOR_SWEEP_PAUSE_SECONDS)
 
 
 def build_segment_index(uri: str, handler: IndexHandler, config: IndexJobConfig, telemetry: Telemetry) -> None:
     """Build one index increment through the production segment API in process.
 
-    Mirrors :meth:`IndexHandler.build` without Spark: select uncovered fragments (or every fragment on a vector
-    growth retrain), build one uncommitted segment per shard against a version-pinned handle, and publish through
-    :func:`commit_segments`, which drops stale segments after a concurrent rewrite and retries conflicts. The
-    index's accumulated deltas are then bounded with :func:`merge_index_deltas`.
+    Mirrors :meth:`IndexHandler.build` without Spark by delegating to the production
+    the production replan loop shape with an in-process segment builder: it resolves the target
+    fragments, builds one uncommitted segment per shard against a version-pinned handle, and publishes through
+    :func:`lance_etl.indexing.commit_segments`, which drops stale segments after a concurrent rewrite. When the
+    commit would orphan fragments held by a wider existing segment that a compaction remapped, the loop re-resolves
+    the fragment set at the latest version and rebuilds instead of letting the orphan ``ValueError`` kill the actor.
+    The index's accumulated deltas are then bounded with :func:`merge_index_deltas`.
 
     Args:
         uri: Dataset URI.
@@ -400,27 +404,87 @@ def build_segment_index(uri: str, handler: IndexHandler, config: IndexJobConfig,
     if handler.skip_reason(dataset) is not None:
         return
     handler.validate(dataset)
-    targets: list[int] = handler.target_fragments(dataset)
-    if targets:
-        artifacts: object | None = handler.prepare(dataset, uri, telemetry)
-        version: int = dataset.version
+
+    def build_documents(groups: list[list[int]], version: int, artifacts: object | None) -> list[str]:
+        """Build one serialized segment per shard in process against the pinned version.
+
+        Args:
+            groups: Fragment-id shards to build.
+            version: Dataset version to pin every shard build to.
+            artifacts: Broadcast artifacts for the segment builder, if any.
+
+        Returns:
+            The serialized segments for the shards.
+        """
         documents: list[str] = []
-        for group in split_evenly(targets, config.num_shards):
+        for group in groups:
             shard: lance.LanceDataset = lance.dataset(uri, version=version, storage_options=config.storage_options)
             documents.append(serialize_segment(handler.build_segment(shard, list(group), artifacts)))
-        commit_segments(uri, documents, handler.column, handler.index_name, handler.merges(), config, telemetry)
-        handler.record_coverage(uri, lance.dataset(uri, storage_options=config.storage_options))
+        return documents
+
+    for attempt in range(config.max_stale_replans):
+        del attempt
+        current: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+        targets: list[int] = handler.target_fragments(current)
+        if not targets:
+            break
+        artifacts: object | None = handler.prepare(current, uri, telemetry)
+        groups: list[list[int]] = split_evenly(targets, shard_count(len(targets), config))
+        documents: list[str] = build_documents(groups, current.version, artifacts)
+        try:
+            committed: int = indexing_segments.commit_segments(
+                uri, documents, handler.column, handler.index_name, handler.merges(), config, telemetry
+            )
+        except ValueError as exc:
+            if not is_stale_fragment_error(exc):
+                raise
+            continue
+        if committed == len(documents):
+            break
     refreshed: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
     if handler.index_name in {description.name for description in refreshed.describe_indices()}:
         merge_index_deltas(uri, handler.index_name, config, telemetry)
+
+
+def index_tail_dataset(uri: str, config: IndexJobConfig, telemetry: Telemetry) -> None:
+    """Index one tail dataset through the unified plan-build-commit functions, fully in process.
+
+    Mirrors :meth:`LanceIndexer.run` for a single dataset without Spark: the plan phase resolves
+    targets and shards, vector artifacts resolve through the production reuse-or-train path, each
+    shard builds through :func:`lance_etl.indexing.build_one_shard`, and every index publishes
+    through :func:`lance_etl.indexing.commit_one_index`.
+
+    Args:
+        uri: Dataset URI.
+        config: Indexing configuration.
+        telemetry: Telemetry facade shared by the actors.
+    """
+    plan: dict[str, object] = plan_dataset_indexes(uri, config, telemetry)
+    if "skipped" in plan:
+        return
+    artifacts: dict[tuple[str, str], tuple] = {}
+    for spec in plan["specs"]:
+        if spec["kind"] == "vector" and spec["mode"] == "segments":
+            _, _, artifact, _, _ = resolve_vector_artifacts(uri, spec["column"], spec["index_name"], config)
+            artifacts[(uri, spec["column"])] = artifact
+    for spec in plan["specs"]:
+        base: dict[str, object] = {**spec, "uri": uri, "version": plan["version"]}
+        if not spec["shards"]:
+            build_one_shard({**base, "shard": []}, artifacts, config, telemetry)
+            continue
+        payloads: list[dict[str, object]] = []
+        for shard in spec["shards"]:
+            _, _, payload = build_one_shard({**base, "shard": list(shard)}, artifacts, config, telemetry)
+            payloads.append(payload)
+        commit_one_index(uri, spec, payloads, config, telemetry)
 
 
 def fts_first_build(uri: str, handler: FtsIndexHandler, config: IndexJobConfig, telemetry: Telemetry) -> None:
     """Build the inverted index through the production shared-uuid metadata-merge path.
 
     Each fragment is built under one shared index id against a version-pinned handle, the per-fragment metadata is
-    merged, and the index is published with :meth:`FtsIndexHandler.commit_index`, whose stale-publish guard raises
-    ``ValueError`` when a concurrent compaction rewrote covered fragments between build and commit.
+    merged, and the index is published with :func:`lance_etl.indexing.publish_fts_index`, whose stale-publish guard
+    raises ``ValueError`` when a concurrent compaction rewrote covered fragments between build and commit.
 
     Args:
         uri: Dataset URI.
@@ -450,7 +514,7 @@ def fts_first_build(uri: str, handler: FtsIndexHandler, config: IndexJobConfig, 
         )
     refreshed: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
     refreshed.merge_index_metadata(shared_uuid, index_type="INVERTED")
-    handler.commit_index(uri, refreshed, shared_uuid, fragment_ids, telemetry)
+    publish_fts_index(uri, handler.column, handler.index_name, shared_uuid, fragment_ids, config, telemetry)
 
 
 def maintain_head_indexes(
@@ -478,7 +542,10 @@ def maintain_head_indexes(
         telemetry: Telemetry facade shared by the actors.
         events: Test-side event counter recording deferred FTS builds.
     """
-    build_segment_index(uri, vector_handler, config, telemetry)
+    if vector_handler.index_name not in {description.name for description in lance.dataset(uri).describe_indices()}:
+        bootstrap_vector_index(uri, vector_handler.column, vector_handler.index_name, config, telemetry)
+    else:
+        build_segment_index(uri, vector_handler, config, telemetry)
     build_segment_index(uri, btree_handler, config, telemetry)
     dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
     existing: set[str] = {description.name for description in dataset.describe_indices()}
@@ -521,7 +588,7 @@ def run_indexer_loop(
             maintain_head_indexes(head_uri, vector_handler, btree_handler, fts_handler, config, telemetry, events)
         for uri in tail_uris:
             if open_or_none(uri) is not None:
-                index_dataset_locally(uri, config)
+                index_tail_dataset(uri, config, telemetry)
         time.sleep(INDEXER_SWEEP_PAUSE_SECONDS)
 
 
@@ -593,6 +660,15 @@ def assert_full_index_coverage(uri: str, required_names: set[str]) -> None:
         assert remaining == 0, f"{uri} index {name} leaves {remaining} fragments unindexed"
 
 
+@pytest.mark.xfail(
+    reason=(
+        "pylance 8.0.0 wheel regression: concurrent merge_insert against a dataset carrying BTREE "
+        "index deltas raises the internal error 'RowAddrTreeMap::from_sorted_iter called with "
+        "non-sorted input' (lance-index scalar/btree/flat.rs via merge_insert.rs). The failure is "
+        "loud (the merge errors, no silent corruption). Remove this marker once an upstream fix ships."
+    ),
+    strict=False,
+)
 def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Three concurrent actors converge with zero data loss, full index coverage, and a bounded fragment count.
 
@@ -629,37 +705,31 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
     ]
     tail_uris: list[str] = [dataset_uri(etl_config, *routing) for routing in tail_routings]
 
-    head_compactor: LanceCompactor = LanceCompactor(
-        CompactionConfig(
-            telemetry=telemetry_config,
-            target_rows_per_fragment=HEAD_TARGET_ROWS_PER_FRAGMENT,
-            run_cleanup=False,
-            commit_backoff_seconds=0.05,
-            large_commit_retries=2,
-            replan_budget=4,
-        )
-    )
-    tail_compaction_config: CompactionConfig = CompactionConfig(
+    head_compaction_config: MaintenanceConfig = MaintenanceConfig(
         telemetry=telemetry_config,
-        run_cleanup=False,
+        target_rows_per_fragment=HEAD_TARGET_ROWS_PER_FRAGMENT,
+        commit_backoff_seconds=0.05,
+        large_commit_retries=2,
+        replan_budget=4,
+    )
+    tail_compaction_config: MaintenanceConfig = MaintenanceConfig(
+        telemetry=telemetry_config,
         commit_retries=30,
         commit_backoff_seconds=0.05,
     )
     index_config: IndexJobConfig = IndexJobConfig(
         telemetry=telemetry_config,
-        vector_column="vector",
+        vector_columns=["vector"],
         num_partitions=8,
         vector_min_rows=1000,
         scalar_columns=["vector_id"],
         text_columns=["text"],
-        num_shards=4,
+        fragments_per_index_task=4,
         commit_retries=30,
         commit_backoff_seconds=0.05,
         max_index_deltas=4,
     )
-    vector_handler: VectorIndexHandler = VectorIndexHandler(
-        index_config, "vector", index_config.resolved_vector_index_name()
-    )
+    vector_handler: VectorIndexHandler = VectorIndexHandler(index_config, "vector", vector_index_name("vector"))
     btree_handler: BTreeIndexHandler = BTreeIndexHandler(index_config, "vector_id", scalar_index_name("vector_id"))
     fts_handler: FtsIndexHandler = FtsIndexHandler(index_config, "text", fts_index_name("text"))
 
@@ -725,7 +795,7 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
                     run_compactor_loop,
                     head_uri,
                     tail_uris,
-                    head_compactor,
+                    head_compaction_config,
                     tail_compaction_config,
                     telemetry,
                     stop,
@@ -770,7 +840,7 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
     assert not failures, f"actors died: {failures}"
 
     head_required: set[str] = {
-        index_config.resolved_vector_index_name(),
+        vector_index_name("vector"),
         scalar_index_name("vector_id"),
         fts_index_name("text"),
     }
@@ -778,22 +848,22 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
 
     maintain_head_indexes(head_uri, vector_handler, btree_handler, fts_handler, index_config, telemetry, events)
     for uri in tail_uris:
-        index_dataset_locally(uri, index_config)
+        index_tail_dataset(uri, index_config, telemetry)
     collapse_index_deltas(head_uri, head_required, index_config, telemetry)
     for uri in tail_uris:
         collapse_index_deltas(uri, tail_required, index_config, telemetry)
     final_cycles: int = 0
     while final_cycles < FINAL_COMPACT_CYCLES:
         final_cycles += 1
-        if compact_head_with_replan(head_uri, head_compactor, telemetry) == "noop":
+        if compact_head_with_replan(head_uri, head_compaction_config, telemetry) == "noop":
             break
     for uri in tail_uris:
-        compact_small_dataset(uri, tail_compaction_config, telemetry)
+        compact_dataset_inline(uri, tail_compaction_config, telemetry)
     maintain_head_indexes(head_uri, vector_handler, btree_handler, fts_handler, index_config, telemetry, events)
     for uri in tail_uris:
-        index_dataset_locally(uri, index_config)
+        index_tail_dataset(uri, index_config, telemetry)
 
-    cleanup_config: CompactionConfig = CompactionConfig(telemetry=telemetry_config)
+    cleanup_config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config)
     bytes_removed: int = 0
     for uri in [head_uri, *tail_uris]:
         bytes_removed += cleanup_dataset(uri, cleanup_config, telemetry)
@@ -853,3 +923,216 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
         f"head_rows={len(expected_head)} head_fragments={head_fragments} "
         f"tail_fragments={tail_fragment_counts}"
     )
+
+
+def deterministic_vector(identifier: int, dim: int) -> list[float]:
+    """Return a deterministic, per-id unique vector so an exact nearest query has a single zero-distance answer.
+
+    Args:
+        identifier: The integer row id seeding the vector.
+        dim: The vector dimension.
+
+    Returns:
+        A vector of ``dim`` floats in ``[0, 1)``.
+    """
+    generator: random.Random = random.Random(identifier * 2_654_435_761)
+    return [generator.random() for _ in range(dim)]
+
+
+def make_vector_table(start: int, count: int, dim: int) -> pa.Table:
+    """Build a contiguous block of id and vector rows.
+
+    Args:
+        start: First id in the block.
+        count: Number of rows.
+        dim: Vector dimension.
+
+    Returns:
+        A table with an ``id`` column and a fixed-size-list ``vector`` column.
+    """
+    ids: list[int] = list(range(start, start + count))
+    flat: pa.Array = pa.array(
+        [value for identifier in ids for value in deterministic_vector(identifier, dim)], pa.float32()
+    )
+    return pa.table({"id": pa.array(ids, pa.int64()), "vector": pa.FixedSizeListArray.from_arrays(flat, dim)})
+
+
+def write_two_fragment_dataset(uri: str) -> None:
+    """Write a dataset of exactly two fragments: a large clean one and a smaller one to be partly deleted.
+
+    Fragment 0 carries ids ``0..299`` and fragment 1 carries ids ``300..499``. Keeping fragment 0 above the
+    compaction target while fragment 1 accrues deletions lets a later compaction rewrite fragment 1 alone, which is
+    what remaps a wider existing index segment over the surviving fragment and triggers the orphan-fragment race.
+
+    Args:
+        uri: Dataset URI.
+    """
+    lance.write_dataset(make_vector_table(0, 300, DIM), uri, mode="create", max_rows_per_file=1_000_000)
+    lance.write_dataset(make_vector_table(300, 200, DIM), uri, mode="append", max_rows_per_file=1_000_000)
+
+
+def racing_compaction_commit(
+    uri: str,
+    compaction_config: MaintenanceConfig,
+    telemetry: Telemetry,
+    state: dict[str, bool],
+) -> Callable[..., int]:
+    """Build a ``commit_segments`` replacement that compacts once before the first commit, then records orphans.
+
+    The first segment commit runs a compaction that rewrites the smaller fragment and remaps the wider existing
+    segment over the surviving one, exactly the window the production code must survive. The real commit is then
+    invoked. An orphan-fragment ``ValueError`` is recorded and re-raised so the production rebuild loop in
+    :func:`build_and_commit_segments` re-resolves the fragment set and re-commits.
+
+    Args:
+        uri: Dataset URI.
+        compaction_config: Configuration for the racing compaction.
+        telemetry: Telemetry facade.
+        state: Mutable flags recording whether the compaction ran and whether an orphan error was raised.
+
+    Returns:
+        A drop-in replacement for :func:`lance_etl.indexing.commit_segments`.
+    """
+    real_commit: Callable[..., int] = indexing_segments.commit_segments
+
+    def commit(*args: object, **kwargs: object) -> int:
+        """Compact once, then commit, recording any orphan-fragment error.
+
+        Args:
+            args: Positional arguments forwarded to the real commit.
+            kwargs: Keyword arguments forwarded to the real commit.
+
+        Returns:
+            The number of segments committed by the real commit.
+        """
+        if not state["compacted"]:
+            state["compacted"] = True
+            compact_dataset_inline(uri, compaction_config, telemetry)
+        try:
+            return real_commit(*args, **kwargs)
+        except ValueError as exc:
+            if is_stale_fragment_error(exc):
+                state["orphan"] = True
+            raise
+
+    return commit
+
+
+def test_vector_segment_commit_survives_compaction_orphan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A compaction that remaps a wider IVF_RQ segment over a freshly built shard must not kill the indexer.
+
+    Reproduces the orphan-fragment race deterministically: an existing merged vector segment covers both fragments,
+    a rebuild pass builds one shard segment per fragment, and a hooked compaction rewrites the smaller fragment and
+    remaps the wider segment over the survivor between the build and the commit. Publishing the surviving shard then
+    raises lance's ``"would orphan fragments"`` ``ValueError`` (``rust/lance/src/index.rs:1233``). The fix re-resolves
+    the fragment set at the latest version, rebuilds, and re-commits, so every live fragment ends up covered and a
+    vector query stays exact.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory hosting the dataset.
+        monkeypatch: Pytest monkeypatch used to interleave the compaction with the commit.
+    """
+    uri: str = str(tmp_path / "orphan_vector")
+    write_two_fragment_dataset(uri)
+    telemetry_config: TelemetryConfig = TelemetryConfig(service="orphan-vector-test", env="test")
+    telemetry: Telemetry = Telemetry.create(telemetry_config, attach_lance_bridge=False)
+    shared: dict[str, Any] = {
+        "telemetry": telemetry_config,
+        "vector_columns": ["vector"],
+        "num_partitions": 4,
+        "vector_min_rows": 10,
+        "fragments_per_index_task": 1,
+        "commit_retries": 10,
+        "commit_backoff_seconds": 0.0,
+    }
+    build_config: IndexJobConfig = IndexJobConfig(**shared)
+    index_name: str = vector_index_name("vector")
+    bootstrap_vector_index(uri, "vector", index_name, build_config, telemetry)
+    assert unindexed_fragment_count(lance.dataset(uri), index_name) == 0
+
+    lance.dataset(uri).delete("id >= 300 and id < 450")
+    rebuild_config: IndexJobConfig = IndexJobConfig(rebuild=True, **shared)
+    compaction_config: MaintenanceConfig = MaintenanceConfig(
+        telemetry=telemetry_config,
+        target_rows_per_fragment=250,
+        commit_retries=10,
+        commit_backoff_seconds=0.0,
+    )
+    state: dict[str, bool] = {"compacted": False, "orphan": False}
+    monkeypatch.setattr(
+        indexing_segments, "commit_segments", racing_compaction_commit(uri, compaction_config, telemetry, state)
+    )
+    build_segment_index(uri, VectorIndexHandler(rebuild_config, "vector", index_name), rebuild_config, telemetry)
+    monkeypatch.undo()
+
+    assert state["compacted"], "the racing compaction never ran"
+    assert state["orphan"], "the concurrent compaction did not trigger the orphan-fragment race"
+    final: lance.LanceDataset = lance.dataset(uri)
+    assert unindexed_fragment_count(final, index_name) == 0, "the vector index left fragments uncovered"
+    probe: int = 100
+    nearest: pa.Table = final.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": deterministic_vector(probe, DIM), "k": 1, "nprobes": 4, "refine_factor": 50},
+    )
+    assert nearest["id"][0].as_py() == probe, "vector query missed the exact-match id after the orphan rebuild"
+    remaining: set[int] = set(final.to_table(columns=["id"]).column("id").to_pylist())
+    assert remaining == set(range(0, 300)) | set(range(450, 500)), "row content diverged after the orphan rebuild"
+
+
+def test_scalar_segment_commit_survives_compaction_orphan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A compaction that remaps a wider BTREE segment over a freshly built shard must not kill the indexer.
+
+    The scalar segment path shares the same rebuild loop as the vector path, so the orphan-fragment guard is proven
+    here too: a wide single-segment BTREE covers both fragments, a sharded rebuild builds one segment per fragment,
+    and a hooked compaction rewrites the smaller fragment and remaps the wider segment over the survivor. The
+    surviving shard would orphan the rewritten fragment, so the commit raises and the loop re-resolves and rebuilds.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory hosting the dataset.
+        monkeypatch: Pytest monkeypatch used to interleave the compaction with the commit.
+    """
+    uri: str = str(tmp_path / "orphan_btree")
+    write_two_fragment_dataset(uri)
+    telemetry_config: TelemetryConfig = TelemetryConfig(service="orphan-scalar-test", env="test")
+    telemetry: Telemetry = Telemetry.create(telemetry_config, attach_lance_bridge=False)
+    index_name: str = scalar_index_name("id")
+    wide_config: IndexJobConfig = IndexJobConfig(
+        telemetry=telemetry_config,
+        scalar_columns=["id"],
+        fragments_per_index_task=10_000,
+        commit_retries=10,
+        commit_backoff_seconds=0.0,
+    )
+    build_segment_index(uri, BTreeIndexHandler(wide_config, "id", index_name), wide_config, telemetry)
+    assert unindexed_fragment_count(lance.dataset(uri), index_name) == 0
+
+    lance.dataset(uri).delete("id >= 300 and id < 450")
+    rebuild_config: IndexJobConfig = IndexJobConfig(
+        telemetry=telemetry_config,
+        scalar_columns=["id"],
+        fragments_per_index_task=1,
+        rebuild=True,
+        commit_retries=10,
+        commit_backoff_seconds=0.0,
+    )
+    compaction_config: MaintenanceConfig = MaintenanceConfig(
+        telemetry=telemetry_config,
+        target_rows_per_fragment=250,
+        commit_retries=10,
+        commit_backoff_seconds=0.0,
+    )
+    state: dict[str, bool] = {"compacted": False, "orphan": False}
+    monkeypatch.setattr(
+        indexing_segments, "commit_segments", racing_compaction_commit(uri, compaction_config, telemetry, state)
+    )
+    build_segment_index(uri, BTreeIndexHandler(rebuild_config, "id", index_name), rebuild_config, telemetry)
+    monkeypatch.undo()
+
+    assert state["compacted"], "the racing compaction never ran"
+    assert state["orphan"], "the concurrent compaction did not trigger the orphan-fragment race"
+    final: lance.LanceDataset = lance.dataset(uri)
+    assert unindexed_fragment_count(final, index_name) == 0, "the scalar index left fragments uncovered"
+    hits: pa.Table = final.to_table(filter="id = 100")
+    assert hits.num_rows == 1, "scalar query did not return exactly one row after the orphan rebuild"
+    remaining: set[int] = set(final.to_table(columns=["id"]).column("id").to_pylist())
+    assert remaining == set(range(0, 300)) | set(range(450, 500)), "row content diverged after the orphan rebuild"

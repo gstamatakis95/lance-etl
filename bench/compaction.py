@@ -1,7 +1,7 @@
-"""Compact the benchmark datasets with the project's real ``LanceCompactor``.
+"""Compact the benchmark datasets with the project's real ``MaintenanceJob``.
 
 Records total wall time plus the fragment count of every dataset before and after the run. The fine-grained
-plan/execute/commit stage timings are emitted by ``lance_etl.compaction`` itself as Datadog distributions
+plan/execute/commit stage timings are emitted by ``lance_etl.maintenance`` itself as Datadog distributions
 (``dataset.rewrite_ms``, ``dataset.commit_ms``). This phase records the end-to-end wall time and the per-dataset
 metrics dictionary the compactor returns (fragments removed/added, files removed/added, bytes reclaimed).
 
@@ -22,7 +22,7 @@ import lance
 from bench.config import BenchConfig
 from bench.results import save_phase
 from bench.spark_session import bench_telemetry_config, build_spark
-from lance_etl.compaction import CompactionConfig, LanceCompactor
+from lance_etl.maintenance import MaintenanceConfig, MaintenanceJob
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ def run_compact(config: BenchConfig) -> dict[str, Any]:
     """
     uris: list[str] = config.dataset_uris()
     before: dict[str, int] = fragment_counts(uris)
-    compaction_config = CompactionConfig(
+    compaction_config = MaintenanceConfig(
         telemetry=bench_telemetry_config(),
         target_rows_per_fragment=config.compact_target_rows,
         defer_index_remap=False,
@@ -58,7 +58,7 @@ def run_compact(config: BenchConfig) -> dict[str, Any]:
     spark = build_spark(config, "bench-compact")
     try:
         started: float = time.perf_counter()
-        stats: list[dict[str, Any]] = LanceCompactor(compaction_config).run(spark, uris)
+        stats: list[dict[str, Any]] = MaintenanceJob(compaction_config).run(spark, uris)
         elapsed: float = time.perf_counter() - started
     finally:
         spark.stop()

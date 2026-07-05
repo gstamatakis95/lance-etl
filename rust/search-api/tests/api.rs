@@ -1,5 +1,5 @@
-//! Integration tests: builds tiny Lance datasets in a tempdir (single and date-partitioned),
-//! creates INVERTED and IVF vector indexes, serves the gRPC API on a local TCP port, and
+//! Integration tests: builds tiny Lance datasets in a tempdir, creates INVERTED and IVF vector
+//! indexes, serves the gRPC API on a local TCP port, and
 //! exercises every RPC plus the standard health service with a tonic client.
 
 use std::sync::Arc;
@@ -7,7 +7,9 @@ use std::sync::Arc;
 use arrow_array::types::Float32Type;
 use arrow_array::{FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use async_trait::async_trait;
 use lance::Dataset;
+use lance::dataset::{WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
 use lance_index::IndexType;
@@ -15,16 +17,18 @@ use lance_index::scalar::InvertedIndexParams;
 use lance_linalg::distance::DistanceType as LanceDistanceType;
 use prost_types::value::Kind;
 use search_api::config::Config;
+use search_api::domain::{FusedHit, RerankRequest, Reranker, SearchError};
 use search_api::grpc::SearchGrpc;
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
 use search_api::pb::search_service_client::SearchServiceClient;
 use search_api::pb::search_service_server::SearchServiceServer;
 use search_api::pb::{
-    BooleanQuery, ClustersRequest, CompareOp, Comparison, DatasetTarget, DateRange, DistanceType, Filter, FtsQuery,
-    Fusion, HybridSearchRequest, InList, LiteralValue, MatchQuery, PhraseQuery, PrewarmRequest, RrfFusion, TextQuery,
-    TextSearchRequest, VectorQuery, VectorSearchRequest, filter, fts_query, fusion, literal_value, text_query,
+    BooleanQuery, ClustersRequest, CompareOp, Comparison, DatasetTarget, DistanceType, Filter, FtsQuery, Fusion,
+    HybridSearchRequest, IdentityRerank, InList, LiteralValue, MatchQuery, PhraseQuery, PrewarmRequest, Rerank,
+    RrfFusion, TextQuery, TextSearchRequest, VectorQuery, VectorSearchRequest, WeightedFusion, filter, fts_query,
+    fusion, literal_value, rerank, text_query,
 };
-use search_api::telemetry::{self, Metrics, RecallCapture, RecallRecord};
+use search_api::telemetry::{self, Metrics, RecallCapture, RecallQueryType, RecallRecord};
 use tempfile::TempDir;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Code;
@@ -40,24 +44,12 @@ const DIM: i32 = 4;
 /// Backend type wired by the tests: Lance over the caching provider.
 type Backend = LanceSearchBackend<CachingDatasetProvider>;
 
-/// Builds the proto target for `{org}/tenant1/ns1` without a date range.
+/// Builds the proto target for `{org}/tenant1/ns1`.
 fn target(org: &str) -> Option<DatasetTarget> {
     Some(DatasetTarget {
         org_id: org.to_string(),
         tenant_id: "tenant1".to_string(),
         namespace: "ns1".to_string(),
-        date_range: None,
-    })
-}
-
-/// Builds the proto target for `{org}/tenant1/ns1` with an inclusive date range.
-fn dated_target(org: &str, start: &str, end: &str) -> Option<DatasetTarget> {
-    Some(DatasetTarget {
-        date_range: Some(DateRange {
-            start_date: start.to_string(),
-            end_date: end.to_string(),
-        }),
-        ..target(org).unwrap()
     })
 }
 
@@ -128,34 +120,6 @@ async fn build_test_dataset(uri: &str) {
         .unwrap();
 }
 
-/// Writes three day-partitioned datasets under `{root}/org1/tenant1/ns1/` where `vector_id = 1`
-/// recurs on every day with a different vector: an exact match for `[1,0,0,0]` on 2026-06-02 and
-/// progressively worse copies on the other days.
-async fn build_dated_datasets(root: &std::path::Path) {
-    let base = root.join("org1/tenant1/ns1");
-    write_rows(
-        &format!("{}/2026-06-01.lance", base.display()),
-        &[
-            (10, 1, "day one copy", [0.0, 1.0, 0.0, 0.0]),
-            (11, 2, "day one other", [0.0, 0.0, 1.0, 0.0]),
-        ],
-    )
-    .await;
-    write_rows(
-        &format!("{}/2026-06-02.lance", base.display()),
-        &[
-            (20, 1, "day two copy", [1.0, 0.0, 0.0, 0.0]),
-            (21, 3, "day two other", [0.0, 0.0, 0.0, 1.0]),
-        ],
-    )
-    .await;
-    write_rows(
-        &format!("{}/2026-06-03.lance", base.display()),
-        &[(30, 1, "day three copy", [0.5, 0.5, 0.0, 0.0])],
-    )
-    .await;
-}
-
 /// Serves the gRPC API on an ephemeral local port and returns a connected channel.
 ///
 /// The server stack mirrors production: telemetry is initialized in disabled (log-only) mode and
@@ -167,12 +131,18 @@ async fn serve(tmp: &TempDir) -> Channel {
 
 /// Like [`serve`] but emitting per-RPC metrics through the given facade.
 async fn serve_with_metrics(tmp: &TempDir, metrics: Arc<Metrics>) -> Channel {
-    serve_full(tmp, metrics, None).await
+    serve_full(tmp, metrics, None, None).await
 }
 
-/// Like [`serve_with_metrics`] but optionally enabling sampled-query recall capture.
-async fn serve_full(tmp: &TempDir, metrics: Arc<Metrics>, recall: Option<RecallCapture>) -> Channel {
-    drop(telemetry::init_tracing(true));
+/// Like [`serve_with_metrics`] but optionally enabling sampled-query recall capture and a custom
+/// post-fusion reranker.
+async fn serve_full(
+    tmp: &TempDir,
+    metrics: Arc<Metrics>,
+    recall: Option<RecallCapture>,
+    reranker: Option<Arc<dyn Reranker>>,
+) -> Channel {
+    drop(telemetry::init_tracing(true, metrics.clone()));
     let config = Config {
         base_uri: tmp.path().display().to_string(),
         dataset_cache_capacity: 16,
@@ -182,27 +152,36 @@ async fn serve_full(tmp: &TempDir, metrics: Arc<Metrics>, recall: Option<RecallC
         cache_dir: tmp.path().join("disk-cache"),
         disk_index_cache_bytes: 64 * 1024 * 1024,
         disk_store_cache_bytes: 64 * 1024 * 1024,
-        disk_cache_ttl_secs: 3600,
-        store_cache_max_range_bytes: 4 * 1024 * 1024,
-        disk_cache_sweep_secs: 300,
-        disk_cache_disabled: false,
+        cache_backend: search_api::config::CacheBackendKind::Disk,
+        redis_url: None,
+        redis_namespace: search_api::config::DEFAULT_REDIS_NAMESPACE.to_string(),
         prewarm_concurrency: 4,
-        fanout_concurrency: 4,
-        id_column: "vector_id".to_string(),
         statsd_addr: "127.0.0.1:8125".to_string(),
         telemetry_disabled: true,
         recall_sample_rate: 0.0,
+        io_concurrency: search_api::config::DEFAULT_IO_CONCURRENCY,
+        serve_by_tag: search_api::config::DEFAULT_SERVE_BY_TAG,
+        serve_tag: search_api::config::DEFAULT_SERVE_TAG.to_string(),
+        serve_tag_ttl_secs: search_api::config::DEFAULT_SERVE_TAG_TTL_SECS,
+        event_timestamp_column: search_api::config::DEFAULT_EVENT_TIMESTAMP_COLUMN.to_string(),
+        default_minimum_nprobes: search_api::config::DEFAULT_MINIMUM_NPROBES,
+        default_maximum_nprobes: search_api::config::DEFAULT_MAXIMUM_NPROBES,
+        nprobes_ceiling: search_api::config::DEFAULT_NPROBES_CEILING,
+        default_refine_factor: search_api::config::DEFAULT_REFINE_FACTOR,
+        fast_search_default: search_api::config::DEFAULT_FAST_SEARCH,
+        request_timeout_ms: search_api::config::DEFAULT_REQUEST_TIMEOUT_MS,
+        max_concurrent_streams: search_api::config::DEFAULT_MAX_CONCURRENT_STREAMS,
+        concurrency_limit_per_connection: search_api::config::DEFAULT_CONCURRENCY_LIMIT_PER_CONNECTION,
+        prewarm_targets_path: None,
     };
-    let provider = CachingDatasetProvider::with_telemetry(&config, metrics.clone());
-    let backend = Arc::new(
-        LanceSearchBackend::new(provider)
-            .with_fanout_concurrency(config.fanout_concurrency)
-            .with_id_column(config.id_column.clone())
-            .with_metrics(metrics.clone()),
-    );
+    let provider = CachingDatasetProvider::with_telemetry(&config, metrics.clone()).await;
+    let backend = Arc::new(LanceSearchBackend::new(provider).with_metrics(metrics.clone()));
     let mut service = SearchGrpc::with_metrics(backend, metrics);
     if let Some(recall) = recall {
         service = service.with_recall(recall);
+    }
+    if let Some(reranker) = reranker {
+        service = service.with_reranker(reranker);
     }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -297,6 +276,9 @@ async fn search_rpcs_return_sensible_results() {
 
     let response = client
         .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 2)),
         })
@@ -309,6 +291,9 @@ async fn search_rpcs_return_sensible_results() {
 
     let response = client
         .text_search(TextSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(simple_text_query("lemon", 3)),
         })
@@ -321,11 +306,16 @@ async fn search_rpcs_return_sensible_results() {
 
     let response = client
         .hybrid_search(HybridSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: target("org1"),
             vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
             text: Some(simple_text_query("pear", 0)),
             k: 2,
             fusion: None,
+            filter: None,
+            filter_mode: 0,
         })
         .await
         .unwrap()
@@ -350,6 +340,9 @@ async fn typed_filters_replace_sql_strings() {
     query.filter = Some(compare_filter("id", CompareOp::Gt, 2));
     let response = client
         .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(query),
         })
@@ -376,6 +369,9 @@ async fn typed_filters_replace_sql_strings() {
     });
     let response = client
         .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(query),
         })
@@ -390,6 +386,9 @@ async fn typed_filters_replace_sql_strings() {
     query.filter = Some(compare_filter("id; DROP TABLE users", CompareOp::Gt, 0));
     let status = client
         .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(query),
         })
@@ -412,6 +411,9 @@ async fn vector_knobs_distance_type_row_id_and_offset() {
     query.projection = vec!["id".to_string()];
     let response = client
         .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(query),
         })
@@ -430,6 +432,9 @@ async fn vector_knobs_distance_type_row_id_and_offset() {
     query.offset = Some(1);
     let response = client
         .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(query),
         })
@@ -460,6 +465,9 @@ async fn fts_phrase_and_boolean_queries() {
     };
     let response = client
         .text_search(TextSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(phrase),
         })
@@ -497,6 +505,9 @@ async fn fts_phrase_and_boolean_queries() {
     };
     let response = client
         .text_search(TextSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(boolean),
         })
@@ -517,6 +528,9 @@ async fn hybrid_fusion_config_is_applied() {
 
     let response = client
         .hybrid_search(HybridSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: target("org1"),
             vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
             text: Some(simple_text_query("pear", 0)),
@@ -524,6 +538,8 @@ async fn hybrid_fusion_config_is_applied() {
             fusion: Some(Fusion {
                 strategy: Some(fusion::Strategy::Rrf(RrfFusion { rrf_k: Some(1.0) })),
             }),
+            filter: None,
+            filter_mode: 0,
         })
         .await
         .unwrap()
@@ -534,6 +550,9 @@ async fn hybrid_fusion_config_is_applied() {
 
     let status = client
         .hybrid_search(HybridSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: target("org1"),
             vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
             text: Some(simple_text_query("pear", 0)),
@@ -541,117 +560,12 @@ async fn hybrid_fusion_config_is_applied() {
             fusion: Some(Fusion {
                 strategy: Some(fusion::Strategy::Rrf(RrfFusion { rrf_k: Some(-3.0) })),
             }),
+            filter: None,
+            filter_mode: 0,
         })
         .await
         .unwrap_err();
     assert_eq!(status.code(), Code::InvalidArgument);
-}
-
-#[tokio::test]
-async fn date_range_fanout_dedups_by_best_score_and_skips_missing_days() {
-    let tmp = TempDir::new().unwrap();
-    build_dated_datasets(tmp.path()).await;
-    let channel = serve(&tmp).await;
-    let mut client = SearchServiceClient::new(channel);
-
-    let response = client
-        .vector_search(VectorSearchRequest {
-            target: dated_target("org1", "2026-06-01", "2026-06-04"),
-            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 3)),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    let vids: Vec<f64> = response
-        .results
-        .iter()
-        .map(|hit| row_number(&hit.row, "vector_id"))
-        .collect();
-    assert_eq!(
-        vids.iter().filter(|vid| **vid == 1.0).count(),
-        1,
-        "duplicate vector_id must be deduplicated: {vids:?}"
-    );
-    assert_eq!(row_number(&response.results[0].row, "vector_id"), 1.0);
-    assert_eq!(
-        row_number(&response.results[0].row, "id"),
-        20.0,
-        "dedup must keep the best (minimum-distance) copy, which lives on 2026-06-02"
-    );
-    assert!(response.results[0].distance.abs() < 1e-6);
-    assert!(
-        response
-            .results
-            .windows(2)
-            .all(|pair| pair[0].distance <= pair[1].distance + 1e-6),
-        "merged results must stay ordered nearest-first"
-    );
-}
-
-#[tokio::test]
-async fn date_range_fanout_respects_explicit_projection_without_leaking_the_id_column() {
-    let tmp = TempDir::new().unwrap();
-    build_dated_datasets(tmp.path()).await;
-    let channel = serve(&tmp).await;
-    let mut client = SearchServiceClient::new(channel);
-
-    let mut query = vector_query(vec![1.0, 0.0, 0.0, 0.0], 3);
-    query.projection = vec!["id".to_string()];
-    let response = client
-        .vector_search(VectorSearchRequest {
-            target: dated_target("org1", "2026-06-01", "2026-06-03"),
-            query: Some(query),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(
-        row_number(&response.results[0].row, "id"),
-        20.0,
-        "dedup must work even when the projection omits the id column"
-    );
-    for hit in &response.results {
-        let row = hit.row.as_ref().unwrap();
-        assert!(
-            !row.fields.contains_key("vector_id"),
-            "the internally projected id column must be stripped from responses"
-        );
-    }
-}
-
-#[tokio::test]
-async fn date_range_with_zero_existing_datasets_is_not_found() {
-    let tmp = TempDir::new().unwrap();
-    build_dated_datasets(tmp.path()).await;
-    let channel = serve(&tmp).await;
-    let mut client = SearchServiceClient::new(channel);
-
-    let status = client
-        .vector_search(VectorSearchRequest {
-            target: dated_target("org1", "2026-07-01", "2026-07-03"),
-            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 2)),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(status.code(), Code::NotFound);
-
-    let status = client
-        .vector_search(VectorSearchRequest {
-            target: dated_target("org1", "2026-06-03", "2026-06-01"),
-            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 2)),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(status.code(), Code::InvalidArgument, "inverted ranges are rejected");
-
-    let status = client
-        .vector_search(VectorSearchRequest {
-            target: dated_target("org1", "2026-06-XX", "2026-06-03"),
-            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 2)),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(status.code(), Code::InvalidArgument, "malformed dates are rejected");
 }
 
 #[tokio::test]
@@ -668,6 +582,7 @@ async fn prewarm_rpc_warms_metadata_and_indexes() {
             all_indexes: true,
             index_names: vec![],
             fts_with_position: true,
+            version_ref: None,
         })
         .await
         .unwrap()
@@ -679,6 +594,9 @@ async fn prewarm_rpc_warms_metadata_and_indexes() {
 
     let response = client
         .text_search(TextSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(simple_text_query("lemon", 3)),
         })
@@ -702,6 +620,7 @@ async fn prewarm_rpc_reports_per_index_errors_and_status_codes() {
             all_indexes: false,
             index_names: vec!["text_idx".into(), "no_such_index".into()],
             fts_with_position: false,
+            version_ref: None,
         })
         .await
         .unwrap()
@@ -719,6 +638,7 @@ async fn prewarm_rpc_reports_per_index_errors_and_status_codes() {
             all_indexes: false,
             index_names: vec![],
             fts_with_position: false,
+            version_ref: None,
         })
         .await
         .unwrap_err();
@@ -731,26 +651,11 @@ async fn prewarm_rpc_reports_per_index_errors_and_status_codes() {
             all_indexes: false,
             index_names: vec![],
             fts_with_position: false,
+            version_ref: None,
         })
         .await
         .unwrap_err();
     assert_eq!(status.code(), Code::InvalidArgument);
-
-    let status = client
-        .prewarm(PrewarmRequest {
-            target: dated_target("org1", "2026-06-01", "2026-06-03"),
-            metadata: true,
-            all_indexes: false,
-            index_names: vec![],
-            fts_with_position: false,
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(
-        status.code(),
-        Code::InvalidArgument,
-        "prewarm must reject multi-day ranges"
-    );
 }
 
 #[tokio::test]
@@ -850,19 +755,6 @@ async fn clusters_rpc_not_found_and_invalid_cases() {
 
     let status = client
         .clusters(ClustersRequest {
-            target: dated_target("org1", "2026-06-01", "2026-06-03"),
-            index_name: None,
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(
-        status.code(),
-        Code::InvalidArgument,
-        "clusters must reject multi-day ranges"
-    );
-
-    let status = client
-        .clusters(ClustersRequest {
             target: target("org1"),
             index_name: Some("text_idx".to_string()),
         })
@@ -883,6 +775,9 @@ async fn missing_dataset_and_bad_target_return_proper_status_codes() {
 
     let status = client
         .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: target("absent"),
             query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 1)),
         })
@@ -893,6 +788,9 @@ async fn missing_dataset_and_bad_target_return_proper_status_codes() {
 
     let status = client
         .text_search(TextSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: target("../escape"),
             query: Some(simple_text_query("x", 1)),
         })
@@ -903,6 +801,9 @@ async fn missing_dataset_and_bad_target_return_proper_status_codes() {
 
     let status = client
         .text_search(TextSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: None,
             query: Some(simple_text_query("x", 1)),
         })
@@ -913,10 +814,9 @@ async fn missing_dataset_and_bad_target_return_proper_status_codes() {
 }
 
 #[tokio::test]
-async fn recall_capture_samples_vector_searches_and_skips_text_hybrid_and_fanout() {
+async fn recall_capture_samples_vector_searches() {
     let tmp = TempDir::new().unwrap();
     build_test_dataset(&org1_uri(&tmp)).await;
-    build_dated_datasets(tmp.path()).await;
     let (receiver, sink) = cadence::SpyMetricSink::new();
     let metrics = Arc::new(Metrics::from_sink(sink));
     let captured: Arc<std::sync::Mutex<Vec<RecallRecord>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -924,13 +824,16 @@ async fn recall_capture_samples_vector_searches_and_skips_text_hybrid_and_fanout
     let recall = RecallCapture::new(1.0, "vector_id", metrics.clone()).with_hook(Arc::new(move |record| {
         records_sink.lock().unwrap().push(record.clone());
     }));
-    let channel = serve_full(&tmp, metrics, Some(recall)).await;
+    let channel = serve_full(&tmp, metrics, Some(recall), None).await;
     let mut client = SearchServiceClient::new(channel);
 
     let mut query = vector_query(vec![1.0, 0.0, 0.0, 0.0], 2);
     query.filter = Some(compare_filter("id", CompareOp::Ge, 1));
     let response = client
         .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(query),
         })
@@ -943,6 +846,7 @@ async fn recall_capture_samples_vector_searches_and_skips_text_hybrid_and_fanout
         let records = captured.lock().unwrap();
         assert_eq!(records.len(), 1, "rate 1.0 must sample every eligible request");
         let record = &records[0];
+        assert_eq!(record.query_type, RecallQueryType::Vector);
         assert_eq!(record.org_id, "org1");
         assert_eq!(record.tenant_id, "tenant1");
         assert_eq!(record.namespace, "ns1");
@@ -953,7 +857,12 @@ async fn recall_capture_samples_vector_searches_and_skips_text_hybrid_and_fanout
             record.dataset_version.is_some(),
             "the served dataset version must be captured"
         );
-        assert_eq!(record.query_vector_json, "[1.0,0.0,0.0,0.0]");
+        assert_eq!(record.query_vector_json.as_deref(), Some("[1.0,0.0,0.0,0.0]"));
+        assert_eq!(record.text_query_json, None, "vector samples carry no text query");
+        assert_eq!(
+            record.result_scores_json, None,
+            "vector samples carry distances, not scores"
+        );
         assert_eq!(
             record.filter_json.as_deref(),
             Some(r#"{"compare":{"column":"id","op":"ge","value":{"int":1}}}"#)
@@ -961,43 +870,16 @@ async fn recall_capture_samples_vector_searches_and_skips_text_hybrid_and_fanout
         let ids: Vec<serde_json::Value> = serde_json::from_str(&record.result_ids_json).unwrap();
         assert_eq!(ids.len(), 2, "one id per served hit, in rank order");
         assert_eq!(ids[0], serde_json::json!(1), "rank 1 must be the exact match");
-        let distances: Vec<f64> = serde_json::from_str(&record.result_distances_json).unwrap();
+        let distances: Vec<f64> = serde_json::from_str(record.result_distances_json.as_deref().unwrap()).unwrap();
         assert_eq!(distances.len(), 2);
         assert!(distances[0] <= distances[1]);
     }
 
-    client
-        .text_search(TextSearchRequest {
-            target: target("org1"),
-            query: Some(simple_text_query("lemon", 3)),
-        })
-        .await
-        .unwrap();
-    client
-        .hybrid_search(HybridSearchRequest {
-            target: target("org1"),
-            vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
-            text: Some(simple_text_query("pear", 0)),
-            k: 2,
-            fusion: None,
-        })
-        .await
-        .unwrap();
-    client
-        .vector_search(VectorSearchRequest {
-            target: dated_target("org1", "2026-06-01", "2026-06-03"),
-            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 3)),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        captured.lock().unwrap().len(),
-        1,
-        "text, hybrid, and date-range fan-out requests must never be sampled"
-    );
-
     let response = client
         .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 1)),
         })
@@ -1020,26 +902,134 @@ async fn recall_capture_samples_vector_searches_and_skips_text_hybrid_and_fanout
     assert!(
         lines
             .iter()
-            .any(|line| line.starts_with("search_api.recall.samples:1|c") && line.contains("filtered:true")),
+            .any(|line| line.starts_with("search_api.recall.samples:1|c")
+                && line.contains("query_type:vector")
+                && line.contains("filtered:true")),
         "missing filtered recall sample count: {lines:?}"
     );
     assert!(
         lines
             .iter()
-            .any(|line| line.starts_with("search_api.recall.samples:1|c") && line.contains("filtered:false")),
+            .any(|line| line.starts_with("search_api.recall.samples:1|c")
+                && line.contains("query_type:vector")
+                && line.contains("filtered:false")),
         "missing unfiltered recall sample count: {lines:?}"
     );
     assert_eq!(
         lines.iter().filter(|line| line.contains("recall.samples")).count(),
         2,
-        "exactly the two eligible requests must be counted: {lines:?}"
+        "exactly the two eligible vector requests must be counted: {lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn recall_capture_samples_text_and_hybrid_with_new_attributes() {
+    let tmp = TempDir::new().unwrap();
+    build_test_dataset(&org1_uri(&tmp)).await;
+    let (receiver, sink) = cadence::SpyMetricSink::new();
+    let metrics = Arc::new(Metrics::from_sink(sink));
+    let captured: Arc<std::sync::Mutex<Vec<RecallRecord>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let records_sink = captured.clone();
+    let recall = RecallCapture::new(1.0, "vector_id", metrics.clone()).with_hook(Arc::new(move |record| {
+        records_sink.lock().unwrap().push(record.clone());
+    }));
+    let channel = serve_full(&tmp, metrics, Some(recall), None).await;
+    let mut client = SearchServiceClient::new(channel);
+
+    client
+        .text_search(TextSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
+            target: target("org1"),
+            query: Some(simple_text_query("lemon", 3)),
+        })
+        .await
+        .unwrap();
+    client
+        .hybrid_search(HybridSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
+            target: target("org1"),
+            vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
+            text: Some(simple_text_query("pear", 0)),
+            k: 2,
+            fusion: Some(Fusion {
+                strategy: Some(fusion::Strategy::Weighted(search_api::pb::WeightedFusion {
+                    vector_weight: Some(0.7),
+                })),
+            }),
+            filter: None,
+            filter_mode: 0,
+        })
+        .await
+        .unwrap();
+
+    let records = captured.lock().unwrap();
+    assert_eq!(
+        records.len(),
+        2,
+        "rate 1.0 must sample both the text and hybrid requests"
+    );
+
+    let text = &records[0];
+    assert_eq!(text.query_type, RecallQueryType::Text);
+    assert!(
+        text.dataset_version.is_some(),
+        "text samples must capture the served version"
+    );
+    assert_eq!(text.query_vector_json, None, "text samples carry no query vector");
+    assert_eq!(text.fusion_json, None, "text samples carry no fusion");
+    let text_query: serde_json::Value = serde_json::from_str(text.text_query_json.as_deref().unwrap()).unwrap();
+    assert_eq!(text_query["match"]["terms"], serde_json::json!("lemon"));
+    let text_columns: Vec<String> = serde_json::from_str(text.text_columns_json.as_deref().unwrap()).unwrap();
+    assert_eq!(text_columns, vec!["text".to_string()]);
+    let ids: Vec<serde_json::Value> = serde_json::from_str(&text.result_ids_json).unwrap();
+    assert_eq!(ids, vec![serde_json::json!(4)], "lemon matches only row 4");
+    let scores: Vec<f64> = serde_json::from_str(text.result_scores_json.as_deref().unwrap()).unwrap();
+    assert_eq!(scores.len(), 1);
+    assert!(scores[0] > 0.0, "text relevance score must be positive");
+    assert_eq!(
+        text.result_distances_json, None,
+        "text samples carry scores, not distances"
+    );
+
+    let hybrid = &records[1];
+    assert_eq!(hybrid.query_type, RecallQueryType::Hybrid);
+    assert!(hybrid.dataset_version.is_some());
+    assert_eq!(hybrid.query_vector_json.as_deref(), Some("[0.0,1.0,0.0,0.0]"));
+    let hybrid_query: serde_json::Value = serde_json::from_str(hybrid.text_query_json.as_deref().unwrap()).unwrap();
+    assert_eq!(hybrid_query["match"]["terms"], serde_json::json!("pear"));
+    assert_eq!(
+        hybrid.fusion_json.as_deref(),
+        Some(r#"{"weighted":{"vector_weight":0.7}}"#)
+    );
+    let hybrid_scores: Vec<f64> = serde_json::from_str(hybrid.result_scores_json.as_deref().unwrap()).unwrap();
+    assert!(!hybrid_scores.is_empty(), "hybrid samples must record fused scores");
+    assert_eq!(hybrid.result_distances_json, None);
+
+    let mut lines = Vec::new();
+    while let Ok(packet) = receiver.try_recv() {
+        lines.push(String::from_utf8(packet).unwrap());
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("search_api.recall.samples:1|c") && line.contains("query_type:text")),
+        "missing text recall sample count: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("search_api.recall.samples:1|c") && line.contains("query_type:hybrid")),
+        "missing hybrid recall sample count: {lines:?}"
     );
 }
 
 #[tokio::test]
 async fn instrumented_server_emits_rpc_metrics_and_passes_requests_through() {
     let tmp = TempDir::new().unwrap();
-    build_dated_datasets(tmp.path()).await;
     build_test_dataset(&org1_uri(&tmp)).await;
     let (receiver, sink) = cadence::SpyMetricSink::new();
     let channel = serve_with_metrics(&tmp, Arc::new(Metrics::from_sink(sink))).await;
@@ -1047,6 +1037,9 @@ async fn instrumented_server_emits_rpc_metrics_and_passes_requests_through() {
 
     let response = client
         .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: target("org1"),
             query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 2)),
         })
@@ -1055,18 +1048,11 @@ async fn instrumented_server_emits_rpc_metrics_and_passes_requests_through() {
         .into_inner();
     assert_eq!(response.results.len(), 2, "instrumentation must not alter results");
 
-    let response = client
-        .vector_search(VectorSearchRequest {
-            target: dated_target("org1", "2026-06-01", "2026-06-04"),
-            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 3)),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(!response.results.is_empty());
-
     let status = client
         .text_search(TextSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
             target: target("absent"),
             query: Some(simple_text_query("x", 1)),
         })
@@ -1111,24 +1097,6 @@ async fn instrumented_server_emits_rpc_metrics_and_passes_requests_through() {
     assert!(
         lines
             .iter()
-            .any(|line| line.starts_with("search_api.fanout.legs:3|d") && line.contains("leg:vector")),
-        "missing fan-out width distribution: {lines:?}"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.starts_with("search_api.fanout.leg.duration_ms:") && line.contains("leg:vector")),
-        "missing per-leg latency distribution: {lines:?}"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.starts_with("search_api.fanout.dedup.dropped:2|c") && line.contains("leg:vector")),
-        "missing dedup-drop counter: {lines:?}"
-    );
-    assert!(
-        lines
-            .iter()
             .any(|line| line.starts_with("search_api.dataset.open.duration_ms:") && line.contains("cold:true")),
         "missing dataset open distribution: {lines:?}"
     );
@@ -1139,7 +1107,493 @@ async fn instrumented_server_emits_rpc_metrics_and_passes_requests_through() {
         "missing handle cache gauge: {lines:?}"
     );
     assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("search_api.query.iops:") && line.contains("rpc:vector_search")),
+        "missing per-query iops distribution from the lance execution-stats callback: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("search_api.query.bytes_read:") && line.contains("rpc:vector_search")),
+        "missing per-query bytes_read distribution: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("search_api.query.parts_loaded:") && line.contains("rpc:vector_search")),
+        "missing per-query parts_loaded distribution: {lines:?}"
+    );
+    assert!(
         !lines.iter().any(|line| line.contains("org_id")),
         "org_id must never appear on metrics: {lines:?}"
+    );
+}
+
+/// Builds a string literal for use in filter predicates.
+fn string_literal(text: &str) -> LiteralValue {
+    LiteralValue {
+        kind: Some(literal_value::Kind::StringValue(text.to_string())),
+    }
+}
+
+/// Builds a `column = "string"` equality filter.
+fn string_eq_filter(column: &str, value: &str) -> Filter {
+    Filter {
+        predicate: Some(filter::Predicate::Comparison(Comparison {
+            column: column.to_string(),
+            op: CompareOp::Eq as i32,
+            value: Some(string_literal(value)),
+        })),
+    }
+}
+
+#[tokio::test]
+async fn vector_search_string_equality_filter_returns_matching_rows_only() {
+    let tmp = TempDir::new().unwrap();
+    build_test_dataset(&org1_uri(&tmp)).await;
+    let channel = serve(&tmp).await;
+    let mut client = SearchServiceClient::new(channel);
+
+    let mut query = vector_query(vec![0.0, 1.0, 0.0, 0.0], 4);
+    query.filter = Some(string_eq_filter("text", "red apple pie"));
+    let response = client
+        .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
+            target: target("org1"),
+            query: Some(query),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        response.results.len(),
+        1,
+        "string equality filter must return only the matching row"
+    );
+    assert_eq!(
+        row_number(&response.results[0].row, "id"),
+        1.0,
+        "only row 1 has text = 'red apple pie'"
+    );
+
+    let mut query = vector_query(vec![1.0, 0.0, 0.0, 0.0], 4);
+    query.filter = Some(string_eq_filter("text", "no such text value"));
+    let response = client
+        .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
+            target: target("org1"),
+            query: Some(query),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        response.results.is_empty(),
+        "a string equality filter with no matching value must return zero hits"
+    );
+}
+
+#[tokio::test]
+async fn hybrid_request_level_filter_applies_to_both_legs() {
+    let tmp = TempDir::new().unwrap();
+    build_test_dataset(&org1_uri(&tmp)).await;
+    let channel = serve(&tmp).await;
+    let mut client = SearchServiceClient::new(channel);
+
+    let response = client
+        .hybrid_search(HybridSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
+            target: target("org1"),
+            vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
+            text: Some(simple_text_query("pear", 0)),
+            k: 4,
+            fusion: None,
+            filter: Some(string_eq_filter("text", "green pear tart")),
+            filter_mode: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        response.results.len(),
+        1,
+        "request-level string equality filter must restrict both legs to the matching row"
+    );
+    assert_eq!(
+        row_number(&response.results[0].row, "id"),
+        2.0,
+        "only row 2 has text = 'green pear tart'"
+    );
+
+    let unfiltered = client
+        .hybrid_search(HybridSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
+            target: target("org1"),
+            vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
+            text: Some(simple_text_query("pear", 0)),
+            k: 4,
+            fusion: None,
+            filter: None,
+            filter_mode: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        unfiltered.results.len() >= response.results.len(),
+        "removing the request-level filter must not reduce the result count"
+    );
+
+    let response_combined = client
+        .hybrid_search(HybridSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
+            target: target("org1"),
+            vector: Some({
+                let mut q = vector_query(vec![0.0, 1.0, 0.0, 0.0], 0);
+                q.filter = Some(compare_filter("id", CompareOp::Le, 3));
+                q
+            }),
+            text: Some(simple_text_query("pear", 0)),
+            k: 4,
+            fusion: None,
+            filter: Some(string_eq_filter("text", "green pear tart")),
+            filter_mode: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        response_combined.results.len(),
+        1,
+        "per-leg filter ANDed with request-level filter must still return only the matching row"
+    );
+    assert_eq!(
+        row_number(&response_combined.results[0].row, "id"),
+        2.0,
+        "the combined AND predicate must resolve to row 2 only"
+    );
+}
+
+/// A reranker that reverses the candidate order, used to prove the post-fusion seam is exercised.
+struct ReverseReranker;
+
+#[async_trait]
+impl Reranker for ReverseReranker {
+    async fn rerank(&self, _request: &RerankRequest, mut hits: Vec<FusedHit>) -> Result<Vec<FusedHit>, SearchError> {
+        hits.reverse();
+        Ok(hits)
+    }
+}
+
+/// A reranker that always fails, used to prove rerank errors map onto a tonic status.
+struct FailingReranker;
+
+#[async_trait]
+impl Reranker for FailingReranker {
+    async fn rerank(&self, _request: &RerankRequest, _hits: Vec<FusedHit>) -> Result<Vec<FusedHit>, SearchError> {
+        Err(SearchError::internal("reranker model unavailable"))
+    }
+}
+
+/// Builds an identity rerank spec proto, optionally truncating to `top_n`.
+fn identity_rerank(top_n: Option<u64>) -> Option<Rerank> {
+    Some(Rerank {
+        strategy: Some(rerank::Strategy::Identity(IdentityRerank { top_n })),
+    })
+}
+
+#[tokio::test]
+async fn rerank_seam_reorders_only_when_a_spec_is_set() {
+    let tmp = TempDir::new().unwrap();
+    build_test_dataset(&org1_uri(&tmp)).await;
+    let channel = serve_full(
+        &tmp,
+        Arc::new(Metrics::disabled()),
+        None,
+        Some(Arc::new(ReverseReranker)),
+    )
+    .await;
+    let mut client = SearchServiceClient::new(channel);
+
+    let baseline = client
+        .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
+            target: target("org1"),
+            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 3)),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let baseline_ids: Vec<f64> = baseline.results.iter().map(|hit| row_number(&hit.row, "id")).collect();
+    assert_eq!(
+        baseline_ids[0], 1.0,
+        "without a rerank spec the reranker must not run, so order is unchanged"
+    );
+
+    let reranked = client
+        .vector_search(VectorSearchRequest {
+            rerank: identity_rerank(None),
+            time_range: None,
+            version_ref: None,
+            target: target("org1"),
+            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 3)),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let reranked_ids: Vec<f64> = reranked.results.iter().map(|hit| row_number(&hit.row, "id")).collect();
+    let mut expected = baseline_ids.clone();
+    expected.reverse();
+    assert_eq!(
+        reranked_ids, expected,
+        "with a spec set the injected reranker must reorder the candidates"
+    );
+}
+
+#[tokio::test]
+async fn rerank_errors_map_to_a_tonic_status() {
+    let tmp = TempDir::new().unwrap();
+    build_test_dataset(&org1_uri(&tmp)).await;
+    let channel = serve_full(
+        &tmp,
+        Arc::new(Metrics::disabled()),
+        None,
+        Some(Arc::new(FailingReranker)),
+    )
+    .await;
+    let mut client = SearchServiceClient::new(channel);
+
+    let status = client
+        .text_search(TextSearchRequest {
+            rerank: identity_rerank(None),
+            time_range: None,
+            version_ref: None,
+            target: target("org1"),
+            query: Some(simple_text_query("lemon", 3)),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        status.code(),
+        Code::Internal,
+        "a reranker error must surface as INTERNAL"
+    );
+    assert!(status.message().contains("reranker model unavailable"));
+}
+
+#[tokio::test]
+async fn default_identity_reranker_truncates_to_top_n() {
+    let tmp = TempDir::new().unwrap();
+    build_test_dataset(&org1_uri(&tmp)).await;
+    let channel = serve(&tmp).await;
+    let mut client = SearchServiceClient::new(channel);
+
+    let response = client
+        .vector_search(VectorSearchRequest {
+            rerank: identity_rerank(Some(2)),
+            time_range: None,
+            version_ref: None,
+            target: target("org1"),
+            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 4)),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        response.results.len(),
+        2,
+        "the default identity reranker must truncate to top_n while preserving order"
+    );
+    assert_eq!(row_number(&response.results[0].row, "id"), 1.0);
+}
+
+#[tokio::test]
+async fn weighted_fusion_proto_variant_is_applied() {
+    let tmp = TempDir::new().unwrap();
+    build_test_dataset(&org1_uri(&tmp)).await;
+    let channel = serve(&tmp).await;
+    let mut client = SearchServiceClient::new(channel);
+
+    let response = client
+        .hybrid_search(HybridSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
+            target: target("org1"),
+            vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
+            text: Some(simple_text_query("pear", 0)),
+            k: 2,
+            fusion: Some(Fusion {
+                strategy: Some(fusion::Strategy::Weighted(WeightedFusion {
+                    vector_weight: Some(1.0),
+                })),
+            }),
+            filter: None,
+            filter_mode: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.results.len(), 2);
+    assert_eq!(
+        row_number(&response.results[0].row, "id"),
+        2.0,
+        "row 2 is both the nearest vector and the pear match, so it tops weighted fusion"
+    );
+    assert!(response.results[0].fused_score >= response.results[1].fused_score);
+
+    let status = client
+        .hybrid_search(HybridSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
+            target: target("org1"),
+            vector: Some(vector_query(vec![0.0, 1.0, 0.0, 0.0], 0)),
+            text: Some(simple_text_query("pear", 0)),
+            k: 2,
+            fusion: Some(Fusion {
+                strategy: Some(fusion::Strategy::Weighted(WeightedFusion {
+                    vector_weight: Some(1.5),
+                })),
+            }),
+            filter: None,
+            filter_mode: 0,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        status.code(),
+        Code::InvalidArgument,
+        "vector_weight outside [0,1] must be rejected"
+    );
+}
+
+/// Appends one extra row at `uri`, producing a new committed version beyond any tagged one.
+async fn append_row(uri: &str, row: (i32, i32, &str, [f32; 4])) {
+    let schema = test_schema();
+    let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        vec![Some(row.3.iter().map(|value| Some(*value)).collect::<Vec<_>>())],
+        DIM,
+    );
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![row.0])),
+            Arc::new(Int32Array::from(vec![row.1])),
+            Arc::new(StringArray::from(vec![row.2])),
+            Arc::new(vectors),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    Dataset::write(
+        reader,
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn version_ref_pins_a_search_to_a_tagged_or_explicit_snapshot() {
+    let tmp = TempDir::new().unwrap();
+    let uri = org1_uri(&tmp);
+    build_test_dataset(&uri).await;
+    let dataset = Dataset::open(&uri).await.unwrap();
+    let tagged = dataset.version_id();
+    dataset.tags().create("20260611T120000Z", tagged).await.unwrap();
+    append_row(&uri, (9, 9, "purple grape jam", [0.9, 0.9, 0.0, 0.0])).await;
+
+    let channel = serve(&tmp).await;
+    let mut client = SearchServiceClient::new(channel);
+
+    let latest = client
+        .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
+            target: target("org1"),
+            query: Some(vector_query(vec![0.9, 0.9, 0.0, 0.0], 5)),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(latest.results.len(), 5, "an unpinned search must see the appended row");
+    assert_eq!(row_number(&latest.results[0].row, "id"), 9.0);
+
+    let at_tag = client
+        .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: Some(search_api::pb::vector_search_request::VersionRef::Tag(
+                "20260611T120000Z".to_string(),
+            )),
+            target: target("org1"),
+            query: Some(vector_query(vec![0.9, 0.9, 0.0, 0.0], 5)),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        at_tag.results.len(),
+        4,
+        "a tag-pinned search must only see the tagged snapshot's rows"
+    );
+    assert!(
+        at_tag.results.iter().all(|hit| row_number(&hit.row, "id") != 9.0),
+        "the appended row must be invisible at the tagged snapshot"
+    );
+
+    let at_version = client
+        .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: Some(search_api::pb::vector_search_request::VersionRef::Version(tagged)),
+            target: target("org1"),
+            query: Some(vector_query(vec![0.9, 0.9, 0.0, 0.0], 5)),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        at_version.results.len(),
+        4,
+        "an explicit version pin behaves like its tag"
+    );
+
+    let text_at_tag = client
+        .text_search(TextSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: Some(search_api::pb::text_search_request::VersionRef::Tag(
+                "20260611T120000Z".to_string(),
+            )),
+            target: target("org1"),
+            query: Some(simple_text_query("lemon", 3)),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        text_at_tag.results.len(),
+        1,
+        "a tag-pinned text search must serve FTS hits from the tagged snapshot"
     );
 }

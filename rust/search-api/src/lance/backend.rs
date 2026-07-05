@@ -1,30 +1,29 @@
-//! Lance-backed implementation of the [`SearchBackend`] trait, including date-range fan-out.
+//! Lance-backed implementation of the [`SearchBackend`] trait over single-dataset targets.
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
 
 use arrow_array::Float32Array;
 use arrow_schema::DataType;
-use chrono::NaiveDate;
-use futures::StreamExt;
 use lance::Dataset;
-use lance::dataset::scanner::Scanner;
+use lance::dataset::scanner::{ExecutionStatsCallback, ExecutionSummaryCounts, Scanner};
+use lance::deps::datafusion::logical_expr::Expr;
+use lance::index::DatasetIndexExt;
 use lance_core::ROW_ID;
 use lance_linalg::distance::DistanceType;
 use serde_json::{Map, Value};
-use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::domain::{
-    DatasetTarget, DistanceKind, FilterMode, FusedHit, Hit, HybridQuery, ScoreOrder, SearchBackend, SearchError,
-    TextQuery, VectorQuery, VectorSearchOutcome, merge_hits,
+    DatasetTarget, DistanceKind, FilterMode, Hit, HybridQuery, HybridSearchOutcome, SearchBackend, SearchError,
+    TextQuery, TextSearchOutcome, TimeRange, VectorQuery, VectorSearchOutcome,
 };
 use crate::lance::error::classify_lance_error;
-use crate::lance::filter::filter_to_expr;
+use crate::lance::filter::{filter_to_expr, time_range_to_expr};
 use crate::lance::provider::DatasetProvider;
 use crate::lance::rows::batch_to_json_rows;
 use crate::lance::text::text_query_to_fts;
-use crate::telemetry::FanoutLeg;
+use crate::telemetry::{Metrics, Rpc};
 
 /// Column key under which Lance reports vector distances.
 const DISTANCE_KEY: &str = "_distance";
@@ -32,25 +31,121 @@ const DISTANCE_KEY: &str = "_distance";
 /// Column key under which Lance reports BM25 scores.
 const SCORE_KEY: &str = "_score";
 
+/// Object-store IO statistics captured from one Lance scan and attached to the per-query-leg span
+/// as `object_store.*` attributes, so a slow query can be drilled into by its object-store request
+/// volume. The attributes are provider-neutral: the service runs over AWS S3, Azure Blob, and GCS
+/// through Lance's provider-agnostic object store, so the names carry no provider prefix.
+///
+/// Values are sourced from Lance's execution-stats callback ([`ExecutionSummaryCounts`]). Lance
+/// exposes aggregate counts only: a precise GET/HEAD/LIST breakdown is not available outside the
+/// `test-util` build, so this records the object-store request count and the IO totals that are.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanIoStats {
+    /// Object-store requests made to the storage layer (`object_store.requests`).
+    pub requests: u64,
+    /// I/O operations after coalescing (`object_store.iops`).
+    pub iops: u64,
+    /// Bytes pulled from storage (`object_store.bytes_read`).
+    pub bytes_read: u64,
+    /// Index partitions loaded from storage (`object_store.parts_loaded`).
+    pub parts_loaded: u64,
+    /// Top-level indices loaded from storage (`object_store.indices_loaded`).
+    pub indices_loaded: u64,
+}
+
+impl ScanIoStats {
+    /// Builds the stats from one Lance execution-summary count snapshot.
+    fn from_counts(counts: &ExecutionSummaryCounts) -> Self {
+        Self {
+            requests: counts.requests as u64,
+            iops: counts.iops as u64,
+            bytes_read: counts.bytes_read as u64,
+            parts_loaded: counts.parts_loaded as u64,
+            indices_loaded: counts.indices_loaded as u64,
+        }
+    }
+
+    /// Attaches every count to `span` as an `object_store.*` attribute. Low cardinality: counts
+    /// only, never org/tenant ids.
+    fn attach_to_span(&self, span: &tracing::Span) {
+        span.set_attribute("object_store.requests", self.requests as i64);
+        span.set_attribute("object_store.iops", self.iops as i64);
+        span.set_attribute("object_store.bytes_read", self.bytes_read as i64);
+        span.set_attribute("object_store.parts_loaded", self.parts_loaded as i64);
+        span.set_attribute("object_store.indices_loaded", self.indices_loaded as i64);
+    }
+}
+
+/// Observer invoked with the [`ScanIoStats`] captured from each scan. Test seam for asserting the
+/// object-store stat-capture path runs without inspecting exported spans.
+pub type ScanStatsHook = Arc<dyn Fn(&ScanIoStats) + Send + Sync>;
+
+/// Server-side ANN defaults applied when the corresponding request field is unset.
+///
+/// Kept in a small struct so they can be passed as one argument to [`run_vector_query`] without
+/// extending that function's parameter list every time a new knob is added.
+#[derive(Debug, Clone, Copy)]
+pub struct AnnDefaults {
+    /// Minimum IVF partitions probed when the request leaves probe knobs unset.
+    pub minimum_nprobes: usize,
+    /// Maximum IVF partitions probed when the request leaves probe knobs unset. Also the ceiling
+    /// clamped onto any client-supplied maximum. Never `None` at dispatch time so a prefilter
+    /// whale query cannot traverse every partition.
+    pub maximum_nprobes: usize,
+    /// Hard ceiling on any client-supplied nprobes / minimum_nprobes / maximum_nprobes.
+    pub nprobes_ceiling: usize,
+    /// Refine factor applied when the request leaves `refine_factor` unset. 0 disables it.
+    pub default_refine_factor: u32,
+    /// Whether to apply `fast_search` when the dataset has an index for the queried column.
+    pub fast_search_default: bool,
+}
+
+impl AnnDefaults {
+    /// Populates defaults from the service config.
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            minimum_nprobes: config.default_minimum_nprobes,
+            maximum_nprobes: config.default_maximum_nprobes,
+            nprobes_ceiling: config.nprobes_ceiling,
+            default_refine_factor: config.default_refine_factor,
+            fast_search_default: config.fast_search_default,
+        }
+    }
+}
+
+impl Default for AnnDefaults {
+    fn default() -> Self {
+        Self {
+            minimum_nprobes: crate::config::DEFAULT_MINIMUM_NPROBES,
+            maximum_nprobes: crate::config::DEFAULT_MAXIMUM_NPROBES,
+            nprobes_ceiling: crate::config::DEFAULT_NPROBES_CEILING,
+            default_refine_factor: crate::config::DEFAULT_REFINE_FACTOR,
+            fast_search_default: crate::config::DEFAULT_FAST_SEARCH,
+        }
+    }
+}
+
 /// Search backend executing queries with Lance scanners over datasets from a [`DatasetProvider`].
 pub struct LanceSearchBackend<P: DatasetProvider> {
     pub(crate) provider: P,
     pub(crate) prewarm_concurrency: usize,
-    pub(crate) fanout_concurrency: usize,
-    pub(crate) id_column: String,
     pub(crate) metrics: Arc<crate::telemetry::Metrics>,
+    pub(crate) event_timestamp_column: String,
+    pub(crate) scan_stats_hook: Option<ScanStatsHook>,
+    pub(crate) ann_defaults: AnnDefaults,
 }
 
 impl<P: DatasetProvider> LanceSearchBackend<P> {
-    /// Creates a backend over the given dataset provider with default concurrency knobs, the
-    /// default dedup id column, and telemetry disabled.
+    /// Creates a backend over the given dataset provider with the default prewarm concurrency, the
+    /// default event-timestamp column, telemetry disabled, and default ANN server-side knobs.
     pub fn new(provider: P) -> Self {
         Self {
             provider,
             prewarm_concurrency: crate::config::DEFAULT_PREWARM_CONCURRENCY,
-            fanout_concurrency: crate::config::DEFAULT_FANOUT_CONCURRENCY,
-            id_column: crate::config::DEFAULT_ID_COLUMN.to_string(),
             metrics: Arc::new(crate::telemetry::Metrics::disabled()),
+            event_timestamp_column: crate::config::DEFAULT_EVENT_TIMESTAMP_COLUMN.to_string(),
+            scan_stats_hook: None,
+            ann_defaults: AnnDefaults::default(),
         }
     }
 
@@ -60,194 +155,102 @@ impl<P: DatasetProvider> LanceSearchBackend<P> {
         self
     }
 
-    /// Sets how many per-day datasets one date-range fan-out queries concurrently.
-    pub fn with_fanout_concurrency(mut self, fanout_concurrency: usize) -> Self {
-        self.fanout_concurrency = fanout_concurrency.max(1);
-        self
-    }
-
-    /// Sets the logical id column used to deduplicate fan-out results across date partitions.
-    pub fn with_id_column(mut self, id_column: impl Into<String>) -> Self {
-        self.id_column = id_column.into();
-        self
-    }
-
-    /// Emits backend metrics (prewarm, fan-out, and clusters timings) through the given facade.
+    /// Emits backend metrics (prewarm and clusters timings) through the given facade.
     pub fn with_metrics(mut self, metrics: Arc<crate::telemetry::Metrics>) -> Self {
         self.metrics = metrics;
         self
     }
 
-    /// Runs `run` against every existing per-day dataset of the range with bounded concurrency.
-    ///
-    /// Days whose dataset does not exist are skipped. Returns `NotFound` only when zero datasets
-    /// exist in the whole range. Any other per-leg failure fails the call. Each leg runs inside a
-    /// `fanout.leg` span and reports its latency to the `fanout.leg.duration_ms` distribution,
-    /// on failure as well as on success, so error storms stay visible in the latency breakdown.
-    async fn fan_out<T, F, Fut>(
-        &self,
-        target: &DatasetTarget,
-        days: Vec<NaiveDate>,
-        leg: FanoutLeg,
-        run: F,
-    ) -> Result<Vec<T>, SearchError>
-    where
-        F: Fn(Arc<Dataset>) -> Fut,
-        Fut: Future<Output = Result<T, SearchError>>,
-        T: Send,
-    {
-        let days_requested = days.len();
-        let run = &run;
-        let outcomes: Vec<Result<Option<T>, SearchError>> = futures::stream::iter(days.into_iter().map(|day| {
-            let span = tracing::info_span!("fanout.leg", leg.date = %day, leg.kind = leg.as_tag());
-            async move {
-                let started = Instant::now();
-                let dataset = match self.provider.dataset(target, Some(day)).await {
-                    Ok(dataset) => dataset,
-                    Err(SearchError::NotFound(_)) => {
-                        tracing::debug!(leg.date = %day, "fan-out leg skipped, dataset missing");
-                        return Ok(None);
-                    }
-                    Err(error) => return Err(error),
-                };
-                let result = run(dataset).await;
-                self.metrics.fanout_leg_duration(leg, started.elapsed());
-                Ok(Some(result?))
-            }
-            .instrument(span)
-        }))
-        .buffer_unordered(self.fanout_concurrency.max(1))
-        .collect()
-        .await;
-        let mut legs = Vec::new();
-        for outcome in outcomes {
-            if let Some(result) = outcome? {
-                legs.push(result);
-            }
-        }
-        if legs.is_empty() {
-            return Err(SearchError::not_found("no datasets exist in the requested date range"));
-        }
-        let span = tracing::Span::current();
-        span.record("fanout.days", days_requested as u64);
-        span.record("fanout.legs", legs.len() as u64);
-        self.metrics.fanout_legs(leg, legs.len() as u64);
-        Ok(legs)
+    /// Sets the column a request time range is applied to.
+    pub fn with_event_timestamp_column(mut self, column: impl Into<String>) -> Self {
+        self.event_timestamp_column = column.into();
+        self
     }
 
-    /// Merges fan-out legs, recording dedup metrics and span attributes, then strips the id
-    /// column from the merged rows when it was added only for deduplication.
-    fn merge_fanout_legs(
-        &self,
-        legs: Vec<Vec<Hit>>,
-        order: ScoreOrder,
-        k: usize,
-        leg: FanoutLeg,
-        strip_id: bool,
-    ) -> Vec<Hit> {
-        let outcome = merge_hits(legs, &self.id_column, order, k);
-        tracing::Span::current().record("fanout.dedup_dropped", outcome.duplicates_dropped);
-        self.metrics.fanout_dedup_dropped(leg, outcome.duplicates_dropped);
-        let mut hits = outcome.hits;
-        if strip_id {
-            for hit in &mut hits {
-                hit.row.remove(&self.id_column);
-            }
-        }
-        hits
+    /// Installs an observer invoked with the IO stats captured from each scan. Test seam.
+    pub fn with_scan_stats_hook(mut self, hook: ScanStatsHook) -> Self {
+        self.scan_stats_hook = Some(hook);
+        self
     }
 
-    /// Ensures the dedup id column is part of an explicit projection during fan-out.
-    ///
-    /// Returns true when the column was added (and must be stripped from merged rows). Empty
-    /// projections already include every scalar column and are left untouched.
-    fn ensure_id_projected(&self, projection: &mut Vec<String>) -> bool {
-        if projection.is_empty() || projection.iter().any(|column| column == &self.id_column) {
-            return false;
-        }
-        projection.push(self.id_column.clone());
-        true
+    /// Applies server-side ANN defaults (probe counts, refine factor, fast-search gate).
+    pub fn with_ann_defaults(mut self, defaults: AnnDefaults) -> Self {
+        self.ann_defaults = defaults;
+        self
     }
+
+    /// Bundles the per-query execution context (metrics, RPC tag, event-timestamp column,
+    /// scan-stats hook, and ANN defaults) borrowed for one search leg.
+    fn context(&self, rpc: Rpc) -> QueryContext<'_> {
+        QueryContext {
+            metrics: &self.metrics,
+            rpc,
+            event_timestamp_column: &self.event_timestamp_column,
+            scan_stats_hook: self.scan_stats_hook.as_ref(),
+            ann_defaults: self.ann_defaults,
+        }
+    }
+}
+
+/// Borrowed per-query execution context shared by a search leg.
+struct QueryContext<'a> {
+    /// Metrics facade for per-query execution stats.
+    metrics: &'a Arc<Metrics>,
+    /// RPC tag for metrics and the scan-stats span.
+    rpc: Rpc,
+    /// Column a request time range is applied to.
+    event_timestamp_column: &'a str,
+    /// Optional observer of the captured scan IO stats (test seam).
+    scan_stats_hook: Option<&'a ScanStatsHook>,
+    /// Server-side ANN defaults: probe counts, refine factor, and fast-search gate.
+    ann_defaults: AnnDefaults,
 }
 
 impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
     #[tracing::instrument(
         name = "backend.vector_search",
         skip_all,
-        fields(
-            org_id = %target.org_id,
-            search.k = query.k,
-            fanout.days = tracing::field::Empty,
-            fanout.legs = tracing::field::Empty,
-            fanout.dedup_dropped = tracing::field::Empty,
-        )
+        fields(org_id = %target.org_id, search.k = query.k)
     )]
     async fn vector_search(
         &self,
         target: &DatasetTarget,
-        mut query: VectorQuery,
+        query: VectorQuery,
     ) -> Result<VectorSearchOutcome, SearchError> {
-        let Some(range) = target.date_range else {
-            let dataset = self.provider.dataset(target, None).await?;
-            let hits = run_vector_query(&dataset, &query).await?;
-            return Ok(VectorSearchOutcome {
-                hits,
-                dataset_version: Some(dataset.version_id()),
-            });
-        };
         validate_k(query.k)?;
-        let strip_id = self.ensure_id_projected(&mut query.projection);
-        let query = &query;
-        let legs = self
-            .fan_out(target, range.days(), FanoutLeg::Vector, |dataset| async move {
-                run_vector_query(&dataset, query).await
-            })
-            .await?;
+        let dataset = self.provider.dataset(target, query.reference.clone()).await?;
+        let hits = run_vector_query(&dataset, &query, &self.context(Rpc::VectorSearch)).await?;
         Ok(VectorSearchOutcome {
-            hits: self.merge_fanout_legs(legs, ScoreOrder::LowerIsBetter, query.k, FanoutLeg::Vector, strip_id),
-            dataset_version: None,
+            hits,
+            dataset_version: Some(dataset.version_id()),
         })
     }
 
     #[tracing::instrument(
         name = "backend.text_search",
         skip_all,
-        fields(
-            org_id = %target.org_id,
-            search.k = query.k,
-            fanout.days = tracing::field::Empty,
-            fanout.legs = tracing::field::Empty,
-            fanout.dedup_dropped = tracing::field::Empty,
-        )
+        fields(org_id = %target.org_id, search.k = query.k)
     )]
-    async fn text_search(&self, target: &DatasetTarget, mut query: TextQuery) -> Result<Vec<Hit>, SearchError> {
-        let Some(range) = target.date_range else {
-            let dataset = self.provider.dataset(target, None).await?;
-            return run_text_query(&dataset, &query).await;
-        };
+    async fn text_search(&self, target: &DatasetTarget, query: TextQuery) -> Result<TextSearchOutcome, SearchError> {
         validate_k(query.k)?;
-        let strip_id = self.ensure_id_projected(&mut query.projection);
-        let query = &query;
-        let legs = self
-            .fan_out(target, range.days(), FanoutLeg::Text, |dataset| async move {
-                run_text_query(&dataset, query).await
-            })
-            .await?;
-        Ok(self.merge_fanout_legs(legs, ScoreOrder::HigherIsBetter, query.k, FanoutLeg::Text, strip_id))
+        let dataset = self.provider.dataset(target, query.reference.clone()).await?;
+        let hits = run_text_query(&dataset, &query, &self.context(Rpc::TextSearch)).await?;
+        Ok(TextSearchOutcome {
+            hits,
+            dataset_version: Some(dataset.version_id()),
+        })
     }
 
     #[tracing::instrument(
         name = "backend.hybrid_search",
         skip_all,
-        fields(
-            org_id = %target.org_id,
-            search.k = query.k,
-            fanout.days = tracing::field::Empty,
-            fanout.legs = tracing::field::Empty,
-            fanout.dedup_dropped = tracing::field::Empty,
-        )
+        fields(org_id = %target.org_id, search.k = query.k)
     )]
-    async fn hybrid_search(&self, target: &DatasetTarget, query: HybridQuery) -> Result<Vec<FusedHit>, SearchError> {
+    async fn hybrid_search(
+        &self,
+        target: &DatasetTarget,
+        query: HybridQuery,
+    ) -> Result<HybridSearchOutcome, SearchError> {
         validate_k(query.k)?;
         let mut vector_query = query.vector;
         if vector_query.k == 0 {
@@ -258,57 +261,23 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
             text_query.k = query.k;
         }
         let fusion = query.fusion;
-        let Some(range) = target.date_range else {
-            let dataset = self.provider.dataset(target, None).await?;
-            let (vector_hits, text_hits) = tokio::join!(
-                run_vector_query(&dataset, &vector_query),
-                run_text_query(&dataset, &text_query),
-            );
-            let (vector_hits, text_hits) = (vector_hits?, text_hits?);
-            let fuse_span = tracing::info_span!("fusion.fuse", search.k = query.k);
-            return Ok(fuse_span.in_scope(|| fusion.fuse(vec![vector_hits, text_hits], query.k)));
-        };
-        let strip_vector_id = self.ensure_id_projected(&mut vector_query.projection);
-        let strip_text_id = self.ensure_id_projected(&mut text_query.projection);
-        let strip_id = strip_vector_id || strip_text_id;
-        let (vector_query, text_query) = (&vector_query, &text_query);
-        let legs: Vec<(Vec<Hit>, Vec<Hit>)> = self
-            .fan_out(target, range.days(), FanoutLeg::Hybrid, |dataset| async move {
-                let (vector_hits, text_hits) = tokio::join!(
-                    run_vector_query(&dataset, vector_query),
-                    run_text_query(&dataset, text_query),
-                );
-                Ok((vector_hits?, text_hits?))
-            })
-            .await?;
-        let (vector_legs, text_legs): (Vec<Vec<Hit>>, Vec<Vec<Hit>>) = legs.into_iter().unzip();
-        let merged_vector = self.merge_fanout_legs(
-            vector_legs,
-            ScoreOrder::LowerIsBetter,
-            vector_query.k,
-            FanoutLeg::Hybrid,
-            false,
+        let dataset = self.provider.dataset(target, query.reference.clone()).await?;
+        let context = self.context(Rpc::HybridSearch);
+        let (vector_hits, text_hits) = tokio::join!(
+            run_vector_query(&dataset, &vector_query, &context),
+            run_text_query(&dataset, &text_query, &context),
         );
-        let merged_text = self.merge_fanout_legs(
-            text_legs,
-            ScoreOrder::HigherIsBetter,
-            text_query.k,
-            FanoutLeg::Hybrid,
-            false,
-        );
+        let (vector_hits, text_hits) = (vector_hits?, text_hits?);
         let fuse_span = tracing::info_span!("fusion.fuse", search.k = query.k);
-        let mut fused = fuse_span.in_scope(|| fusion.fuse(vec![merged_vector, merged_text], query.k));
-        if strip_id {
-            for hit in &mut fused {
-                hit.row.remove(&self.id_column);
-            }
-        }
-        Ok(fused)
+        Ok(HybridSearchOutcome {
+            hits: fuse_span.in_scope(|| fusion.fuse(vec![vector_hits, text_hits], query.k)),
+            dataset_version: Some(dataset.version_id()),
+        })
     }
 }
 
 /// Returns the name of the first fixed-size-list vector column in the dataset schema.
-pub fn default_vector_column(dataset: &Dataset) -> Result<String, SearchError> {
+fn default_vector_column(dataset: &Dataset) -> Result<String, SearchError> {
     dataset
         .schema()
         .fields
@@ -319,7 +288,7 @@ pub fn default_vector_column(dataset: &Dataset) -> Result<String, SearchError> {
 }
 
 /// Lists the scalar (non-vector) columns returned by default in search results.
-pub fn scalar_output_columns(dataset: &Dataset) -> Vec<String> {
+fn scalar_output_columns(dataset: &Dataset) -> Vec<String> {
     dataset
         .schema()
         .fields
@@ -342,13 +311,21 @@ fn validate_k(k: usize) -> Result<(), SearchError> {
     Ok(())
 }
 
-/// Applies projection, row-id, typed filter, and limit/offset to a scanner.
+/// Applies projection, typed filter, optional event-time range, and limit/offset to a scanner.
+///
+/// The caller-provided filter and the event-time range predicate are ANDed into a single filter
+/// expression through the typed [`filter_to_expr`] / [`time_range_to_expr`] path, so no raw SQL is
+/// ever constructed. When only a time range is present it still drives the scan filter, naturally
+/// pruned by a BTREE or zone-map on the event-timestamp column.
+///
+/// The physical `_rowid` column is not requested here: each query path enables it conditionally via
+/// [`Scanner::with_row_id`] before calling this helper, so pure single-leg searches that neither
+/// return the row id nor feed cross-leg fusion dedup skip the extra object-store read.
 fn apply_common_options(
     scanner: &mut Scanner,
     dataset: &Dataset,
     projection: &[String],
-    filter: Option<&crate::domain::Filter>,
-    filter_mode: FilterMode,
+    predicate: ScanPredicate<'_>,
     k: usize,
     offset: Option<usize>,
 ) -> Result<(), SearchError> {
@@ -359,11 +336,9 @@ fn apply_common_options(
     } else {
         scanner.project(projection).map_err(|err| classify_lance_error(&err))?;
     }
-    scanner.with_row_id();
-    if let Some(filter) = filter {
-        let expr = filter_to_expr(filter, &schema_columns(dataset))?;
+    if let Some(expr) = predicate.combined_expr(dataset)? {
         scanner.filter_expr(expr);
-        scanner.prefilter(filter_mode == FilterMode::Prefilter);
+        scanner.prefilter(predicate.filter_mode == FilterMode::Prefilter);
     }
     scanner
         .limit(Some(k as i64), offset.map(|skip| skip as i64))
@@ -371,9 +346,169 @@ fn apply_common_options(
     Ok(())
 }
 
+/// The scan predicate inputs: the caller's typed filter, its prefilter/postfilter mode, the
+/// optional event-time window, and the column the window applies to.
+struct ScanPredicate<'a> {
+    /// Caller-provided typed predicate, if any.
+    filter: Option<&'a crate::domain::Filter>,
+    /// Whether the predicate runs before or after the index search.
+    filter_mode: FilterMode,
+    /// Optional event-time window, ANDed with `filter`.
+    time_range: Option<&'a TimeRange>,
+    /// Column the event-time window is applied to.
+    event_timestamp_column: &'a str,
+}
+
+impl ScanPredicate<'_> {
+    /// Combines the caller filter and the event-time range into one DataFusion expression, ANDing
+    /// them when both are present. Returns `None` when neither restricts the scan.
+    fn combined_expr(&self, dataset: &Dataset) -> Result<Option<Expr>, SearchError> {
+        let filter_expr = match self.filter {
+            Some(filter) => Some(filter_to_expr(filter, &schema_columns(dataset))?),
+            None => None,
+        };
+        let range_expr = match self.time_range {
+            Some(range) if range.is_bounded() => {
+                let data_type = event_timestamp_data_type(dataset, self.event_timestamp_column)?;
+                time_range_to_expr(range, self.event_timestamp_column, &data_type)?
+            }
+            _ => None,
+        };
+        Ok(match (filter_expr, range_expr) {
+            (Some(filter), Some(range)) => Some(filter.and(range)),
+            (Some(filter), None) => Some(filter),
+            (None, range) => range,
+        })
+    }
+}
+
+/// Resolves the Arrow data type of the event-timestamp column, rejecting an absent column.
+fn event_timestamp_data_type(dataset: &Dataset, column: &str) -> Result<DataType, SearchError> {
+    dataset
+        .schema()
+        .fields
+        .iter()
+        .find(|field| field.name == column)
+        .map(|field| field.data_type())
+        .ok_or_else(|| {
+            SearchError::invalid_argument(format!("event-timestamp column {column:?} not found in dataset schema"))
+        })
+}
+
+/// Builds a Lance scan-stats callback that reports per-query object-store stats both as `query.*`
+/// metric distributions tagged by `rpc` and as `object_store.*` attributes on `span`.
+///
+/// Lance invokes the callback once, after the scan's plan finishes, with the aggregated
+/// [`ExecutionSummaryCounts`]. The callback emits metrics through the infallible facade and writes
+/// span attributes through the OpenTelemetry layer (a no-op when telemetry is disabled), so it
+/// never panics and never blocks the scan. `span` is the per-query-leg span captured at scan setup,
+/// a child of the per-RPC server span, so the RPC trace shows the object-store volume of each leg.
+fn execution_stats_callback(
+    metrics: Arc<Metrics>,
+    rpc: Rpc,
+    span: tracing::Span,
+    hook: Option<ScanStatsHook>,
+) -> ExecutionStatsCallback {
+    Arc::new(move |counts: &ExecutionSummaryCounts| {
+        let stats = ScanIoStats::from_counts(counts);
+        metrics.query_execution_stats(rpc, stats.iops, stats.bytes_read, stats.parts_loaded);
+        stats.attach_to_span(&span);
+        if let Some(hook) = &hook {
+            hook(&stats);
+        }
+    })
+}
+
+/// Returns true when the dataset has at least one committed vector index on `column`.
+///
+/// Used to gate the `fast_search` default for the vector leg: `fast_search = true` on a dataset
+/// with no vector index causes Lance to return an empty result immediately (scanner.rs
+/// ~3804-3807), so the default must be skipped for the unindexed small-org tier. This check is
+/// O(#indices) against the in-memory manifest and does not perform any IO.
+async fn dataset_has_vector_index(dataset: &Dataset, column: &str) -> bool {
+    let Ok(metas) = dataset.load_indices().await else {
+        return false;
+    };
+    use crate::lance::prewarm::VECTOR_DETAILS_SUFFIX;
+    metas.iter().any(|meta| {
+        let is_vector = meta
+            .index_details
+            .as_ref()
+            .is_some_and(|details| details.type_url.ends_with(VECTOR_DETAILS_SUFFIX));
+        if !is_vector {
+            return false;
+        }
+        let field_id = match meta.fields.first() {
+            Some(id) => *id,
+            None => return false,
+        };
+        dataset
+            .schema()
+            .field_path(field_id)
+            .map(|path| path == column)
+            .unwrap_or(false)
+    })
+}
+
+/// Returns true when the dataset has at least one committed FTS (INVERTED) index covering
+/// `column`.
+///
+/// Used to gate the `fast_search` default for the text leg: `fast_search = true` on a dataset
+/// with no FTS index causes Lance to return an empty result immediately (scanner.rs ~3527), so the
+/// default must not fire for the unindexed small-org tier. Without this guard, fresh fragments
+/// appended between nightly index runs would be silently excluded even when no index exists. This
+/// check is O(#indices) against the in-memory manifest and does not perform any IO.
+async fn dataset_has_fts_index(dataset: &Dataset, columns: &[String]) -> bool {
+    let Ok(metas) = dataset.load_indices().await else {
+        return false;
+    };
+    use crate::lance::prewarm::INVERTED_DETAILS_SUFFIX;
+    metas.iter().any(|meta| {
+        let is_fts = meta
+            .index_details
+            .as_ref()
+            .is_some_and(|details| details.type_url.ends_with(INVERTED_DETAILS_SUFFIX));
+        if !is_fts {
+            return false;
+        }
+        if columns.is_empty() {
+            return true;
+        }
+        meta.fields.iter().any(|field_id| {
+            dataset
+                .schema()
+                .field_path(*field_id)
+                .map(|path| columns.iter().any(|col| col.as_str() == path))
+                .unwrap_or(false)
+        })
+    })
+}
+
 /// Runs one nearest-neighbor query against an open dataset.
+///
+/// Server-side ANN defaults from [`QueryContext::ann_defaults`] are applied when the request
+/// leaves the corresponding knobs unset:
+///
+/// - `minimum_nprobes`: floored to `ann_defaults.minimum_nprobes` (default 8) so whale datasets
+///   with 4096+ IVF partitions probe enough partitions for useful recall even with no client
+///   tuning.
+/// - `maximum_nprobes`: always set to at most `ann_defaults.nprobes_ceiling` (default 64) so a
+///   selective prefilter can never drive Lance to probe every partition. When the request supplies
+///   `nprobes` (a single fixed value) the ceiling is also clamped there.
+/// - `refine_factor`: set to `ann_defaults.default_refine_factor` (default 2) when the request
+///   leaves it unset, recovering recall lost to 1-bit RaBitQ quantisation.
+/// - `fast_search`: the effective value resolves as
+///   `query.fast_search.unwrap_or(default && has_vector_index)`. An explicit client value —
+///   including `false` for read-after-write freshness — always wins. When the request leaves it
+///   unset, the server default is applied only when the dataset has a vector index for the queried
+///   column, keeping unindexed datasets unaffected (where `fast_search = true` would produce empty
+///   results, scanner.rs ~3804-3807).
 #[tracing::instrument(name = "lance.vector_query", skip_all, fields(search.k = query.k))]
-async fn run_vector_query(dataset: &Dataset, query: &VectorQuery) -> Result<Vec<Hit>, SearchError> {
+async fn run_vector_query(
+    dataset: &Dataset,
+    query: &VectorQuery,
+    context: &QueryContext<'_>,
+) -> Result<Vec<Hit>, SearchError> {
     validate_k(query.k)?;
     if query.vector.is_empty() {
         return Err(SearchError::invalid_argument("vector must be non-empty"));
@@ -384,7 +519,15 @@ async fn run_vector_query(dataset: &Dataset, query: &VectorQuery) -> Result<Vec<
     };
     let key = Float32Array::from(query.vector.clone());
     let fetch = query.k + query.offset.unwrap_or(0);
+    let d = &context.ann_defaults;
+    let ceiling = d.nprobes_ceiling;
     let mut scanner = dataset.scan();
+    scanner.scan_stats_callback(execution_stats_callback(
+        context.metrics.clone(),
+        context.rpc,
+        tracing::Span::current(),
+        context.scan_stats_hook.cloned(),
+    ));
     scanner
         .nearest(&column_name, &key, fetch)
         .map_err(|err| classify_lance_error(&err))?;
@@ -392,33 +535,52 @@ async fn run_vector_query(dataset: &Dataset, query: &VectorQuery) -> Result<Vec<
         scanner.distance_metric(distance_to_lance(distance));
     }
     if let Some(nprobes) = query.nprobes {
-        scanner.nprobes(nprobes);
+        let clamped = nprobes.min(ceiling);
+        scanner.nprobes(clamped);
+        scanner.maximum_nprobes(clamped);
     } else {
-        if let Some(minimum) = query.minimum_nprobes {
-            scanner.minimum_nprobes(minimum);
-        }
-        if let Some(maximum) = query.maximum_nprobes {
-            scanner.maximum_nprobes(maximum);
-        }
+        let min = query.minimum_nprobes.unwrap_or(d.minimum_nprobes).min(ceiling);
+        let max = query.maximum_nprobes.unwrap_or(d.maximum_nprobes).min(ceiling);
+        scanner.minimum_nprobes(min);
+        scanner.maximum_nprobes(max.max(min));
     }
-    if let Some(refine_factor) = query.refine_factor {
+    let effective_refine = query.refine_factor.or({
+        if d.default_refine_factor > 0 {
+            Some(d.default_refine_factor)
+        } else {
+            None
+        }
+    });
+    if let Some(refine_factor) = effective_refine {
         scanner.refine(refine_factor);
     }
     if let Some(ef) = query.ef {
         scanner.ef(ef);
     }
-    if query.fast_search {
+    let apply_fast_search = match query.fast_search {
+        Some(value) => value,
+        None => d.fast_search_default && dataset_has_vector_index(dataset, &column_name).await,
+    };
+    if apply_fast_search {
         scanner.fast_search();
     }
     if query.bypass_vector_index {
         scanner.use_index(false);
     }
+    let needs_row_id = query.with_row_id || context.rpc == Rpc::HybridSearch;
+    if needs_row_id {
+        scanner.with_row_id();
+    }
     apply_common_options(
         &mut scanner,
         dataset,
         &query.projection,
-        query.filter.as_ref(),
-        query.filter_mode,
+        ScanPredicate {
+            filter: query.filter.as_ref(),
+            filter_mode: query.filter_mode,
+            time_range: query.time_range.as_ref(),
+            event_timestamp_column: context.event_timestamp_column,
+        },
         query.k,
         query.offset,
     )?;
@@ -426,25 +588,65 @@ async fn run_vector_query(dataset: &Dataset, query: &VectorQuery) -> Result<Vec<
         .try_into_batch()
         .await
         .map_err(|err| classify_lance_error(&err))?;
-    rows_to_hits(batch_to_json_rows(&batch)?, DISTANCE_KEY, query.with_row_id)
+    rows_to_hits(
+        batch_to_json_rows(&batch)?,
+        DISTANCE_KEY,
+        query.with_row_id,
+        needs_row_id,
+    )
 }
 
 /// Runs one full-text query against an open dataset.
+///
+/// When the dataset is under continuous ingest, each new fragment appended after the last FTS
+/// index build adds a flat-scan cost proportional to the fragment size. The effective
+/// `fast_search` value resolves as
+/// `query.fast_search.unwrap_or(default && has_fts_index)`. An explicit client value — including
+/// `false` for read-after-write freshness — always wins. When the request leaves it unset the
+/// server default is applied only when the dataset has an FTS index covering the queried columns,
+/// keeping unindexed datasets unaffected (where `fast_search = true` would produce empty results,
+/// scanner.rs ~3527).
 #[tracing::instrument(name = "lance.text_query", skip_all, fields(search.k = query.k))]
-async fn run_text_query(dataset: &Dataset, query: &TextQuery) -> Result<Vec<Hit>, SearchError> {
+async fn run_text_query(
+    dataset: &Dataset,
+    query: &TextQuery,
+    context: &QueryContext<'_>,
+) -> Result<Vec<Hit>, SearchError> {
     validate_k(query.k)?;
     let fetch = query.k + query.offset.unwrap_or(0);
     let fts = text_query_to_fts(query, fetch)?;
     let mut scanner = dataset.scan();
+    scanner.scan_stats_callback(execution_stats_callback(
+        context.metrics.clone(),
+        context.rpc,
+        tracing::Span::current(),
+        context.scan_stats_hook.cloned(),
+    ));
     scanner
         .full_text_search(fts)
         .map_err(|err| classify_lance_error(&err))?;
+    let d = &context.ann_defaults;
+    let apply_fast_search = match query.fast_search {
+        Some(value) => value,
+        None => d.fast_search_default && dataset_has_fts_index(dataset, &query.columns).await,
+    };
+    if apply_fast_search {
+        scanner.fast_search();
+    }
+    let needs_row_id = query.with_row_id || context.rpc == Rpc::HybridSearch;
+    if needs_row_id {
+        scanner.with_row_id();
+    }
     apply_common_options(
         &mut scanner,
         dataset,
         &query.projection,
-        query.filter.as_ref(),
-        query.filter_mode,
+        ScanPredicate {
+            filter: query.filter.as_ref(),
+            filter_mode: query.filter_mode,
+            time_range: query.time_range.as_ref(),
+            event_timestamp_column: context.event_timestamp_column,
+        },
         query.k,
         query.offset,
     )?;
@@ -452,23 +654,36 @@ async fn run_text_query(dataset: &Dataset, query: &TextQuery) -> Result<Vec<Hit>
         .try_into_batch()
         .await
         .map_err(|err| classify_lance_error(&err))?;
-    rows_to_hits(batch_to_json_rows(&batch)?, SCORE_KEY, query.with_row_id)
+    rows_to_hits(batch_to_json_rows(&batch)?, SCORE_KEY, query.with_row_id, needs_row_id)
 }
 
-/// Converts JSON result rows into hits, extracting the score column and the stable row id.
+/// Converts JSON result rows into hits, extracting the score column and the physical row id.
 ///
 /// The score column is always removed from the row (it travels in a dedicated response field).
-/// The row id is kept in the row only when `keep_row_id` is set.
-fn rows_to_hits(rows: Vec<Map<String, Value>>, score_key: &str, keep_row_id: bool) -> Result<Vec<Hit>, SearchError> {
+/// When `has_row_id` is set the physical `_rowid` column is read from the row; it is kept in the row
+/// only when `keep_row_id` is also set, otherwise it is stripped after capture. When `has_row_id` is
+/// false the scanner did not fetch the column and the hit carries a placeholder row id of 0, which is
+/// never consulted because such hits never feed fusion dedup.
+fn rows_to_hits(
+    rows: Vec<Map<String, Value>>,
+    score_key: &str,
+    keep_row_id: bool,
+    has_row_id: bool,
+) -> Result<Vec<Hit>, SearchError> {
     rows.into_iter()
         .map(|mut row| {
-            let row_id = row
-                .get(ROW_ID)
-                .and_then(Value::as_u64)
-                .ok_or_else(|| SearchError::internal("search result row is missing its row id"))?;
-            if !keep_row_id {
-                row.remove(ROW_ID);
-            }
+            let row_id = if has_row_id {
+                let captured = row
+                    .get(ROW_ID)
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| SearchError::internal("search result row is missing its row id"))?;
+                if !keep_row_id {
+                    row.remove(ROW_ID);
+                }
+                captured
+            } else {
+                0
+            };
             let score = row.remove(score_key).and_then(|value| value.as_f64()).unwrap_or(0.0);
             Ok(Hit { row_id, score, row })
         })

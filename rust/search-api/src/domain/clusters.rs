@@ -33,9 +33,6 @@ impl ClusterReport {
 /// so the gRPC layer never references engine types.
 pub trait ClusterReader: Send + Sync + 'static {
     /// Reads the IVF centroids of the targeted dataset's vector index.
-    ///
-    /// The target must address exactly one dataset: a date range, when present, has to cover a
-    /// single day.
     fn clusters(
         &self,
         target: &DatasetTarget,

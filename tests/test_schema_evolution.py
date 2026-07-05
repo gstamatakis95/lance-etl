@@ -1,7 +1,7 @@
 """Schema-evolution test asserting the inverted index lands on the right field.
 
-After a column drop and a column add, the Arrow positional index of the new column diverges from its Lance field id;
-committing an index keyed by the positional index would attach it to the wrong field. This exercises the
+After a column drop and a column add, the Arrow positional index of the new column diverges from its Lance field id.
+Committing an index keyed by the positional index would attach it to the wrong field. This exercises the
 ``lance_field_id`` fix end-to-end through the distributed INVERTED path.
 """
 

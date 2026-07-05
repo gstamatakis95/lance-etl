@@ -9,7 +9,7 @@ use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
 
-use crate::domain::{ClusterReader, ClusterReport, ClusterSpec, DatasetTarget, SearchError};
+use crate::domain::{ClusterReader, ClusterReport, ClusterSpec, DatasetRef, DatasetTarget, SearchError};
 use crate::lance::backend::LanceSearchBackend;
 use crate::lance::error::classify_lance_error;
 use crate::lance::prewarm::VECTOR_DETAILS_SUFFIX;
@@ -26,7 +26,7 @@ use crate::lance::provider::DatasetProvider;
 /// Returns `NotFound` when the index does not exist (or no vector index exists for the default),
 /// `InvalidArgument` when the name resolves to a non-vector index, the default is ambiguous, or
 /// the index carries no centroid data, and an engine-classified error for everything else.
-pub async fn ivf_centroids(dataset: &Dataset, index_name: Option<&str>) -> Result<ClusterReport, SearchError> {
+async fn ivf_centroids(dataset: &Dataset, index_name: Option<&str>) -> Result<ClusterReport, SearchError> {
     let name = match index_name {
         Some(name) => name.to_string(),
         None => default_vector_index(dataset).await?,
@@ -56,9 +56,8 @@ pub async fn ivf_centroids(dataset: &Dataset, index_name: Option<&str>) -> Resul
         .schema()
         .field_path(field_id)
         .map_err(|err| classify_lance_error(&err))?;
-    let uuid = meta.uuid.to_string();
     let index = dataset
-        .open_vector_index(&column, &uuid, &NoOpMetricsCollector)
+        .open_vector_index(&column, &meta.uuid, &NoOpMetricsCollector)
         .await
         .map_err(|err| classify_lance_error(&err))?;
     let ivf = index.ivf_model();
@@ -130,8 +129,7 @@ impl<P: DatasetProvider> ClusterReader for LanceSearchBackend<P> {
         )
     )]
     async fn clusters(&self, target: &DatasetTarget, spec: ClusterSpec) -> Result<ClusterReport, SearchError> {
-        let date = target.single_date()?;
-        let dataset = self.provider.dataset(target, date).await?;
+        let dataset = self.provider.dataset(target, DatasetRef::Serve).await?;
         let started = Instant::now();
         let report = ivf_centroids(&dataset, spec.index_name.as_deref()).await?;
         self.metrics.clusters_read(started.elapsed());

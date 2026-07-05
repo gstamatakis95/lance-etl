@@ -4,4 +4,4 @@ Provides the ETL, compaction, and indexing jobs that move data from Iceberg into
 cluster, together with the shared telemetry and cloud-storage helpers they rely on.
 """
 
-__version__ = "0.1.0"
+version: str = "0.1.0"

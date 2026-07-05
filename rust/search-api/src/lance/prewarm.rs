@@ -8,7 +8,7 @@ use lance::index::DatasetIndexExt;
 use lance_index::{FtsPrewarmOptions, PrewarmOptions, is_system_index};
 use tracing::Instrument;
 
-use crate::domain::{DatasetTarget, PrewarmReport, PrewarmSpec, PrewarmedIndex, Prewarmer, SearchError};
+use crate::domain::{DatasetRef, DatasetTarget, PrewarmReport, PrewarmSpec, PrewarmedIndex, Prewarmer, SearchError};
 use crate::lance::backend::LanceSearchBackend;
 use crate::lance::error::classify_lance_error;
 use crate::lance::provider::DatasetProvider;
@@ -23,24 +23,47 @@ pub(crate) const VECTOR_DETAILS_SUFFIX: &str = "VectorIndexDetails";
 /// Warms one dataset's caches by opening it through the shared session (manifest, transaction,
 /// and index-listing metadata) and then prewarming the requested indexes.
 ///
-/// The target must address exactly one dataset: a date range, when present, has to cover a
-/// single day.
+/// A spec that requests neither metadata nor any index ([`PrewarmSpec::is_noop`]) short-circuits
+/// into an empty report without opening the dataset, since opening is the only thing that warms
+/// metadata.
 ///
-/// Memory budget note: BTree/IVF prewarm loads every page/partition. With the disk index cache
+/// Memory budget note: BTree/IVF prewarm loads every page/partition. With a persistent cache
 /// backend the in-memory hot tier evicts under its Moka budget while the serialized copies stay
-/// on disk, which is exactly the desired outcome for cold-process warmups.
+/// in the persistent store, which is exactly the desired outcome for cold-process warmups.
 impl<P: DatasetProvider> Prewarmer for LanceSearchBackend<P> {
-    #[tracing::instrument(name = "backend.prewarm", skip_all, fields(org_id = %target.org_id))]
-    async fn prewarm(&self, target: &DatasetTarget, spec: PrewarmSpec) -> Result<PrewarmReport, SearchError> {
+    #[tracing::instrument(
+        name = "backend.prewarm",
+        skip_all,
+        fields(org_id = %target.org_id, prewarm.resolved_version = tracing::field::Empty)
+    )]
+    async fn prewarm(
+        &self,
+        target: &DatasetTarget,
+        spec: PrewarmSpec,
+        reference: DatasetRef,
+    ) -> Result<PrewarmReport, SearchError> {
         let total_start = Instant::now();
-        let date = target.single_date()?;
-        let dataset = match self.provider.dataset(target, date).await {
+        if spec.is_noop() {
+            self.metrics.prewarm(PrewarmStatus::Ok, total_start.elapsed());
+            return Ok(PrewarmReport {
+                metadata_warmed: false,
+                indexes: Vec::new(),
+                metadata_duration: Duration::ZERO,
+                total_duration: total_start.elapsed(),
+                index_cache_size_bytes: self.provider.index_cache_size_bytes(),
+                resolved_version: 0,
+            });
+        }
+        let dataset = match self.provider.dataset_for_prewarm(target, reference).await {
             Ok(dataset) => dataset,
             Err(error) => {
                 self.metrics.prewarm(PrewarmStatus::Error, total_start.elapsed());
                 return Err(error);
             }
         };
+        let resolved_version = dataset.version_id();
+        tracing::Span::current().record("prewarm.resolved_version", resolved_version);
+        self.metrics.prewarm_last_version(resolved_version);
         let metadata_duration = total_start.elapsed();
         let mut indexes = Vec::new();
         if spec.wants_indexes() {
@@ -58,6 +81,7 @@ impl<P: DatasetProvider> Prewarmer for LanceSearchBackend<P> {
             metadata_duration,
             total_duration: total_start.elapsed(),
             index_cache_size_bytes: self.provider.index_cache_size_bytes(),
+            resolved_version,
         };
         let status = if report.indexes.iter().any(|index| index.error.is_some()) {
             PrewarmStatus::Partial
@@ -72,6 +96,7 @@ impl<P: DatasetProvider> Prewarmer for LanceSearchBackend<P> {
             org_id = %target.org_id,
             status = status.as_tag(),
             indexes_warmed = warmed,
+            resolved_version,
             duration_ms = report.total_duration.as_millis() as u64,
             "prewarm finished"
         );
