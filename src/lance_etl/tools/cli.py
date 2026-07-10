@@ -20,18 +20,18 @@ from __future__ import annotations
 
 import argparse
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from lance_etl.cliutil import (
     add_common_arguments,
     add_index_column_arguments,
     build_spark,
     build_telemetry_config,
-    configure_logging_from_args,
     index_config_from_args,
     parse_epoch_ms,
     parse_partition_cols,
     parse_storage_options,
+    run_cli_main,
     run_with_spark,
 )
 from lance_etl.etl import ROUTING_COLS
@@ -187,7 +187,6 @@ def run_recall(args: argparse.Namespace) -> None:
             base_uri=args.base_uri,
             telemetry=build_telemetry_config(args),
             storage_options=parse_storage_options(args),
-            id_column="vector_id",
             vector_column=args.vector_column,
             max_samples=args.max_samples,
         )
@@ -273,15 +272,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     Returns:
         A process exit code.
     """
-    args: argparse.Namespace = build_parser().parse_args(argv)
-    configure_logging_from_args(args)
-    runners = {
+    runners: dict[str, Callable[[argparse.Namespace], int | None]] = {
         "recall": run_recall,
         "migrate-namespace": run_migrate_namespace,
         "optimize-iceberg": run_optimize_iceberg,
     }
-    try:
-        runners[args.command](args)
-        return 0
-    except Exception:
-        return 1
+    return run_cli_main(build_parser(), runners, argv)

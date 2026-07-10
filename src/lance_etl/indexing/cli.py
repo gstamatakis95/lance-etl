@@ -17,11 +17,10 @@ from lance_etl.cliutil import (
     add_index_column_arguments,
     build_spark,
     build_telemetry_config,
-    configure_logging_from_args,
     index_config_from_args,
     load_uris_or_none,
     parse_storage_options,
-    resolve_exit_code,
+    run_cli_main,
     run_with_spark,
 )
 from lance_etl.fanout import count_failed
@@ -104,9 +103,4 @@ def main(argv: Sequence[str] | None = None) -> int:
         the run completed but one or more datasets failed in isolation and will be retried by the
         next scheduled run.
     """
-    args: argparse.Namespace = build_parser().parse_args(argv)
-    configure_logging_from_args(args)
-    try:
-        return resolve_exit_code(run(args))
-    except Exception:
-        return 1
+    return run_cli_main(build_parser(), run, argv)

@@ -92,7 +92,6 @@ def test_rewrite_data_files_statement_and_metrics(telemetry: Telemetry) -> None:
     assert f"'min-input-files', '{DEFAULT_MIN_INPUT_FILES}'" in statement
     assert f"'target-file-size-bytes', '{DEFAULT_TARGET_FILE_SIZE_BYTES}'" in statement
     assert result.metrics == {"rewritten_data_files_count": 4, "added_data_files_count": 1}
-    assert result.ran is True
 
 
 def test_expire_snapshots_statement(telemetry: Telemetry) -> None:
@@ -249,7 +248,6 @@ def test_optimizer_compacts_data_files(tmp_path: Path) -> None:
 
         assert [step.step for step in report.steps] == ["rewrite_data_files"]
         rewrite_step = report.steps[0]
-        assert rewrite_step.ran is True
         assert rewrite_step.metrics.get("rewritten_data_files_count", 0) > 0
 
         files_after: int = data_file_count(spark, table)

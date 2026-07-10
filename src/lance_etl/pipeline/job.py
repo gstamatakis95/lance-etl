@@ -26,7 +26,7 @@ from typing import Any
 
 from pyspark.sql import SparkSession
 
-from lance_etl.fanout import dataset_result_failed
+from lance_etl.fanout import TAG_FANOUT_PARTITIONS, dataset_result_failed
 from lance_etl.indexing.config import IndexJobConfig
 from lance_etl.indexing.runner import LanceIndexer
 from lance_etl.maintenance.job import MaintenanceConfig, MaintenanceJob
@@ -34,9 +34,6 @@ from lance_etl.maintenance.tools import prune_interval_tags_fleet, update_servin
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 logger: logging.Logger = logging.getLogger(__name__)
-
-TAG_PARTITIONS: int = 512
-"""Maximum Spark partitions for the prune and stamp fan-outs."""
 
 
 @dataclass
@@ -148,7 +145,7 @@ class PipelineJob:
                 config.telemetry,
                 config.storage_options,
                 config.tag_keep_last,
-                partitions=TAG_PARTITIONS,
+                partitions=TAG_FANOUT_PARTITIONS,
             )
         pruned_tags_total: int = sum(int(r.get("tags_pruned", 0)) for r in prune_results)
         run_span.set_tag("pruned_tags", pruned_tags_total)
@@ -168,10 +165,14 @@ class PipelineJob:
         """Run the interval-tag stamp phase, or skip it when ``tag_stamp`` is ``None``.
 
         Stamps the configured interval tag on every dataset whose index stats pass
-        :func:`stamp_eligible` and whose maintenance result carries no error, then optionally
-        advances the ``HEAD`` tag on the same datasets when ``serve_tag`` is set. A dataset whose
-        compaction failed is never HEAD-promoted, so a failed dataset's serving version never
-        advances past its last good state.
+        :func:`stamp_eligible` and whose maintenance result carries no error, and, when
+        ``serve_tag`` is set, advances the ``HEAD`` tag on the same datasets in the SAME
+        fan-out: :func:`~lance_etl.maintenance.tools.update_serving_tags` opens each dataset
+        exactly once and flips both tags against that one open handle
+        (:func:`~lance_etl.maintenance.tools.update_serving_tag`), instead of re-opening every
+        eligible dataset a second time for the HEAD flip. A dataset whose compaction failed is
+        never HEAD-promoted, so a failed dataset's serving version never advances past its last
+        good state.
 
         Args:
             spark: Active Spark session.
@@ -183,8 +184,8 @@ class PipelineJob:
             driver_telemetry: The driver's telemetry facade.
 
         Returns:
-            The raw tag-update results (interval stamps plus any HEAD flips), empty when
-            stamping is disabled.
+            The raw per-dataset tag-update results (interval stamp plus any HEAD flip, both from
+            the single fan-out call), empty when stamping is disabled.
         """
         config: PipelineConfig = self.config
         if config.tag_stamp is None:
@@ -196,9 +197,10 @@ class PipelineJob:
             for u in uris
             if stamp_eligible(index_by_uri.get(u, {})) and not dataset_result_failed(maint_by_uri.get(u, {}))
         ]
+        tags: list[str] = [config.tag_stamp, "HEAD"] if config.serve_tag else [config.tag_stamp]
         logger.info(
-            "pipeline: stamping tag %r on %d/%d eligible datasets",
-            config.tag_stamp,
+            "pipeline: stamping tag(s) %r on %d/%d eligible datasets",
+            tags,
             len(eligible_uris),
             len(uris),
         )
@@ -208,25 +210,16 @@ class PipelineJob:
                 eligible_uris,
                 config.telemetry,
                 config.storage_options,
-                tag=config.tag_stamp,
-                partitions=TAG_PARTITIONS,
+                tags=tags,
+                partitions=TAG_FANOUT_PARTITIONS,
             )
-        run_span.set_tag("stamped", len(stamp_results))
-        driver_telemetry.gauge("run.stamped_datasets", len(stamp_results))
+        stamped: int = sum(1 for r in stamp_results if config.tag_stamp in r.get("tags", []))
+        run_span.set_tag("stamped", stamped)
+        driver_telemetry.gauge("run.stamped_datasets", stamped)
 
         if config.serve_tag:
-            logger.info("pipeline: advancing HEAD tag on %d datasets", len(eligible_uris))
-            with driver_telemetry.timed("run.head_tag_ms"):
-                head_results: list[dict[str, Any]] = update_serving_tags(
-                    spark,
-                    eligible_uris,
-                    config.telemetry,
-                    config.storage_options,
-                    tag="HEAD",
-                    partitions=TAG_PARTITIONS,
-                )
-            stamp_results = stamp_results + head_results
-            driver_telemetry.gauge("run.head_tags_flipped", len(head_results))
+            head_flipped: int = sum(1 for r in stamp_results if "HEAD" in r.get("tags", []))
+            driver_telemetry.gauge("run.head_tags_flipped", head_flipped)
         return stamp_results
 
     def run(self, spark: SparkSession, uris: list[str]) -> dict[str, Any]:
@@ -249,8 +242,9 @@ class PipelineJob:
             - ``index_results``: raw list from :meth:`LanceIndexer.run`.
             - ``prune_results``: raw list from :meth:`prune_interval_tags_fleet` (empty list
               when pruning is skipped).
-            - ``stamp_results``: raw list from :meth:`update_serving_tags` calls (empty list
-              when stamping is skipped).
+            - ``stamp_results``: raw list from the single :func:`~lance_etl.maintenance.tools.update_serving_tags`
+              fan-out (interval tag plus, when ``serve_tag`` is set, ``HEAD``, flipped together
+              per dataset), empty when stamping is skipped.
             - ``tag_stamp``: the interval tag name that was written, or ``None``.
             - ``counts``: summary counts with keys ``total``, ``pruned_tags``,
               ``maintenance_skipped``, ``index_skipped``, ``stamped``, and ``failed`` (datasets
@@ -301,7 +295,7 @@ class PipelineJob:
                 "pruned_tags": pruned_tags_total,
                 "maintenance_skipped": maintenance_skipped,
                 "index_skipped": index_skipped,
-                "stamped": len([r for r in stamp_results if r.get("tag") == config.tag_stamp]),
+                "stamped": sum(1 for r in stamp_results if config.tag_stamp in r.get("tags", [])),
                 "failed": failed,
             }
             run_span.set_tag("maintenance_skipped", maintenance_skipped)

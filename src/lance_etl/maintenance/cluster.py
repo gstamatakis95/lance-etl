@@ -35,7 +35,16 @@ from pyspark.sql import SparkSession
 import lance_etl.maintenance.job as maintenance_job
 from lance_etl.column_roles import VECTOR_ROLE, load_column_roles
 from lance_etl.etl.sink import DATA_STORAGE_VERSION
-from lance_etl.fanout import BUILD_PARTITION_FACTOR, FANOUT_PARTITION_FACTOR, derive_partitions, fan_out_per_dataset
+from lance_etl.fanout import (
+    BUILD_PARTITION_FACTOR,
+    FANOUT_PARTITION_FACTOR,
+    FLAT_ERROR,
+    FLAT_OK,
+    REWRITE_PARTITION_FACTOR,
+    derive_partitions,
+    fan_out_per_dataset,
+    run_flat_tagged_job,
+)
 from lance_etl.indexing.config import METRIC_TO_DISTANCE, IndexJobConfig, vector_index_name
 from lance_etl.indexing.optimize import load_centroids, load_vector_config, save_centroids
 from lance_etl.indexing.segments import (
@@ -489,6 +498,27 @@ def plan_cluster_rewrite(
     }
 
 
+def read_shard_tasks(plans: list[dict[str, Any]]) -> list[tuple[str, int, list[int], str, str]]:
+    """Flatten eligible plans into per-shard read tasks shared by the histogram and rewrite scans.
+
+    Both the histogram scan and the rewrite scan read the same fragment shards at the same pinned
+    version, so they share one task shape: one ``(uri, read_version, shard, column, distance_type)``
+    tuple per fragment shard of every eligible dataset. Keeping the flattening in one place stops the
+    two phases from drifting apart.
+
+    Args:
+        plans: The eligible plan dicts.
+
+    Returns:
+        One read task per fragment shard across every eligible dataset.
+    """
+    return [
+        (plan["uri"], plan["read_version"], shard, plan["column"], plan["distance_type"])
+        for plan in plans
+        for shard in plan["shards"]
+    ]
+
+
 def partition_histogram(
     uri: str,
     version: int,
@@ -745,7 +775,7 @@ def commit_cluster_overwrite(
     return len(fragments)
 
 
-def cluster_index_config(config: MaintenanceConfig, num_partitions: int, num_bits: int, metric: str) -> IndexJobConfig:
+def cluster_index_config(config: MaintenanceConfig, num_partitions: int, metric: str) -> IndexJobConfig:
     """Build a minimal indexing configuration for the vector-index rebuild commit.
 
     ``cluster.py`` constructs its own :class:`IndexJobConfig` rather than importing one from the
@@ -755,13 +785,11 @@ def cluster_index_config(config: MaintenanceConfig, num_partitions: int, num_bit
     Args:
         config: Maintenance configuration supplying telemetry, storage, and retry budgets.
         num_partitions: The IVF partition count carried by the preserved centroids.
-        num_bits: The RaBitQ bits per sub-dimension from the stored config.
         metric: The distance metric from the stored config.
 
     Returns:
         An indexing configuration wired for the segment-path rebuild.
     """
-    del num_bits
     return IndexJobConfig(
         telemetry=config.telemetry,
         storage_options=config.storage_options,
@@ -958,11 +986,7 @@ class ClusterRunState:
         """
         centroids = self.broadcast_centroids(plans)
         storage_options: dict[str, Any] | None = self.config.storage_options
-        tasks: list[tuple[str, int, list[int], str, str]] = [
-            (plan["uri"], plan["read_version"], shard, plan["column"], plan["distance_type"])
-            for plan in plans
-            for shard in plan["shards"]
-        ]
+        tasks: list[tuple[str, int, list[int], str, str]] = read_shard_tasks(plans)
 
         def run_one(item: tuple[str, int, list[int], str, str]) -> tuple[str, str, Any]:
             """Count one shard's histogram, tagging success or failure by dataset."""
@@ -971,40 +995,30 @@ class ClusterRunState:
                 counts: list[int] = partition_histogram(
                     uri, item[1], item[2], item[3], centroids.value[uri], item[4], storage_options
                 )
-                return "ok", uri, counts
+                return FLAT_OK, uri, counts
             except Exception as exc:
-                return "error", uri, str(exc)
+                return FLAT_ERROR, uri, str(exc)
 
-        tagged: list[tuple[str, str, Any]] = (
-            self.spark.sparkContext.parallelize(tasks, self.flat_partitions(len(tasks))).map(run_one).collect()
-        )
-        return self.reduce_histograms(tagged, plans)
+        grouped, errors = run_flat_tagged_job(self.spark, tasks, run_one, self.flat_partitions(len(tasks)))
+        return self.reduce_histograms(grouped, errors)
 
-    def reduce_histograms(
-        self, tagged: list[tuple[str, str, Any]], plans: list[dict[str, Any]]
-    ) -> dict[str, list[int]]:
+    def reduce_histograms(self, grouped: dict[str, list[Any]], errors: dict[str, str]) -> dict[str, list[int]]:
         """Sum per-shard histograms per dataset, error-marking any dataset with a failed shard.
 
+        Every successful shard result is a full-width per-partition-count list, so the sum's width
+        is implied by the shard data itself rather than a separately threaded plan width.
+
         Args:
-            tagged: The ``(tag, uri, value)`` histogram results.
-            plans: The eligible plan dicts, for the partition width.
+            grouped: The per-dataset lists of successful shard histograms.
+            errors: The first failure message per dataset with any failed shard.
 
         Returns:
             The per-dataset summed histograms for datasets whose every shard succeeded.
         """
-        width_by_uri: dict[str, int] = {plan["uri"]: plan["num_partitions"] + 1 for plan in plans}
-        errors: dict[str, str] = {}
-        sums: dict[str, np.ndarray] = {}
-        for tag, uri, value in tagged:
-            if tag == "error":
-                errors.setdefault(uri, value)
-                continue
-            accumulator: np.ndarray = sums.setdefault(uri, np.zeros(width_by_uri[uri], dtype=np.int64))
-            accumulator += np.asarray(value, dtype=np.int64)
         for uri, message in errors.items():
             self.results[uri] = {"uri": uri, "error": message, "phase": "cluster-histogram", "bytes_removed": 0}
-            sums.pop(uri, None)
-        return {uri: counts.tolist() for uri, counts in sums.items()}
+            grouped.pop(uri, None)
+        return {uri: np.sum(np.asarray(counts, dtype=np.int64), axis=0).tolist() for uri, counts in grouped.items()}
 
     def derive_global_buckets(
         self, plans: list[dict[str, Any]], counts_by_uri: dict[str, list[int]]
@@ -1047,6 +1061,7 @@ class ClusterRunState:
         """
         global_buckets_by_uri, owner_by_bucket = self.derive_global_buckets(plans, counts_by_uri)
         centroids = self.broadcast_centroids(plans)
+        buckets = self.spark.sparkContext.broadcast(global_buckets_by_uri)
         owners = self.spark.sparkContext.broadcast(owner_by_bucket)
         schema_rows: dict[str, tuple[pa.Schema, int]] = {
             plan["uri"]: (plan["schema"], cluster_rows_per_task(self.config)) for plan in plans
@@ -1056,7 +1071,7 @@ class ClusterRunState:
         collected: list[tuple[Any, ...]] = run_rewrite_shuffle(
             self.spark,
             plans,
-            global_buckets_by_uri,
+            buckets,
             centroids,
             owners,
             meta,
@@ -1228,8 +1243,8 @@ class ClusterRunState:
         """Build every committed dataset's index segments in one flat job, isolating per dataset.
 
         Each shard build is tagged like the histogram phase: a failing
-        :func:`build_cluster_index_segment` yields an ``("error", uri, message)`` result instead of
-        killing the job, so one dataset's failed segment build never aborts the run after other
+        :func:`build_cluster_index_segment` yields a ``(FLAT_ERROR, uri, message)`` result instead
+        of killing the job, so one dataset's failed segment build never aborts the run after other
         datasets' overwrites already committed. A dataset with any errored shard is reported through
         the returned error map so :meth:`rebuild_indexes` can drop it before the finalise fan-out,
         ensuring a partially-built dataset never reaches ``commit_segments`` with an incomplete
@@ -1264,22 +1279,11 @@ class ClusterRunState:
                     plan["rabitq_model"],
                     storage_options,
                 )
-                return REWRITE_OK, uri, document
+                return FLAT_OK, uri, document
             except Exception as exc:
-                return REWRITE_ERROR, uri, str(exc)
+                return FLAT_ERROR, uri, str(exc)
 
-        if not tasks:
-            return {}, {}
-        tagged: list[tuple[str, str, str]] = (
-            self.spark.sparkContext.parallelize(tasks, self.flat_partitions(len(tasks))).map(build_one).collect()
-        )
-        errors: dict[str, str] = {}
-        grouped: dict[str, list[str]] = {}
-        for tag, uri, value in tagged:
-            if tag == REWRITE_ERROR:
-                errors.setdefault(uri, value)
-                continue
-            grouped.setdefault(uri, []).append(value)
+        grouped, errors = run_flat_tagged_job(self.spark, tasks, build_one, self.flat_partitions(len(tasks)))
         for uri in errors:
             grouped.pop(uri, None)
         return grouped, errors
@@ -1288,7 +1292,7 @@ class ClusterRunState:
 def run_rewrite_shuffle(
     spark: SparkSession,
     plans: list[dict[str, Any]],
-    global_buckets_by_uri: dict[str, list[tuple[int, int, int, int, int]]],
+    buckets: Any,
     centroids: Any,
     owners: Any,
     meta: Any,
@@ -1308,10 +1312,17 @@ def run_rewrite_shuffle(
     :data:`REWRITE_ERROR_KEY` shuffle key that ``partitionBy`` hashes onto a valid partition and
     ``write_partition`` passes straight through.
 
+    The read fan-out is sized by :func:`~lance_etl.fanout.derive_partitions` at
+    :data:`~lance_etl.fanout.REWRITE_PARTITION_FACTOR`, capped by the read task count, independent
+    of ``total_buckets``. The subsequent ``partitionBy`` shuffle decouples read width from write
+    bucket width, so capping the read scan (the heaviest I/O: a full all-columns dataset scan) at
+    the write bucket count would throttle it for no benefit to the write side.
+
     Args:
         spark: Active Spark session.
         plans: The eligible plan dicts.
-        global_buckets_by_uri: The per-dataset enumerated global buckets.
+        buckets: The broadcast per-dataset enumerated global buckets, shipped once per executor
+            rather than captured in the read closure and re-serialized per read task.
         centroids: The broadcast centroid handle.
         owners: The broadcast global-bucket-to-URI owner map.
         meta: The broadcast per-URI ``(schema, rows_per_task)`` map.
@@ -1322,11 +1333,7 @@ def run_rewrite_shuffle(
         Tagged results, either ``(REWRITE_OK, uri, global_bucket, seq, fragment_json, rows)`` for a
         written fragment or ``(REWRITE_ERROR, uri, message)`` for an isolated read or write failure.
     """
-    read_tasks: list[tuple[str, int, list[int], str, str]] = [
-        (plan["uri"], plan["read_version"], shard, plan["column"], plan["distance_type"])
-        for plan in plans
-        for shard in plan["shards"]
-    ]
+    read_tasks: list[tuple[str, int, list[int], str, str]] = read_shard_tasks(plans)
     if not read_tasks or total_buckets == 0:
         return []
 
@@ -1346,7 +1353,7 @@ def run_rewrite_shuffle(
                     column,
                     centroids.value[uri],
                     distance_type,
-                    global_buckets_by_uri[uri],
+                    buckets.value[uri],
                     storage_options,
                 )
             except Exception as exc:
@@ -1378,7 +1385,7 @@ def run_rewrite_shuffle(
                 logger.warning("cluster: rewrite write bucket %d failed for %s: %s", global_bucket, uri, exc)
                 yield (REWRITE_ERROR, uri, str(exc))
 
-    slices: int = max(1, min(total_buckets, len(read_tasks)))
+    slices: int = max(1, min(len(read_tasks), derive_partitions(spark, REWRITE_PARTITION_FACTOR)))
     return (
         spark.sparkContext.parallelize(read_tasks, slices)
         .mapPartitions(read_partition)
@@ -1484,9 +1491,7 @@ def finalise_cluster_dataset(
         A success result dict, or one carrying an ``{"error", "phase": "cluster_index"}`` marker
         while keeping the rewritten data.
     """
-    index_config: IndexJobConfig = cluster_index_config(
-        config, plan["num_partitions"], plan["num_bits"], plan["metric"]
-    )
+    index_config: IndexJobConfig = cluster_index_config(config, plan["num_partitions"], plan["metric"])
     try:
         commit_segments(uri, segment_documents, plan["column"], plan["index_name"], True, index_config, telemetry)
     except Exception as exc:

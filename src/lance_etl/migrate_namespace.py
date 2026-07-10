@@ -721,16 +721,3 @@ class NamespaceMigrator:
             telemetry.gauge("run.datasets_compacted", report.compacted)
             telemetry.gauge("run.datasets_indexed", report.indexed)
             return report
-
-
-def discover_and_migrate(config: MigrateConfig, spark: SparkSession) -> MigrateReport:
-    """Run a namespace migration end-to-end.
-
-    Args:
-        config: Migrate configuration.
-        spark: Active Spark session.
-
-    Returns:
-        The migration report.
-    """
-    return NamespaceMigrator(config).run(spark)

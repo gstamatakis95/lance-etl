@@ -12,6 +12,7 @@ import random
 import sys
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
+from typing import Any
 
 os.environ.setdefault("DD_TRACE_ENABLED", "false")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -21,6 +22,7 @@ import pyarrow as pa
 import pytest
 from lance.optimize import Compaction
 
+from lance_etl.etl.pivot import group_run_starts
 from lance_etl.maintenance import MaintenanceConfig, cleanup_dataset, compaction_metrics_dict
 from lance_etl.telemetry import Telemetry, TelemetryConfig, commit_with_retries
 
@@ -116,6 +118,36 @@ def compact_dataset_inline(uri: str, config: MaintenanceConfig, telemetry: Telem
     result: dict[str, int] = {"tasks": 1, "bytes_removed": bytes_removed}
     result.update(metrics)
     return result
+
+
+def group_by_routing(table: pa.Table, routing_cols: list[str]) -> Iterator[tuple[tuple[Any, ...], pa.Table]]:
+    """Yield each routing key's rows from a partition table sorted by the routing columns.
+
+    Test-only equivalence oracle for :func:`~lance_etl.etl.pivot.stream_routing_groups`.
+    Production streams instead of materializing.
+
+    Expects the partition to arrive sorted by ``routing_cols`` (the ETL chains
+    ``sortWithinPartitions`` onto the routing shuffle), so each distinct key occupies one
+    contiguous run and every group is a zero-copy slice. Total cost is ``O(rows)`` in the run
+    scan regardless of how many distinct keys the partition holds, which is what keeps a
+    long-tail increment with tens of thousands of tiny groups per partition linear.
+
+    Degradation, not corruption, on unsorted input: a key split across non-adjacent runs is
+    yielded once per run, so its dataset receives multiple idempotent ``merge_insert`` calls
+    over disjoint row sets — correct output, extra commits.
+
+    Args:
+        table: The materialized partition table, sorted by the routing columns.
+        routing_cols: The routing key columns.
+
+    Yields:
+        ``(key_values, sub_table)`` for each contiguous routing-key run.
+    """
+    starts: list[int] = group_run_starts(table, routing_cols)
+    for position, start in enumerate(starts):
+        stop: int = starts[position + 1] if position + 1 < len(starts) else table.num_rows
+        key: tuple[Any, ...] = tuple(table.column(c)[start].as_py() for c in routing_cols)
+        yield key, table.slice(start, stop - start)
 
 
 class FakeBroadcast:

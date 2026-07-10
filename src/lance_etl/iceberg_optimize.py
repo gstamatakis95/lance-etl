@@ -113,13 +113,11 @@ class IcebergStepResult:
 
     Attributes:
         step: The procedure name, for example ``rewrite_data_files``.
-        ran: Whether the step was enabled and executed.
-        duration_seconds: Wall time of the ``CALL``, or 0.0 when the step did not run.
+        duration_seconds: Wall time of the ``CALL``.
         metrics: Integer result columns reported by the procedure, for example ``rewritten_data_files_count``.
     """
 
     step: str
-    ran: bool
     duration_seconds: float
     metrics: dict[str, int] = field(default_factory=dict)
 
@@ -221,7 +219,7 @@ class IcebergOptimizer:
         telemetry.incr(f"iceberg.optimize.{step}", tags=[f"table:{self.config.table}"])
         for key, value in metrics.items():
             telemetry.gauge(f"iceberg.optimize.{step}.{key}", float(value), tags=[f"table:{self.config.table}"])
-        return IcebergStepResult(step=step, ran=True, duration_seconds=duration, metrics=metrics)
+        return IcebergStepResult(step=step, duration_seconds=duration, metrics=metrics)
 
     def rewrite_data_files(self, spark: SparkSession, telemetry: Telemetry) -> IcebergStepResult:
         """Bin-pack small data files into larger ones via ``rewrite_data_files``.

@@ -54,7 +54,7 @@ def test_single_fragment_above_threshold_plans_task(
 
     fresh: lance.LanceDataset = lance.dataset(uri)
     config: MaintenanceConfig = make_config(telemetry_config)
-    assert compaction_skip_reason(fresh, config) is None
+    assert compaction_skip_reason(fresh) is None
 
     planned: dict[str, object] = plan_one_dataset(uri, config, None, telemetry)
     assert planned.get("task_jsons")
@@ -91,7 +91,7 @@ def test_single_fragment_below_threshold_skips(
 
     fresh: lance.LanceDataset = lance.dataset(uri)
     config: MaintenanceConfig = make_config(telemetry_config)
-    assert compaction_skip_reason(fresh, config) is None
+    assert compaction_skip_reason(fresh) is None
 
     result: dict[str, object] = plan_one_dataset(uri, config, None, telemetry)
     assert int(result.get("tasks", -1)) == 0
@@ -99,35 +99,31 @@ def test_single_fragment_below_threshold_skips(
     assert lance.dataset(uri).version == version_before_plan
 
 
-def test_single_fragment_no_deletions_skips(tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
+def test_single_fragment_no_deletions_skips(tmp_path: Path) -> None:
     """A single fragment with no deletions is skipped with the unchanged message.
 
     Args:
         tmp_path: Pytest-provided temporary directory.
-        telemetry_config: The test telemetry configuration.
     """
     uri: str = str(tmp_path / "no_deletions.lance")
     table: pa.Table = make_vector_table(100, dim=8)
     write_fragmented_dataset(uri, table, max_rows_per_file=1000)
 
     dataset: lance.LanceDataset = lance.dataset(uri)
-    config: MaintenanceConfig = make_config(telemetry_config)
-    reason: str | None = compaction_skip_reason(dataset, config)
+    reason: str | None = compaction_skip_reason(dataset)
     assert reason is not None
     assert reason.startswith("only 1 fragment")
 
 
-def test_multi_fragment_not_skipped(tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
+def test_multi_fragment_not_skipped(tmp_path: Path) -> None:
     """A multi-fragment dataset is never short-circuited by the skip check.
 
     Args:
         tmp_path: Pytest-provided temporary directory.
-        telemetry_config: The test telemetry configuration.
     """
     uri: str = str(tmp_path / "multi_fragment.lance")
     table: pa.Table = make_vector_table(100, dim=8)
     write_fragmented_dataset(uri, table, max_rows_per_file=10)
 
     dataset: lance.LanceDataset = lance.dataset(uri)
-    config: MaintenanceConfig = make_config(telemetry_config)
-    assert compaction_skip_reason(dataset, config) is None
+    assert compaction_skip_reason(dataset) is None

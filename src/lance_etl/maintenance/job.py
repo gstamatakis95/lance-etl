@@ -39,10 +39,13 @@ from pyspark.sql import SparkSession
 import lance_etl.maintenance.cluster as maintenance_cluster
 from lance_etl.fanout import (
     FANOUT_PARTITION_FACTOR,
+    FLAT_ERROR,
+    FLAT_OK,
     REWRITE_PARTITION_FACTOR,
     derive_partitions,
     fan_out_per_dataset,
     report_fleet_failures,
+    run_flat_tagged_job,
 )
 from lance_etl.telemetry import (
     DEFAULT_COMMIT_RETRIES,
@@ -432,7 +435,7 @@ def cleanup_dataset(
     return int(stats.bytes_removed)
 
 
-def compaction_skip_reason(dataset: lance.LanceDataset, config: MaintenanceConfig) -> str | None:
+def compaction_skip_reason(dataset: lance.LanceDataset) -> str | None:
     """Return a reason string when the dataset provably needs no compaction planning.
 
     This is a conservative derived-state check using only the already-open dataset handle.
@@ -455,15 +458,11 @@ def compaction_skip_reason(dataset: lance.LanceDataset, config: MaintenanceConfi
 
     Args:
         dataset: The already-open dataset handle.
-        config: Maintenance configuration, kept for symmetry with the rest of the plan phase and
-            for the threshold reasoning above. The actual ratio comparison is Lance's, not
-            reimplemented here, so it is not read directly.
 
     Returns:
         A human-readable skip reason when compaction is unnecessary, or ``None`` when the
         planner must decide.
     """
-    del config
     stats: dict[str, Any] = dataset.stats.dataset_stats()
     num_fragments: int = int(stats["num_fragments"])
     num_deleted_rows: int = int(stats["num_deleted_rows"])
@@ -574,7 +573,7 @@ def plan_one_dataset(
 
     did_work: bool = int(result.get("ttl_rows_deleted", 0)) > 0
 
-    skip: str | None = compaction_skip_reason(dataset, config)
+    skip: str | None = compaction_skip_reason(dataset)
     if skip is not None:
         telemetry.incr("dataset.skipped_no_work")
         bytes_removed: int = idle_cleanup_bytes(uri, config, telemetry, dataset, did_work, cleanup_slot)
@@ -701,8 +700,8 @@ class MaintenanceJob:
 
         Per-dataset failure isolation: each task is executed inside a try/except so a single
         dataset's rewrite failure never aborts the flat job. A failing task is tagged
-        ``("error", uri, message)`` and the first error per URI is recorded, while successful
-        tasks are tagged ``("ok", uri, rewrite_json)`` and grouped by URI. The caller excludes
+        ``(FLAT_ERROR, uri, message)`` and the first error per URI is recorded, while successful
+        tasks are tagged ``(FLAT_OK, uri, rewrite_json)`` and grouped by URI. The caller excludes
         any URI carrying an error from the commit phase, so a dataset whose rewrite partially
         failed is never committed.
 
@@ -724,26 +723,16 @@ class MaintenanceJob:
                 item: The ``(uri, read_version, task_json)`` triple.
 
             Returns:
-                ``("ok", uri, rewrite_json)`` on success or ``("error", uri, message)`` when the
-                rewrite raised, so the driver can isolate the failing dataset.
+                ``(FLAT_OK, uri, rewrite_json)`` on success or ``(FLAT_ERROR, uri, message)`` when
+                the rewrite raised, so the driver can isolate the failing dataset.
             """
             try:
                 uri, rewrite_json = execute_rewrite_task(item[0], item[1], item[2], storage_options)
-                return "ok", uri, rewrite_json
+                return FLAT_OK, uri, rewrite_json
             except Exception as exc:
-                return "error", item[0], str(exc)
+                return FLAT_ERROR, item[0], str(exc)
 
-        max_tasks_resolved: int = derive_partitions(spark, REWRITE_PARTITION_FACTOR)
-        slices: int = max(1, min(max_tasks_resolved, len(tasks)))
-        tagged: list[tuple[str, str, str]] = spark.sparkContext.parallelize(tasks, slices).map(run_one).collect()
-        grouped: dict[str, list[str]] = {}
-        errors_by_uri: dict[str, str] = {}
-        for tag, uri, value in tagged:
-            if tag == "ok":
-                grouped.setdefault(uri, []).append(value)
-            else:
-                errors_by_uri.setdefault(uri, value)
-        return grouped, errors_by_uri
+        return run_flat_tagged_job(spark, tasks, run_one, derive_partitions(spark, REWRITE_PARTITION_FACTOR))
 
     def commit_fleet(self, spark: SparkSession, pending: list[tuple[str, list[str]]]) -> list[dict[str, Any]]:
         """Commit every planned dataset's rewrites in a per-dataset executor fan-out (phase C).

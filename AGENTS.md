@@ -1,7 +1,19 @@
 # AGENTS.md — AI coding agent guide for lance-etl
 
-This file is the canonical reference for any AI agent working in this repository. Read it in full
-before touching any file.
+This file is the canonical repo-wide rulebook for any AI agent working in this repository. Read it
+in full before touching any file. It carries the rules that apply everywhere. The package-specific
+detail — the detailed layout, API ground truth, build and test commands, and per-language telemetry
+— lives in two sub-guides. Read the one that covers what you are changing:
+
+- **`src/lance_etl/AGENTS.md`** — the Python package (Spark ETL, indexing, maintenance, pipeline,
+  tools, recall). The full segment-API index recipe's pylance API facts, Python build/test, Python
+  telemetry, and the commit-retry constants.
+- **`rust/search-api/AGENTS.md`** — the Rust gRPC search service. Crate layout, cargo commands, the
+  lance-crate version-bump coupling, Rust telemetry, the filter-AST rule detail, and proto surface
+  notes.
+
+For a developer-facing tour of the jobs and service see the per-directory `README.md` files. For
+architecture decisions see `docs/adr/README.md`.
 
 ---
 
@@ -9,134 +21,25 @@ before touching any file.
 
 ```
 lance-etl/
-  src/lance_etl/          Python package (production sources)
-    etl/                  ETL job package (python -m lance_etl.etl)
-      __init__.py         Re-exports: IcebergToLanceETL, ETLConfig, ROUTING_COLS, apply_merge, apply_ttl_cast, dataset_uri, derive_bulk_schemas, pivot_map_columns, plan_bulk_append, snapshot_id_bounds
-      cli.py              Entry point for lance-etl-etl script and python -m lance_etl.etl
-      __main__.py         Calls cli.main()
-      job.py              IcebergToLanceETL: read_increment, collapse, adaptive-plan routing (explicit N salted shuffle + partition sort), bulk-append fast path before the merge (run_bulk_phase + exclude_bulk_trios), streaming merge fan-out (merge_partition), hourly interval-tag stamp (stamp_interval_tags)
-      plan.py             ETLConfig-driven adaptive routing: RoutingPlan, compute_routing_plan (per-trio count aggregation), apply_salted_shuffle (big-dataset key-hash sub-bucketing), bucket_count/shuffle_partition_count sizing
-      bulk.py             Bulk-append fast path for big NEW or empty datasets: plan_bulk_append (absent-or-empty eligibility), derive_bulk_schemas (one canonical per-trio schema), bootstrap_bulk_datasets (empty bootstrap + re-check demotion), run_bulk_append (parallel write_fragments fan-out), commit_bulk_transactions (single commit_batch + role merge)
-      pivot.py            ETLConfig, ROUTING_COLS, pivot_map_columns (returns column roles, canonical vector dims), align_to_schema (null-fill/reorder/cast a slice to the driver-derived canonical schema), group_by_routing (sorted-run split), stream_routing_groups (streaming counterpart of group_by_routing), apply_fsl_cast, apply_ttl_cast
-      sink.py             The Lance sink seam: apply_merge, table_chunks, build_update_condition, dataset_uri (format 2.1 bootstrap, role writes), open_or_bootstrap (used by the bulk-append bootstrap)
-    indexing/             Indexing job package (python -m lance_etl.indexing)
-      __init__.py         Re-exports: LanceIndexer, IndexJobConfig, all handlers, segments, optimize helpers
-      cli.py              Entry point for lance-etl-index script and python -m lance_etl.indexing
-      __main__.py         Calls cli.main()
-      config.py           IndexJobConfig, METRIC_TO_DISTANCE, FTS_OPTIONAL_PARAMS, index-name helpers
-      handlers.py         IndexHandler, VectorIndexHandler, BTreeIndexHandler, BitmapIndexHandler, ZonemapIndexHandler, FtsIndexHandler, commit_fts_index, publish_fts_index
-      optimize.py         load_vector_config, write_vector_config, drop_existing_index, optimize_existing_index, merge_index_deltas, maintain_index_locally
-      runner.py           LanceIndexer fleet phases: plan_dataset_indexes, bootstrap_vector_index (streaming k-means), persist_bootstrap_centroids, build_one_shard, commit_one_index, merge_deltas_if_needed, role-based target discovery
-      segments.py         build_vector_segment, build_scalar_segment, commit_segments, split_evenly, stale-fragment guards
-    maintenance/          Maintenance job package (python -m lance_etl.maintenance)
-      __init__.py         Re-exports: MaintenanceJob, MaintenanceConfig, plan_one_dataset, commit_one_dataset, fan_out_per_dataset, update_serving_tag, and helpers
-      cli.py              Entry point for lance-etl-maintenance script and python -m lance_etl.maintenance
-      __main__.py         Calls cli.main()
-      job.py              MaintenanceJob fleet phases: plan_one_dataset, execute_rewrite_task, commit_one_dataset, cleanup_dataset, run_ttl_on_open_dataset, compaction_skip_reason (derived-state skip: dataset_stats num_fragments)
-      tools.py            update_serving_tag, update_serving_tags, migrate_dataset_manifest_paths, migrate_manifest_paths, prune_interval_tags, prune_interval_tags_fleet
-      cluster.py          Clustered rewrite fleet phases: plan_cluster_rewrite, partition_histogram, derive_buckets, rewrite shuffle, commit_cluster_overwrite, preserved-centroid index rebuild, run_cluster_rewrites
-    pipeline/             Unified pipeline job package (python -m lance_etl.pipeline)
-      __init__.py         Re-exports: PipelineJob, PipelineConfig, prune_interval_tags, prune_interval_tags_fleet, stamp_eligible
-      cli.py              Entry point for lance-etl-pipeline script and python -m lance_etl.pipeline
-      __main__.py         Calls cli.main()
-      job.py              PipelineJob, PipelineConfig: prune -> maintenance -> index -> stamp serialized fleet phases
-    tools/                Operator tools package (python -m lance_etl.tools)
-      __init__.py         Package marker
-      cli.py              Entry point for lance-etl-tools script and python -m lance_etl.tools
-      __main__.py         Calls cli.main()
-    cliutil.py            Shared CLI helpers: add_common_arguments, add_dataset_arguments, add_index_column_arguments, build_spark (memory-safe SQL defaults), build_telemetry_config, load_dataset_uris, parse_* helpers
-    column_roles.py       Column-role metadata (lance-etl.columns): load_column_roles, merge_column_roles
-    fanout.py             Shared per-dataset Spark fan-out (fan_out_per_dataset) used by the maintenance, indexing, and operator-tool fleet phases
-    recall/               Offline recall audit package (invoked via python -m lance_etl.tools recall)
-      __init__.py         Re-exports: RecallAuditJob, RecallJobConfig, RecallSample, DatadogSpanSource, scoring and query-translation helpers
-      config.py           RecallJobConfig, identifier/path allowlists, BM25 params, scanner batch size
-      source.py           SpanSource, DatadogSpanSource, InMemorySpanSource: fetch and parse recall.* span attributes into RecallSample
-      queries.py          filter_ast_to_sql, text_query_field_queries, tokenize_text, fuse_legs: span-to-query replay translation
-      scoring.py          brute_force_top_k, bm25_top_k, grade_against_reference, grade_hybrid_reference: recall@k/nDCG@k/MRR scoring
-      job.py              RecallAuditJob: two-tier Spark fan-out that scores every sample and renders the aggregate report
-    telemetry.py          Telemetry, TelemetryConfig, LanceRuntimeConfig, commit_with_retries
-    cloud_storage.py      resolve_filesystem + discover_datasets (driver walk or executor-fanned listing) for pyarrow filesystem I/O
-    iceberg_optimize.py   IcebergOptimizer + IcebergOptimizeConfig: source Iceberg table maintenance via CALL procedures (rewrite_data_files, rewrite_manifests, expire_snapshots, opt-in remove_orphan_files)
-    migrate_namespace.py  NamespaceMigrator + MigrateConfig: one-off namespace copy/optimize utility
-  bench/                  Benchmark package (python -m bench)
-    cli.py                Subcommand dispatch: download / prepare / ingest / index / compact
-                          / search / report / e2e / experiment / all
-    experiment.py         Agent loop iteration: prepare + spawn server + e2e + sizes + sweep -> metrics.json + experiments.jsonl
-    server.py             ServerHandle: build/spawn/health-check/restart/stop the search-api binary
-    sizes.py              On-disk data/index/meta byte measurement across the Lance fleet
-    config.py             BenchConfig dataclass + full flag set
-    datasets.py           DatasetAdapter registry: Sift1mAdapter, BigannAdapter
-    download.py           Corpus acquisition + checksum verification
-    prepare.py            Iceberg table + prepared artifacts (queries, ground truth, vocab)
-    ingest.py             Real ETL run via LanceIndexer / IcebergToLanceETL
-    indexes.py            Index build phase
-    compaction.py         Compaction phase
-    search.py             Recall / FTS / hybrid / load / clusters / prewarm search legs
-    report.py             summary.md, recall.csv, results.csv, pareto.png aggregation
-    grpc_client.py        gRPC stub helpers for the search legs
-    results.py            Phase artifact I/O (save_phase, load_phase, read_json, write_json)
-  rust/search-api/        Rust gRPC search service (tonic, lance crate)
-    proto/                lance_etl/v1/lance_etl.proto (one file: SearchService + IntakeService, shared DatasetTarget)
-    src/domain/           Transport-agnostic types and traits
-      target.rs           DatasetTarget, DatasetRef — dataset addressing (one dataset per request)
-      query.rs            VectorQuery, TextQuery, HybridQuery, Hit, FusedHit
-      filter.rs           Typed predicate AST (no raw SQL)
-      backend.rs          SearchBackend trait
-      prewarm.rs          PrewarmSpec, PrewarmReport, Prewarmer trait
-      clusters.rs         ClusterSpec, ClusterReport, ClusterReader trait
-      fusion.rs           FusionSpec (Rrf and Weighted variants) and within-dataset fusion logic
-      intake.rs           IntakeBatch, Record, RecordWrite, WriteOp, RecordSink trait, StdoutSink placeholder
-      error.rs            SearchError
-    src/cache/            Persistent two-tier caching layer (index + metadata, no raw data), pluggable disk/redis backends
-      layout.rs           Versioned stamp naming, key hashing, framing, atomic writes, TTL/budget sweep
-      entry_store.rs      EntryStore trait: the persistent byte-store seam beneath both tiers
-      disk_store.rs       Local-disk EntryStore (the default backend, prefixes.json registry)
-      redis_store.rs      Shared-Redis EntryStore (hash-per-dir keys, native TTL, registry hygiene)
-      index_cache.rs      HybridIndexCacheBackend: Moka hot tier + pluggable persistent CacheBackend
-      store_cache.rs      Read-through byte cache for immutable metadata of wrapped stores
-      janitor.rs          Periodic TTL + budget sweep over the disk tiers (redis needs none)
-    src/lance/            Lance backend implementations
-      backend.rs          LanceSearchBackend — single-dataset dispatch, vector/text/hybrid fusion
-      provider.rs         DatasetProvider trait, CachingDatasetProvider (shared session + LRU)
-      filter.rs           filter_to_expr: domain Filter -> DataFusion Expr
-      text.rs             Domain text query tree -> Lance FTS parameters
-      rows.rs             Arrow record batch -> JSON row conversion
-      prewarm.rs          Prewarmer impl over Lance prewarm APIs
-      index_reader.rs     IVF centroid extraction, ClusterReader impl
-      error.rs            Lance error classification into SearchError
-    src/grpc/             Tonic transport
-      mod.rs              SearchGrpc<B>: tonic service adapter (search) + IntakeGrpc<S> (intake)
-      convert.rs          Proto <-> domain conversion for the search service
-      intake.rs           IntakeGrpc<S>: tonic adapter over any RecordSink
-      intake_convert.rs   Proto <-> domain conversion for the intake service
-    src/telemetry/        Datadog observability
-      traces.rs           OTLP span export, JSON stdout logs with trace correlation
-      metrics.rs          Typed DogStatsD facade (Metrics struct + Rpc + IntakeRpc tag enums)
-      recall.rs           Deterministic sampled-query capture into recall.* span attributes
-    src/config.rs         Config from env vars
-    src/lib.rs            Crate root
-    src/main.rs           Binary entry point
-    Cargo.toml            Workspace root for the crate
-  airflow/
-    lance_etl_common.py        Shared DAG helpers: default_args, common environment variables, and task-factory utilities
-    lance_etl_etl_dag.py       Airflow DAG for the ETL job (optimize-iceberg [optional] >> etl)
-    lance_etl_pipeline_dag.py  Airflow DAG for the unified pipeline (prune >> maintenance >> index >> stamp, max_active_runs=1)
-  tests/                  pytest suite (conftest.py + test_*.py)
-  docs/
-    adr/                  Architecture decisions, consolidated into six thematic documents plus a numbered index (README.md)
-  market-research/        Detailed evaluation notes, plans, and evidence underlying the ADRs
-  pyproject.toml          Build, dependencies, ruff config
+  src/lance_etl/     Python package: Spark ETL, indexing, maintenance, pipeline, tools, recall (detail: src/lance_etl/AGENTS.md)
+  rust/search-api/   Rust gRPC search service: tonic transport over the Lance crate (detail: rust/search-api/AGENTS.md)
+  bench/             End-to-end benchmark package, python -m bench (detail: bench/README.md)
+  airflow/           Two Airflow DAGs: the ETL DAG and the unified pipeline DAG
+  tests/             pytest suite (conftest.py + test_*.py)
+  docs/adr/          Architecture decisions, six thematic documents plus a numbered index (docs/adr/README.md)
+  market-research/   Detailed evaluation notes, plans, and evidence underlying the ADRs
+  pyproject.toml     Build, dependencies, ruff config
 ```
 
-The lance checkout at `/Users/gstamatakis/IdeaProjects/lance` is the API ground truth. When you
-are unsure whether a pylance API exists or what its signature is, read that checkout. Do not guess.
+The lance checkout at `/Users/gstamatakis/IdeaProjects/lance` is the API ground truth. When you are
+unsure whether a pylance API exists or what its signature is, read that checkout. Do not guess.
 
 ---
 
 ## Hard coding rules
 
-These are non-negotiable. A review that finds a violation must fix it before marking the change
-done.
+These are non-negotiable and repo-wide. A review that finds a violation must fix it before marking
+the change done.
 
 ### 1. No leading underscores on any defined name
 
@@ -239,12 +142,15 @@ requires lance 8 (upstream commits e8748a405 and cc657c5e3), which this repo alr
 
 Never call `merge_index_metadata` for BTREE, BITMAP, or vector types. The call raises.
 
+The pylance API facts these recipes depend on (`build_rq_model`, `get_ivf_model`,
+`IvfModel.save/load`, `lance_field_id`, and so on) are in `src/lance_etl/AGENTS.md`.
+
 ### 7. No raw SQL strings in the gRPC filter API
 
-The `Filter` type in `src/domain/filter.rs` is a typed AST. Column names are validated against the
-dataset schema and the allowlist `[A-Za-z_][A-Za-z0-9_]*`. Literals become typed DataFusion `lit`
-expressions via `filter_to_expr`. Do not accept, construct, or pass raw SQL strings anywhere in
-the gRPC or domain layers.
+The `Filter` type in `rust/search-api/src/domain/filter.rs` is a typed AST. Column names are
+validated against the dataset schema and the allowlist `[A-Za-z_][A-Za-z0-9_]*`. Literals become
+typed DataFusion `lit` expressions via `filter_to_expr`. Do not accept, construct, or pass raw SQL
+strings anywhere in the gRPC or domain layers. The full detail is in `rust/search-api/AGENTS.md`.
 
 ### 8. No stable row IDs — they are rejected, not deferred
 
@@ -256,115 +162,20 @@ decision. Revisiting requires a fresh ADR.
 
 ---
 
-## Build and test commands
+## Telemetry conventions (repo-wide)
 
-### Python
-
-```bash
-# Install (editable) with dev dependencies
-uv pip install -e ".[dev]"
-
-# Install bench extras
-uv pip install --group bench
-
-# Lint and format (must pass before any commit)
-uvx ruff format src/ tests/ airflow/ bench/
-uvx ruff check src/ tests/ airflow/ bench/
-
-# Run tests
-.venv/bin/pytest
-```
-
-pylance `>=8.0.0` installs from PyPI (8.0.0 released 2026-07-01, superseding the
-build-from-checkout requirement of the 8.0.0b6 era):
-
-```bash
-uv pip install "pylance>=8.0.0"
-```
-
-### Rust (rust/search-api)
-
-```bash
-cd rust/search-api
-cargo fmt                    # format
-cargo clippy -- -D warnings  # lint (must be clean)
-cargo build                  # compile
-cargo test                   # unit tests
-```
-
-The Redis cache-backend integration tests (`tests/redis_cache.rs`) spawn a throwaway local
-`redis-server` per test and self-skip with a message when the binary is not installed, so
-`cargo test` stays green without Redis. Install `redis-server` to run them unskipped.
-
-The lance crates are sourced from crates.io (`lance = "8.0.0"` and friends in
-`rust/search-api/Cargo.toml`). Bump them together with the pylance dependency and the
-`LANCE_CACHE_STAMP` in `src/cache/layout.rs`, which wipes the on-disk caches across lance
-versions because the cache codec format is unstable between releases. The same stamp also
-namespaces the Redis cache keys, so after a bump the old generation of keys simply ages out
-through its TTLs (ADR 0031).
-
----
-
-## API ground truth and known API notes
-
-Key facts to internalize:
-
-- `lance.lance.indices.build_rq_model(dimension, num_bits=1, dtype="float32")` is a real API
-  returning a JSON string. The vector dimension must be divisible by 8.
-- Streaming k-means (`streaming_sample_rate`, `streaming_coreset_rate`,
-  `streaming_refine_passes`) is exposed only through the committed `create_index` path. The
-  distributed segment path refuses internal training and requires precomputed centroids.
-- `create_index_uncommitted(..., rabitq_model=str)` is validated. Passing a wrong JSON raises
-  `ValueError`. The same string must reach every executor shard.
-- `CommitConflictError` is not reliably importable from `lance` directly. Use the fallback chain
-  in `telemetry.py`. Conflicts surface as `OSError` or `RuntimeError` from lance internals.
-- `defer_index_remap=True` builds a `__lance_frag_reuse` system index at commit time through
-  the options passed to `Compaction.commit`. pylance 8.0.0 carries the `options` parameter.
-- The FTS path requires a Lance field id (not a pyarrow schema index) for `Index(fields=[...])`.
-  Resolve it with `lance_field_id(dataset, column)` from `indexing/segments.py` — the single
-  documented helper for that internal access, per hard rule 1. Never inline the underlying
-  `_ds.lance_schema` lookup at call sites.
-- Iceberg 1.10 rejects `start-timestamp` / `end-timestamp` outside changelog scans. Use
-  `snapshot_id_bounds` in `etl.py` to resolve wall-clock windows to `start-snapshot-id` /
-  `end-snapshot-id` from the `{table}.snapshots` metadata table before reading.
-- KNOWN pylance 8.0.0 REGRESSION: concurrent `merge_insert` against a dataset carrying BTREE
-  index deltas can raise the internal error `RowAddrTreeMap::from_sorted_iter called with
-  non-sorted input`. The failure is loud (the merge errors and retries surface it, no silent
-  corruption), and the coexistence stress test is marked xfail with this reason. Re-test and
-  drop the marker when an upstream fix ships.
-- V2 manifest paths default on (`enable_v2_manifest_paths=True` at dataset creation). New datasets
-  use V2. Existing datasets migrate via `migrate_manifest_paths_v2`. V2 makes every dataset open
-  a single object-store request regardless of version-history depth.
-- `lance.indices.IvfModel.save(uri, *, storage_options=)` / `IvfModel.load(uri, *,
-  storage_options=)` persist and read IVF centroids through lance's own object-store layer in a
-  single-file format. This is the centroid sidecar mechanism (ADR 0040). Never use
-  `create_index`'s `ivf_centroids_file` parameter, which bypasses `storage_options`.
-
----
-
-## Telemetry conventions
-
-- `Telemetry.create(config)` must be called once per process (driver and each executor). Never
-  pickle a `Telemetry` object into a closure. Pickle only the `TelemetryConfig` dataclass.
-- Metrics are namespaced under `config.metric_prefix` (default `lance.pipeline`) and tagged with
-  `env:`, `service:`, and optional constant tags.
-- Lance trace events are bridged to Datadog automatically on the first `Telemetry.create` call per
-  process via `attach_lance_event_bridge`.
-- The Rust service emits `search_api.*` metrics via the typed `Metrics` facade. All metric emitters
-  are infallible: an unreachable Datadog Agent never panics and never fails a request.
-- Per-query-leg spans (`lance.vector_query` / `lance.text_query`) carry `object_store.*`
-  attributes sourced from Lance execution-stats events: `object_store.requests`,
-  `object_store.iops`, `object_store.bytes_read`, `object_store.parts_loaded`,
-  `object_store.indices_loaded`. These are aggregate counts only (no per-method GET/HEAD/LIST split, as
-  Lance does not expose that in production builds). They stay low cardinality: no org, tenant, or
-  version identifier is attached to span attributes.
+Telemetry is Datadog throughout. `Telemetry.create(config)` runs once per process on the Python
+side, and the Rust service emits `search_api.*` metrics through a typed facade. All metric emitters
+are infallible: an unreachable Datadog Agent never fails a request or a job. Span attributes and
+metric tags stay low cardinality — no org, tenant, or version identifier is attached. The
+per-language specifics (Python metric prefix and event bridge, the Rust `object_store.*` span
+attributes and typed tag enums) are in `src/lance_etl/AGENTS.md` and `rust/search-api/AGENTS.md`.
 
 ---
 
 ## Commit-conflict retry pattern
 
-All commits (ETL merge_insert, index commit, compaction commit) must go through
-`commit_with_retries` from `telemetry.py`. Retry budgets are defined as named constants in
-`telemetry.py`: `DEFAULT_CONFLICT_RETRIES` (10) for ETL, `DEFAULT_COMMIT_RETRIES` (20) for index
-and compaction, and `DEFAULT_LARGE_COMMIT_RETRIES` (2) for the compaction `Compaction.commit`. The retry
-loop re-reads the dataset before each attempt so it operates against the latest version.
+All Python commits (ETL merge_insert, index commit, compaction commit) must go through
+`commit_with_retries` from `src/lance_etl/telemetry.py`, which re-reads the dataset before each
+attempt so it operates against the latest version. The named retry-budget constants are documented
+in `src/lance_etl/AGENTS.md`.

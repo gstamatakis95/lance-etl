@@ -24,6 +24,7 @@ from unittest.mock import MagicMock
 import lance
 import pyarrow as pa
 import pytest
+from conftest import group_by_routing
 from pyspark.sql import SparkSession
 from pyspark.sql.types import (
     ArrayType,
@@ -38,7 +39,7 @@ from pyspark.sql.types import (
 import lance_etl.etl.pivot as pivot_module
 from lance_etl.cliutil import SPARK_CONF_DEFAULTS
 from lance_etl.etl import ETLConfig, IcebergToLanceETL, dataset_uri
-from lance_etl.etl.pivot import ROUTING_COLS, group_by_routing
+from lance_etl.etl.pivot import ROUTING_COLS
 from lance_etl.etl.plan import RoutingPlan, compute_routing_plan
 from lance_etl.telemetry import TelemetryConfig
 

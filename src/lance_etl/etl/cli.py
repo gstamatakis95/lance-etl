@@ -15,11 +15,11 @@ from lance_etl.cliutil import (
     add_common_arguments,
     build_spark,
     build_telemetry_config,
-    configure_logging_from_args,
     parse_epoch_ms,
     parse_hour_tag,
     parse_key_values,
     parse_storage_options,
+    run_cli_main,
     run_with_spark,
 )
 from lance_etl.etl.job import IcebergToLanceETL
@@ -114,10 +114,4 @@ def main(argv: Sequence[str] | None = None) -> int:
     Returns:
         A process exit code.
     """
-    args: argparse.Namespace = build_parser().parse_args(argv)
-    configure_logging_from_args(args)
-    try:
-        run(args)
-        return 0
-    except Exception:
-        return 1
+    return run_cli_main(build_parser(), run, argv)

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from lance_etl.cliutil import (
     add_common_arguments,
@@ -29,11 +29,10 @@ from lance_etl.cliutil import (
     add_ttl_arguments,
     build_spark,
     build_telemetry_config,
-    configure_logging_from_args,
     load_dataset_uris,
     load_uris_or_none,
     parse_storage_options,
-    resolve_exit_code,
+    run_cli_main,
     run_with_spark,
 )
 from lance_etl.fanout import count_failed
@@ -184,7 +183,7 @@ def run_tag(args: argparse.Namespace) -> int:
                 load_dataset_uris(args, spark),
                 build_telemetry_config(args),
                 parse_storage_options(args),
-                tag=args.tag,
+                tags=[args.tag],
                 target_version=args.tag_version,
             )
         )
@@ -238,14 +237,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         the run completed but one or more datasets failed in isolation and will be retried by the
         next scheduled run.
     """
-    args: argparse.Namespace = build_parser().parse_args(argv)
-    configure_logging_from_args(args)
-    runners = {
+    runners: dict[str, Callable[[argparse.Namespace], int | None]] = {
         "run": run_run,
         "tag": run_tag,
         "migrate-manifests": run_migrate_manifests,
     }
-    try:
-        return resolve_exit_code(runners[args.command](args))
-    except Exception:
-        return 1
+    return run_cli_main(build_parser(), runners, argv)

@@ -19,8 +19,9 @@ from __future__ import annotations
 from typing import Any
 
 import pyarrow as pa
+from conftest import group_by_routing
 
-from lance_etl.etl.pivot import ROUTING_COLS, group_by_routing, stream_routing_groups
+from lance_etl.etl.pivot import ROUTING_COLS, stream_routing_groups
 
 ROUTING: list[str] = list(ROUTING_COLS)
 

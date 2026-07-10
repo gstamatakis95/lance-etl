@@ -46,9 +46,8 @@ class ETLConfig:
 
     The schema-contract columns (:data:`KEY_COL`, :data:`OP_COL`, :data:`DELETE_OP_VALUES`,
     :data:`TTL_COL`) and the operational constants (``MAX_SHUFFLE_PARTITIONS`` in
-    :mod:`lance_etl.etl.plan`, ``MAX_BULK_TASKS_PER_DATASET`` and ``DATA_STORAGE_VERSION`` in
-    :mod:`lance_etl.etl.bulk` and :mod:`lance_etl.etl.sink`) are fixed module-level constants, not
-    fields, because they are never varied.
+    :mod:`lance_etl.etl.plan` and ``DATA_STORAGE_VERSION`` in :mod:`lance_etl.etl.sink`) are fixed
+    module-level constants, not fields, because they are never varied.
 
     Attributes:
         base_uri: Root location under which per-tenant datasets live.
@@ -104,15 +103,48 @@ class ETLConfig:
     tag_stamp: str | None = None
 
 
+def routing_stats_schema(extra_fields: list[tuple[str, pa.DataType]]) -> pa.Schema:
+    """Build a per-dataset stats schema: one string column per routing column plus extras.
+
+    Shared builder behind :func:`stats_schema` and :func:`lance_etl.etl.bulk.bulk_stats_schema`,
+    so both the merge and bulk-append fast-path stats schemas agree on the routing-column prefix.
+
+    Args:
+        extra_fields: Additional ``(name, type)`` fields appended after the routing columns.
+
+    Returns:
+        A schema with one string column per :data:`ROUTING_COLS` entry, followed by ``extra_fields``
+        in order.
+    """
+    fields: list[tuple[str, pa.DataType]] = [(column, pa.string()) for column in ROUTING_COLS]
+    fields.extend(extra_fields)
+    return pa.schema(fields)
+
+
+def routing_stats_ddl(extra_columns: list[tuple[str, str]]) -> str:
+    """Return the Spark DDL string matching :func:`routing_stats_schema`.
+
+    Shared builder behind :func:`stats_spark_ddl` and
+    :func:`lance_etl.etl.bulk.bulk_stats_spark_ddl`.
+
+    Args:
+        extra_columns: Additional ``(name, spark_type)`` columns appended after the routing columns.
+
+    Returns:
+        A DDL string with routing columns as string, followed by ``extra_columns`` in order.
+    """
+    columns: str = ", ".join(f"`{column}` string" for column in ROUTING_COLS)
+    extras: str = ", ".join(f"`{name}` {spark_type}" for name, spark_type in extra_columns)
+    return f"{columns}, {extras}" if extras else columns
+
+
 def stats_schema() -> pa.Schema:
     """Build the per-dataset stats schema (routing columns + upserted/deleted counters).
 
     Returns:
         A schema with one string column per routing column plus ``upserted`` and ``deleted``.
     """
-    fields: list[tuple[str, pa.DataType]] = [(column, pa.string()) for column in ROUTING_COLS]
-    fields.extend([("upserted", pa.int64()), ("deleted", pa.int64())])
-    return pa.schema(fields)
+    return routing_stats_schema([("upserted", pa.int64()), ("deleted", pa.int64())])
 
 
 def stats_spark_ddl() -> str:
@@ -121,8 +153,7 @@ def stats_spark_ddl() -> str:
     Returns:
         A DDL string with routing columns as string plus upserted/deleted as bigint.
     """
-    columns: str = ", ".join(f"`{column}` string" for column in ROUTING_COLS)
-    return f"{columns}, `upserted` bigint, `deleted` bigint"
+    return routing_stats_ddl([("upserted", "bigint"), ("deleted", "bigint")])
 
 
 def apply_fsl_cast(
@@ -283,33 +314,6 @@ def group_run_starts(table: pa.Table, routing_cols: list[str]) -> list[int]:
     return [0, *boundaries]
 
 
-def group_by_routing(table: pa.Table, routing_cols: list[str]) -> Iterator[tuple[tuple[Any, ...], pa.Table]]:
-    """Yield each routing key's rows from a partition table sorted by the routing columns.
-
-    Expects the partition to arrive sorted by ``routing_cols`` (the ETL chains
-    ``sortWithinPartitions`` onto the routing shuffle), so each distinct key occupies one
-    contiguous run and every group is a zero-copy slice. Total cost is ``O(rows)`` in the run
-    scan regardless of how many distinct keys the partition holds, which is what keeps a
-    long-tail increment with tens of thousands of tiny groups per partition linear.
-
-    Degradation, not corruption, on unsorted input: a key split across non-adjacent runs is
-    yielded once per run, so its dataset receives multiple idempotent ``merge_insert`` calls
-    over disjoint row sets — correct output, extra commits.
-
-    Args:
-        table: The materialized partition table, sorted by the routing columns.
-        routing_cols: The routing key columns.
-
-    Yields:
-        ``(key_values, sub_table)`` for each contiguous routing-key run.
-    """
-    starts: list[int] = group_run_starts(table, routing_cols)
-    for position, start in enumerate(starts):
-        stop: int = starts[position + 1] if position + 1 < len(starts) else table.num_rows
-        key: tuple[Any, ...] = tuple(table.column(c)[start].as_py() for c in routing_cols)
-        yield key, table.slice(start, stop - start)
-
-
 def stream_routing_groups(
     batches: Iterator[pa.RecordBatch],
     routing_cols: list[str],
@@ -318,16 +322,17 @@ def stream_routing_groups(
 ) -> Iterator[tuple[tuple[Any, ...], pa.Table]]:
     """Stream routing-key groups from an iterator of batches without materializing the partition.
 
-    Streaming counterpart of :func:`group_by_routing`: consumes an iterator of Arrow batches
-    sorted by ``routing_cols`` and yields ``(key, sub_table)`` groups while holding at most one
-    group (or one flush's worth) in memory, so executor memory scales with one dataset group
-    rather than the whole partition. Cost is ``O(rows)``.
+    Streaming counterpart of the non-streaming, whole-partition grouping this module used to
+    expose: consumes an iterator of Arrow batches sorted by ``routing_cols`` and yields ``(key,
+    sub_table)`` groups while holding at most one group (or one flush's worth) in memory, so
+    executor memory scales with one dataset group rather than the whole partition. Cost is
+    ``O(rows)``.
 
     Because collapse runs before this stage, each key is already exactly one atomic row, so a
     byte-budget flush mid-run never splits a key across upsert commits. When one key does span
     multiple flushes, it yields multiple groups over disjoint rows, and the downstream idempotent
-    :func:`~lance_etl.etl.sink.apply_merge` calls converge — the same degradation contract as
-    :func:`group_by_routing`.
+    :func:`~lance_etl.etl.sink.apply_merge` calls converge — the same key-split-across-runs
+    degradation contract as the test-only equivalence oracle in ``tests/conftest.py``.
 
     Byte accounting uses each batch's mean row width (``nbytes // num_rows``) rather than a
     per-slice ``.nbytes``, which over-counts zero-copy slices.
@@ -441,9 +446,10 @@ def build_stats_batch(rows: list[tuple[Any, ...]], schema: pa.Schema) -> pa.Reco
     """Build the per-partition stats record batch.
 
     Args:
-        rows: One ``(*routing_values, upserted, deleted)`` per dataset, matching the schema's
-            column order.
-        schema: The stats schema produced by :func:`stats_schema`.
+        rows: One tuple of values per dataset, matching the schema's column order — the routing
+            column values followed by the extra stat values in schema order.
+        schema: The stats schema the rows conform to, e.g. from :func:`stats_schema` or
+            :func:`lance_etl.etl.bulk.bulk_stats_schema`.
 
     Returns:
         A record batch conforming to the given schema.

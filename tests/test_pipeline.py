@@ -121,7 +121,7 @@ def noop_update_serving_tags(
     dataset_uris: Any,
     telemetry_cfg: Any,
     storage_options: Any,
-    tag: str = "HEAD",
+    tags: Any = ("HEAD",),
     target_version: Any = None,
     partitions: int = 512,
 ) -> list[dict[str, Any]]:
@@ -132,14 +132,14 @@ def noop_update_serving_tags(
         dataset_uris: Unused URI iterable.
         telemetry_cfg: Unused telemetry config.
         storage_options: Unused storage options.
-        tag: Unused tag name.
+        tags: Unused tag names.
         target_version: Unused target version.
         partitions: Unused partition count.
 
     Returns:
         An empty list.
     """
-    del spark, dataset_uris, telemetry_cfg, storage_options, tag, target_version, partitions
+    del spark, dataset_uris, telemetry_cfg, storage_options, tags, target_version, partitions
     return []
 
 
@@ -186,14 +186,14 @@ class TestPhaseOrdering:
             dataset_uris: Any,
             telemetry_cfg: Any,
             storage_options: Any,
-            tag: str = "HEAD",
+            tags: Any = ("HEAD",),
             target_version: Any = None,
             partitions: int = 512,
         ) -> list[dict[str, Any]]:
-            """Record each stamp call."""
+            """Record the single stamp call, carrying every tag it flipped."""
             del spark, dataset_uris, telemetry_cfg, storage_options, target_version, partitions
-            order.append(f"stamp:{tag}")
-            return [{"uri": uri, "tag": tag, "version": 1, "created": True}]
+            order.append(f"stamp:{','.join(tags)}")
+            return [{"uri": uri, "tags": list(tags), "version": 1, "created": dict.fromkeys(tags, True)}]
 
         monkeypatch.setattr(pipeline_job, "prune_interval_tags_fleet", fake_prune_fleet)
         monkeypatch.setattr(pipeline_job.MaintenanceJob, "run", fake_maintenance_run)
@@ -207,7 +207,7 @@ class TestPhaseOrdering:
             serve_tag=True,
         )
         PipelineJob(config).run(FakeSpark(), [uri])
-        assert order == ["prune", "maintenance", "index", "stamp:20260611T120000Z", "stamp:HEAD"]
+        assert order == ["prune", "maintenance", "index", "stamp:20260611T120000Z,HEAD"]
 
     def test_prune_skipped_when_tag_keep_last_none(
         self,
@@ -380,14 +380,16 @@ class TestStampGating:
             dataset_uris: Any,
             telemetry_cfg: Any,
             storage_options: Any,
-            tag: str = "HEAD",
+            tags: Any = ("HEAD",),
             target_version: Any = None,
             partitions: int = 512,
         ) -> list[dict[str, Any]]:
             """Capture the URIs passed to the stamp fan-out."""
             del spark, telemetry_cfg, storage_options, target_version, partitions
             stamped_uris.extend(list(dataset_uris))
-            return [{"uri": u, "tag": tag, "version": 1, "created": True} for u in dataset_uris]
+            return [
+                {"uri": u, "tags": list(tags), "version": 1, "created": dict.fromkeys(tags, True)} for u in dataset_uris
+            ]
 
         monkeypatch.setattr(pipeline_job, "prune_interval_tags_fleet", noop_prune_fleet)
         monkeypatch.setattr(pipeline_job.MaintenanceJob, "run", noop_maintenance_run)
@@ -402,6 +404,53 @@ class TestStampGating:
         PipelineJob(config).run(FakeSpark(), [uri_ok, uri_err])
         assert uri_ok in stamped_uris
         assert uri_err not in stamped_uris
+
+    def test_serve_tag_stamps_interval_and_head_in_one_fan_out(
+        self,
+        telemetry_config: TelemetryConfig,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """One update_serving_tags fan-out flips both the interval tag and HEAD.
+
+        With ``serve_tag`` set, the stamp phase must make exactly one call carrying both tags
+        instead of one call per tag.
+        """
+        uri: str = write_tiny_dataset(tmp_path)
+        calls: list[list[str]] = []
+
+        def fake_update_serving_tags(
+            spark: Any,
+            dataset_uris: Any,
+            telemetry_cfg: Any,
+            storage_options: Any,
+            tags: Any = ("HEAD",),
+            target_version: Any = None,
+            partitions: int = 512,
+        ) -> list[dict[str, Any]]:
+            """Record every call's tag list so the test can assert on the call count."""
+            del spark, telemetry_cfg, storage_options, target_version, partitions
+            calls.append(list(tags))
+            return [
+                {"uri": u, "tags": list(tags), "version": 1, "created": dict.fromkeys(tags, True)} for u in dataset_uris
+            ]
+
+        monkeypatch.setattr(pipeline_job, "prune_interval_tags_fleet", noop_prune_fleet)
+        monkeypatch.setattr(pipeline_job.MaintenanceJob, "run", noop_maintenance_run)
+        monkeypatch.setattr(pipeline_job.LanceIndexer, "run", noop_indexer_run)
+        monkeypatch.setattr(pipeline_job, "update_serving_tags", fake_update_serving_tags)
+
+        config = make_config(
+            telemetry_config,
+            tag_keep_last=None,
+            tag_stamp="20260611T120000Z",
+            serve_tag=True,
+        )
+        result: dict[str, Any] = PipelineJob(config).run(FakeSpark(), [uri])
+
+        assert len(calls) == 1
+        assert calls[0] == ["20260611T120000Z", "HEAD"]
+        assert result["counts"]["stamped"] == 1
 
     def test_no_tag_stamp_skips_update_serving_tags(
         self,

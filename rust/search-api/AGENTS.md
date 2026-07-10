@@ -1,0 +1,161 @@
+# AGENTS.md — Rust search service (`rust/search-api/`)
+
+The repository-root `AGENTS.md` is the canonical rulebook. Its eight **Hard coding rules** apply
+here in full. For Rust the relevant ones are rule 2 (`///` doc comments only on public items, no
+`//` inline comments in production code paths), rule 7 (no raw SQL strings in the filter API), and
+rule 8 (no stable row IDs). This file adds the service specifics: the crate layout, cargo commands,
+the lance-crate version-bump coupling, Rust telemetry conventions, the filter-AST rule detail, and
+proto surface facts not already in the sibling `README.md`.
+
+`README.md` in this directory is the developer-facing service overview (what it serves, the
+five-layer architecture, invariants, configuration, observability). Read it first and do not
+duplicate it here. This file is agent-facing and complementary.
+
+---
+
+## Layout
+
+```
+rust/search-api/        Rust gRPC search service (tonic, lance crate)
+  proto/                lance_etl/v1/lance_etl.proto (one file: SearchService + IntakeService, shared DatasetTarget)
+  src/domain/           Transport-agnostic types and traits
+    target.rs           DatasetTarget, DatasetRef — dataset addressing (one dataset per request)
+    query.rs            VectorQuery, TextQuery, HybridQuery, Hit, FusedHit
+    filter.rs           Typed predicate AST (no raw SQL)
+    backend.rs          SearchBackend trait
+    prewarm.rs          PrewarmSpec, PrewarmReport, Prewarmer trait
+    clusters.rs         ClusterSpec, ClusterReport, ClusterReader trait
+    fusion.rs           FusionSpec (Rrf and Weighted variants) and within-dataset fusion logic
+    intake.rs           IntakeBatch, Record, RecordWrite, WriteOp, RecordSink trait, StdoutSink placeholder
+    error.rs            SearchError
+  src/cache/            Persistent two-tier caching layer (index + metadata, no raw data), pluggable disk/redis backends
+    layout.rs           Versioned stamp naming, key hashing, framing, atomic writes, TTL/budget sweep
+    entry_store.rs      EntryStore trait: the persistent byte-store seam beneath both tiers
+    disk_store.rs       Local-disk EntryStore (the default backend, prefixes.json registry)
+    redis_store.rs      Shared-Redis EntryStore (hash-per-dir keys, native TTL, registry hygiene)
+    index_cache.rs      HybridIndexCacheBackend: Moka hot tier + pluggable persistent CacheBackend
+    store_cache.rs      Read-through byte cache for immutable metadata of wrapped stores
+    janitor.rs          Periodic TTL + budget sweep over the disk tiers (redis needs none)
+  src/lance/            Lance backend implementations
+    backend.rs          LanceSearchBackend — single-dataset dispatch, vector/text/hybrid fusion
+    provider.rs         DatasetProvider trait, CachingDatasetProvider (shared session + LRU)
+    filter.rs           filter_to_expr: domain Filter -> DataFusion Expr
+    text.rs             Domain text query tree -> Lance FTS parameters
+    rows.rs             Arrow record batch -> JSON row conversion
+    prewarm.rs          Prewarmer impl over Lance prewarm APIs
+    index_reader.rs     IVF centroid extraction, ClusterReader impl
+    error.rs            Lance error classification into SearchError
+  src/grpc/             Tonic transport
+    mod.rs              SearchGrpc<B>: tonic service adapter (search) + IntakeGrpc<S> (intake)
+    convert.rs          Proto <-> domain conversion for the search service
+    intake.rs           IntakeGrpc<S>: tonic adapter over any RecordSink
+    intake_convert.rs   Proto <-> domain conversion for the intake service
+  src/telemetry/        Datadog observability
+    traces.rs           OTLP span export, JSON stdout logs with trace correlation
+    metrics.rs          Typed DogStatsD facade (Metrics struct + Rpc + IntakeRpc tag enums)
+    recall.rs           Deterministic sampled-query capture into recall.* span attributes
+  src/config.rs         Config from env vars
+  src/lib.rs            Crate root
+  src/main.rs           Binary entry point
+  Cargo.toml            Workspace root for the crate
+```
+
+---
+
+## Build, test, lint
+
+```bash
+cd rust/search-api
+cargo fmt                    # format
+cargo clippy -- -D warnings  # lint (must be clean)
+cargo build                  # compile
+cargo test                   # unit tests
+```
+
+The Redis cache-backend integration tests (`tests/redis_cache.rs`) spawn a throwaway local
+`redis-server` per test and self-skip with a message when the binary is not installed, so
+`cargo test` stays green without Redis. Install `redis-server` to run them unskipped.
+
+---
+
+## Lance-crate version-bump coupling
+
+The lance crates are sourced from crates.io (`lance = "8.0.0"` and friends in `Cargo.toml`). Bump
+them together with three coupled things:
+
+1. The `pylance` dependency pin in the Python project (`../../pyproject.toml`).
+2. `LANCE_CACHE_STAMP` in `src/cache/layout.rs`. It is baked into the on-disk stamp directory name,
+   because the cache codec format is unstable between lance releases. Bumping it makes
+   `prepare_cache_root` wipe any sibling stamp directory on next startup.
+3. The same stamp namespaces every Redis cache key, so after a bump the old generation of keys
+   simply ages out through its TTLs rather than being actively purged (ADR 0031,
+   `../../docs/adr/caching-and-observability.md`).
+
+---
+
+## Filter-AST rule (hard rule 7 detail)
+
+`domain::filter::Filter` is a typed AST (`Compare`, `InList`, `IsNull`, `IsNotNull`, `Between`,
+`And`, `Or`, `Not`). Column names are validated against the dataset schema at translation time and
+the identifier allowlist `[A-Za-z_][A-Za-z0-9_]*`. Literals become typed DataFusion `lit`
+expressions via `lance::filter::filter_to_expr`. Do not accept, construct, or pass a raw SQL string
+anywhere in the `grpc` or `domain` layers. The AST also has a stable serde JSON shape (documented
+in `domain/filter.rs`) because the same JSON is written into the `recall.filter` span attribute and
+parsed by the Python recall audit job. Field names and enum tagging are a cross-language contract,
+not just an internal detail.
+
+---
+
+## Telemetry conventions (Rust)
+
+- The service emits `search_api.*` metrics via the typed `Metrics` facade in
+  `src/telemetry/metrics.rs`, tagged with small closed enums (`Rpc`, `IntakeRpc`, `CacheName`,
+  `Tier`) rather than free-form strings.
+- All metric emitters are infallible. An unreachable Datadog Agent never panics and never fails a
+  request. The same degrade-not-fail rule applies to the Redis `EntryStore`: a Redis round-trip
+  error becomes a cache miss or dropped write, counted by `cache.backend_errors`, never a failed
+  search.
+- Per-query-leg spans (`lance.vector_query` / `lance.text_query`) carry `object_store.*` attributes
+  sourced from Lance execution-stats events: `object_store.requests`, `object_store.iops`,
+  `object_store.bytes_read`, `object_store.parts_loaded`, `object_store.indices_loaded`. These are
+  aggregate counts only (no per-method GET/HEAD/LIST split, as Lance does not expose that in
+  production builds). They stay low cardinality: no org, tenant, or version identifier is attached
+  to span attributes or metric tags.
+
+---
+
+## Proto surface notes
+
+The `README.md` in this directory lists the RPCs and their purposes and the full environment-
+variable table. These finer-grained normative facts are recorded here so they are not lost.
+
+- **TimeRange windowing.** `VectorSearch`, `TextSearch`, and `HybridSearch` accept an optional
+  `TimeRange { optional int64 start_ms; optional int64 end_ms }` (epoch milliseconds, start
+  inclusive, end exclusive, either bound optional). The window always applies to the fixed
+  event-timestamp column (`event_timestamp`) and is translated to a typed range predicate ANDed
+  with any `Filter`, pruned by a BTREE or zone-map on that column. A `TimeRange` absent from the
+  request leaves every search path behaving exactly as before.
+- **HybridSearch request-level filter.** `HybridSearch` accepts a request-level `filter` (field 8)
+  and `filter_mode` (field 9) that are ANDed into both the vector leg and the text leg
+  independently. When a leg already carries its own filter the two predicates are combined with a
+  typed `AND` node. Absent means no additional predicate beyond what each leg specifies.
+- **Intake records.** Each `RecordWrite` carries an `op` (`WriteOp`: UPSERT or DELETE) and a
+  `Record`. A `Record` contains a string `id`, an `event_timestamp_ms` (epoch milliseconds, the
+  canonical ETL clock, no separate ingestion timestamp), a `metadata` string map, a `vectors` map
+  of named fixed-dimension float arrays (one per vector column), and a `texts` map of named text
+  fields (one per FTS column). The dataset `target` on the request names `org_id`, `tenant_id`, and
+  `namespace` and is never duplicated onto individual records. `WriteRecordsResponse` returns only
+  record ids: `succeeded_ids` for records the sink accepted and `failed_ids` for records that
+  failed validation or sink acceptance. A record whose id is itself empty or invalid cannot be
+  reported by id and is omitted from `failed_ids`. The only shipped sink is `StdoutSink`, a
+  structured-print placeholder. A future `KafkaSink` implements the same `RecordSink` trait and
+  replaces it at the construction site in `main` without changing the proto, transport, or domain
+  types.
+- **Fusion and rerank.** `RrfFusion` (default, reciprocal-rank fusion with configurable `rrf_k`) or
+  `WeightedFusion` (min-max normalized legs combined by `vector_weight`). Post-fusion reranking:
+  `IdentityRerank` (no-op identity, with optional `top_n` truncation) is the only shipped strategy
+  and is the seam where a cross-encoder or LLM reranker slots in without changing the request shape.
+- **Prewarm.** The `Prewarm` RPC accepts `version` (explicit committed version id) or `tag`
+  (resolves the named tag at call time) and returns `resolved_version`, enabling the safe
+  green-before-flip workflow: build the green version, prewarm every replica against it explicitly,
+  confirm `resolved_version`, then flip the serving tag. Never flip then warm.

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from lance_etl.cliutil import (
@@ -22,12 +22,11 @@ from lance_etl.cliutil import (
     add_ttl_arguments,
     build_spark,
     build_telemetry_config,
-    configure_logging_from_args,
     index_config_from_args,
     load_uris_or_none,
     parse_storage_options,
     parse_window_tag,
-    resolve_exit_code,
+    run_cli_main,
     run_with_spark,
 )
 from lance_etl.indexing.config import IndexJobConfig
@@ -159,12 +158,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         the run completed but one or more datasets failed in isolation and will be retried by the
         next scheduled run.
     """
-    args: argparse.Namespace = build_parser().parse_args(argv)
-    configure_logging_from_args(args)
-    runners = {
+    runners: dict[str, Callable[[argparse.Namespace], int | None]] = {
         "run": run_run,
     }
-    try:
-        return resolve_exit_code(runners[args.command](args))
-    except Exception:
-        return 1
+    return run_cli_main(build_parser(), runners, argv)

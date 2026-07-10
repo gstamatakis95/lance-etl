@@ -39,7 +39,6 @@ from lance_etl.etl.pivot import (
     DELETE_OP_VALUES,
     KEY_COL,
     OP_COL,
-    ROUTING_COLS,
     TTL_COL,
     ETLConfig,
     apply_ttl_cast,
@@ -68,12 +67,8 @@ def dataset_uri(config: ETLConfig, *components: str) -> str:
         The dataset URI for the given routing key.
 
     Raises:
-        ValueError: If the component count is not three or any component is an empty string.
+        ValueError: If any component is not a non-empty string.
     """
-    if len(components) != len(ROUTING_COLS):
-        raise ValueError(
-            f"expected {len(ROUTING_COLS)} routing components for {list(ROUTING_COLS)}, got {len(components)}"
-        )
     for component in components:
         if not isinstance(component, str) or not component:
             raise ValueError(f"invalid routing component: {component!r}")

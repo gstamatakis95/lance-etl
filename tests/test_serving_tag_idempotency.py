@@ -71,7 +71,7 @@ def test_double_create_resolves_to_update(
     monkeypatch.setattr(lance_dataset_module.Tags, "list", empty_list)
     result: dict[str, object] = update_serving_tag(uri, 2, None, telemetry)
 
-    assert result["created"] is False
+    assert result["created"] == {"HEAD": False}
     assert result["version"] == 2
     assert lance.dataset(uri).tags.get_version("HEAD") == 2
 
@@ -104,7 +104,7 @@ def test_update_missing_resolves_to_create(
     monkeypatch.setattr(lance_dataset_module.Tags, "list", present_list)
     result: dict[str, object] = update_serving_tag(uri, 1, None, telemetry)
 
-    assert result["created"] is True
+    assert result["created"] == {"HEAD": True}
     assert result["version"] == 1
     assert lance.dataset(uri).tags.get_version("HEAD") == 1
 

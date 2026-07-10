@@ -1,7 +1,7 @@
 """Dataset URI construction and CLI partition-flag parsing.
 
 Covers the fixed three-level dataset-path construction (byte-identical to the historical
-``{org}/{tenant}/{namespace}.lance`` layout), validation of component count and values, and the
+``{org}/{tenant}/{namespace}.lance`` layout), validation of component values, and the
 ``parse_partition_cols`` helper used by the ``migrate-namespace`` subcommand.
 """
 
@@ -42,11 +42,6 @@ class TestDatasetUri:
         """The default configuration produces the historical three-level path."""
         uri: str = dataset_uri(base_config, "org1", "tenant1", "ns1")
         assert uri == f"{base_config.base_uri}/org1/tenant1/ns1.lance"
-
-    def test_component_count_mismatch_raises(self, base_config: ETLConfig) -> None:
-        """Passing the wrong number of routing values raises a clear error."""
-        with pytest.raises(ValueError, match="expected 3 routing components"):
-            dataset_uri(base_config, "org1", "tenant1")
 
     def test_null_component_raises(self, base_config: ETLConfig) -> None:
         """A null routing value raises instead of building a broken path."""

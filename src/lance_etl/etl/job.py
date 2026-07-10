@@ -92,17 +92,11 @@ from lance_etl.etl.plan import (
     routing_null_predicate,
 )
 from lance_etl.etl.sink import apply_merge, dataset_uri
+from lance_etl.fanout import TAG_FANOUT_PARTITIONS
 from lance_etl.maintenance.tools import update_serving_tags
 from lance_etl.telemetry import Telemetry
 
 logger: logging.Logger = logging.getLogger(__name__)
-
-DEFAULT_TAG_STAMP_PARTITIONS: int = 512
-"""Lower bound on the interval-tag stamp fan-out width.
-
-Matches the ``update_serving_tags`` default so the tag flip keeps its historical width for small
-runs, while a large fleet grows the fan-out past this floor via the dataset-per-task ratio.
-"""
 
 
 def snapshot_id_bounds(
@@ -570,7 +564,7 @@ class IcebergToLanceETL:
         merges, which touch one dataset from multiple partitions) and fans the create-or-move
         tag update out per dataset via :func:`~lance_etl.maintenance.tools.update_serving_tags`
         at each dataset's latest version. The fan-out width follows the same dataset-per-task
-        floor as the routing shuffle, clamped below by :data:`DEFAULT_TAG_STAMP_PARTITIONS`. A
+        floor as the routing shuffle, clamped below by :data:`~lance_etl.fanout.TAG_FANOUT_PARTITIONS`. A
         second run within the same hour moves that hour's tag forward, so the tag always marks the
         hour's newest version. Skipped when ``config.tag_stamp`` is unset or the run wrote nothing.
 
@@ -590,7 +584,7 @@ class IcebergToLanceETL:
                 uris,
                 config.telemetry,
                 config.storage_options,
-                tag=config.tag_stamp,
-                partitions=max(DEFAULT_TAG_STAMP_PARTITIONS, math.ceil(len(uris) / config.datasets_per_task)),
+                tags=[config.tag_stamp],
+                partitions=max(TAG_FANOUT_PARTITIONS, math.ceil(len(uris) / config.datasets_per_task)),
             )
         telemetry.gauge("run.tags_stamped", len(results))

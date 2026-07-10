@@ -17,9 +17,9 @@ from lance.indices import IndicesBuilder
 
 from lance_etl.indexing.config import (
     IVF_RQ_NUM_BITS,
-    RETRAIN_GROWTH_FACTOR,
     IndexJobConfig,
     config_reusable,
+    growth_exceeds_retrain_factor,
 )
 from lance_etl.indexing.optimize import (
     drop_existing_index,
@@ -260,7 +260,9 @@ class VectorIndexHandler(IndexHandler):
         """Decide whether dataset growth since training forces a centroid retrain.
 
         A config without ``rows_at_train`` predates the retrain trigger and retrains once to
-        record it.
+        record it. The threshold comparison itself is shared with
+        :func:`~lance_etl.indexing.runner.vector_index_needs_retrain` through
+        :func:`~lance_etl.indexing.config.growth_exceeds_retrain_factor`.
 
         Args:
             cfg: The stored artifact config.
@@ -272,7 +274,7 @@ class VectorIndexHandler(IndexHandler):
         rows_at_train: Any = cfg.get("rows_at_train")
         if rows_at_train is None:
             return True
-        return rows > RETRAIN_GROWTH_FACTOR * int(rows_at_train)
+        return growth_exceeds_retrain_factor(rows, int(rows_at_train))
 
     def needs_bootstrap(self, dataset: lance.LanceDataset) -> bool:
         """Decide whether this index must be rebuilt through a streaming bootstrap.

@@ -52,8 +52,6 @@ from lance_etl.fanout import (
 from lance_etl.indexing.config import (
     IVF_RQ_NUM_BITS,
     MAX_STALE_REPLANS,
-    RETRAIN_GROWTH_FACTOR,
-    STREAMING_CORESET_RATE,
     STREAMING_REFINE_PASSES,
     STREAMING_SAMPLE_RATE,
     IndexJobConfig,
@@ -61,6 +59,7 @@ from lance_etl.indexing.config import (
     degrade_num_partitions,
     derive_num_partitions,
     fts_index_name,
+    growth_exceeds_retrain_factor,
     scalar_index_name,
     vector_index_name,
     zonemap_index_name,
@@ -78,13 +77,11 @@ from lance_etl.indexing.optimize import (
     index_delta_count,
     load_vector_config,
     maintain_index_locally,
+    optimize_existing_index,
     save_centroids,
     write_vector_config,
 )
-from lance_etl.indexing.optimize import merge_index_deltas as merge_index_deltas_now
 from lance_etl.indexing.segments import (
-    build_scalar_segment,
-    build_vector_segment,
     commit_index_with_retries,
     commit_segments,
     is_stale_fragment_error,
@@ -118,13 +115,6 @@ KIND_TO_HANDLER: dict[str, type[IndexHandler]] = {
     FTS_KIND: FtsIndexHandler,
 }
 """Maps an index kind to the handler class owning its type-specific logic."""
-
-KIND_TO_SCALAR_INDEX_TYPE: dict[str, str] = {
-    BTREE_KIND: "BTREE",
-    BITMAP_KIND: "BITMAP",
-    ZONEMAP_KIND: "ZONEMAP",
-}
-"""Maps a non-vector, non-FTS index kind to its Lance scalar index type string."""
 
 
 def index_failure_phase(result: dict[str, Any]) -> str:
@@ -208,7 +198,8 @@ def vector_index_needs_retrain(dataset: lance.LanceDataset, column: str, count_r
     The index needs work when its ``lance-etl.vector.{column}`` config entry is absent or carries
     no positive ``rows_at_train`` (an index built outside the segment path awaiting a full
     rebuild), or when the row count grew past :data:`~lance_etl.indexing.config.RETRAIN_GROWTH_FACTOR`
-    times the recorded ``rows_at_train``. The config read comes from the already-loaded manifest.
+    times the recorded ``rows_at_train``, per :func:`~lance_etl.indexing.config.growth_exceeds_retrain_factor`.
+    The config read comes from the already-loaded manifest.
 
     Args:
         dataset: The already-open dataset handle.
@@ -224,7 +215,7 @@ def vector_index_needs_retrain(dataset: lance.LanceDataset, column: str, count_r
     rows_at_train: int = int(cfg.get("rows_at_train") or 0)
     if rows_at_train <= 0:
         return True
-    return count_rows() > RETRAIN_GROWTH_FACTOR * rows_at_train
+    return growth_exceeds_retrain_factor(count_rows(), rows_at_train)
 
 
 def index_needs_work(
@@ -472,12 +463,6 @@ def bootstrap_vector_index(
     planned: int = derive_num_partitions(rows, config.num_partitions)
     partitions: int = degrade_num_partitions(planned, rows, STREAMING_SAMPLE_RATE)
     rabitq_model: str = native_indices.build_rq_model(dimension=dimension, num_bits=IVF_RQ_NUM_BITS)
-    streaming_kwargs: dict[str, Any] = {
-        "streaming_sample_rate": STREAMING_SAMPLE_RATE,
-        "streaming_refine_passes": STREAMING_REFINE_PASSES,
-    }
-    if STREAMING_CORESET_RATE is not None:
-        streaming_kwargs["streaming_coreset_rate"] = STREAMING_CORESET_RATE
 
     def action() -> lance.LanceDataset:
         """Re-open the dataset at the latest version and run the committed create_index."""
@@ -492,7 +477,8 @@ def bootstrap_vector_index(
                 num_partitions=partitions,
                 num_bits=IVF_RQ_NUM_BITS,
                 rabitq_model=rabitq_model,
-                **streaming_kwargs,
+                streaming_sample_rate=STREAMING_SAMPLE_RATE,
+                streaming_refine_passes=STREAMING_REFINE_PASSES,
             )
         return fresh
 
@@ -566,11 +552,14 @@ def build_one_shard(
 ) -> tuple[str, str, dict[str, Any]]:
     """Build one flat-job task on an executor: a segment shard, FTS fragment shard, or FTS maintain.
 
-    A vector segment shard resolves its OWN dataset's IVF_RQ artifacts from the already-open
-    version-pinned handle through :meth:`VectorIndexHandler.prepare` — centroids read sidecar-first
-    from the object-store cache with a ``get_ivf_model`` fallback, the RaBitQ rotation from the
-    stored config (ADR 0040). There is no fleet-wide artifact broadcast: each task reads only the
-    one dataset it builds.
+    A non-bootstrap, non-FTS shard dispatches through :func:`make_handler`: the handler's
+    ``prepare`` resolves any artifacts to broadcast to the shard build and its ``build_segment``
+    builds the uncommitted segment, so each index kind's segment-API call is owned by its handler
+    instead of being duplicated here. A vector segment shard resolves its OWN dataset's IVF_RQ
+    artifacts from the already-open version-pinned handle through :meth:`VectorIndexHandler.prepare`
+    — centroids read sidecar-first from the object-store cache with a ``get_ivf_model`` fallback,
+    the RaBitQ rotation from the stored config (ADR 0040). There is no fleet-wide artifact
+    broadcast: each task reads only the one dataset it builds.
 
     Args:
         task: The shard task spec from the plan phase, flattened with ``uri`` and ``version``.
@@ -624,21 +613,9 @@ def build_one_shard(
         return uri, index_name, {"built": built}
 
     with telemetry.timed("segment.build_ms", tags=tags):
-        if kind == VECTOR_KIND:
-            artifacts: tuple = VectorIndexHandler(config, column, index_name).prepare(dataset, uri, telemetry)
-            segment = build_vector_segment(
-                dataset,
-                shard,
-                artifacts,
-                column=column,
-                index_name=index_name,
-                metric=config.metric,
-            )
-        else:
-            index_type: str = KIND_TO_SCALAR_INDEX_TYPE[kind]
-            segment = build_scalar_segment(
-                dataset, shard, None, column=column, index_name=index_name, index_type=index_type
-            )
+        handler: IndexHandler = make_handler(kind, column, index_name, config)
+        artifacts: object | None = handler.prepare(dataset, uri, telemetry)
+        segment = handler.build_segment(dataset, shard, artifacts)
     telemetry.incr("segment.built", tags=tags)
     return uri, index_name, {"segment": serialize_segment(segment)}
 
@@ -652,9 +629,10 @@ def commit_one_index(
 ) -> dict[str, Any]:
     """Commit one dataset's index on an executor (phase C), classifying stale-fragment failures.
 
-    Segment kinds go through the production :func:`commit_segments`, which merges vector and
-    zonemap segments before publishing (BTREE and BITMAP commit unmerged deltas instead) —
-    running here keeps the merge off the driver. FTS rebuilds drop
+    Segment kinds go through the production :func:`commit_segments`. Whether segments are merged
+    before publishing is decided by the index kind's handler ``merges()`` (vector and zonemap
+    merge, BTREE and BITMAP commit unmerged deltas instead) — running here keeps the merge off the
+    driver. FTS rebuilds drop
     the old index only now, after the executor builds finished, then merge the per-fragment
     metadata and publish, so the old index stayed live for the whole build. A stale-fragment
     error returns a ``stale`` marker so the fleet re-plans this index in the next round.
@@ -689,7 +667,7 @@ def commit_one_index(
             return {"column": column, "index": index_name, "segments": built, "fragments": len(spec["fragments"])}
 
         documents: list[str] = [payload["segment"] for payload in payloads if "segment" in payload]
-        merge: bool = kind in (VECTOR_KIND, ZONEMAP_KIND)
+        merge: bool = make_handler(kind, column, index_name, config).merges()
         with telemetry.timed("index.commit_ms", tags=[f"index:{index_name}"]):
             committed: int = commit_segments(uri, documents, column, index_name, merge, config, telemetry)
         stats: dict[str, Any] = {
@@ -903,6 +881,12 @@ def record_commit_outcomes(
 def merge_deltas_if_needed(uri: str, index_name: str, config: IndexJobConfig, telemetry: Telemetry) -> bool:
     """Merge one index's accumulated deltas on an executor when over the configured cap.
 
+    Calls :func:`~lance_etl.indexing.optimize.optimize_existing_index` directly with the delta
+    count already computed here, rather than going through
+    :func:`~lance_etl.indexing.optimize.merge_index_deltas`, which would re-open the dataset and
+    recompute the same count a second time. The ``index.deltas_merged`` telemetry increment and
+    the "merged N index deltas" log line are reproduced here to match that helper's behavior.
+
     Args:
         uri: Dataset URI.
         index_name: The index whose deltas to bound.
@@ -915,10 +899,14 @@ def merge_deltas_if_needed(uri: str, index_name: str, config: IndexJobConfig, te
     dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
     if index_name not in {description.name for description in dataset.describe_indices()}:
         return False
-    if index_delta_count(dataset, index_name) <= config.max_index_deltas:
+    deltas: int = index_delta_count(dataset, index_name)
+    if deltas <= config.max_index_deltas:
         return False
     with telemetry.timed("index.delta_merge_ms", tags=[f"index:{index_name}"]):
-        return merge_index_deltas_now(uri, index_name, config, telemetry)
+        optimize_existing_index(uri, index_name, config, telemetry, num_indices_to_merge=deltas)
+        telemetry.incr("index.deltas_merged", tags=[f"index:{index_name}"])
+        logger.info("merged %d index deltas into one for %s on %s", deltas, index_name, uri)
+        return True
 
 
 class LanceIndexer:

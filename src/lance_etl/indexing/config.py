@@ -35,9 +35,6 @@ partitions lance compresses chunks into a weighted coreset and trains final cent
 weighted hierarchical k-means.
 """
 
-STREAMING_CORESET_RATE: int | None = None
-"""Optional override of the final weighted coreset budget, never varied. ``None`` uses the lance default."""
-
 STREAMING_REFINE_PASSES: int = 1
 """Extra streaming Lloyd refinement passes after coreset training, never varied.
 
@@ -46,6 +43,23 @@ Each pass loads at most ``num_partitions * STREAMING_SAMPLE_RATE`` raw vectors.
 
 RETRAIN_GROWTH_FACTOR: float = 4.0
 """Retrain when row count exceeds this multiple of ``rows_at_train``, never varied."""
+
+
+def growth_exceeds_retrain_factor(rows: int, rows_at_train: int) -> bool:
+    """Report whether dataset growth since centroid training exceeds the retrain factor.
+
+    Shared comparison behind both retrain triggers. Callers keep their own
+    absent-config semantics. Only the threshold arithmetic lives here.
+
+    Args:
+        rows: The dataset's current row count.
+        rows_at_train: The row count recorded when the centroids were last trained.
+
+    Returns:
+        ``True`` when growth since training exceeds :data:`RETRAIN_GROWTH_FACTOR`.
+    """
+    return rows > RETRAIN_GROWTH_FACTOR * rows_at_train
+
 
 MAX_STALE_REPLANS: int = 3
 """Fleet-level plan-build-commit rounds for stale indexes before giving up, never varied."""
@@ -57,8 +71,8 @@ class IndexJobConfig:
 
     The IVF partition policy bounds (:data:`MIN_IVF_PARTITIONS`, :data:`MAX_IVF_PARTITIONS`,
     :data:`TARGET_ROWS_PER_IVF_PARTITION`), the RaBitQ bit width (:data:`IVF_RQ_NUM_BITS`), the
-    streaming k-means knobs (:data:`STREAMING_SAMPLE_RATE`, :data:`STREAMING_CORESET_RATE`,
-    :data:`STREAMING_REFINE_PASSES`), the retrain trigger (:data:`RETRAIN_GROWTH_FACTOR`), and the
+    streaming k-means knobs (:data:`STREAMING_SAMPLE_RATE`, :data:`STREAMING_REFINE_PASSES`), the
+    retrain trigger (:data:`RETRAIN_GROWTH_FACTOR`), and the
     stale-replan bound (:data:`MAX_STALE_REPLANS`) are fixed module-level constants, not fields,
     because they are never varied. The IVF training distance is always derived from ``metric`` via
     :meth:`resolved_distance_type`, and the four fine-grained FTS tokenizer toggles

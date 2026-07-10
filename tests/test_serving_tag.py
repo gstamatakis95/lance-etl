@@ -33,8 +33,8 @@ def test_update_serving_tag_creates_at_latest(tmp_path: Path, telemetry: Telemet
     uri: str = str(tmp_path / "ds.lance")
     write_versions(uri, 2)
     result: dict[str, object] = update_serving_tag(uri, None, None, telemetry)
-    assert result["created"] is True
-    assert result["tag"] == "HEAD"
+    assert result["created"] == {"HEAD": True}
+    assert result["tags"] == ["HEAD"]
     assert result["version"] == 2
     assert lance.dataset(uri).tags.get_version("HEAD") == 2
 
@@ -45,9 +45,30 @@ def test_update_serving_tag_moves_existing(tmp_path: Path, telemetry: Telemetry)
     write_versions(uri, 3)
     update_serving_tag(uri, None, None, telemetry)
     moved: dict[str, object] = update_serving_tag(uri, 1, None, telemetry)
-    assert moved["created"] is False
+    assert moved["created"] == {"HEAD": False}
     assert moved["version"] == 1
     assert lance.dataset(uri).tags.get_version("HEAD") == 1
+
+
+def test_update_serving_tag_flips_multiple_tags_at_the_same_version(tmp_path: Path, telemetry: Telemetry) -> None:
+    """One call flips several tags against the same resolved version, one dataset open."""
+    uri: str = str(tmp_path / "ds.lance")
+    write_versions(uri, 2)
+    result: dict[str, object] = update_serving_tag(uri, None, None, telemetry, tags=["20260710T000000Z", "HEAD"])
+    assert result["tags"] == ["20260710T000000Z", "HEAD"]
+    assert result["created"] == {"20260710T000000Z": True, "HEAD": True}
+    dataset: lance.LanceDataset = lance.dataset(uri)
+    assert dataset.tags.get_version("20260710T000000Z") == 2
+    assert dataset.tags.get_version("HEAD") == 2
+
+
+def test_update_serving_tag_deduplicates_repeated_tag_names(tmp_path: Path, telemetry: Telemetry) -> None:
+    """A tag name repeated in the input is flipped once, not twice."""
+    uri: str = str(tmp_path / "ds.lance")
+    write_versions(uri, 1)
+    result: dict[str, object] = update_serving_tag(uri, None, None, telemetry, tags=["HEAD", "HEAD"])
+    assert result["tags"] == ["HEAD"]
+    assert result["created"] == {"HEAD": True}
 
 
 def test_cleanup_exempts_tagged_versions(tmp_path: Path, telemetry: Telemetry) -> None:

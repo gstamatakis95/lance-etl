@@ -419,6 +419,44 @@ def load_uris_or_none(
     return uris
 
 
+def run_cli_main(
+    parser: argparse.ArgumentParser,
+    runners: dict[str, Callable[[argparse.Namespace], int | None]] | Callable[[argparse.Namespace], int | None],
+    argv: Sequence[str] | None,
+) -> int:
+    """Run one per-job CLI main: parse, configure logging, dispatch, map the exit code.
+
+    Owns the shape shared by all five per-job CLIs. ``runners`` is either a subcommand dispatch
+    dict keyed by ``args.command`` (maintenance, pipeline, tools) or the single runner for a
+    subcommand-free CLI (etl, indexing). A runner returns the isolated failed-dataset count
+    (``None`` is treated as zero), which :func:`resolve_exit_code` maps to ``0`` or
+    :data:`EXIT_PARTIAL_FAILURE`. Any exception escaping the runner yields exit code ``1``.
+    ``SystemExit`` from argparse (``--help``, bad flags) propagates before the try block,
+    preserving argparse's own exit codes.
+
+    Args:
+        parser: The subcommand's fully-built argument parser.
+        runners: Either a single runner callable, or a dispatch dict mapping ``args.command``
+            values to their runner callables.
+        argv: Optional argument vector forwarded to ``parser.parse_args``. Defaults to ``sys.argv``.
+
+    Returns:
+        A process exit code: ``0`` when every dataset succeeded, ``1`` when the run raised an
+        unhandled exception, and :data:`EXIT_PARTIAL_FAILURE` (``3``) when the run completed but
+        one or more datasets failed in isolation.
+    """
+    args: argparse.Namespace = parser.parse_args(argv)
+    configure_logging_from_args(args)
+    try:
+        runner: Callable[[argparse.Namespace], int | None] = (
+            runners[args.command] if isinstance(runners, dict) else runners
+        )
+        failed: int | None = runner(args)
+        return resolve_exit_code(failed if failed is not None else 0)
+    except Exception:
+        return 1
+
+
 def resolve_exit_code(failed: int) -> int:
     """Map a failed-dataset count to the shared partial-failure exit code convention.
 

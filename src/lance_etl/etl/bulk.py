@@ -59,7 +59,10 @@ from lance_etl.etl.pivot import (
     ETLConfig,
     align_to_schema,
     apply_ttl_cast,
+    build_stats_batch,
     pivot_map_columns,
+    routing_stats_ddl,
+    routing_stats_schema,
     stream_routing_groups,
 )
 from lance_etl.etl.plan import RoutingPlan, apply_salted_shuffle, collapse
@@ -71,12 +74,6 @@ logger: logging.Logger = logging.getLogger(__name__)
 MAP_COLUMNS: tuple[str, str, str] = ("vectors", "texts", "metadata")
 """Optional source map columns expanded by the pivot, excluded from the canonical base columns."""
 
-MAX_BULK_TASKS_PER_DATASET: int = 1024
-"""Cap on parallel append tasks per bulk-eligible dataset, never varied.
-
-Appends have no per-key commit contention so this is far higher than the merge-writer cap.
-"""
-
 
 def bulk_stats_schema() -> pa.Schema:
     """Build the per-task bulk-append stats schema.
@@ -85,9 +82,7 @@ def bulk_stats_schema() -> pa.Schema:
         A schema of one string column per routing column plus ``appended`` (int64) and ``txn``
         (binary) carrying the pickled append transaction back to the driver.
     """
-    fields: list[tuple[str, pa.DataType]] = [(column, pa.string()) for column in ROUTING_COLS]
-    fields.extend([("appended", pa.int64()), ("txn", pa.binary())])
-    return pa.schema(fields)
+    return routing_stats_schema([("appended", pa.int64()), ("txn", pa.binary())])
 
 
 def bulk_stats_spark_ddl() -> str:
@@ -96,8 +91,7 @@ def bulk_stats_spark_ddl() -> str:
     Returns:
         A DDL string with routing columns as string, ``appended`` as bigint, and ``txn`` as binary.
     """
-    columns: str = ", ".join(f"`{column}` string" for column in ROUTING_COLS)
-    return f"{columns}, `appended` bigint, `txn` binary"
+    return routing_stats_ddl([("appended", "bigint"), ("txn", "binary")])
 
 
 def plan_bulk_append(plan: RoutingPlan, config: ETLConfig) -> list[tuple[str, str, str, int]]:
@@ -109,10 +103,10 @@ def plan_bulk_append(plan: RoutingPlan, config: ETLConfig) -> list[tuple[str, st
     non-empty dataset is left to the merge path, whose idempotent upsert is required to reconcile
     existing rows.
 
-    The returned sub-bucket count reuses the plan's ``K`` (already ``> 1`` for a big trio), capped
-    by :data:`MAX_BULK_TASKS_PER_DATASET`. Appends carry no per-key commit contention, so the
-    cap is far higher than the merge-writer cap, but the driver does not have the raw per-trio row
-    count here, so the plan's ``K`` is the parallelism used rather than a freshly recomputed one.
+    The returned sub-bucket count reuses the plan's per-trio bucket count ``K`` (already ``> 1``
+    for a big trio) unchanged: the driver does not have the raw per-trio row count here, so the
+    plan's ``K`` is the parallelism used rather than a freshly recomputed one. Appends carry no
+    per-key commit contention, so this parallelism is safe to run unthrottled.
 
     Args:
         plan: The routing plan carrying the big trios and their sub-bucket counts.
@@ -133,8 +127,7 @@ def plan_bulk_append(plan: RoutingPlan, config: ETLConfig) -> list[tuple[str, st
         except (FileNotFoundError, ValueError):
             empty = True
         if empty:
-            bulk_tasks: int = min(MAX_BULK_TASKS_PER_DATASET, max(1, sub_buckets))
-            eligible.append((org, tenant, namespace, bulk_tasks))
+            eligible.append((org, tenant, namespace, sub_buckets))
     return eligible
 
 
@@ -478,10 +471,7 @@ def run_bulk_append(
                 executor_telemetry.error("etl bulk partition failed")
                 raise
         if results:
-            arrays: list[pa.Array] = [
-                pa.array([row[index] for row in results], field.type) for index, field in enumerate(output_schema)
-            ]
-            yield pa.RecordBatch.from_arrays(arrays, schema=output_schema)
+            yield build_stats_batch(results, output_schema)
 
     collected: list[Any] = routed.mapInArrow(append_partition, schema=output_ddl).collect()
     return [
