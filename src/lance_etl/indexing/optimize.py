@@ -1,6 +1,7 @@
 """Incremental index maintenance helpers.
 
-Provides load/write for the vector artifact config, optimize-in-place for one existing index,
+Provides load/write for the vector artifact config, the object-store centroid sidecar cache
+(save/load keyed by the ``rows_at_train`` fingerprint), optimize-in-place for one existing index,
 delta-count query, delta merge, old-index drop, and the combined maintain-locally helper used
 by the FTS incremental path.
 """
@@ -12,6 +13,8 @@ import logging
 from typing import Any
 
 import lance
+import pyarrow as pa
+from lance.indices import IvfModel
 
 from lance_etl.indexing.config import IndexJobConfig, vector_config_key
 from lance_etl.indexing.segments import commit_index_with_retries
@@ -82,6 +85,89 @@ def write_vector_config(
         dataset.update_config({key: payload})
 
     commit_index_with_retries(action, config, telemetry, tags)
+
+
+def centroid_sidecar_uri(uri: str, index_name: str, rows_at_train: int) -> str:
+    """Build the object-store URI of the centroid sidecar for one vector-index generation.
+
+    The sidecar lives in a ``{uri}.artifacts`` directory that is a sibling of the ``.lance``
+    dataset directory, so dataset discovery skips it: its final path component ends in
+    ``.artifacts`` rather than ``.lance`` (see
+    :func:`lance_etl.cloud_storage.dataset_paths_under`). The ``rows_at_train`` fingerprint in the
+    filename makes the whole path change whenever the centroids are retrained, so a stale sidecar
+    can never be mistaken for a current one and reuse or invalidation is automatic (ADR 0040).
+
+    Args:
+        uri: Dataset URI, ending in ``.lance``.
+        index_name: The vector index name the centroids belong to.
+        rows_at_train: The row count recorded when the centroids were trained, the staleness
+            fingerprint that keys the sidecar generation.
+
+    Returns:
+        The sidecar URI ``{uri}.artifacts/{index_name}.{rows_at_train}.ivf``.
+    """
+    base: str = uri.rstrip("/")
+    return f"{base}.artifacts/{index_name}.{rows_at_train}.ivf"
+
+
+def save_centroids(
+    uri: str,
+    index_name: str,
+    centroids: pa.Array,
+    metric: str,
+    rows_at_train: int,
+    storage_options: dict[str, Any] | None,
+) -> None:
+    """Persist IVF centroids to an object-store sidecar for future-run reuse.
+
+    Writes the centroids through lance's native :class:`lance.indices.IvfModel` single-file
+    format, which threads ``storage_options`` through lance's own object-store layer (the same
+    credential path as :func:`lance.dataset`). The ``distance_type`` is set from ``metric`` because
+    :meth:`IvfModel.save` requires a non-``None`` string. It is unused on the reuse read path,
+    which passes the metric to ``create_index_uncommitted`` separately.
+
+    Args:
+        uri: Dataset URI.
+        index_name: The vector index name the centroids belong to.
+        centroids: The IVF centroid array from ``get_ivf_model(index_name).centroids``.
+        metric: The distance metric, stored as the model's ``distance_type``.
+        rows_at_train: The staleness fingerprint keying the sidecar generation.
+        storage_options: Object-store options forwarded to lance.
+    """
+    sidecar: str = centroid_sidecar_uri(uri, index_name, rows_at_train)
+    IvfModel(centroids, distance_type=metric).save(sidecar, storage_options=storage_options)
+
+
+def load_centroids(
+    uri: str,
+    index_name: str,
+    rows_at_train: int,
+    storage_options: dict[str, Any] | None,
+) -> pa.Array | None:
+    """Read the IVF centroid sidecar for one vector-index generation, or ``None`` on a miss.
+
+    This is the conditional-reuse gate. A returned array means the sidecar for the exact
+    ``rows_at_train`` fingerprint exists and was read, so the current centroids can be reused
+    without re-reading the committed index. Any failure — an absent sidecar, a partial write, or a
+    version-incompatible file — returns ``None`` so the caller falls back to ``get_ivf_model``,
+    which keeps correctness independent of sidecar liveness.
+
+    Args:
+        uri: Dataset URI.
+        index_name: The vector index name the centroids belong to.
+        rows_at_train: The staleness fingerprint keying the sidecar generation.
+        storage_options: Object-store options forwarded to lance.
+
+    Returns:
+        The centroid array on a fingerprint hit, or ``None`` when the sidecar is absent or
+        unreadable.
+    """
+    sidecar: str = centroid_sidecar_uri(uri, index_name, rows_at_train)
+    try:
+        return IvfModel.load(sidecar, storage_options=storage_options).centroids
+    except Exception as exc:
+        logger.debug("centroid sidecar miss for %s on %s: %s", index_name, uri, exc)
+        return None
 
 
 def optimize_existing_index(

@@ -73,7 +73,7 @@ def job_config(tmp_path: Path, telemetry_config: TelemetryConfig) -> RecallJobCo
     Returns:
         The configuration.
     """
-    return RecallJobConfig(base_uri=str(tmp_path), telemetry=telemetry_config, batch_size=16)
+    return RecallJobConfig(base_uri=str(tmp_path), telemetry=telemetry_config)
 
 
 class TestRankingQuality:

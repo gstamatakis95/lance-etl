@@ -1,10 +1,11 @@
-"""Segment serialisation, IVF centroid I/O, executor-offloaded training, and the build-and-commit loop.
+"""Segment serialisation, executor-offloaded training, and the build-and-commit loop.
 
 Provides all the primitives needed by the distributed index build: serialise/deserialise
-uncommitted segment metadata, IPC-encode/decode IVF centroids, shard fragment lists, validate
-live fragments, and commit collected segments with conflict retries. IVF centroid training
-happens inside the streaming bootstrap build (see :mod:`lance_etl.indexing.runner`), and the
-stale-fragment replan loop lives there as fleet-level rounds.
+uncommitted segment metadata, shard fragment lists, validate live fragments, and commit collected
+segments with conflict retries. IVF centroid training happens inside the streaming bootstrap build
+(see :mod:`lance_etl.indexing.runner`), the centroids are cached to and reused from an object-store
+sidecar (see :mod:`lance_etl.indexing.optimize`), and the stale-fragment replan loop lives in the
+runner as fleet-level rounds.
 """
 
 from __future__ import annotations
@@ -16,7 +17,6 @@ from collections.abc import Callable
 from typing import Any
 
 import lance
-import pyarrow as pa
 from lance.dataset import Index
 
 from lance_etl.indexing.config import IndexJobConfig
@@ -26,35 +26,6 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 STALE_FRAGMENT_MARKERS: tuple[str, ...] = ("would orphan fragments", "no longer exist")
 """Error-message substrings that identify a segment commit invalidated by a concurrent compaction."""
-
-
-def centroids_to_ipc(centroids: pa.Array) -> bytes:
-    """Serialize IVF centroids to an Arrow IPC stream.
-
-    Args:
-        centroids: The fixed-size-list centroid array.
-
-    Returns:
-        The IPC stream bytes.
-    """
-    table: pa.Table = pa.table({"centroids": centroids})
-    sink: pa.BufferOutputStream = pa.BufferOutputStream()
-    with pa.ipc.new_stream(sink, table.schema) as writer:
-        writer.write_table(table)
-    return sink.getvalue().to_pybytes()
-
-
-def centroids_from_ipc(data: bytes) -> pa.Array:
-    """Deserialize IVF centroids from an Arrow IPC stream.
-
-    Args:
-        data: The IPC stream bytes.
-
-    Returns:
-        The fixed-size-list centroid array.
-    """
-    reader = pa.ipc.open_stream(pa.BufferReader(data))
-    return reader.read_all().column("centroids").combine_chunks()
 
 
 def split_evenly(values: list[int], shards: int) -> list[list[int]]:
@@ -263,8 +234,8 @@ def build_vector_segment(
     Args:
         dataset: A dataset handle pinned to the build version.
         fragment_ids: The fragment ids for this shard.
-        artifacts: The centroids bytes, the shared RaBitQ model string, num_bits, and the IVF
-            partition count.
+        artifacts: The centroids ``pa.Array``, the shared RaBitQ model string, num_bits, and the
+            IVF partition count.
         column: The column to index.
         index_name: The name of the index.
         metric: The distance metric for the vector index.
@@ -278,8 +249,7 @@ def build_vector_segment(
     """
     if artifacts is None:
         raise ValueError("build_vector_segment requires artifacts from prepare; got None")
-    centroids_bytes, rabitq_model, num_bits, num_partitions = artifacts
-    centroids: pa.Array = centroids_from_ipc(centroids_bytes)
+    centroids, rabitq_model, num_bits, num_partitions = artifacts
     return dataset.create_index_uncommitted(
         column=column,
         index_type="IVF_RQ",
@@ -345,7 +315,7 @@ def commit_segments(
         segment_documents: Serialized segments returned by the executors.
         column: The indexed column.
         index_name: The index name to publish under.
-        merge: Whether to merge segments before committing, used for IVF_RQ and BITMAP.
+        merge: Whether to merge segments before committing, used for IVF_RQ and ZONEMAP.
         config: Indexing configuration.
         telemetry: Driver telemetry facade.
 

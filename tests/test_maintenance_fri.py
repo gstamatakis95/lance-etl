@@ -88,10 +88,12 @@ def test_reads_stay_correct_after_deferred_remap(
 
 
 def test_defer_index_remap_scoped_to_execute_options(telemetry_config: TelemetryConfig) -> None:
-    """The deferral flag reaches execute options but is dropped at plan time.
+    """The deferral flag reaches execute options and is honored again at commit time.
 
-    The distributed commit binding compacts with default options, so the flag is only honored where
-    ``Compaction.execute`` parses the full option set.
+    The distributed commit binding (``commit_one_dataset`` in ``maintenance/job.py``) passes
+    ``options=config.execute_options()`` to ``Compaction.commit``, so ``defer_index_remap`` takes
+    effect at commit time too, not only through ``Compaction.execute``. pylance 8.0.0's
+    ``Compaction.commit`` carries the ``options`` parameter that makes this possible.
 
     Args:
         telemetry_config: The test telemetry configuration.

@@ -163,6 +163,25 @@ class FakeRdd:
         """
         return FakeRdd(list(fn(iter(self.items))))
 
+    def partitionBy(self, numPartitions: int, partitionFunc: Callable[[object], int] | None = None) -> FakeRdd:
+        """Return an identity stand-in for a key-partitioned shuffle.
+
+        A real Spark shuffle co-locates every item sharing a key onto one partition. The fake
+        keeps every item on the single in-process partition instead, which is semantically
+        sufficient here because the write side of the clustered rewrite (``write_partition`` in
+        ``maintenance/cluster.py``) groups the collected items by key itself before writing, so it
+        does not depend on the shuffle actually separating keys across partitions.
+
+        Args:
+            numPartitions: Ignored; the fake carries every item on one in-process partition.
+            partitionFunc: Ignored; the write side groups items by key itself.
+
+        Returns:
+            A new fake RDD with the same items, in the same order.
+        """
+        del numPartitions, partitionFunc
+        return FakeRdd(list(self.items))
+
     def collect(self) -> list[object]:
         """Return the items.
 
@@ -174,6 +193,9 @@ class FakeRdd:
 
 class FakeSparkContext:
     """Minimal stand-in for a SparkContext with broadcast support."""
+
+    defaultParallelism: int = 4
+    """Fixed stand-in core count so derive_partitions has a small, deterministic cluster size."""
 
     def parallelize(self, items: Iterable[object], slices: int) -> FakeRdd:
         """Wrap items into a fake RDD.

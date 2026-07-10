@@ -24,19 +24,30 @@ Serialization guarantee
 -----------------------
 ``max_active_runs=1`` ensures that at most one pipeline run is in flight at any time.
 This is the same constraint that the old index DAG used, now extended to cover the
-full maintenance+index+stamp sequence.  Concurrent ETL runs and the pipeline DAG may
-overlap: commit conflicts are resolved by the existing retry loop in
-``commit_with_retries``.
+full maintenance+index+stamp sequence.  It only serializes this DAG against itself.
+It does not prevent the separately scheduled ``lance_etl_etl`` DAG from committing to
+the same dataset while a pipeline run is in flight. ADR 0038 documents that ingestion
+and this pipeline must not overlap per dataset as an operational scheduling rule, not
+a code-level lease: today the only backstop for an overlap is the Python
+``commit_with_retries`` retry loop plus the compaction replan loop, the indexer's
+stale-segment guards, and the lazy frag-reuse remap reconciling conflicting commits.
+None of those make concurrent writes to the same dataset a designed-for scenario, so
+avoiding the overlap is still the operator's responsibility.
 
-Schedule recommendation
------------------------
-Set ``lance_etl_pipeline_schedule`` to a cron offset like ``15 * * * *`` so this DAG
-trails the hourly ETL DAG within the same clock hour, e.g.::
+Schedule default and recommendation
+------------------------------------
+``lance_etl_pipeline_schedule`` defaults to the cron offset ``15 * * * *`` so this DAG
+trails the hourly ETL DAG within the same clock hour out of the box, e.g.::
 
     ETL schedules at :00, pipeline schedules at :15.
 
-The default value ``@hourly`` is correct for environments where a single Airflow
-worker runs the DAGs sequentially and no clock-offset tuning is needed.
+This reduces the default collision window but does not eliminate it: a slow ETL run
+can still be in flight when the pipeline run starts. Full mutual exclusion per ADR 0038
+requires a structural coupling in addition to the stagger, such as merging the two DAGs
+into one serialized DAG, an ``ExternalTaskSensor`` gating the pipeline on the ETL DAG's
+run, or a shared Airflow pool that limits total concurrent Spark submissions. Override
+the offset (or set it back to ``@hourly``) via the ``lance_etl_pipeline_schedule``
+Variable when a different arrangement fits the deployment.
 
 Manual-trigger override
 -----------------------
@@ -45,8 +56,9 @@ different fleet file for a one-off run without editing any Variable.
 
 Airflow Variables consumed by this DAG:
     lance_etl_pipeline_schedule
-        Airflow schedule expression (default ``@hourly``).  Set to a cron expression
-        such as ``15 * * * *`` to trail the ETL DAG within the hour.
+        Airflow schedule expression (default ``15 * * * *``, i.e. ``:15`` past every
+        hour) so this DAG trails the hourly ``lance_etl_etl`` DAG by default.  Set to
+        ``@hourly`` or any other cron expression to change the offset.
     lance_etl_datasets_file
         Path to a newline-delimited file of dataset URIs (one per line).
     lance_etl_dd_service
@@ -147,7 +159,7 @@ def build_pipeline_application_args(params: dict[str, str | int]) -> list[str]:
     return args
 
 
-dag_schedule: str = Variable.get("lance_etl_pipeline_schedule", default_var="@hourly")
+dag_schedule: str = Variable.get("lance_etl_pipeline_schedule", default_var="15 * * * *")
 
 with DAG(
     dag_id=DAG_ID,

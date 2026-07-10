@@ -2,9 +2,35 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from lance_etl.telemetry import commit_with_retries, is_commit_conflict_error
+
+
+def test_no_sleep_after_final_exhausting_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exhausting the retry budget raises immediately, without a wasted final sleep.
+
+    ``on_conflict`` still fires on every conflicting attempt, including the last, but
+    ``time.sleep`` must be called only ``retries`` times (once between each pair of attempts),
+    never after the final attempt whose failure is about to be re-raised.
+    """
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    attempts: list[int] = []
+    conflicts: list[int] = []
+
+    def action() -> None:
+        """Always raise a conflict."""
+        attempts.append(1)
+        raise RuntimeError("Commit conflict")
+
+    with pytest.raises(RuntimeError):
+        commit_with_retries(action, retries=3, backoff_seconds=1.0, on_conflict=lambda: conflicts.append(1))
+    assert len(attempts) == 4
+    assert len(conflicts) == 4
+    assert len(sleep_calls) == 3
 
 
 def test_matcher_accepts_both_conflict_markers() -> None:

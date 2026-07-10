@@ -17,12 +17,27 @@ indexing which live in the separate ``lance_etl_pipeline`` DAG.
 COEXISTENCE
 -----------
 The two DAGs (``lance_etl_etl``, ``lance_etl_pipeline``) run independently and share no
-files. Each derives its dataset list from its own inputs. Overlapping runs are safe by
-design: concurrent commits are reconciled by commit retries, the compaction replan loop,
-the indexer's stale-segment guards, and the lazy frag-reuse remap. Serialization within
-the pipeline DAG is handled by ``max_active_runs=1`` on ``lance_etl_pipeline``. Staggering
-the two schedules (e.g. ETL at ``:00``, pipeline at ``:15``) is recommended operational
-practice for cluster contention, not a correctness requirement.
+files. Each derives its dataset list from its own inputs, and neither has any code-level
+coupling to the other: no ``ExternalTaskSensor``, no shared pool, no Dataset-based
+scheduling. ADR 0038 records that ingestion (this DAG's ``merge_insert``) and the
+maintenance/indexing pipeline must not overlap per dataset, and that this is an
+operational scheduling rule, not a correctness guarantee baked into the code. Today, an
+overlap that does happen is only reconciled by the Python ``commit_with_retries`` retry
+loop, the compaction replan loop, the indexer's stale-segment guards, and the lazy
+frag-reuse remap. Those make a colliding commit *retry and converge* rather than
+corrupt, but they are a backstop for an unwanted event, not a designed-for scenario, so
+overlapping runs are not "safe by design." ``max_active_runs=1`` on ``lance_etl_pipeline``
+only serializes the pipeline DAG against itself; it does not prevent this DAG from
+overlapping the pipeline DAG.
+
+Out of the box, ``lance_etl_pipeline``'s schedule Variable
+(``lance_etl_pipeline_schedule``) defaults to the cron offset ``15 * * * *`` so it
+trails this DAG's default ``@hourly`` schedule within the same clock hour, reducing the
+default collision window. That stagger alone does not guarantee no overlap (a slow ETL
+run can still be in flight when the pipeline run starts), so full mutual exclusion per
+ADR 0038 still requires an explicit structural coupling: merging the two DAGs into one
+serialized DAG, adding an ``ExternalTaskSensor`` so the pipeline waits on this DAG's
+run, or a shared Airflow pool limiting total concurrent Spark submissions.
 
 Airflow Variables consumed by this DAG:
     lance_etl_etl_schedule

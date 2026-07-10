@@ -18,9 +18,13 @@ from lance_etl.cliutil import (
     build_spark,
     build_telemetry_config,
     configure_logging_from_args,
-    load_dataset_uris,
+    index_config_from_args,
+    load_uris_or_none,
     parse_storage_options,
+    resolve_exit_code,
+    run_with_spark,
 )
+from lance_etl.fanout import count_failed
 from lance_etl.indexing.config import IndexJobConfig
 from lance_etl.indexing.runner import LanceIndexer
 
@@ -53,41 +57,39 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run(args: argparse.Namespace) -> None:
+def run(args: argparse.Namespace) -> int:
     """Execute the indexing job from parsed arguments.
 
     Builds a Spark session, constructs the configuration, and dispatches to
-    :class:`~lance_etl.indexing.runner.LanceIndexer`.
+    :class:`~lance_etl.indexing.runner.LanceIndexer`. A single dataset's index failure is isolated
+    into an error marker by the fleet phases rather than aborting the run, so this returns the
+    count of failed datasets for the operator alert instead of raising.
 
     Args:
         args: Parsed command-line arguments.
+
+    Returns:
+        The number of datasets that failed in isolation, ``0`` when all succeeded.
     """
     spark = build_spark(APP_NAME)
-    uris = load_dataset_uris(args, spark)
-    if not uris:
-        logger.info("index: no datasets in the URI list, nothing to do")
-        spark.stop()
-        return
-    try:
-        config: IndexJobConfig = IndexJobConfig(
-            telemetry=build_telemetry_config(args),
-            storage_options=parse_storage_options(args),
-            vector_columns=list(args.vector_column or []),
-            metric=args.metric,
-            scalar_columns=list(args.scalar_column or []),
-            bitmap_columns=list(args.bitmap_column or []),
-            zonemap_columns=list(args.zonemap_column or []),
-            text_columns=list(args.text_column or []),
-            fts_base_tokenizer=args.fts_base_tokenizer,
-            fts_language=args.fts_language,
+
+    def work() -> int:
+        """Load the fleet, run the indexer, and return the failed-dataset count."""
+        uris: list[str] | None = load_uris_or_none(args, spark, "index", logger)
+        if uris is None:
+            return 0
+        config: IndexJobConfig = index_config_from_args(
+            args,
+            build_telemetry_config(args),
+            parse_storage_options(args),
             rebuild=args.rebuild,
         )
-        LanceIndexer(config).run(spark, uris)
-    except Exception:
-        logger.exception("indexing job failed")
-        raise
-    finally:
-        spark.stop()
+        failed: int = count_failed(LanceIndexer(config).run(spark, uris))
+        if failed:
+            logger.warning("indexing job: %d datasets failed and will be retried next run", failed)
+        return failed
+
+    return run_with_spark(spark, "indexing job", logger, work)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -97,12 +99,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         argv: Optional argument vector. Defaults to ``sys.argv``.
 
     Returns:
-        A process exit code.
+        A process exit code: ``0`` when every dataset succeeded, ``1`` when the run itself raised
+        an unhandled exception, and :data:`~lance_etl.cliutil.EXIT_PARTIAL_FAILURE` (``3``) when
+        the run completed but one or more datasets failed in isolation and will be retried by the
+        next scheduled run.
     """
     args: argparse.Namespace = build_parser().parse_args(argv)
     configure_logging_from_args(args)
     try:
-        run(args)
-        return 0
+        return resolve_exit_code(run(args))
     except Exception:
         return 1

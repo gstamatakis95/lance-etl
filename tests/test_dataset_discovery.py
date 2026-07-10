@@ -139,3 +139,28 @@ def test_cli_base_uri_combines_with_explicit_uris(mixed_depth_base: Path) -> Non
     uris: list[str] = load_dataset_uris(args)
     assert uris[0] == "s3://bucket/explicit.lance"
     assert len(uris) == 4
+
+
+def test_cli_dedupes_repeated_explicit_uris() -> None:
+    """Repeating the same --dataset-uri flag contributes exactly one URI, not two."""
+    args = indexing_cli.build_parser().parse_args(
+        [
+            "--dataset-uri",
+            "s3://bucket/one.lance",
+            "--dataset-uri",
+            "s3://bucket/one.lance",
+            "--dataset-uri",
+            "s3://bucket/two.lance",
+        ]
+    )
+    uris: list[str] = load_dataset_uris(args)
+    assert uris == ["s3://bucket/one.lance", "s3://bucket/two.lance"]
+
+
+def test_cli_dedupes_explicit_uri_also_found_by_discovery(mixed_depth_base: Path) -> None:
+    """A URI named both explicitly and via --base-uri discovery contributes exactly one entry."""
+    duplicate_uri: str = str(mixed_depth_base / "x.lance")
+    args = indexing_cli.build_parser().parse_args(["--dataset-uri", duplicate_uri, "--base-uri", str(mixed_depth_base)])
+    uris: list[str] = load_dataset_uris(args)
+    assert len(uris) == len(set(uris)) == 3
+    assert uris[0] == duplicate_uri

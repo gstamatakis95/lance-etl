@@ -110,6 +110,8 @@ class TestSampleParsing:
             ({"dataset_version": "x"}, "invalid:recall.dataset_version"),
             ({"captured_at_unix_ms": None}, "missing:recall.captured_at_unix_ms"),
             ({"org_id": "../etc"}, "invalid:recall.org_id"),
+            ({"org_id": "."}, "invalid:recall.org_id"),
+            ({"org_id": ".."}, "invalid:recall.org_id"),
             ({"tenant_id": "a/b"}, "invalid:recall.tenant_id"),
             ({"namespace": ""}, "missing:recall.namespace"),
             ({"query_vector": "not json"}, "invalid:recall.query_vector"),
@@ -327,9 +329,7 @@ class TestRecallCli:
         assert args.base_uri == "s3://bucket/root"
         assert args.dd_site == "datadoghq.com"
         assert args.max_samples == 10_000
-        assert args.id_column == "vector_id"
         assert args.vector_column == "vector"
-        assert args.batch_size == 8192
 
     def test_recall_requires_window_and_base_uri(self) -> None:
         """Missing required flags fail argument parsing."""

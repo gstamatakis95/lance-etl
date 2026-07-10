@@ -8,15 +8,15 @@ APIs, and a small dataset is simply the one-shard case:
   sink), runs the derived-state skip check, and shards each index's target fragments into
   build tasks sized by ``fragments_per_index_task``. A vector index whose artifacts are absent,
   mismatched, or growth-stale plans one ``bootstrap`` task instead of shards (ADR 0030).
-- Artifacts (:meth:`LanceIndexer.resolve_fleet_artifacts`): one flat Spark job reads the IVF_RQ
-  artifacts back for every ``segments``-mode vector index in the fleet: centroids from the
-  committed index via ``get_ivf_model`` and the RaBitQ rotation from the stored config. This
-  phase is reuse-only, so no training sample ever exists here.
 - Build (:meth:`LanceIndexer.build_fleet_segments`): ONE flat Spark job over every dataset's
-  shard tasks. Vector and scalar shards build uncommitted segments, a vector bootstrap task
-  runs a committed ``create_index`` whose internal streaming k-means trains the centroids, FTS
-  rebuild shards build per-fragment inverted indices under their dataset's shared index id,
-  and FTS maintain runs as a single task per dataset.
+  shard tasks. Each vector segment shard resolves its OWN dataset's IVF_RQ artifacts on the
+  executor — centroids read sidecar-first from the object-store cache with a ``get_ivf_model``
+  fallback, the RaBitQ rotation from the stored config (ADR 0040), so no fleet-wide centroid
+  broadcast is ever built. Vector and scalar shards build uncommitted segments, a vector
+  bootstrap task runs a committed ``create_index`` whose internal streaming k-means trains the
+  centroids and caches them to the sidecar, FTS rebuild shards build per-fragment inverted
+  indices under their dataset's shared index id, and FTS maintain runs as a single task per
+  dataset.
 - Commit (:func:`commit_one_index`): a per-(dataset, index) executor fan-out merges vector
   segments and publishes through the production commit paths, keeping the heavy merge off the
   driver. A stale-fragment commit (a concurrent compaction rewrote planned fragments) marks the
@@ -24,8 +24,9 @@ APIs, and a small dataset is simply the one-shard case:
 - Delta bound (:func:`merge_deltas_if_needed`): a final per-(dataset, index) fan-out merges
   accumulated index deltas once they exceed ``max_index_deltas``.
 
-:meth:`LanceIndexer.run` repeats plan-artifacts-build-commit for stale indexes up to
-``max_stale_replans`` rounds, then defers the survivors to the next scheduled run.
+:meth:`LanceIndexer.run` repeats plan-build-commit for stale indexes up to
+:data:`~lance_etl.indexing.config.MAX_STALE_REPLANS` rounds, then defers the survivors to the next
+scheduled run.
 """
 
 from __future__ import annotations
@@ -41,8 +42,20 @@ from lance.lance import indices as native_indices
 from pyspark.sql import SparkSession
 
 from lance_etl.column_roles import SCALAR_ROLE, TEXT_ROLE, VECTOR_ROLE, load_column_roles
-from lance_etl.fanout import fan_out_per_dataset
+from lance_etl.fanout import (
+    BUILD_PARTITION_FACTOR,
+    FANOUT_PARTITION_FACTOR,
+    derive_partitions,
+    fan_out_per_dataset,
+    report_fleet_failures,
+)
 from lance_etl.indexing.config import (
+    IVF_RQ_NUM_BITS,
+    MAX_STALE_REPLANS,
+    RETRAIN_GROWTH_FACTOR,
+    STREAMING_CORESET_RATE,
+    STREAMING_REFINE_PASSES,
+    STREAMING_SAMPLE_RATE,
     IndexJobConfig,
     bitmap_index_name,
     degrade_num_partitions,
@@ -65,12 +78,14 @@ from lance_etl.indexing.optimize import (
     index_delta_count,
     load_vector_config,
     maintain_index_locally,
+    save_centroids,
     write_vector_config,
 )
 from lance_etl.indexing.optimize import merge_index_deltas as merge_index_deltas_now
 from lance_etl.indexing.segments import (
     build_scalar_segment,
     build_vector_segment,
+    commit_index_with_retries,
     commit_segments,
     is_stale_fragment_error,
     serialize_segment,
@@ -110,6 +125,20 @@ KIND_TO_SCALAR_INDEX_TYPE: dict[str, str] = {
     ZONEMAP_KIND: "ZONEMAP",
 }
 """Maps a non-vector, non-FTS index kind to its Lance scalar index type string."""
+
+
+def index_failure_phase(result: dict[str, Any]) -> str:
+    """Return the constant ``dataset.failed`` metric phase tag for a failed indexing dataset.
+
+    Args:
+        result: The failed dataset's terminal result. Unused: indexing tags every failure with the
+            single ``index`` phase, unlike maintenance, whose failures carry a per-phase marker.
+
+    Returns:
+        The literal phase tag ``"index"``.
+    """
+    del result
+    return "index"
 
 
 def make_handler(kind: str, column: str, index_name: str, config: IndexJobConfig) -> IndexHandler:
@@ -173,19 +202,16 @@ def resolve_index_targets(dataset: lance.LanceDataset, config: IndexJobConfig) -
     return discovered
 
 
-def vector_index_needs_retrain(
-    dataset: lance.LanceDataset, config: IndexJobConfig, column: str, count_rows: Callable[[], int]
-) -> bool:
+def vector_index_needs_retrain(dataset: lance.LanceDataset, column: str, count_rows: Callable[[], int]) -> bool:
     """Report whether an existing vector index needs a full retrain.
 
     The index needs work when its ``lance-etl.vector.{column}`` config entry is absent or carries
     no positive ``rows_at_train`` (an index built outside the segment path awaiting a full
-    rebuild), or when the row count grew past ``config.retrain_growth_factor`` times the recorded
-    ``rows_at_train``. The config read comes from the already-loaded manifest.
+    rebuild), or when the row count grew past :data:`~lance_etl.indexing.config.RETRAIN_GROWTH_FACTOR`
+    times the recorded ``rows_at_train``. The config read comes from the already-loaded manifest.
 
     Args:
         dataset: The already-open dataset handle.
-        config: Indexing configuration.
         column: The indexed vector column.
         count_rows: Cached row-count supplier shared across the dataset's per-index checks.
 
@@ -198,7 +224,7 @@ def vector_index_needs_retrain(
     rows_at_train: int = int(cfg.get("rows_at_train") or 0)
     if rows_at_train <= 0:
         return True
-    return count_rows() > config.retrain_growth_factor * rows_at_train
+    return count_rows() > RETRAIN_GROWTH_FACTOR * rows_at_train
 
 
 def index_needs_work(
@@ -237,7 +263,7 @@ def index_needs_work(
         return True
     if int(stats.get("num_indices") or 0) > config.max_index_deltas:
         return True
-    return kind == VECTOR_KIND and vector_index_needs_retrain(dataset, config, column, count_rows)
+    return kind == VECTOR_KIND and vector_index_needs_retrain(dataset, column, count_rows)
 
 
 def index_skip_reason(
@@ -403,36 +429,6 @@ def plan_dataset_indexes(
     return {"uri": uri, "version": dataset.version, "specs": specs, "done": done}
 
 
-def resolve_vector_artifacts(
-    uri: str,
-    column: str,
-    index_name: str,
-    config: IndexJobConfig,
-) -> tuple[str, str, tuple, bool, int | None]:
-    """Read one vector index's reusable IVF_RQ artifacts back on an executor.
-
-    Delegates to the reuse-only :meth:`VectorIndexHandler.prepare`: centroids come from the
-    committed index via ``get_ivf_model`` and the RaBitQ rotation from the stored config. Only
-    ``segments``-mode specs reach this phase — datasets needing training plan a streaming
-    bootstrap build instead (ADR 0030).
-
-    Args:
-        uri: Dataset URI.
-        column: The vector column.
-        index_name: The index name.
-        config: Indexing configuration.
-
-    Returns:
-        ``(uri, column, artifacts, reused, num_partitions)`` where ``artifacts`` is the tuple
-        the segment builders expect.
-    """
-    telemetry: Telemetry = Telemetry.create(config.telemetry)
-    handler: VectorIndexHandler = VectorIndexHandler(config, column, index_name)
-    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-    artifacts: tuple = handler.prepare(dataset, uri, telemetry)
-    return uri, column, artifacts, handler.reused_artifacts, handler.num_partitions_used
-
-
 def bootstrap_vector_index(
     uri: str,
     column: str,
@@ -445,8 +441,19 @@ def bootstrap_vector_index(
     Runs a committed ``create_index`` whose internal training uses lance's streaming k-means
     (bounded memory regardless of partition count), sharing a freshly minted RaBitQ rotation so
     later incremental segments stay on the same model. After the commit the artifact config is
-    stored so future runs reuse the centroids through ``get_ivf_model``. ``replace=True`` makes
-    a growth retrain a wholesale index replacement.
+    stored and the trained centroids are cached to the object-store sidecar keyed by
+    ``rows_at_train`` (:func:`persist_bootstrap_centroids`), so future runs reuse them sidecar-first
+    with a ``get_ivf_model`` fallback (ADR 0040). ``replace=True`` makes a growth retrain a
+    wholesale index replacement.
+
+    The commit is wrapped in :func:`commit_index_with_retries` (``config.commit_retries``
+    budget) so a concurrent maintenance, compaction, or ETL commit on the same dataset no longer
+    aborts the whole fleet build round: this was the one commit path in the repo with no retry
+    wrapper. Each retry re-opens the dataset fresh so it rebases on the latest version before
+    retrying ``create_index``. Because the committed path trains and commits in a single call, a
+    retry re-runs streaming k-means rather than only the cheap commit. That is acceptable here:
+    bootstrap conflicts are rare (a fresh index build, with ingest and indexing serialized per
+    dataset by the pipeline), and the alternative is the entire fleet build aborting.
 
     Args:
         uri: Dataset URI.
@@ -462,27 +469,36 @@ def bootstrap_vector_index(
     handler: VectorIndexHandler = VectorIndexHandler(config, column, index_name)
     dimension: int = handler.dimension(dataset)
     rows: int = dataset.count_rows()
-    planned: int = derive_num_partitions(rows, config.num_partitions, config)
-    partitions: int = degrade_num_partitions(planned, rows, config.streaming_sample_rate)
-    rabitq_model: str = native_indices.build_rq_model(dimension=dimension, num_bits=config.ivf_rq_num_bits)
+    planned: int = derive_num_partitions(rows, config.num_partitions)
+    partitions: int = degrade_num_partitions(planned, rows, STREAMING_SAMPLE_RATE)
+    rabitq_model: str = native_indices.build_rq_model(dimension=dimension, num_bits=IVF_RQ_NUM_BITS)
     streaming_kwargs: dict[str, Any] = {
-        "streaming_sample_rate": config.streaming_sample_rate,
-        "streaming_refine_passes": config.streaming_refine_passes,
+        "streaming_sample_rate": STREAMING_SAMPLE_RATE,
+        "streaming_refine_passes": STREAMING_REFINE_PASSES,
     }
-    if config.streaming_coreset_rate is not None:
-        streaming_kwargs["streaming_coreset_rate"] = config.streaming_coreset_rate
-    with telemetry.timed("index.build_ms", tags=[f"index:{index_name}"]):
-        dataset.create_index(
-            column,
-            "IVF_RQ",
-            name=index_name,
-            metric=config.metric,
-            replace=True,
-            num_partitions=partitions,
-            num_bits=config.ivf_rq_num_bits,
-            rabitq_model=rabitq_model,
-            **streaming_kwargs,
-        )
+    if STREAMING_CORESET_RATE is not None:
+        streaming_kwargs["streaming_coreset_rate"] = STREAMING_CORESET_RATE
+
+    def action() -> lance.LanceDataset:
+        """Re-open the dataset at the latest version and run the committed create_index."""
+        fresh: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+        with telemetry.timed("index.build_ms", tags=[f"index:{index_name}"]):
+            fresh.create_index(
+                column,
+                "IVF_RQ",
+                name=index_name,
+                metric=config.metric,
+                replace=True,
+                num_partitions=partitions,
+                num_bits=IVF_RQ_NUM_BITS,
+                rabitq_model=rabitq_model,
+                **streaming_kwargs,
+            )
+        return fresh
+
+    committed_dataset: lance.LanceDataset = commit_index_with_retries(
+        action, config, telemetry, tags=[f"index:{index_name}"]
+    )
     telemetry.incr("index.committed", tags=[f"index:{index_name}"])
     telemetry.incr("artifacts.trained")
     write_vector_config(
@@ -492,34 +508,72 @@ def bootstrap_vector_index(
             "rows_at_train": rows,
             "dimension": dimension,
             "metric": config.metric,
-            "num_bits": config.ivf_rq_num_bits,
+            "num_bits": IVF_RQ_NUM_BITS,
             "num_partitions": partitions,
             "rabitq_model": rabitq_model,
         },
         config,
         telemetry,
     )
+    persist_bootstrap_centroids(committed_dataset, uri, index_name, rows, config, telemetry)
     return {
         "column": column,
         "index": index_name,
         "segments": 1,
-        "fragments": len(dataset.get_fragments()),
+        "fragments": len(committed_dataset.get_fragments()),
         "num_partitions": partitions,
         "reused_artifacts": False,
     }
 
 
+def persist_bootstrap_centroids(
+    dataset: lance.LanceDataset,
+    uri: str,
+    index_name: str,
+    rows_at_train: int,
+    config: IndexJobConfig,
+    telemetry: Telemetry,
+) -> None:
+    """Cache the freshly trained centroids to the object-store sidecar, best-effort.
+
+    Reads the committed centroids back via ``get_ivf_model`` and writes them to the sidecar keyed
+    by ``rows_at_train`` so future runs reuse them without re-reading the index (ADR 0040). This is
+    a pure cache write: the index is already committed and the RaBitQ rotation plus fingerprint are
+    already in the config, so a sidecar-write failure is counted, logged, and swallowed rather than
+    re-raised. A missing sidecar simply routes the next run through the ``get_ivf_model`` fallback.
+
+    Args:
+        dataset: The dataset whose committed index carries the trained centroids.
+        uri: Dataset URI.
+        index_name: The vector index name.
+        rows_at_train: The staleness fingerprint keying the sidecar generation.
+        config: Indexing configuration.
+        telemetry: Telemetry facade for the current executor process.
+    """
+    try:
+        centroids = dataset.get_ivf_model(index_name).centroids
+        save_centroids(uri, index_name, centroids, config.metric, rows_at_train, config.storage_options)
+        telemetry.incr("artifacts.centroid_sidecar_written")
+    except Exception as exc:
+        telemetry.incr("index.centroid_sidecar_write_error")
+        logger.warning("centroid sidecar write failed for %s on %s: %s", index_name, uri, exc)
+
+
 def build_one_shard(
     task: dict[str, Any],
-    artifacts_by_key: dict[tuple[str, str], tuple],
     config: IndexJobConfig,
     telemetry: Telemetry,
 ) -> tuple[str, str, dict[str, Any]]:
     """Build one flat-job task on an executor: a segment shard, FTS fragment shard, or FTS maintain.
 
+    A vector segment shard resolves its OWN dataset's IVF_RQ artifacts from the already-open
+    version-pinned handle through :meth:`VectorIndexHandler.prepare` — centroids read sidecar-first
+    from the object-store cache with a ``get_ivf_model`` fallback, the RaBitQ rotation from the
+    stored config (ADR 0040). There is no fleet-wide artifact broadcast: each task reads only the
+    one dataset it builds.
+
     Args:
         task: The shard task spec from the plan phase, flattened with ``uri`` and ``version``.
-        artifacts_by_key: The fleet's vector artifacts keyed by ``(uri, column)``.
         config: Indexing configuration.
         telemetry: Telemetry facade for the current executor process.
 
@@ -571,10 +625,11 @@ def build_one_shard(
 
     with telemetry.timed("segment.build_ms", tags=tags):
         if kind == VECTOR_KIND:
+            artifacts: tuple = VectorIndexHandler(config, column, index_name).prepare(dataset, uri, telemetry)
             segment = build_vector_segment(
                 dataset,
                 shard,
-                artifacts_by_key[(uri, column)],
+                artifacts,
                 column=column,
                 index_name=index_name,
                 metric=config.metric,
@@ -620,7 +675,6 @@ def commit_one_index(
 
     try:
         if kind == FTS_KIND:
-            handler: FtsIndexHandler = FtsIndexHandler(config, column, index_name)
             built: int = sum(int(payload.get("built", 0)) for payload in payloads)
             commit_fts_index(
                 uri,
@@ -632,7 +686,6 @@ def commit_one_index(
                 config,
                 telemetry,
             )
-            del handler
             return {"column": column, "index": index_name, "segments": built, "fragments": len(spec["fragments"])}
 
         documents: list[str] = [payload["segment"] for payload in payloads if "segment" in payload]
@@ -661,13 +714,43 @@ def commit_one_index(
         return {"column": column, "index": index_name, "segments": 0, "fragments": 0, "stale": True}
 
 
+def build_shard_task(spec: dict[str, Any], uri: str, version: int, shard: list[int]) -> dict[str, Any]:
+    """Build one minimal shard task carrying only the keys :func:`build_one_shard` reads.
+
+    Args:
+        spec: The index spec from the plan phase.
+        uri: Dataset URI.
+        version: The plan-time dataset version.
+        shard: The fragment ids this task builds, empty for bootstrap and FTS maintain specs.
+
+    Returns:
+        A task dict with ``kind``, ``column``, ``index_name``, ``mode``, ``uri``, ``version``,
+        and ``shard``, plus ``index_uuid`` for FTS rebuild specs.
+    """
+    task: dict[str, Any] = {
+        "kind": spec["kind"],
+        "column": spec["column"],
+        "index_name": spec["index_name"],
+        "mode": spec["mode"],
+        "uri": uri,
+        "version": version,
+        "shard": shard,
+    }
+    if "index_uuid" in spec:
+        task["index_uuid"] = spec["index_uuid"]
+    return task
+
+
 def flatten_shard_tasks(
     specs_by_uri: dict[str, list[dict[str, Any]]], version_by_uri: dict[str, int]
 ) -> list[dict[str, Any]]:
     """Expand every dataset's index specs into the flat build-task list for one Spark job.
 
-    Each shard becomes one task carrying its spec fields plus ``uri``, ``version``, and
-    ``shard``. Specs without shards (vector bootstraps and FTS maintains) become a single task
+    Each task is minimal: only the keys :func:`build_one_shard` actually reads (``kind``,
+    ``column``, ``index_name``, ``mode``, ``uri``, ``version``, ``shard``, and ``index_uuid`` for
+    FTS rebuilds), not the full spec. This keeps spec-only fields such as an FTS rebuild's entire
+    ``fragments`` list out of every one of that index's shard tasks, since the build phase never
+    reads them. Specs without shards (vector bootstraps and FTS maintains) become a single task
     with an empty shard.
 
     Args:
@@ -681,12 +764,11 @@ def flatten_shard_tasks(
     for uri, specs in specs_by_uri.items():
         version: int = version_by_uri[uri]
         for spec in specs:
-            base: dict[str, Any] = {**spec, "uri": uri, "version": version}
             if not spec["shards"]:
-                shard_tasks.append({**base, "shard": []})
+                shard_tasks.append(build_shard_task(spec, uri, version, []))
                 continue
             for shard in spec["shards"]:
-                shard_tasks.append({**base, "shard": list(shard)})
+                shard_tasks.append(build_shard_task(spec, uri, version, list(shard)))
     return shard_tasks
 
 
@@ -699,9 +781,12 @@ def collect_round_specs(
 
     A skipped dataset records its skip reason, finished indexes append their stats, and each
     dataset with buildable specs registers every spec's kind and pins its plan-time version.
-    On a stale-replan round the re-plan reports every already-current index in ``done`` again,
-    so entries whose index name is already recorded for the dataset are not appended twice —
-    the result stats stay one entry per index per run.
+    A dataset whose plan fan-out failed carries an ``{"error", "phase"}`` marker instead of specs
+    (the plan fan-out uses ``phase="plan"``): its error is recorded on the dataset and it builds
+    nothing this run, isolating the failure from the rest of the fleet. On a stale-replan round
+    the re-plan reports every already-current index in ``done`` again, so entries whose index name
+    is already recorded for the dataset are not appended twice — the result stats stay one entry
+    per index per run.
 
     Args:
         plans: The per-dataset plan records from the plan fan-out.
@@ -714,6 +799,10 @@ def collect_round_specs(
     specs_by_uri: dict[str, list[dict[str, Any]]] = {}
     for plan in plans:
         uri: str = plan["uri"]
+        if "error" in plan:
+            stats_by_uri[uri]["error"] = plan["error"]
+            stats_by_uri[uri]["error_phase"] = plan.get("phase", "plan")
+            continue
         if "skipped" in plan:
             stats_by_uri[uri]["skipped"] = plan["skipped"]
             continue
@@ -727,6 +816,88 @@ def collect_round_specs(
                 kind_by_index[(uri, spec["index_name"])] = spec["kind"]
             stats_by_uri[uri]["version"] = plan["version"]
     return specs_by_uri
+
+
+def fold_build_payloads(
+    built: list[tuple[str, str, dict[str, Any]]],
+    stats_by_uri: dict[str, dict[str, Any]],
+) -> tuple[dict[tuple[str, str], list[dict[str, Any]]], set[tuple[str, str]]]:
+    """Fold the flat build job's payloads into terminal stats and pending commit payloads.
+
+    A finished ``stats`` payload (vector bootstrap or FTS maintain) is appended as a terminal
+    index result. An ``error`` payload records one per-index error entry (deduplicated per index)
+    and marks the ``(uri, index_name)`` errored so the caller excludes it from the commit phase,
+    because a failed build must never publish a partial index. Every other payload is a segment or
+    FTS-shard build gathered for its index's commit.
+
+    Args:
+        built: The ``(uri, index_name, payload)`` triples collected from the build job.
+        stats_by_uri: Per-dataset result records, mutated in place.
+
+    Returns:
+        The build payloads keyed by ``(uri, index_name)`` for the commit phase, and the set of
+        ``(uri, index_name)`` pairs whose build failed and must be excluded from commit.
+    """
+    payloads_by_index: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    errored_indexes: set[tuple[str, str]] = set()
+    for uri, index_name, payload in built:
+        build_key: tuple[str, str] = (uri, index_name)
+        if "error" in payload:
+            if build_key not in errored_indexes:
+                stats_by_uri[uri]["indexes"].append(
+                    {
+                        "column": payload.get("column", ""),
+                        "index": index_name,
+                        "error": payload["error"],
+                        "phase": payload.get("phase", "build"),
+                    }
+                )
+                errored_indexes.add(build_key)
+            continue
+        if "stats" in payload:
+            stats_by_uri[uri]["indexes"].append(payload["stats"])
+            continue
+        payloads_by_index.setdefault(build_key, []).append(payload)
+    return payloads_by_index, errored_indexes
+
+
+def record_commit_outcomes(
+    outcomes: list[tuple[str, dict[str, Any]]],
+    stats_by_uri: dict[str, dict[str, Any]],
+) -> set[str]:
+    """Fold the commit fan-out's outcomes into per-dataset stats, returning the stale URIs.
+
+    A stale outcome routes its dataset back for a re-plan. An error outcome appends one per-index
+    error entry (terminal, never re-planned). A success outcome appends the committed stats
+    directly: segment-mode vector commits no longer carry the ``reused_artifacts`` or
+    ``num_partitions`` extras (each shard resolves its own artifacts now, so there is no fleet
+    artifact phase to source them), while a vector bootstrap's stats still carry ``num_partitions``
+    and ``reused_artifacts=False`` from :func:`bootstrap_vector_index`.
+
+    Args:
+        outcomes: The ``(uri, stats)`` pairs collected from the commit fan-out.
+        stats_by_uri: Per-dataset result records, mutated in place.
+
+    Returns:
+        The datasets whose commit hit stale fragments, for the next stale-replan round.
+    """
+    stale_uris: set[str] = set()
+    for uri, stats in outcomes:
+        if stats.pop("stale", False):
+            stale_uris.add(uri)
+            continue
+        if "error" in stats:
+            stats_by_uri[uri]["indexes"].append(
+                {
+                    "column": stats.get("column", ""),
+                    "index": stats.get("index", ""),
+                    "error": stats["error"],
+                    "phase": stats.get("phase", "index_commit"),
+                }
+            )
+            continue
+        stats_by_uri[uri]["indexes"].append(stats)
+    return stale_uris
 
 
 def merge_deltas_if_needed(uri: str, index_name: str, config: IndexJobConfig, telemetry: Telemetry) -> bool:
@@ -761,58 +932,20 @@ class LanceIndexer:
         """
         self.config: IndexJobConfig = config
 
-    def resolve_fleet_artifacts(
-        self, spark: SparkSession, vector_specs: list[tuple[str, dict[str, Any]]]
-    ) -> tuple[dict[tuple[str, str], tuple], dict[tuple[str, str], dict[str, Any]]]:
-        """Resolve every vector index's artifacts in one flat Spark job.
-
-        Args:
-            spark: Active Spark session.
-            vector_specs: ``(uri, spec)`` pairs for the fleet's vector indexes.
-
-        Returns:
-            The artifacts keyed by ``(uri, column)``, and per-key extra stats
-            (``reused_artifacts``, ``num_partitions``).
-        """
-        config: IndexJobConfig = self.config
-        if not vector_specs:
-            return {}, {}
-
-        def resolve_one(item: tuple[str, str, str]) -> tuple[str, str, tuple, bool, int | None]:
-            """Resolve one vector index's artifacts on an executor.
-
-            Args:
-                item: ``(uri, column, index_name)``.
-
-            Returns:
-                The artifacts and reuse stats for the index.
-            """
-            return resolve_vector_artifacts(item[0], item[1], item[2], config)
-
-        items: list[tuple[str, str, str]] = [(uri, spec["column"], spec["index_name"]) for uri, spec in vector_specs]
-        slices: int = max(1, min(len(items), config.max_build_tasks))
-        resolved: list[tuple[str, str, tuple, bool, int | None]] = (
-            spark.sparkContext.parallelize(items, slices).map(resolve_one).collect()
-        )
-        artifacts: dict[tuple[str, str], tuple] = {}
-        extras: dict[tuple[str, str], dict[str, Any]] = {}
-        for uri, column, artifact, reused, partitions in resolved:
-            artifacts[(uri, column)] = artifact
-            extras[(uri, column)] = {"reused_artifacts": reused, "num_partitions": partitions}
-        return artifacts, extras
-
     def build_fleet_segments(
         self,
         spark: SparkSession,
         shard_tasks: list[dict[str, Any]],
-        artifacts: dict[tuple[str, str], tuple],
     ) -> list[tuple[str, str, dict[str, Any]]]:
         """Run every dataset's build tasks in one flat Spark job.
+
+        Each vector segment shard resolves its own dataset's IVF_RQ artifacts on the executor
+        (centroids sidecar-first, ``get_ivf_model`` fallback, rotation from the stored config), so
+        no fleet-wide artifact dict is collected to the driver or broadcast to the tasks (ADR 0040).
 
         Args:
             spark: Active Spark session.
             shard_tasks: Flattened shard task specs across the fleet.
-            artifacts: The fleet's vector artifacts, broadcast once to all tasks.
 
         Returns:
             ``(uri, index_name, payload)`` triples collected from the executors.
@@ -820,23 +953,45 @@ class LanceIndexer:
         config: IndexJobConfig = self.config
         if not shard_tasks:
             return []
-        broadcast = spark.sparkContext.broadcast(artifacts)
 
         def build_partition(items: Any) -> Any:
             """Build the shard tasks assigned to this executor task.
+
+            Per-index failure isolation: a shard build failure is caught and turned into an error
+            payload carrying the shard's ``(uri, index_name)`` so the driver drops the whole index
+            from the commit phase (a failed build must never publish a partial index) and records
+            the error on its dataset, without aborting the rest of the fleet's build tasks. A vector
+            shard whose artifacts cannot be resolved raises inside ``build_one_shard`` and is
+            isolated on exactly this path, replacing the deleted fleet artifact phase.
 
             Args:
                 items: The task specs for this partition.
 
             Yields:
-                One build payload per task.
+                One ``(uri, index_name, payload)`` triple per task, an error payload when the
+                shard build raised.
             """
             executor_telemetry: Telemetry = Telemetry.create(config.telemetry)
             with executor_telemetry.span("lance.indexing.build_segment"):
                 for task in items:
-                    yield build_one_shard(task, broadcast.value, config, executor_telemetry)
+                    try:
+                        yield build_one_shard(task, config, executor_telemetry)
+                    except Exception as exc:
+                        executor_telemetry.incr("segment.build_error", tags=[f"index:{task['index_name']}"])
+                        logger.warning(
+                            "index build shard failed for %s on %s, isolating: %s",
+                            task["index_name"],
+                            task["uri"],
+                            exc,
+                        )
+                        yield (
+                            task["uri"],
+                            task["index_name"],
+                            {"error": str(exc), "phase": "build", "column": task["column"]},
+                        )
 
-        slices: int = max(1, min(len(shard_tasks), config.max_build_tasks))
+        max_build_tasks_resolved: int = derive_partitions(spark, BUILD_PARTITION_FACTOR)
+        slices: int = max(1, min(len(shard_tasks), max_build_tasks_resolved))
         return spark.sparkContext.parallelize(shard_tasks, slices).mapPartitions(build_partition).collect()
 
     def commit_fleet(
@@ -858,17 +1013,38 @@ class LanceIndexer:
         def commit_partition(items: Any) -> Any:
             """Commit the indexes assigned to this executor task.
 
+            Per-index failure isolation: ``commit_one_index`` returns its own stale marker and
+            only raises on a genuine non-stale error, so any exception reaching here is caught and
+            turned into an error marker identifying its ``(uri, column, index)`` instead of
+            aborting the fan-out.
+
             Args:
                 items: The ``(uri, spec, payloads)`` triples for this partition.
 
             Yields:
-                One ``(uri, stats)`` pair per index.
+                One ``(uri, stats)`` pair per index, an error marker when the commit raised.
             """
             executor_telemetry: Telemetry = Telemetry.create(config.telemetry)
             for uri, spec, payloads in items:
-                yield uri, commit_one_index(uri, spec, payloads, config, executor_telemetry)
+                try:
+                    yield uri, commit_one_index(uri, spec, payloads, config, executor_telemetry)
+                except Exception as exc:
+                    executor_telemetry.incr("index.commit_error", tags=[f"index:{spec['index_name']}"])
+                    logger.warning("index commit failed for %s on %s, isolating: %s", spec["index_name"], uri, exc)
+                    yield (
+                        uri,
+                        {
+                            "uri": uri,
+                            "column": spec["column"],
+                            "index": spec["index_name"],
+                            "error": str(exc),
+                            "phase": "index_commit",
+                            "stale": False,
+                        },
+                    )
 
-        slices: int = max(1, min(len(entries), config.batch_partitions))
+        batch_partitions_resolved: int = derive_partitions(spark, FANOUT_PARTITION_FACTOR)
+        slices: int = max(1, min(len(entries), batch_partitions_resolved))
         return spark.sparkContext.parallelize(entries, slices).mapPartitions(commit_partition).collect()
 
     def bound_fleet_deltas(self, spark: SparkSession, entries: list[tuple[str, str]]) -> dict[tuple[str, str], bool]:
@@ -888,17 +1064,31 @@ class LanceIndexer:
         def merge_partition(items: Any) -> Any:
             """Bound the deltas of the indexes assigned to this executor task.
 
+            Delta bounding is best-effort: a failure for one index is logged and reported as an
+            unmerged result so the deltas are simply left for the next run instead of aborting the
+            fleet's delta-bound pass.
+
             Args:
                 items: The ``(uri, index_name)`` pairs for this partition.
 
             Yields:
-                ``(uri, index_name, merged)`` per index.
+                ``(uri, index_name, merged)`` per index, ``merged=False`` when the bound raised.
             """
             executor_telemetry: Telemetry = Telemetry.create(config.telemetry)
             for uri, index_name in items:
-                yield uri, index_name, merge_deltas_if_needed(uri, index_name, config, executor_telemetry)
+                try:
+                    yield uri, index_name, merge_deltas_if_needed(uri, index_name, config, executor_telemetry)
+                except Exception as exc:
+                    logger.warning(
+                        "index delta bound failed for %s on %s, leaving deltas for next run: %s",
+                        index_name,
+                        uri,
+                        exc,
+                    )
+                    yield uri, index_name, False
 
-        slices: int = max(1, min(len(entries), config.batch_partitions))
+        batch_partitions_resolved: int = derive_partitions(spark, FANOUT_PARTITION_FACTOR)
+        slices: int = max(1, min(len(entries), batch_partitions_resolved))
         merged: list[tuple[str, str, bool]] = (
             spark.sparkContext.parallelize(entries, slices).mapPartitions(merge_partition).collect()
         )
@@ -913,13 +1103,20 @@ class LanceIndexer:
         kind_by_index: dict[tuple[str, str], str],
         driver_telemetry: Telemetry,
     ) -> list[str]:
-        """Run one plan-artifacts-build-commit round over the pending datasets.
+        """Run one plan-build-commit round over the pending datasets.
 
         The plan fan-out resolves each dataset's index specs (folded into the accumulators by
-        :func:`collect_round_specs`), one flat Spark job resolves the fleet's vector artifacts,
-        one flat Spark job builds every shard task, and the commit fan-out publishes per index.
-        Finished index stats accumulate into ``stats_by_uri`` and every spec's kind is recorded
-        in ``kind_by_index`` for the final delta bound.
+        :func:`collect_round_specs`), one flat Spark job builds every shard task (each vector shard
+        resolving its own artifacts sidecar-first, ADR 0040), and the commit fan-out publishes per
+        index. Finished index stats accumulate into ``stats_by_uri`` and every spec's kind is
+        recorded in ``kind_by_index`` for the final delta bound.
+
+        Per-index failure isolation: a plan, build, or commit failure is recorded as an error entry
+        on the affected dataset's ``indexes`` list (or a dataset-level error for a plan failure) and
+        the affected index is dropped from the rest of the round, so a failed build never publishes
+        a partial index and one pathological index never aborts the fleet round. A vector index
+        whose artifacts cannot be resolved now fails inside its build shard and is isolated on that
+        path. The other indexes and datasets still build and commit.
 
         Args:
             spark: Active Spark session.
@@ -933,73 +1130,62 @@ class LanceIndexer:
             The datasets whose commits hit stale fragments, sorted, for the next round.
         """
         config: IndexJobConfig = self.config
+        plan_batch_partitions: int = derive_partitions(spark, FANOUT_PARTITION_FACTOR)
         plans: list[dict[str, Any]] = fan_out_per_dataset(
             spark,
             pending_uris,
             config.telemetry,
             lambda uri, telemetry: plan_dataset_indexes(uri, config, telemetry),
-            config.batch_partitions,
+            plan_batch_partitions,
+            phase="plan",
         )
 
         specs_by_uri: dict[str, list[dict[str, Any]]] = collect_round_specs(plans, stats_by_uri, kind_by_index)
         if not specs_by_uri:
             return []
 
-        vector_specs: list[tuple[str, dict[str, Any]]] = [
-            (uri, spec)
-            for uri, specs in specs_by_uri.items()
-            for spec in specs
-            if spec["kind"] == VECTOR_KIND and spec["mode"] == "segments"
-        ]
-        with driver_telemetry.timed("run.artifacts_ms"):
-            artifacts, artifact_extras = self.resolve_fleet_artifacts(spark, vector_specs)
-
         version_by_uri: dict[str, int] = {uri: stats_by_uri[uri]["version"] for uri in specs_by_uri}
         shard_tasks: list[dict[str, Any]] = flatten_shard_tasks(specs_by_uri, version_by_uri)
         logger.info(
             "indexing round %d/%d: %d datasets, %d build tasks",
             round_index + 1,
-            config.max_stale_replans,
+            MAX_STALE_REPLANS,
             len(specs_by_uri),
             len(shard_tasks),
         )
         with driver_telemetry.timed("run.build_ms"):
-            built: list[tuple[str, str, dict[str, Any]]] = self.build_fleet_segments(spark, shard_tasks, artifacts)
+            built: list[tuple[str, str, dict[str, Any]]] = self.build_fleet_segments(spark, shard_tasks)
 
-        payloads_by_index: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        for uri, index_name, payload in built:
-            if "stats" in payload:
-                stats_by_uri[uri]["indexes"].append(payload["stats"])
-                continue
-            payloads_by_index.setdefault((uri, index_name), []).append(payload)
+        payloads_by_index, errored_indexes = fold_build_payloads(built, stats_by_uri)
 
         commit_entries: list[tuple[str, dict[str, Any], list[dict[str, Any]]]] = []
         for uri, specs in specs_by_uri.items():
             for spec in specs:
                 key: tuple[str, str] = (uri, spec["index_name"])
-                if key in payloads_by_index:
+                if key not in errored_indexes and key in payloads_by_index:
                     commit_entries.append((uri, spec, payloads_by_index[key]))
         with driver_telemetry.timed("run.commit_ms"):
             outcomes: list[tuple[str, dict[str, Any]]] = self.commit_fleet(spark, commit_entries)
 
-        stale_uris: set[str] = set()
-        for uri, stats in outcomes:
-            if stats.pop("stale", False):
-                stale_uris.add(uri)
-                continue
-            extra: dict[str, Any] = artifact_extras.get((uri, stats["column"]), {})
-            stats_by_uri[uri]["indexes"].append({**stats, **extra})
-        return sorted(stale_uris)
+        return sorted(record_commit_outcomes(outcomes, stats_by_uri))
 
     def run(self, spark: SparkSession, dataset_uris: list[str]) -> list[dict[str, Any]]:
-        """Index every dataset through the unified plan-artifacts-build-commit rounds.
+        """Index every dataset through the unified plan-build-commit rounds.
+
+        Per-dataset failure isolation: a dataset whose plan failed carries a dataset-level
+        ``"error"`` key, and a dataset with a failed index carries an error entry in its
+        ``indexes`` list. Either way the dataset still lands one terminal record and every other
+        dataset completes. The failed datasets are re-planned by the next scheduled run, since the
+        job is cursor-free. Callers detect failures by scanning for a dataset-level ``"error"`` or
+        a per-index ``"error"`` entry.
 
         Args:
             spark: Active Spark session.
             dataset_uris: Datasets to index.
 
         Returns:
-            One statistics dictionary per dataset, in input order.
+            One statistics dictionary per dataset, in input order. A failed dataset carries an
+            ``"error"`` key or an error entry among its ``indexes``.
         """
         config: IndexJobConfig = self.config
         driver_telemetry: Telemetry = Telemetry.create(config.telemetry)
@@ -1012,7 +1198,7 @@ class LanceIndexer:
             pending_uris: list[str] = list(dataset_uris)
             kind_by_index: dict[tuple[str, str], str] = {}
 
-            for round_index in range(config.max_stale_replans):
+            for round_index in range(MAX_STALE_REPLANS):
                 pending_uris = self.run_round(
                     spark, round_index, pending_uris, stats_by_uri, kind_by_index, driver_telemetry
                 )
@@ -1024,7 +1210,7 @@ class LanceIndexer:
                     "index build on %s still has uncovered fragments after %d stale-replan rounds; "
                     "next scheduled run re-covers",
                     uri,
-                    config.max_stale_replans,
+                    MAX_STALE_REPLANS,
                 )
 
             delta_entries: list[tuple[str, str]] = sorted(
@@ -1048,5 +1234,8 @@ class LanceIndexer:
             run_span.set_tag("skipped_datasets", skipped)
             driver_telemetry.gauge("run.datasets", len(results))
             driver_telemetry.gauge("run.datasets_skipped", skipped)
+
+            report_fleet_failures(results, run_span, driver_telemetry, "indexing run", index_failure_phase, logger)
+
             logger.info("indexing run: %d datasets (%d skipped)", len(results), skipped)
             return results

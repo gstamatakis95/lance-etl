@@ -9,6 +9,7 @@ import pytest
 from bench.config import (
     DEFAULT_CORPUS_ROOT,
     DEFAULT_ICEBERG_PACKAGE,
+    RECALL_CUTOFFS,
     SIFT_BASE_COUNT,
     SUBCOMMANDS,
     BenchConfig,
@@ -197,3 +198,18 @@ class TestDerivedPaths:
         config: BenchConfig = config_for(["ingest", "--tenants", "2", "--workspace", "/tmp/ws"])
         base: str = str(Path("/tmp/ws").resolve() / "lance")
         assert config.dataset_uris() == [f"{base}/org0/tenant0/ns.lance", f"{base}/org1/tenant0/ns.lance"]
+
+
+class TestSearchKValidation:
+    """search_k must cover the deepest recall cutoff or recall_at silently deflates."""
+
+    def test_search_k_below_deepest_cutoff_rejected(self) -> None:
+        """A search_k smaller than max(RECALL_CUTOFFS) raises instead of silently deflating recall."""
+        too_small: int = max(RECALL_CUTOFFS) - 1
+        with pytest.raises(ValueError, match="search_k"):
+            config_for(["search", "--search-k", str(too_small)])
+
+    def test_search_k_covering_deepest_cutoff_accepted(self) -> None:
+        """A search_k equal to the deepest cutoff is accepted."""
+        config: BenchConfig = config_for(["search", "--search-k", str(max(RECALL_CUTOFFS))])
+        assert config.search_k == max(RECALL_CUTOFFS)

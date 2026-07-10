@@ -40,6 +40,8 @@ SUBCOMMANDS: tuple[str, ...] = (
     "experiment",
 )
 PHASE_NAMES: tuple[str, ...] = ("download", "prepare", "ingest", "index", "compact", "search", "report")
+RECALL_CUTOFFS: tuple[int, ...] = (1, 10, 100)
+"""Recall cut-off depths scored by the search and e2e legs; ``search_k`` must cover the deepest one."""
 
 
 def default_run_id() -> str:
@@ -216,6 +218,23 @@ class BenchConfig:
     server_env: dict[str, str] = field(default_factory=dict)
     baseline: str | None = None
 
+    def __post_init__(self) -> None:
+        """Validate cross-field invariants after the dataclass fields are populated.
+
+        Raises:
+            ValueError: If ``search_k`` is smaller than the deepest :data:`RECALL_CUTOFFS` depth.
+                ``recall_at`` slices the retrieved-id array to the cut-off width, so a shorter
+                array silently caps recall below its true value instead of raising, which would
+                make ``search_k`` misconfiguration masquerade as a real recall drop.
+        """
+        deepest_cutoff: int = max(RECALL_CUTOFFS)
+        if self.search_k < deepest_cutoff:
+            raise ValueError(
+                f"search_k={self.search_k} is below the deepest recall cutoff {deepest_cutoff} "
+                f"(RECALL_CUTOFFS={RECALL_CUTOFFS}); recall_at_{deepest_cutoff} would be silently "
+                f"deflated by the shorter retrieved-id array. Pass --search-k >= {deepest_cutoff}."
+            )
+
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> BenchConfig:
         """Build a configuration from parsed command-line arguments.
@@ -368,7 +387,12 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--refine-factors", type=parse_refine_list, default=None, help="Comma list; 'none' disables, e.g. none,5,10"
     )
-    parser.add_argument("--search-k", type=int, default=SIFT_GT_DEPTH)
+    parser.add_argument(
+        "--search-k",
+        type=int,
+        default=SIFT_GT_DEPTH,
+        help=f"Neighbors requested per query; must be >= {max(RECALL_CUTOFFS)}, the deepest recall cutoff",
+    )
     parser.add_argument("--max-queries", type=int, default=None, help="Cap query vectors per sweep point")
     parser.add_argument("--fts-queries", dest="fts_query_count", type=int, default=100)
     parser.add_argument("--hybrid-queries", dest="hybrid_query_count", type=int, default=100)

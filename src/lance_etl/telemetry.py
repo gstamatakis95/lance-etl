@@ -52,11 +52,13 @@ Raised above the 30-second Lance default to give headroom on hot multi-tenant da
 """
 
 DEFAULT_COMMIT_RETRIES: int = 20
-"""Conflict-retry budget for index and compaction commits.
+"""Conflict-retry budget for index commits and the per-row TTL-delete commit.
 
 This is the single home for the budget that was duplicated across :class:`lance_etl.indexing.IndexJobConfig` and
-:class:`lance_etl.maintenance.MaintenanceConfig`. It sizes the only retry layer the binding-less segment-index and
-distributed-compaction commits have.
+:class:`lance_etl.maintenance.MaintenanceConfig`. It sizes the only retry layer the binding-less segment-index
+commits and the TTL ``delete`` commit have. The fleet ``Compaction.commit`` call is a separate, smaller layer sized by
+:data:`DEFAULT_LARGE_COMMIT_RETRIES` instead, because its conflict scan is pinned to the plan version so a semantic
+conflict re-fails deterministically and only the raw manifest-write race benefits from a retry.
 """
 
 DEFAULT_LARGE_COMMIT_RETRIES: int = 2
@@ -164,6 +166,10 @@ def commit_with_retries(
     correct as-is: shrinking them would thin the only coverage for ``CommitConflict`` and the binding-less compaction
     commits, and growing them would not help because the inner loop already owns ``RetryableCommitConflict`` exhaustion.
 
+    On the final attempt a conflict raises immediately instead of sleeping first: there is no further retry left to
+    justify the delay, so the caller sees the failure without waiting up to ``backoff_seconds * 64`` for nothing.
+    ``on_conflict`` still fires on every conflict, including the last.
+
     Args:
         action: The commit to attempt, returning any result.
         retries: Conflict retries allowed beyond the first attempt.
@@ -186,6 +192,8 @@ def commit_with_retries(
             last_exc = exc
             if on_conflict is not None:
                 on_conflict()
+            if attempt == retries:
+                break
             time.sleep(random.uniform(0.0, backoff_seconds * (2 ** min(attempt, 6))))
     assert last_exc is not None
     raise last_exc

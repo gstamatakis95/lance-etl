@@ -683,21 +683,6 @@ impl Metrics {
             .send();
     }
 
-    /// One post-fusion reranking pass: candidate count and duration tagged by `rpc`.
-    ///
-    /// `candidates` is the number of hits fed to the reranker before any truncation. Emitted only
-    /// when a request carries a rerank spec, so the default identity path stays metric-free.
-    pub fn rerank(&self, rpc: Rpc, candidates: u64, duration: Duration) {
-        self.client
-            .distribution_with_tags("rerank.duration_ms", millis(duration))
-            .with_tag("rpc", rpc.as_tag())
-            .send();
-        self.client
-            .distribution_with_tags("rerank.candidates", candidates)
-            .with_tag("rpc", rpc.as_tag())
-            .send();
-    }
-
     /// Duration of reading the IVF centroids for one Clusters call.
     pub fn clusters_read(&self, duration: Duration) {
         self.client
@@ -926,23 +911,6 @@ mod tests {
                 .any(|line| line.starts_with("search_api.recall.samples:1|c") && line.contains("query_type:hybrid")),
             "missing hybrid sample count: {lines:?}"
         );
-    }
-
-    #[test]
-    fn rerank_metric_renders_candidates_and_duration_tagged_by_rpc() {
-        let (metrics, drain) = spy_metrics();
-        metrics.rerank(Rpc::HybridSearch, 7, Duration::from_millis(4));
-        let lines = drain();
-        let expect = [
-            ("search_api.rerank.duration_ms:4|d", "rpc:hybrid_search"),
-            ("search_api.rerank.candidates:7|d", "rpc:hybrid_search"),
-        ];
-        for (head, tag) in expect {
-            assert!(
-                lines.iter().any(|line| line.starts_with(head) && line.contains(tag)),
-                "missing {head} with {tag} in {lines:?}"
-            );
-        }
     }
 
     #[test]

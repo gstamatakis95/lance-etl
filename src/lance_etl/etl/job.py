@@ -17,18 +17,25 @@ The per-dataset Lance schema is grow-only. Columns are never removed; new keys a
 ``add_columns`` schema evolution on first appearance.
 
 Every window is an idempotent merge keyed by vector id: replayed or retried windows converge
-instead of duplicating. No separate bulk path is needed for backfills.
+instead of duplicating.
 
 Heavy work (dataset reads, writes, pivot, merge) runs exclusively in Spark executors.
 The driver only resolves snapshot bounds, short-circuits on empty windows, and collects stats.
-Everything that maps cleanly onto Spark stays in Spark: the key-hash batch split, the
-null-routing-row filter (with an ``Observation``-based dropped-row count), and the
-last-write-wins collapse are all native DataFrame operations. The Arrow closure carries only
-what Spark cannot express — the dynamic per-dataset map pivot and the Lance merge commits.
+Everything that maps cleanly onto Spark stays in Spark: the null-routing-row filter (whose
+dropped-row count is folded into the routing plan's single ``groupBy`` scan) and the
+last-write-wins collapse are all native DataFrame operations. The Arrow closure carries only what
+Spark cannot express — the dynamic per-dataset map pivot and the Lance merge commits.
 
-Large increments are absorbed at the Spark level: ``ETLConfig.spark_batches`` splits the
-increment into sequential key-hash batches, each its own Spark job over a fraction of the rows,
-so a single org increment of 50M+ rows runs without raising executor memory limits.
+The increment is sized by an adaptive routing plan (:func:`lance_etl.etl.plan.compute_routing_plan`)
+that salts big datasets across key-hash sub-buckets so no single partition holds a whole billion-row
+org and no task serializes the entire long tail of tiny datasets. Each shuffle partition is consumed
+as a stream (:func:`lance_etl.etl.pivot.stream_routing_groups`), so executor memory scales with one
+dataset group rather than the whole partition.
+
+Big datasets that are new or empty take a bulk-append fast path (:mod:`lance_etl.etl.bulk`): parallel
+``write_fragments`` across their key-hash sub-buckets plus one ``commit_batch`` per dataset, instead
+of thousands of per-key merge commits. Those datasets are excluded from the merge input, so every
+other trio still flows through the idempotent merge path unchanged.
 
 The I/O seams are explicit: :meth:`IcebergToLanceETL.read_increment` is the Iceberg source and
 :mod:`lance_etl.etl.sink` is the Lance sink (idempotent LWW merge, chunked commits, grow-only
@@ -37,13 +44,15 @@ schema with column-role metadata, storage_options pass-through).
 
 from __future__ import annotations
 
+import itertools
 import logging
+import math
 from collections.abc import Iterator
 from datetime import datetime
 from typing import Any
 
 import pyarrow as pa
-from pyspark.sql import Column, DataFrame, Observation, SparkSession
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
     ArrayType,
@@ -56,15 +65,31 @@ from pyspark.sql.types import (
     TimestampNTZType,
     TimestampType,
 )
-from pyspark.sql.window import Window, WindowSpec
 
+from lance_etl.etl.bulk import (
+    bootstrap_bulk_datasets,
+    commit_bulk_transactions,
+    derive_bulk_schemas,
+    plan_bulk_append,
+    run_bulk_append,
+)
 from lance_etl.etl.pivot import (
+    KEY_COL,
+    OP_COL,
     ROUTING_COLS,
+    TTL_COL,
     ETLConfig,
     build_stats_batch,
-    group_by_routing,
     stats_schema,
     stats_spark_ddl,
+    stream_routing_groups,
+)
+from lance_etl.etl.plan import (
+    RoutingPlan,
+    apply_salted_shuffle,
+    collapse,
+    compute_routing_plan,
+    routing_null_predicate,
 )
 from lance_etl.etl.sink import apply_merge, dataset_uri
 from lance_etl.maintenance.tools import update_serving_tags
@@ -73,10 +98,10 @@ from lance_etl.telemetry import Telemetry
 logger: logging.Logger = logging.getLogger(__name__)
 
 DEFAULT_TAG_STAMP_PARTITIONS: int = 512
-"""Partition cap for the interval-tag stamp fan-out when ``num_partitions`` is AQE-sized.
+"""Lower bound on the interval-tag stamp fan-out width.
 
-Matches the ``update_serving_tags`` default so the tag flip keeps its historical width when the
-routing shuffle itself has no fixed count.
+Matches the ``update_serving_tags`` default so the tag flip keeps its historical width for small
+runs, while a large fleet grows the fan-out past this floor via the dataset-per-task ratio.
 """
 
 
@@ -244,7 +269,7 @@ class IcebergToLanceETL:
             return isinstance(t, (LongType, IntegerType))
 
         required_checks: list[tuple[str, Any, str]] = [
-            *[(col, is_string, "StringType") for col in [*ROUTING_COLS, config.key_col, config.op_col]],
+            *[(col, is_string, "StringType") for col in [*ROUTING_COLS, KEY_COL, OP_COL]],
             *[
                 (col, is_timestamp, "TimestampType or TimestampNTZType")
                 for col in [config.ts_col, config.window_column]
@@ -260,7 +285,7 @@ class IcebergToLanceETL:
             ("vectors", is_vector_map, "MapType(StringType, ArrayType(FloatType|DoubleType))"),
             ("texts", is_string_map, "MapType(StringType, StringType)"),
             ("metadata", is_string_map, "MapType(StringType, StringType)"),
-            (config.ttl_col, is_integer, "LongType or IntegerType"),
+            (TTL_COL, is_integer, "LongType or IntegerType"),
         ]
         for col, predicate, expected in optional_checks:
             if col in ft and not predicate(ft[col]):
@@ -273,8 +298,9 @@ class IcebergToLanceETL:
     def collapse(self, source: DataFrame) -> DataFrame:
         """Reduce to the last-write-wins terminal event per (routing key, vector id).
 
-        Orders by ``ts_col`` descending NULLS LAST; ties broken by ``xxhash64`` over all
-        non-MapType columns ascending (MapType columns cannot be hashed by Spark).
+        Delegates to the shared :func:`lance_etl.etl.plan.collapse` free function so the merge and
+        bulk-append paths share one collapse implementation and can never disagree on which row
+        survives per key.
 
         Args:
             source: The source DataFrame with map columns still intact.
@@ -282,15 +308,7 @@ class IcebergToLanceETL:
         Returns:
             One row per routing key and vector id, carrying the terminal op.
         """
-        config: ETLConfig = self.config
-        partition_by: list[Column] = [F.col(c) for c in ROUTING_COLS]
-        partition_by.append(F.col(config.key_col))
-        non_map_cols: list[str] = [f.name for f in source.schema.fields if not isinstance(f.dataType, MapType)]
-        window: WindowSpec = Window.partitionBy(*partition_by).orderBy(
-            F.col(config.ts_col).desc_nulls_last(),
-            F.xxhash64(*[F.col(c) for c in non_map_cols]).asc(),
-        )
-        return source.withColumn("row_num", F.row_number().over(window)).where(F.col("row_num") == 1).drop("row_num")
+        return collapse(source, self.config)
 
     def run(self, spark: SparkSession, table: str, start_ms: int, end_ms: int) -> None:
         """Read one Iceberg window and route it via :meth:`run_on_dataframe`.
@@ -303,97 +321,66 @@ class IcebergToLanceETL:
         """
         self.run_on_dataframe(self.apply_window_filter(self.read_increment(spark, table, start_ms, end_ms)))
 
-    def select_batch(self, source: DataFrame, batch_index: int, batch_count: int) -> DataFrame:
-        """Filter the increment to one Spark-level key-hash batch.
-
-        Buckets rows by ``pmod(xxhash64(key_col), batch_count)`` natively in Spark, so the split
-        is a pushed-down filter rather than driver-side work. Every event for a vector id lands in
-        exactly one batch, so per-batch collapse equals global collapse restricted to that batch
-        and last-write-wins is preserved across the split.
-
-        Args:
-            source: The full incremental source DataFrame.
-            batch_index: Zero-based index of the batch to keep.
-            batch_count: Total number of batches.
-
-        Returns:
-            The batch's rows, or the source unchanged when ``batch_count`` is one.
-        """
-        if batch_count <= 1:
-            return source
-        bucket: Column = F.pmod(F.xxhash64(F.col(self.config.key_col)), F.lit(batch_count))
-        return source.where(bucket == F.lit(batch_index))
-
-    def drop_null_routing_rows(self, source: DataFrame) -> tuple[DataFrame, Observation]:
+    def drop_null_routing_rows(self, source: DataFrame) -> DataFrame:
         """Drop rows carrying a NULL routing value with a native Spark filter.
 
         Filtering before the shuffle removes the dead rows from the wire instead of carrying them
-        into the executors' Arrow path. The dropped-row count is captured through a Spark
-        ``Observation`` in the same pass, so no extra job runs for the metric.
+        into the executors' Arrow path. Uses the shared :func:`~lance_etl.etl.plan.routing_null_predicate`
+        so the filter and the plan's null-routing count can never disagree. The dropped-row count
+        itself is produced by :func:`~lance_etl.etl.plan.compute_routing_plan` in its single
+        ``groupBy`` scan, not here.
 
         Args:
-            source: The batch DataFrame, before collapse.
+            source: The increment DataFrame, before collapse.
 
         Returns:
-            ``(filtered, observation)`` where ``observation`` exposes ``null_routing_rows`` after
-            an action has run on the filtered plan.
+            The source with every null-routing row removed.
         """
-        any_null: Column | None = None
-        for routing_col in ROUTING_COLS:
-            is_null: Column = F.col(routing_col).isNull()
-            any_null = is_null if any_null is None else (any_null | is_null)
-        observation: Observation = Observation()
-        observed: DataFrame = source.observe(observation, F.count(F.when(any_null, True)).alias("null_routing_rows"))
-        return observed.where(~any_null), observation
+        return source.where(~routing_null_predicate())
 
-    def route_batch(self, batch: DataFrame) -> DataFrame:
-        """Collapse a batch, shuffle it by routing key, and sort each partition by the key.
+    def route_increment(self, filtered: DataFrame, plan: RoutingPlan) -> DataFrame:
+        """Collapse the increment, salt-shuffle it by routing key, and sort each partition by the key.
 
-        The shuffle omits an explicit partition count when ``config.num_partitions`` is ``None``
-        so Spark AQE sizes it by bytes, and keeps the fixed width otherwise. AQE coalescing merges
-        whole hash buckets and never splits one, so every routing key lands in exactly one
-        partition either way. ``sortWithinPartitions`` runs in Spark's spill-aware shuffle sort so
+        Delegates to :func:`~lance_etl.etl.plan.apply_salted_shuffle` after the last-write-wins
+        collapse: big datasets are fanned across key-hash sub-buckets so no single partition holds a
+        whole large org, and ``sortWithinPartitions`` runs in Spark's spill-aware shuffle sort so
         each partition reaches the Arrow closure with every dataset's rows as one contiguous run.
 
         Args:
-            batch: The null-routing-filtered batch DataFrame.
+            filtered: The null-routing-filtered increment DataFrame.
+            plan: The adaptive routing plan for this increment.
 
         Returns:
-            The collapsed, routing-partitioned, partition-sorted DataFrame.
+            The collapsed, salt-partitioned, partition-sorted DataFrame.
         """
-        routing_exprs: list[Column] = [F.col(c) for c in ROUTING_COLS]
-        collapsed: DataFrame = self.collapse(batch)
-        num_partitions: int | None = self.config.num_partitions
-        shuffled: DataFrame = (
-            collapsed.repartition(*routing_exprs)
-            if num_partitions is None
-            else collapsed.repartition(num_partitions, *routing_exprs)
-        )
-        return shuffled.sortWithinPartitions(*routing_exprs)
+        return apply_salted_shuffle(self.collapse(filtered), plan)
 
-    def merge_dataframe(self, batch: DataFrame) -> list[Any]:
-        """Collapse, shuffle, sort, and merge one batch, returning the collected per-dataset stats rows.
+    def merge_dataframe(self, filtered: DataFrame, plan: RoutingPlan) -> list[Any]:
+        """Collapse, salt-shuffle, sort, and merge the increment, returning per-dataset stats rows.
 
-        The shuffle hash-partitions by routing key (AQE byte-sized when ``num_partitions`` is
-        ``None``, fixed width otherwise) and ``sortWithinPartitions`` orders each partition by
-        the routing columns in Spark's spill-aware shuffle sort, so the Arrow closure receives
-        each dataset's rows as one contiguous run and grouping is a linear scan. Only the work
-        that cannot be expressed in native Spark runs inside the ``mapInArrow`` closure: the
-        dynamic per-dataset map pivot and the Lance ``merge_insert`` commits.
+        The salted shuffle hash-partitions by routing key (fanning big datasets across sub-buckets)
+        and ``sortWithinPartitions`` orders each partition by the routing columns in Spark's
+        spill-aware shuffle sort, so the Arrow closure receives each dataset's rows as one
+        contiguous run streamed a group at a time. Only work that cannot be expressed in native
+        Spark runs inside the ``mapInArrow`` closure: the dynamic per-dataset map pivot and the
+        Lance ``merge_insert`` commits. Per-dataset stats are pre-aggregated natively before
+        collection, so a big dataset flushed as several groups across partitions still returns one
+        summed stats row.
 
         Args:
-            batch: The null-routing-filtered batch DataFrame.
+            filtered: The null-routing-filtered increment DataFrame.
+            plan: The adaptive routing plan for this increment.
 
         Returns:
-            The collected stats rows, one per dataset this batch touched.
+            The collected per-dataset stats rows, one per dataset this increment touched.
         """
         config: ETLConfig = self.config
         routing: list[str] = list(ROUTING_COLS)
-        routed: DataFrame = self.route_batch(batch)
+        routed: DataFrame = self.route_increment(filtered, plan)
         partition_stats_schema: pa.Schema = stats_schema()
 
         def merge_partition(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
-            """Merge all routing-key groups in one Spark partition.
+            """Stream and merge all routing-key groups in one Spark partition.
 
             Args:
                 batches: Arrow batches for this task.
@@ -401,35 +388,48 @@ class IcebergToLanceETL:
             Yields:
                 One stats record batch when the partition wrote any dataset.
             """
-            collected: list[pa.RecordBatch] = [b for b in batches if b.num_rows]
-            if not collected:
+            first: pa.RecordBatch | None = next(batches, None)
+            if first is None:
                 return
             executor_telemetry: Telemetry = Telemetry.create(config.telemetry)
-            table: pa.Table = pa.Table.from_batches(collected)
+            chained: Iterator[pa.RecordBatch] = itertools.chain([first], batches)
+            counters: dict[str, int] = {}
             results: list[tuple[Any, ...]] = []
             with executor_telemetry.span("lance.etl.partition"):
                 try:
-                    for key, group in group_by_routing(table, routing):
+                    for key, group in stream_routing_groups(chained, routing, config.merge_batch_bytes, counters):
                         upserted, deleted = apply_merge(config, executor_telemetry, key, group)
                         results.append((*key, upserted, deleted))
                 except Exception:
                     executor_telemetry.error("etl partition failed")
                     raise
+            if counters:
+                executor_telemetry.distribution("partition.flushes", counters.get("flushes", 0))
+                executor_telemetry.distribution("partition.peak_buffered_bytes", counters.get("peak_buffered_bytes", 0))
             if results:
                 yield build_stats_batch(results, partition_stats_schema)
 
-        return routed.mapInArrow(merge_partition, schema=stats_spark_ddl()).collect()
+        stats: DataFrame = routed.mapInArrow(merge_partition, schema=stats_spark_ddl())
+        return (
+            stats.groupBy(*ROUTING_COLS)
+            .agg(F.sum("upserted").alias("upserted"), F.sum("deleted").alias("deleted"))
+            .collect()
+        )
 
     def run_on_dataframe(self, source: DataFrame) -> None:
-        """Validate, batch, collapse, shuffle, and merge a pre-read increment into per-tenant Lance datasets.
+        """Validate, plan, collapse, salt-shuffle, and merge a pre-read increment into Lance datasets.
 
-        Order: validate schema, split into ``config.spark_batches`` key-hash batches, then per
-        batch: drop null-routing rows with a native Spark filter, collapse LWW, repartition by
-        routing key, pivot+cast+merge on executors. Batches run sequentially as separate Spark
-        jobs, so executor memory needs scale with the batch size instead of the increment size —
-        an org increment of 50M+ rows is absorbed by raising ``spark_batches``, not memory limits.
-        Null routing rows are counted as ``dataset.null_routing_rows``. After all batches commit,
-        every written dataset is stamped with the configured interval tag
+        Order: validate schema, drop null-routing rows with a native Spark filter, compute the
+        adaptive routing plan (which sizes the shuffle by rows and trio count and identifies the
+        big datasets to salt), run the bulk-append fast path for the big datasets that are new or
+        empty (:meth:`run_bulk_phase`), then collapse LWW, salt-shuffle by routing key, and
+        pivot+cast+merge the remaining trios on executors. Big new or empty datasets take the fast
+        path — parallel ``write_fragments`` plus one ``commit_batch`` per dataset instead of
+        thousands of per-key merge commits — and are excluded from the merge input so no row is
+        written twice. Executor memory scales with one dataset group, not the increment, because
+        each partition is streamed group by group. Null routing rows are counted as
+        ``dataset.null_routing_rows``. An empty increment short-circuits before any merge. After
+        all writes commit, every written dataset is stamped with the configured interval tag
         (:meth:`stamp_interval_tags`).
 
         Args:
@@ -438,37 +438,46 @@ class IcebergToLanceETL:
         config: ETLConfig = self.config
         driver_telemetry: Telemetry = Telemetry.create(config.telemetry)
         with driver_telemetry.span("lance.etl.run") as run_span:
-            self.validate_schema(source)
-            batch_count: int = max(1, config.spark_batches)
-            seen_datasets: set[tuple[str, ...]] = set()
-            upserted: int = 0
-            deleted: int = 0
-            null_routing_rows: int = 0
             try:
+                self.validate_schema(source)
+                filtered: DataFrame = self.drop_null_routing_rows(source)
+                plan: RoutingPlan = compute_routing_plan(source, config)
+                null_routing_rows: int = plan.null_routing_rows
+
+                driver_telemetry.gauge("run.plan_datasets", plan.trio_count)
+                driver_telemetry.gauge("run.plan_big_datasets", len(plan.big_trios))
+                driver_telemetry.gauge("run.plan_buckets", plan.total_buckets)
+                driver_telemetry.gauge("run.plan_partitions", plan.num_partitions)
+                driver_telemetry.gauge("run.plan_rows", plan.total_rows)
+
+                if null_routing_rows:
+                    driver_telemetry.incr("dataset.null_routing_rows", value=null_routing_rows)
+                    logger.warning("dropped %d rows with null routing key(s)", null_routing_rows)
+
+                if plan.total_rows == 0:
+                    run_span.set_tag("datasets", 0)
+                    driver_telemetry.gauge("run.datasets", 0)
+                    driver_telemetry.gauge("run.upserted", 0)
+                    driver_telemetry.gauge("run.deleted", 0)
+                    logger.info("empty increment: no datasets written")
+                    return
+
+                seen_datasets: set[tuple[str, ...]] = set()
+                upserted: int = 0
+                deleted: int = 0
                 with driver_telemetry.timed("run.execute_ms"):
-                    for batch_index in range(batch_count):
-                        batch, observation = self.drop_null_routing_rows(
-                            self.select_batch(source, batch_index, batch_count)
-                        )
-                        rows: list[Any] = self.merge_dataframe(batch)
-                        null_routing_rows += int(observation.get["null_routing_rows"] or 0)
-                        for row in rows:
-                            seen_datasets.add(tuple(row[column] for column in ROUTING_COLS))
-                            upserted += int(row["upserted"] or 0)
-                            deleted += int(row["deleted"] or 0)
-                        logger.info(
-                            "spark batch %d/%d merged %d dataset groups",
-                            batch_index + 1,
-                            batch_count,
-                            len(rows),
-                        )
+                    bulk_seen, bulk_appended, bulk_trios = self.run_bulk_phase(filtered, plan, driver_telemetry)
+                    seen_datasets |= bulk_seen
+                    upserted += bulk_appended
+                    merge_input: DataFrame = self.exclude_bulk_trios(filtered, bulk_trios)
+                    rows: list[Any] = self.merge_dataframe(merge_input, plan)
+                for row in rows:
+                    seen_datasets.add(tuple(row[column] for column in ROUTING_COLS))
+                    upserted += int(row["upserted"] or 0)
+                    deleted += int(row["deleted"] or 0)
             except Exception:
                 driver_telemetry.error("etl run failed")
                 raise
-
-            if null_routing_rows:
-                driver_telemetry.incr("dataset.null_routing_rows", value=null_routing_rows)
-                logger.warning("dropped %d rows with null routing key(s)", null_routing_rows)
 
             datasets: int = len(seen_datasets)
             run_span.set_tag("datasets", datasets)
@@ -483,17 +492,87 @@ class IcebergToLanceETL:
             )
             self.stamp_interval_tags(source.sparkSession, seen_datasets, driver_telemetry)
 
+    def run_bulk_phase(
+        self, filtered: DataFrame, plan: RoutingPlan, telemetry: Telemetry
+    ) -> tuple[set[tuple[str, ...]], int, list[tuple[str, str, str, int]]]:
+        """Run the bulk-append fast path for big new or empty datasets, before the merge.
+
+        Selects the bulk-eligible big trios, derives one canonical schema per trio, bootstraps each
+        empty dataset, fans parallel ``write_fragments`` appends across their key-hash sub-buckets,
+        and commits each trio's fragments as one ``commit_batch`` append
+        (:mod:`lance_etl.etl.bulk`). Every bootstrapped trio is excluded from the subsequent merge
+        so no row is written twice. Returns nothing eligible when the fast path is disabled or every
+        big trio already carries rows.
+
+        Args:
+            filtered: The null-routing-filtered increment, before collapse.
+            plan: The adaptive routing plan carrying the big trios.
+            telemetry: The driver telemetry facade.
+
+        Returns:
+            ``(seen_datasets, appended_rows, eligible_trios)`` — the trios written by the fast path,
+            the total rows appended, and the eligible trios with sub-bucket counts to exclude from
+            the merge.
+        """
+        config: ETLConfig = self.config
+        bulk_trios: list[tuple[str, str, str, int]] = plan_bulk_append(plan, config)
+        if not bulk_trios:
+            return set(), 0, []
+        schemas = derive_bulk_schemas(filtered, bulk_trios, config)
+        eligible: list[tuple[str, str, str]] = bootstrap_bulk_datasets(schemas, config, telemetry)
+        if not eligible:
+            return set(), 0, []
+        sub_buckets: dict[tuple[str, str, str], int] = {(o, t, n): k for o, t, n, k in bulk_trios}
+        eligible_with_buckets: list[tuple[str, str, str, int]] = [
+            (o, t, n, sub_buckets[(o, t, n)]) for o, t, n in eligible
+        ]
+        collected = run_bulk_append(filtered, eligible_with_buckets, schemas, config, telemetry)
+        transactions_by_trio: dict[tuple[str, str, str], list[Any]] = {}
+        for org, tenant, namespace, _, transaction in collected:
+            transactions_by_trio.setdefault((org, tenant, namespace), []).append(transaction)
+        appended_total: int = 0
+        for trio, transactions in transactions_by_trio.items():
+            _, roles, _ = schemas[trio]
+            appended_total += commit_bulk_transactions(
+                config, telemetry, dataset_uri(config, *trio), transactions, roles
+            )
+        telemetry.gauge("run.bulk_appended", appended_total)
+        seen: set[tuple[str, ...]] = {trio for trio in eligible}
+        return seen, appended_total, eligible_with_buckets
+
+    def exclude_bulk_trios(self, filtered: DataFrame, bulk_trios: list[tuple[str, str, str, int]]) -> DataFrame:
+        """Remove every bulk-appended trio's rows from the merge input via a broadcast left-anti join.
+
+        The bulk fast path has already written these trios' rows, so the merge job must handle only
+        the remainder. Returns the frame unchanged when no trio was bulk-appended.
+
+        Args:
+            filtered: The null-routing-filtered increment.
+            bulk_trios: The trios (with sub-bucket counts) the fast path handled.
+
+        Returns:
+            The increment with every bulk-appended trio's rows removed.
+        """
+        if not bulk_trios:
+            return filtered
+        trios_df: DataFrame = filtered.sparkSession.createDataFrame(
+            [(o, t, n) for o, t, n, _ in bulk_trios],
+            schema="org_id string, tenant_id string, namespace string",
+        )
+        return filtered.join(F.broadcast(trios_df), on=list(ROUTING_COLS), how="left_anti")
+
     def stamp_interval_tags(
         self, spark: SparkSession, seen_datasets: set[tuple[str, ...]], telemetry: Telemetry
     ) -> None:
         """Stamp the configured interval tag on every dataset this run wrote.
 
-        Runs once on the driver after all batches commit (never inside the executor-side
+        Runs once on the driver after the merge commits (never inside the executor-side
         merges, which touch one dataset from multiple partitions) and fans the create-or-move
         tag update out per dataset via :func:`~lance_etl.maintenance.tools.update_serving_tags`
-        at each dataset's latest version. A second run within the same hour moves that hour's
-        tag forward, so the tag always marks the hour's newest version. Skipped when
-        ``config.tag_stamp`` is unset or the run wrote nothing.
+        at each dataset's latest version. The fan-out width follows the same dataset-per-task
+        floor as the routing shuffle, clamped below by :data:`DEFAULT_TAG_STAMP_PARTITIONS`. A
+        second run within the same hour moves that hour's tag forward, so the tag always marks the
+        hour's newest version. Skipped when ``config.tag_stamp`` is unset or the run wrote nothing.
 
         Args:
             spark: Active Spark session.
@@ -512,6 +591,6 @@ class IcebergToLanceETL:
                 config.telemetry,
                 config.storage_options,
                 tag=config.tag_stamp,
-                partitions=config.num_partitions or DEFAULT_TAG_STAMP_PARTITIONS,
+                partitions=max(DEFAULT_TAG_STAMP_PARTITIONS, math.ceil(len(uris) / config.datasets_per_task)),
             )
         telemetry.gauge("run.tags_stamped", len(results))

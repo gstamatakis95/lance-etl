@@ -127,10 +127,7 @@ Key environment variables (see `rust/search-api/src/config.rs` for the full list
 |---|---|---|
 | `LANCE_ETL_BASE_URI` | (required) | Base directory of the Lance datasets |
 | `SEARCH_API_PORT` | `8080` | TCP port for the gRPC server |
-| `SEARCH_API_INDEX_CACHE_BYTES` | `1073741824` | In-process index cache budget |
-| `SEARCH_API_METADATA_CACHE_BYTES` | `268435456` | Metadata cache budget |
-| `SEARCH_API_DATASET_CACHE_CAPACITY` | `16384` | Open-dataset-handle LRU capacity (weighted units) |
-| `SEARCH_API_DISK_CACHE_DIR` | `/tmp/rust-search/cache` | Persistent disk cache root |
+| `SEARCH_API_CACHE_DIR` | `/tmp/rust-search/cache` | Persistent disk cache root |
 
 ### Step 3 — Run the e2e benchmark
 
@@ -271,7 +268,7 @@ The e2e flow records `cold_ms` and `warm_ms` for the first query pair at each ta
 
 To measure a true cold start (empty page cache and empty server cache):
 
-1. Start a fresh server with an empty `SEARCH_API_DISK_CACHE_DIR`.
+1. Start a fresh server with an empty `SEARCH_API_CACHE_DIR`.
 2. Run the e2e benchmark without `--prewarm`. Record `cold_ms` from the e2e artifact.
 3. Stop and restart the server with the same empty cache directory.
 4. Run the e2e benchmark with `--prewarm`. Record `cold_ms` again. This measures first-query latency after the Prewarm RPC has loaded metadata and index segments into the in-process cache.

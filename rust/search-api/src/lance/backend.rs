@@ -100,19 +100,6 @@ pub struct AnnDefaults {
     pub fast_search_default: bool,
 }
 
-impl AnnDefaults {
-    /// Populates defaults from the service config.
-    pub fn from_config(config: &crate::config::Config) -> Self {
-        Self {
-            minimum_nprobes: config.default_minimum_nprobes,
-            maximum_nprobes: config.default_maximum_nprobes,
-            nprobes_ceiling: config.nprobes_ceiling,
-            default_refine_factor: config.default_refine_factor,
-            fast_search_default: config.fast_search_default,
-        }
-    }
-}
-
 impl Default for AnnDefaults {
     fn default() -> Self {
         Self {
@@ -133,11 +120,13 @@ pub struct LanceSearchBackend<P: DatasetProvider> {
     pub(crate) event_timestamp_column: String,
     pub(crate) scan_stats_hook: Option<ScanStatsHook>,
     pub(crate) ann_defaults: AnnDefaults,
+    pub(crate) max_k: usize,
 }
 
 impl<P: DatasetProvider> LanceSearchBackend<P> {
     /// Creates a backend over the given dataset provider with the default prewarm concurrency, the
-    /// default event-timestamp column, telemetry disabled, and default ANN server-side knobs.
+    /// default event-timestamp column, telemetry disabled, default ANN server-side knobs, and the
+    /// default `k` ceiling.
     pub fn new(provider: P) -> Self {
         Self {
             provider,
@@ -146,13 +135,8 @@ impl<P: DatasetProvider> LanceSearchBackend<P> {
             event_timestamp_column: crate::config::DEFAULT_EVENT_TIMESTAMP_COLUMN.to_string(),
             scan_stats_hook: None,
             ann_defaults: AnnDefaults::default(),
+            max_k: crate::config::DEFAULT_SEARCH_MAX_K,
         }
-    }
-
-    /// Sets how many indexes one Prewarm call loads concurrently.
-    pub fn with_prewarm_concurrency(mut self, prewarm_concurrency: usize) -> Self {
-        self.prewarm_concurrency = prewarm_concurrency.max(1);
-        self
     }
 
     /// Emits backend metrics (prewarm and clusters timings) through the given facade.
@@ -173,14 +157,8 @@ impl<P: DatasetProvider> LanceSearchBackend<P> {
         self
     }
 
-    /// Applies server-side ANN defaults (probe counts, refine factor, fast-search gate).
-    pub fn with_ann_defaults(mut self, defaults: AnnDefaults) -> Self {
-        self.ann_defaults = defaults;
-        self
-    }
-
     /// Bundles the per-query execution context (metrics, RPC tag, event-timestamp column,
-    /// scan-stats hook, and ANN defaults) borrowed for one search leg.
+    /// scan-stats hook, ANN defaults, and the `k` ceiling) borrowed for one search leg.
     fn context(&self, rpc: Rpc) -> QueryContext<'_> {
         QueryContext {
             metrics: &self.metrics,
@@ -188,6 +166,7 @@ impl<P: DatasetProvider> LanceSearchBackend<P> {
             event_timestamp_column: &self.event_timestamp_column,
             scan_stats_hook: self.scan_stats_hook.as_ref(),
             ann_defaults: self.ann_defaults,
+            max_k: self.max_k,
         }
     }
 }
@@ -204,6 +183,8 @@ struct QueryContext<'a> {
     scan_stats_hook: Option<&'a ScanStatsHook>,
     /// Server-side ANN defaults: probe counts, refine factor, and fast-search gate.
     ann_defaults: AnnDefaults,
+    /// Hard ceiling on `k` and the derived `k + offset` fetch count.
+    max_k: usize,
 }
 
 impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
@@ -217,7 +198,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
         target: &DatasetTarget,
         query: VectorQuery,
     ) -> Result<VectorSearchOutcome, SearchError> {
-        validate_k(query.k)?;
+        validate_k(query.k, self.max_k)?;
         let dataset = self.provider.dataset(target, query.reference.clone()).await?;
         let hits = run_vector_query(&dataset, &query, &self.context(Rpc::VectorSearch)).await?;
         Ok(VectorSearchOutcome {
@@ -232,7 +213,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
         fields(org_id = %target.org_id, search.k = query.k)
     )]
     async fn text_search(&self, target: &DatasetTarget, query: TextQuery) -> Result<TextSearchOutcome, SearchError> {
-        validate_k(query.k)?;
+        validate_k(query.k, self.max_k)?;
         let dataset = self.provider.dataset(target, query.reference.clone()).await?;
         let hits = run_text_query(&dataset, &query, &self.context(Rpc::TextSearch)).await?;
         Ok(TextSearchOutcome {
@@ -251,7 +232,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
         target: &DatasetTarget,
         query: HybridQuery,
     ) -> Result<HybridSearchOutcome, SearchError> {
-        validate_k(query.k)?;
+        validate_k(query.k, self.max_k)?;
         let mut vector_query = query.vector;
         if vector_query.k == 0 {
             vector_query.k = query.k;
@@ -303,10 +284,19 @@ fn schema_columns(dataset: &Dataset) -> HashSet<String> {
     dataset.schema().fields.iter().map(|field| field.name.clone()).collect()
 }
 
-/// Validates that `k` is positive.
-fn validate_k(k: usize) -> Result<(), SearchError> {
+/// Validates that `k` is a positive integer no greater than `max_k`.
+///
+/// Also used to bound the derived `k + offset` fetch count (see [`run_vector_query`] and
+/// [`run_text_query`]): on the flat/unindexed scan path Lance materializes up to that many full
+/// rows into one response, so an unbounded value would let a client force a multi-GB response.
+fn validate_k(k: usize, max_k: usize) -> Result<(), SearchError> {
     if k == 0 {
         return Err(SearchError::invalid_argument("k must be a positive integer"));
+    }
+    if k > max_k {
+        return Err(SearchError::invalid_argument(format!(
+            "k must not exceed {max_k}, got {k}"
+        )));
     }
     Ok(())
 }
@@ -341,7 +331,10 @@ fn apply_common_options(
         scanner.prefilter(predicate.filter_mode == FilterMode::Prefilter);
     }
     scanner
-        .limit(Some(k as i64), offset.map(|skip| skip as i64))
+        .limit(
+            Some(i64::try_from(k).unwrap_or(i64::MAX)),
+            offset.map(|skip| i64::try_from(skip).unwrap_or(i64::MAX)),
+        )
         .map_err(|err| classify_lance_error(&err))?;
     Ok(())
 }
@@ -503,13 +496,17 @@ async fn dataset_has_fts_index(dataset: &Dataset, columns: &[String]) -> bool {
 ///   unset, the server default is applied only when the dataset has a vector index for the queried
 ///   column, keeping unindexed datasets unaffected (where `fast_search = true` would produce empty
 ///   results, scanner.rs ~3804-3807).
+///
+/// The derived fetch count (`k + offset`, computed with `saturating_add` so an absurd offset
+/// cannot wrap) is bounded by [`QueryContext::max_k`] alongside `k` itself, since `fetch` is what
+/// is actually requested from Lance's nearest-neighbor search.
 #[tracing::instrument(name = "lance.vector_query", skip_all, fields(search.k = query.k))]
 async fn run_vector_query(
     dataset: &Dataset,
     query: &VectorQuery,
     context: &QueryContext<'_>,
 ) -> Result<Vec<Hit>, SearchError> {
-    validate_k(query.k)?;
+    validate_k(query.k, context.max_k)?;
     if query.vector.is_empty() {
         return Err(SearchError::invalid_argument("vector must be non-empty"));
     }
@@ -518,7 +515,8 @@ async fn run_vector_query(
         None => default_vector_column(dataset)?,
     };
     let key = Float32Array::from(query.vector.clone());
-    let fetch = query.k + query.offset.unwrap_or(0);
+    let fetch = query.k.saturating_add(query.offset.unwrap_or(0));
+    validate_k(fetch, context.max_k)?;
     let d = &context.ann_defaults;
     let ceiling = d.nprobes_ceiling;
     let mut scanner = dataset.scan();
@@ -606,14 +604,19 @@ async fn run_vector_query(
 /// server default is applied only when the dataset has an FTS index covering the queried columns,
 /// keeping unindexed datasets unaffected (where `fast_search = true` would produce empty results,
 /// scanner.rs ~3527).
+///
+/// As in [`run_vector_query`], the derived fetch count (`k + offset`, via `saturating_add`) is
+/// bounded by [`QueryContext::max_k`] alongside `k`, since `fetch` is the limit passed to the FTS
+/// stage and an unbounded value on the unindexed path would let a client force a huge response.
 #[tracing::instrument(name = "lance.text_query", skip_all, fields(search.k = query.k))]
 async fn run_text_query(
     dataset: &Dataset,
     query: &TextQuery,
     context: &QueryContext<'_>,
 ) -> Result<Vec<Hit>, SearchError> {
-    validate_k(query.k)?;
-    let fetch = query.k + query.offset.unwrap_or(0);
+    validate_k(query.k, context.max_k)?;
+    let fetch = query.k.saturating_add(query.offset.unwrap_or(0));
+    validate_k(fetch, context.max_k)?;
     let fts = text_query_to_fts(query, fetch)?;
     let mut scanner = dataset.scan();
     scanner.scan_stats_callback(execution_stats_callback(
@@ -697,5 +700,31 @@ fn distance_to_lance(distance: DistanceKind) -> DistanceType {
         DistanceKind::Cosine => DistanceType::Cosine,
         DistanceKind::Dot => DistanceType::Dot,
         DistanceKind::Hamming => DistanceType::Hamming,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_k_rejects_zero() {
+        let err = validate_k(0, crate::config::DEFAULT_SEARCH_MAX_K).unwrap_err();
+        assert!(matches!(err, SearchError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn validate_k_rejects_above_max_k() {
+        let err = validate_k(10_001, 10_000).unwrap_err();
+        assert!(
+            matches!(err, SearchError::InvalidArgument(_)),
+            "k above max_k must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_k_accepts_within_bounds() {
+        validate_k(1, 10_000).unwrap();
+        validate_k(10_000, 10_000).unwrap();
     }
 }

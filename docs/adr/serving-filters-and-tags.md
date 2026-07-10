@@ -41,7 +41,8 @@ Status: Accepted
 
 An optional `TimeRange { start_ms, end_ms }` message (epoch milliseconds, start inclusive, end
 exclusive, either bound optional) rides on all three search requests and always applies to the
-event-timestamp column (`SEARCH_API_EVENT_TIMESTAMP_COLUMN`, default `event_timestamp`). The
+event-timestamp column, fixed to the `DEFAULT_EVENT_TIMESTAMP_COLUMN` constant in `config.rs`
+(`event_timestamp`, no longer env-configurable). The
 range translates through the typed-filter path — each bound becomes a literal of the column's
 own Arrow type (timestamp scaled to the column `TimeUnit` with its timezone, or a plain integer
 for epoch-integer columns), so no cross-type coercion occurs. The range ANDs with any
@@ -59,8 +60,8 @@ The safety rules that make it correct with version-keyed caches:
   warmed BEFORE the flip — never flip then warm.
 - The provider resolves the serve tag to a concrete version, keys the open-handle LRU and the
   caches on the resolved version (not the tag string), and bounds tag resolution with a short
-  TTL (`SEARCH_API_SERVE_TAG_TTL_SECS`, default 10) so a flip is observed promptly without
-  per-request manifest reads.
+  TTL (fixed by `DEFAULT_SERVE_TAG_TTL_SECS` in `config.rs`, 10 seconds, no longer
+  env-configurable) so a flip is observed promptly without per-request manifest reads.
 - The byte cache never caches the latest-version pointer in either manifest layout
   (`_latest.manifest`, `latest_version_hint.json`).
 - Telemetry makes a flip-without-prewarm observable (`serve.cold_open` tagged `warmed`).

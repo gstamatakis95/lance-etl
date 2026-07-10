@@ -21,7 +21,8 @@ shard)`` Spark job writes new fragment files into every target across the tier, 
 commits each target's collected fragments in one transaction. The driver only plans, groups, and dispatches. All heavy
 read and write I/O runs in executors. Every commit goes through :func:`lance_etl.telemetry.commit_with_retries`.
 
-The source and target namespace names are validated to be non-empty strings before any work runs.
+The source and target namespace names are validated to be non-empty, non-traversal path components (rejecting the
+literal values ``.`` and ``..``) before any work runs.
 
 Requires pylance and the Datadog Agent on the executors.
 """
@@ -40,14 +41,43 @@ from pyspark.sql import SparkSession
 
 from lance_etl.cloud_storage import discover_datasets
 from lance_etl.etl import ROUTING_COLS
+from lance_etl.etl.sink import DATA_STORAGE_VERSION
 from lance_etl.indexing import IndexJobConfig, LanceIndexer, split_evenly
 from lance_etl.maintenance import MaintenanceConfig, MaintenanceJob, fan_out_per_dataset
 from lance_etl.telemetry import DEFAULT_COMMIT_RETRIES, Telemetry, TelemetryConfig, commit_with_retries
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+NAMESPACE_COL: str = "namespace"
+"""The partition column carrying the namespace component of a dataset path."""
+
+LARGE_DATASET_FRAGMENT_THRESHOLD: int = 128
+"""Fragment count at or above which a dataset is copied with the distributed per-dataset fan-out
+instead of in one executor task."""
+
+BATCH_PARTITIONS: int = 512
+"""Maximum Spark partitions for the small-tier batch copy, the classification job, and the
+large-tier commit fan-out."""
+
+NUM_SHARDS: int = 64
+"""Fragment shards per large dataset, one flat-job task each."""
+
+MAX_TASKS: int = 256
+"""Upper bound on shards per large dataset and on the flat shard job's Spark partitions."""
+
+COMMIT_BACKOFF_SECONDS: float = 0.5
+"""Base backoff between copy-commit retries."""
+
 LANCE_SUFFIX: str = ".lance"
 """Suffix that marks a dataset directory in a discovered path component."""
+
+RESERVED_PATH_COMPONENTS: frozenset[str] = frozenset({".", ".."})
+"""Path components rejected everywhere a routing value becomes a dataset-URI segment.
+
+A non-empty check alone still admits the literal components ``.`` and ``..``, which are valid path segments that
+walk up or stay within the directory tree instead of naming a routing key, letting a configured or discovered value
+escape the ``base_uri`` tree.
+"""
 
 
 def uri_components(base_uri: str, uri: str) -> list[str]:
@@ -87,8 +117,7 @@ class MigrateConfig:
         telemetry: Telemetry configuration created once per process.
         partition_cols: Columns whose values build each dataset path in order, used to locate datasets and to know which
             path component carries the namespace. Defaults to the stable ``org_id``, ``tenant_id``, ``namespace`` trio.
-        namespace_col: Which entry of ``partition_cols`` is the namespace component. Must be present in
-            ``partition_cols``.
+            Must contain :data:`NAMESPACE_COL`.
         storage_options: Object-store options forwarded to pylance and pyarrow.
         recompact: Recompact every target after the copy by reusing :class:`lance_etl.maintenance.MaintenanceJob`.
         reindex: Rebuild indexes on every target after compaction by reusing :class:`lance_etl.indexing.LanceIndexer`.
@@ -96,21 +125,8 @@ class MigrateConfig:
             unless ``index`` supplies an index specification.
         overwrite_target: Permit overwriting a target dataset that already exists. When ``False`` (the default) an
             existing target fails the whole run rather than clobbering data silently.
-        compaction: Compaction configuration for the recompact step. When ``None`` a default one is derived from this
-            config's telemetry and storage options.
         index: Index specification for the reindex step, naming the vector, scalar, bitmap, and text columns to build.
             When ``None`` reindexing is skipped because the columns to index cannot be guessed.
-        large_dataset_fragment_threshold: Fragment count at or above which a dataset is copied with the distributed
-            per-dataset fan-out instead of in one executor task.
-        batch_partitions: Maximum Spark partitions for the small-tier batch copy and the classification job.
-        num_shards: Fragment shards per large dataset, one flat-job task each.
-        max_tasks: Upper bound on shards per large dataset and on the flat shard job's Spark partitions.
-        max_rows_per_file: Row cap per written fragment file, or ``None`` for the Lance default. Recompaction
-            re-fragments afterwards, so this only shapes the intermediate copy.
-        data_storage_version: Lance file format version for the copied target datasets. The
-            default ``"2.1"`` adopts the latest stable format with structural encodings.
-        commit_retries: Retry budget for copy commits.
-        commit_backoff_seconds: Base backoff between copy-commit retries.
     """
 
     source_namespace: str
@@ -118,38 +134,26 @@ class MigrateConfig:
     base_uri: str
     telemetry: TelemetryConfig
     partition_cols: list[str] = field(default_factory=lambda: list(ROUTING_COLS))
-    namespace_col: str = "namespace"
     storage_options: dict[str, Any] | None = None
     recompact: bool = True
     reindex: bool = True
     overwrite_target: bool = False
-    compaction: MaintenanceConfig | None = None
     index: IndexJobConfig | None = None
-    large_dataset_fragment_threshold: int = 128
-    batch_partitions: int = 512
-    num_shards: int = 64
-    max_tasks: int = 256
-    max_rows_per_file: int | None = None
-    data_storage_version: str = "2.1"
-    commit_retries: int = DEFAULT_COMMIT_RETRIES
-    commit_backoff_seconds: float = 0.5
 
     def namespace_index(self) -> int:
         """Return the position of the namespace component in the dataset path.
 
         Returns:
-            The index of ``namespace_col`` within ``partition_cols``.
+            The index of :data:`NAMESPACE_COL` within ``partition_cols``.
         """
-        return self.partition_cols.index(self.namespace_col)
+        return self.partition_cols.index(NAMESPACE_COL)
 
     def compaction_config(self) -> MaintenanceConfig:
         """Return the compaction configuration for the recompact step.
 
         Returns:
-            The configured compaction config, or a default one sharing this config's telemetry and storage options.
+            A default compaction config sharing this config's telemetry and storage options.
         """
-        if self.compaction is not None:
-            return self.compaction
         return MaintenanceConfig(telemetry=self.telemetry, storage_options=self.storage_options)
 
 
@@ -183,21 +187,21 @@ def validate_config(config: MigrateConfig) -> None:
         config: The configuration to validate.
 
     Raises:
-        ValueError: If the namespaces are equal or empty, are missing from the partition columns, or the
-            partition list is empty or carries duplicates.
+        ValueError: If the namespaces are equal, empty, or a directory-traversal component (``.`` or ``..``), are
+            missing from the partition columns, or the partition list is empty or carries duplicates.
     """
     if not config.partition_cols:
         raise ValueError("partition_cols must list at least one column")
     duplicates: list[str] = sorted({c for c in config.partition_cols if config.partition_cols.count(c) > 1})
     if duplicates:
         raise ValueError(f"partition_cols carries duplicate columns: {duplicates}")
-    if config.namespace_col not in config.partition_cols:
-        raise ValueError(f"namespace_col {config.namespace_col!r} is not in partition_cols {config.partition_cols}")
+    if NAMESPACE_COL not in config.partition_cols:
+        raise ValueError(f"{NAMESPACE_COL!r} is not in partition_cols {config.partition_cols}")
     if config.source_namespace == config.target_namespace:
         raise ValueError("source_namespace and target_namespace must differ; a copy cannot clobber its own source")
     for label, value in (("source_namespace", config.source_namespace), ("target_namespace", config.target_namespace)):
-        if not value:
-            raise ValueError(f"{label} must be a non-empty string, got {value!r}")
+        if not value or value in RESERVED_PATH_COMPONENTS:
+            raise ValueError(f"{label} must be a non-empty, non-traversal path component, got {value!r}")
 
 
 def build_dataset_uri(base_uri: str, components: list[str]) -> str:
@@ -211,10 +215,11 @@ def build_dataset_uri(base_uri: str, components: list[str]) -> str:
         The dataset URI ``base_uri/<val1>/.../<valN>.lance`` confined to the routing-key prefix.
 
     Raises:
-        ValueError: If any component is not a non-empty string.
+        ValueError: If any component is not a non-empty string, or is a directory-traversal component (``.`` or
+            ``..``) that would escape the ``base_uri`` prefix.
     """
     for component in components:
-        if not component:
+        if not component or component in RESERVED_PATH_COMPONENTS:
             raise ValueError(f"invalid routing component: {component!r}")
     base: str = base_uri.rstrip("/")
     return f"{base}/{'/'.join(components)}{LANCE_SUFFIX}"
@@ -334,10 +339,8 @@ def copy_small_dataset(source_uri: str, target_uri: str, config: MigrateConfig, 
         "mode": mode,
         "storage_options": config.storage_options,
         "enable_v2_manifest_paths": True,
-        "data_storage_version": config.data_storage_version,
+        "data_storage_version": DATA_STORAGE_VERSION,
     }
-    if config.max_rows_per_file is not None:
-        write_kwargs["max_rows_per_file"] = config.max_rows_per_file
 
     def action() -> int:
         """Stream the source into the target once, returning the row count copied."""
@@ -350,8 +353,8 @@ def copy_small_dataset(source_uri: str, target_uri: str, config: MigrateConfig, 
     with telemetry.timed("migrate.copy_ms", tags=["tier:small"]):
         rows: int = commit_with_retries(
             action,
-            config.commit_retries,
-            config.commit_backoff_seconds,
+            DEFAULT_COMMIT_RETRIES,
+            COMMIT_BACKOFF_SECONDS,
             lambda: telemetry.incr("migrate.copy_conflict"),
         )
     return {"source": source_uri, "target": target_uri, "tier": "small", "rows": rows}
@@ -389,10 +392,8 @@ def write_fragment_shard(
         "schema": schema,
         "mode": "create",
         "storage_options": config.storage_options,
-        "data_storage_version": config.data_storage_version,
+        "data_storage_version": DATA_STORAGE_VERSION,
     }
-    if config.max_rows_per_file is not None:
-        write_kwargs["max_rows_per_file"] = config.max_rows_per_file
     with telemetry.timed("migrate.shard_write_ms"):
         reader: pa.RecordBatchReader = source.scanner(fragments=fragments).to_reader()
         metadatas: list[FragmentMetadata] = write_fragments(reader, target_uri, **write_kwargs)
@@ -417,7 +418,7 @@ def plan_large_copy(source_uri: str, target_uri: str, config: MigrateConfig, tel
     """
     dataset: lance.LanceDataset = lance.dataset(source_uri, storage_options=config.storage_options)
     fragment_ids: list[int] = [fragment.fragment_id for fragment in dataset.get_fragments()]
-    shards: list[list[int]] = split_evenly(fragment_ids, min(config.num_shards, config.max_tasks))
+    shards: list[list[int]] = split_evenly(fragment_ids, min(NUM_SHARDS, MAX_TASKS))
     telemetry.incr("migrate.large_planned")
     return {
         "source": source_uri,
@@ -458,8 +459,8 @@ def commit_copied_fragments(
 
     commit_with_retries(
         action,
-        config.commit_retries,
-        config.commit_backoff_seconds,
+        DEFAULT_COMMIT_RETRIES,
+        COMMIT_BACKOFF_SECONDS,
         lambda: telemetry.incr("migrate.copy_conflict"),
     )
 
@@ -497,7 +498,7 @@ class NamespaceMigrator:
                 source_uris,
                 config.telemetry,
                 lambda uri, executor_telemetry: classify_source(uri, config, executor_telemetry),
-                config.batch_partitions,
+                BATCH_PARTITIONS,
             )
 
     def copy_small_tier(self, spark: SparkSession, plans: list[dict[str, Any]], telemetry: Telemetry) -> list[str]:
@@ -519,7 +520,7 @@ class NamespaceMigrator:
                 list(targets),
                 config.telemetry,
                 lambda uri, executor_telemetry: copy_small_dataset(uri, targets[uri], config, executor_telemetry),
-                config.batch_partitions,
+                BATCH_PARTITIONS,
             )
         return [outcome["target"] for outcome in outcomes]
 
@@ -554,7 +555,7 @@ class NamespaceMigrator:
                     list(targets),
                     config.telemetry,
                     lambda uri, executor_telemetry: plan_large_copy(uri, targets[uri], config, executor_telemetry),
-                    config.batch_partitions,
+                    BATCH_PARTITIONS,
                 )
 
             shard_tasks: list[tuple[str, str, int, pa.Schema, list[int]]] = [
@@ -579,7 +580,7 @@ class NamespaceMigrator:
 
             documents_by_target: dict[str, list[str]] = {}
             if shard_tasks:
-                slices: int = max(1, min(len(shard_tasks), config.max_tasks))
+                slices: int = max(1, min(len(shard_tasks), MAX_TASKS))
                 with telemetry.timed("run.large_write_ms"):
                     pairs: list[tuple[str, str]] = (
                         spark.sparkContext.parallelize(shard_tasks, slices).mapPartitions(write_partition).collect()
@@ -617,7 +618,7 @@ class NamespaceMigrator:
                     executor_telemetry.incr("migrate.copied")
                     yield {"target": target}
 
-            commit_slices: int = max(1, min(len(commit_entries), config.batch_partitions))
+            commit_slices: int = max(1, min(len(commit_entries), BATCH_PARTITIONS))
             with telemetry.timed("run.large_commit_ms"):
                 outcomes: list[dict[str, Any]] = (
                     spark.sparkContext.parallelize(commit_entries, commit_slices)
@@ -694,7 +695,7 @@ class NamespaceMigrator:
                     f"{len(collisions)} target dataset(s) already exist and overwrite_target is False: {listed}"
                 )
 
-            threshold: int = config.large_dataset_fragment_threshold
+            threshold: int = LARGE_DATASET_FRAGMENT_THRESHOLD
             small_plans: list[dict[str, Any]] = [plan for plan in plans if plan["fragments"] < threshold]
             large_plans: list[dict[str, Any]] = [plan for plan in plans if plan["fragments"] >= threshold]
             run_span.set_tag("small_datasets", len(small_plans))

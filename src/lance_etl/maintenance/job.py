@@ -14,11 +14,18 @@ plan-execute-commit path built on the same Lance APIs:
   round instead of retrying stale rewrites.
 
 :meth:`MaintenanceJob.run` repeats the three phases for conflicted datasets up to
-``replan_budget`` rounds, then defers the survivors to the next scheduled run.
+:data:`REPLAN_BUDGET` rounds, then defers the survivors to the next scheduled run.
+
+Before phase P, an opt-in clustered-rewrite pass (:attr:`MaintenanceConfig.cluster_rewrite`,
+:func:`~lance_etl.maintenance.cluster.run_cluster_rewrites`) reorders eligible datasets so
+same-centroid rows share fragments (ADR 0041). A clustered or cluster-errored dataset never
+enters the plan-execute-commit rounds; only cluster-ineligible datasets pass through into normal
+compaction.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -29,7 +36,14 @@ import lance
 from lance.optimize import Compaction, CompactionMetrics, CompactionTask, RewriteResult
 from pyspark.sql import SparkSession
 
-from lance_etl.fanout import fan_out_per_dataset
+import lance_etl.maintenance.cluster as maintenance_cluster
+from lance_etl.fanout import (
+    FANOUT_PARTITION_FACTOR,
+    REWRITE_PARTITION_FACTOR,
+    derive_partitions,
+    fan_out_per_dataset,
+    report_fleet_failures,
+)
 from lance_etl.telemetry import (
     DEFAULT_COMMIT_RETRIES,
     DEFAULT_LARGE_COMMIT_RETRIES,
@@ -40,6 +54,23 @@ from lance_etl.telemetry import (
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+MATERIALIZE_DELETIONS_THRESHOLD: float = 0.1
+"""Deletion fraction above which ``Compaction.plan`` rewrites a fragment; matches lance's own
+default. An inline index remap is triggered when covered fragments are rewritten, so budget commit
+time accordingly for heavily indexed head datasets."""
+
+COMPACTION_MODE: str = "try_binary_copy"
+"""Lance compaction mode for ``Compaction.execute`` and ``Compaction.plan``; falls back to
+reencode per task, never errors on deletion-bearing fragments unlike ``force_binary_copy``."""
+
+REPLAN_BUDGET: int = 3
+"""Plan/execute/commit rounds a conflicted dataset participates in before it is skipped as hot and
+deferred to the next scheduled run."""
+
+MIN_CLEANUP_HORIZON_SECONDS: int = 6 * 3600
+"""Floor for ``cleanup_older_than_seconds``; cleanup is not transactional, so the floor must exceed
+the longest concurrent job to protect in-flight committer rebase files."""
 
 
 @dataclass
@@ -56,38 +87,31 @@ class MaintenanceConfig:
         target_rows_per_fragment: Desired rows per compacted fragment; matches lance's
             ``CompactionOptions`` default of ``1_048_576`` so the default is explicit and immune
             to upstream shifts.
-        max_rows_per_group: Maximum rows per group within a fragment.
-        max_bytes_per_file: Maximum bytes per compacted file.
-        materialize_deletions_threshold: Deletion fraction above which a fragment is rewritten;
-            default ``0.1`` matches lance's own default. An inline index remap is triggered when
-            covered fragments are rewritten, so budget commit time accordingly for heavily
-            indexed head datasets.
         defer_index_remap: Defer index remap at commit time through the options passed to
             ``Compaction.commit``.
         max_source_fragments: Cap on source fragments consumed per run for incremental
             compaction; ``None`` is unbounded, ``0`` is rejected.
         num_threads: Worker threads inside a single rewrite task.
-        batch_size: Rows per batch when rewriting.
-        max_tasks: Upper bound on Spark partitions for the flat fleet-wide rewrite job.
-        batch_partitions: Maximum Spark partitions for the per-dataset plan and commit fan-outs.
         cleanup_older_than_seconds: Age threshold for version cleanup; default ``172_800`` (2
             days) with the HEAD-tag exemption keeps rollback headroom while cutting manifest
             storage. ``None`` defers to lance's 14-day default. Values below
-            ``min_cleanup_horizon_seconds`` are rejected.
+            :data:`MIN_CLEANUP_HORIZON_SECONDS` are rejected.
         retain_versions: Number of recent versions to retain regardless of age.
         commit_retries: Retry budget for TTL delete commit conflicts.
         commit_backoff_seconds: Base backoff between commit retries.
         large_commit_retries: Retry budget around ``Compaction.commit``; kept small because
             semantic conflicts re-fail deterministically and only the raw manifest-write race
             benefits from a retry.
-        replan_budget: Plan/execute/commit rounds a conflicted dataset participates in before
-            it is skipped as hot and deferred to the next scheduled run.
-        compaction_mode: Lance compaction mode for ``Compaction.execute`` and
-            ``Compaction.plan``; ``try_binary_copy`` falls back to reencode per task, never
-            errors on deletion-bearing fragments unlike ``force_binary_copy``.
-        min_cleanup_horizon_seconds: Floor for ``cleanup_older_than_seconds``; cleanup is not
-            transactional, so the floor must exceed the longest concurrent job to protect
-            in-flight committer rebase files.
+        cleanup_rotation_slots: Idle datasets are cleaned once per this many maintenance runs
+            via a wall-clock rotation slot. 1 cleans every run.
+        cleanup_rotation_cadence_hours: Run cadence in hours used to derive the current rotation
+            slot from wall-clock time.
+        cluster_rewrite: Opt-in clustered full rewrite; rewritten datasets skip normal compaction
+            this run.
+        cluster_column: Explicit vector column to cluster on; ``None`` auto-selects the single
+            vector-role column from the dataset's stored column roles.
+        cluster_serve_tag: Advance the HEAD serving tag blue-green after the vector index rebuild
+            commits.
     """
 
     telemetry: TelemetryConfig
@@ -95,23 +119,19 @@ class MaintenanceConfig:
     ttl_column: str | None = None
     ts_column: str = "event_timestamp"
     target_rows_per_fragment: int = 1_048_576
-    max_rows_per_group: int | None = None
-    max_bytes_per_file: int | None = None
-    materialize_deletions_threshold: float = 0.1
     defer_index_remap: bool = False
     max_source_fragments: int | None = 256
     num_threads: int | None = None
-    batch_size: int | None = None
-    max_tasks: int = 256
-    batch_partitions: int = 512
     cleanup_older_than_seconds: int | None = 172_800
     retain_versions: int | None = None
     commit_retries: int = DEFAULT_COMMIT_RETRIES
     commit_backoff_seconds: float = 0.5
     large_commit_retries: int = DEFAULT_LARGE_COMMIT_RETRIES
-    replan_budget: int = 3
-    compaction_mode: str = "try_binary_copy"
-    min_cleanup_horizon_seconds: int = 6 * 3600
+    cleanup_rotation_slots: int = 8
+    cleanup_rotation_cadence_hours: int = 1
+    cluster_rewrite: bool = False
+    cluster_column: str | None = None
+    cluster_serve_tag: bool = False
 
     def ttl_active(self) -> bool:
         """Report whether the TTL step runs for this configuration.
@@ -140,14 +160,11 @@ class MaintenanceConfig:
             raise ValueError("max_source_fragments=0 is not supported; use None to disable the limit")
         candidates: dict[str, Any] = {
             "target_rows_per_fragment": self.target_rows_per_fragment,
-            "max_rows_per_group": self.max_rows_per_group,
-            "max_bytes_per_file": self.max_bytes_per_file,
             "materialize_deletions": True,
-            "materialize_deletions_threshold": self.materialize_deletions_threshold,
+            "materialize_deletions_threshold": MATERIALIZE_DELETIONS_THRESHOLD,
             "max_source_fragments": self.max_source_fragments,
             "num_threads": self.num_threads,
-            "batch_size": self.batch_size,
-            "compaction_mode": self.compaction_mode,
+            "compaction_mode": COMPACTION_MODE,
         }
         if self.defer_index_remap:
             candidates["defer_index_remap"] = True
@@ -176,14 +193,22 @@ def validate_column_name(column: str, schema: Any) -> None:
 def build_ttl_predicate(ts_column: str, ttl_column: str, cutoff: datetime) -> str:
     """Build the Lance SQL delete predicate for per-row TTL expiration.
 
-    The predicate is ``{ts_column} + {ttl_column} < TIMESTAMP '{iso_cutoff}'`` which deletes
-    every row whose event timestamp plus its own lifetime is strictly before the cutoff instant.
-    Lance evaluates the timestamp-plus-duration column arithmetic natively. Both column names have
-    already been validated against the dataset schema by :func:`validate_column_name` before this
-    function is called.
+    The predicate is
+    ``arrow_cast({ts_column} + {ttl_column}, 'Timestamp(Microsecond, "UTC")') <
+    arrow_cast('{iso_cutoff}', 'Timestamp(Microsecond, "UTC")')`` which deletes every row whose
+    event timestamp plus its own lifetime is strictly before the cutoff instant. Lance evaluates
+    the timestamp-plus-duration column arithmetic natively. Both column names have already been
+    validated against the dataset schema by :func:`validate_column_name` before this function is
+    called.
 
-    The cutoff is formatted in UTC with microsecond resolution as
-    ``YYYY-MM-DDTHH:MM:SS.ffffff``, which DataFusion accepts as a timestamp literal.
+    Both sides of the comparison are cast to ``Timestamp(Microsecond, "UTC")`` so the deletion
+    decision is a direct UTC-instant comparison with no timezone-naive operand and no implicit
+    coercion. A bare ``TIMESTAMP '...'`` literal is always parsed timezone-naive (Lance's SQL
+    layer rejects a timezone in the type itself), which would leave the reconciliation against a
+    timezone-aware ``ts_column`` to implicit coercion and risk a silent offset. Casting the
+    cutoff literal to explicit UTC as well removes that ambiguity entirely. The cutoff is
+    formatted in UTC with microsecond resolution as ``YYYY-MM-DDTHH:MM:SS.ffffff``, which is a
+    UTC wall-clock instant because :attr:`cutoff` is UTC, so attaching UTC on the cast is correct.
 
     Args:
         ts_column: The validated event timestamp column name.
@@ -195,7 +220,9 @@ def build_ttl_predicate(ts_column: str, ttl_column: str, cutoff: datetime) -> st
         A Lance SQL predicate string safe for passing to :meth:`lance.LanceDataset.delete`.
     """
     literal: str = cutoff.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")
-    return f"{ts_column} + {ttl_column} < TIMESTAMP '{literal}'"
+    utc_sum: str = f"arrow_cast({ts_column} + {ttl_column}, 'Timestamp(Microsecond, \"UTC\")')"
+    utc_cutoff: str = f"arrow_cast('{literal}', 'Timestamp(Microsecond, \"UTC\")')"
+    return f"{utc_sum} < {utc_cutoff}"
 
 
 def compute_cutoff() -> datetime:
@@ -208,6 +235,71 @@ def compute_cutoff() -> datetime:
         The current UTC instant.
     """
     return datetime.now(tz=UTC)
+
+
+def dataset_cleanup_slot(uri: str, slots: int) -> int:
+    """Map a dataset URI to a deterministic rotation slot in ``range(slots)``.
+
+    Uses ``hashlib.sha256`` rather than the builtin ``hash()`` because the builtin is salted
+    per interpreter process (``PYTHONHASHSEED`` randomization by default), so the same URI would
+    hash to different slots on the driver and on each executor, and even to a different slot on
+    the same process across runs. That would break both determinism (a dataset must land in the
+    same slot every time it is evaluated) and full-coverage (every dataset must eventually be
+    cleaned as the active slot rotates through ``range(slots)``). SHA-256 is stable across
+    processes and versions, which rotation correctness depends on.
+
+    Args:
+        uri: Dataset URI.
+        slots: Total number of rotation slots.
+
+    Returns:
+        The dataset's fixed slot index, in ``range(slots)``.
+    """
+    digest: bytes = hashlib.sha256(uri.encode()).digest()[:8]
+    return int.from_bytes(digest, "big") % slots
+
+
+def active_cleanup_slot(config: MaintenanceConfig, now: datetime) -> int:
+    """Derive the rotation slot that is active for cleanup at the given instant.
+
+    The active slot advances every ``cleanup_rotation_cadence_hours`` hours and cycles through
+    ``range(cleanup_rotation_slots)``, so over ``cleanup_rotation_slots`` consecutive runs (at
+    the configured cadence) every rotation slot becomes active exactly once.
+
+    Args:
+        config: Maintenance configuration carrying the rotation size and cadence.
+        now: The current instant, passed explicitly so tests can pin it.
+
+    Returns:
+        The active rotation slot index, in ``range(config.cleanup_rotation_slots)``.
+    """
+    hours: int = int(now.timestamp()) // 3600 // config.cleanup_rotation_cadence_hours
+    return hours % config.cleanup_rotation_slots
+
+
+def should_clean_idle(uri: str, config: MaintenanceConfig, cleanup_slot: int | None) -> bool:
+    """Decide whether an idle dataset should be cleaned on this run.
+
+    ``cleanup_slot=None`` is the sentinel a direct caller (a unit test, or any future caller not
+    participating in fleet-wide rotation) uses to mean "always clean," which preserves the
+    pre-rotation behavior for callers that do not thread a rotation slot through. Rotation is
+    also bypassed when ``cleanup_rotation_slots <= 1``, since a single slot degenerates to
+    cleaning every run. Otherwise the dataset is cleaned only when its own deterministic slot
+    matches the currently active one.
+
+    Args:
+        uri: Dataset URI.
+        config: Maintenance configuration carrying the rotation size.
+        cleanup_slot: The active rotation slot for this run, or ``None`` to always clean.
+
+    Returns:
+        ``True`` when this idle dataset should be cleaned this run.
+    """
+    if cleanup_slot is None:
+        return True
+    if config.cleanup_rotation_slots <= 1:
+        return True
+    return dataset_cleanup_slot(uri, config.cleanup_rotation_slots) == cleanup_slot
 
 
 def run_ttl_on_open_dataset(
@@ -312,16 +404,16 @@ def cleanup_dataset(
 
     Raises:
         ValueError: If ``cleanup_older_than_seconds`` is set below
-            ``config.min_cleanup_horizon_seconds``. The horizon must exceed the
+            :data:`MIN_CLEANUP_HORIZON_SECONDS`. The horizon must exceed the
             longest-running concurrent job so its rebase can still read old transaction files.
     """
     if (
         config.cleanup_older_than_seconds is not None
-        and config.cleanup_older_than_seconds < config.min_cleanup_horizon_seconds
+        and config.cleanup_older_than_seconds < MIN_CLEANUP_HORIZON_SECONDS
     ):
         raise ValueError(
             f"cleanup_older_than_seconds={config.cleanup_older_than_seconds} is below the safe floor of "
-            f"{config.min_cleanup_horizon_seconds}; cleanup horizons must exceed the longest concurrent job"
+            f"{MIN_CLEANUP_HORIZON_SECONDS}; cleanup horizons must exceed the longest concurrent job"
         )
     older_than: timedelta | None = (
         timedelta(seconds=config.cleanup_older_than_seconds) if config.cleanup_older_than_seconds is not None else None
@@ -335,28 +427,84 @@ def cleanup_dataset(
             error_if_tagged_old_versions=False,
         )
     telemetry.distribution("dataset.bytes_removed", stats.bytes_removed)
+    telemetry.distribution("dataset.old_versions_removed", stats.old_versions)
+    telemetry.incr("dataset.cleaned")
     return int(stats.bytes_removed)
 
 
-def compaction_skip_reason(dataset: lance.LanceDataset) -> str | None:
-    """Return a reason string when the dataset has one or fewer fragments and needs no compaction.
+def compaction_skip_reason(dataset: lance.LanceDataset, config: MaintenanceConfig) -> str | None:
+    """Return a reason string when the dataset provably needs no compaction planning.
 
     This is a conservative derived-state check using only the already-open dataset handle.
-    A dataset with at most one fragment has nothing to compact. The check reads
-    ``dataset.stats.dataset_stats()["num_fragments"]``, which is available from the in-memory
-    manifest and requires no additional object-store I/O.
+    A dataset with more than one fragment always needs the real planner, since Lance's own
+    ``Compaction.plan`` decides fragment grouping and small-file merging. A dataset with at most
+    one fragment has nothing to compact ONLY when it also carries no soft-deletions: Lance's
+    planner marks a single fragment as a genuine ``CompactItself`` candidate once its deletion
+    fraction exceeds :data:`MATERIALIZE_DELETIONS_THRESHOLD`, so a lone fragment
+    accumulating TTL or merge-insert deletions must still reach ``Compaction.plan`` or its
+    reclaimable space never gets recovered. The check reads ``dataset.stats.dataset_stats()``,
+    which returns ``num_fragments`` and ``num_deleted_rows`` from the in-memory manifest (the
+    latter via ``count_deleted_rows()`` over already-loaded deletion-file metadata), so consuming
+    both costs no additional object-store I/O over the previous fragment-count-only check.
+
+    The single-fragment deletion-fraction ratio is intentionally NOT reimplemented here: that
+    threshold comparison stays inside ``Compaction.plan`` so this function never drifts from
+    Lance's own candidacy logic. When a single fragment carries any deletions, this function
+    returns ``None`` and defers to the planner; a below-threshold fragment simply yields an empty
+    plan that falls through the existing zero-task cleanup path in :func:`plan_one_dataset`.
 
     Args:
         dataset: The already-open dataset handle.
+        config: Maintenance configuration, kept for symmetry with the rest of the plan phase and
+            for the threshold reasoning above. The actual ratio comparison is Lance's, not
+            reimplemented here, so it is not read directly.
 
     Returns:
-        A human-readable skip reason when compaction is unnecessary, or ``None`` when work is
-        needed.
+        A human-readable skip reason when compaction is unnecessary, or ``None`` when the
+        planner must decide.
     """
-    num_fragments: int = int(dataset.stats.dataset_stats()["num_fragments"])
-    if num_fragments <= 1:
+    del config
+    stats: dict[str, Any] = dataset.stats.dataset_stats()
+    num_fragments: int = int(stats["num_fragments"])
+    num_deleted_rows: int = int(stats["num_deleted_rows"])
+    if num_fragments > 1:
+        return None
+    if num_deleted_rows == 0:
         return f"only {num_fragments} fragment(s); nothing to compact"
     return None
+
+
+def idle_cleanup_bytes(
+    uri: str,
+    config: MaintenanceConfig,
+    telemetry: Telemetry,
+    dataset: lance.LanceDataset,
+    did_work: bool,
+    cleanup_slot: int | None,
+) -> int:
+    """Clean an idle dataset's old versions unless the rotation defers it to a later run.
+
+    A dataset that did real work this run (``did_work``, currently a TTL delete) always cleans
+    regardless of rotation, because its own commit just created reclaimable versions. Otherwise
+    the deterministic per-dataset rotation slot from :func:`should_clean_idle` decides, and a
+    deferred dataset increments ``dataset.cleanup_rotation_skipped`` so the savings are directly
+    observable.
+
+    Args:
+        uri: Dataset URI.
+        config: Maintenance configuration.
+        telemetry: Telemetry facade for the current executor process.
+        dataset: The already-open dataset handle to reuse for cleanup.
+        did_work: Whether this dataset had rows deleted (TTL) during this run.
+        cleanup_slot: The active rotation slot for this run, or ``None`` to always clean.
+
+    Returns:
+        The number of bytes reclaimed, or ``0`` when rotation deferred this dataset.
+    """
+    if did_work or should_clean_idle(uri, config, cleanup_slot):
+        return cleanup_dataset(uri, config, telemetry, dataset)
+    telemetry.incr("dataset.cleanup_rotation_skipped")
+    return 0
 
 
 def plan_one_dataset(
@@ -364,6 +512,7 @@ def plan_one_dataset(
     config: MaintenanceConfig,
     cutoff: datetime | None,
     telemetry: Telemetry,
+    cleanup_slot: int | None = None,
 ) -> dict[str, Any]:
     """Run phase P for one dataset on an executor: TTL delete, skip check, and compaction plan.
 
@@ -374,6 +523,14 @@ def plan_one_dataset(
     active one costs one instead of three, which is what keeps a mostly-idle million-dataset
     fleet affordable. Any further staleness against concurrent writers is pre-existing and
     absorbed by the stale-plan conflict replan in the commit phase.
+
+    The two early-exit cleanup calls (the derived-state skip path and the empty-plan path) are
+    gated by :func:`idle_cleanup_bytes`: a dataset that TTL-deleted rows this run
+    (``did_work``) is always cleaned, and every other idle dataset is cleaned only once per
+    ``cleanup_rotation_slots`` runs via its deterministic rotation slot, which is what removes the
+    per-run object-store LIST cost for a fleet of mostly-idle datasets. ``cleanup_slot=None`` (the
+    default) always cleans, preserving the exact pre-rotation behavior for direct callers such as
+    unit tests that do not thread a fleet-wide rotation slot.
 
     Failure isolation: a missing, corrupt, or unreadable dataset returns a skip dict and never
     aborts the fleet run. When TTL is active and a cutoff is supplied, expired rows are deleted
@@ -391,6 +548,8 @@ def plan_one_dataset(
         cutoff: TTL cutoff instant, or ``None`` to skip the TTL step (replan rounds pass None so
             TTL runs exactly once per fleet run).
         telemetry: Telemetry facade for the current executor process.
+        cleanup_slot: The active fleet-wide rotation slot for this run, or ``None`` to always
+            clean idle datasets (the pre-rotation behavior direct callers rely on).
 
     Returns:
         A terminal result dict (``skipped`` or ``tasks: 0``), or a planned dict carrying
@@ -413,18 +572,20 @@ def plan_one_dataset(
         if int(result["ttl_rows_deleted"]) > 0:
             dataset = lance.dataset(uri, storage_options=config.storage_options)
 
-    skip: str | None = compaction_skip_reason(dataset)
+    did_work: bool = int(result.get("ttl_rows_deleted", 0)) > 0
+
+    skip: str | None = compaction_skip_reason(dataset, config)
     if skip is not None:
         telemetry.incr("dataset.skipped_no_work")
-        result.update({"skipped": skip, "tasks": 0, "bytes_removed": cleanup_dataset(uri, config, telemetry, dataset)})
+        bytes_removed: int = idle_cleanup_bytes(uri, config, telemetry, dataset, did_work, cleanup_slot)
+        result.update({"skipped": skip, "tasks": 0, "bytes_removed": bytes_removed})
         return result
 
     plan = Compaction.plan(dataset, options=config.execute_options())
     task_jsons: list[str] = [task.json() for task in plan.tasks]
     if not task_jsons:
-        result.update(
-            {"tasks": 0, "fragments_removed": 0, "bytes_removed": cleanup_dataset(uri, config, telemetry, dataset)}
-        )
+        bytes_removed = idle_cleanup_bytes(uri, config, telemetry, dataset, did_work, cleanup_slot)
+        result.update({"tasks": 0, "fragments_removed": 0, "bytes_removed": bytes_removed})
         return result
 
     result.update({"read_version": plan.read_version, "task_jsons": task_jsons})
@@ -515,7 +676,11 @@ def commit_one_dataset(
 
 
 class MaintenanceJob:
-    """Runs TTL expiration, unified task-based compaction, and version cleanup over a Lance fleet."""
+    """Runs TTL expiration, unified task-based compaction, and version cleanup over a Lance fleet.
+
+    Also runs the opt-in clustered rewrite (:attr:`MaintenanceConfig.cluster_rewrite`) ahead of
+    the plan-execute-commit rounds, subsuming normal compaction for the datasets it rewrites.
+    """
 
     def __init__(self, config: MaintenanceConfig) -> None:
         """Initialize the maintenance job.
@@ -525,40 +690,60 @@ class MaintenanceJob:
         """
         self.config: MaintenanceConfig = config
 
-    def execute_fleet_tasks(self, spark: SparkSession, tasks: list[tuple[str, int, str]]) -> dict[str, list[str]]:
+    def execute_fleet_tasks(
+        self, spark: SparkSession, tasks: list[tuple[str, int, str]]
+    ) -> tuple[dict[str, list[str]], dict[str, str]]:
         """Run every dataset's rewrite tasks in one flat Spark job (phase E).
 
         All datasets' tasks share one job, so Spark schedules the fleet's rewrite work across
         the cluster: a large dataset contributes many tasks and a small one contributes one,
         with no per-dataset job submission or driver thread pool.
 
+        Per-dataset failure isolation: each task is executed inside a try/except so a single
+        dataset's rewrite failure never aborts the flat job. A failing task is tagged
+        ``("error", uri, message)`` and the first error per URI is recorded, while successful
+        tasks are tagged ``("ok", uri, rewrite_json)`` and grouped by URI. The caller excludes
+        any URI carrying an error from the commit phase, so a dataset whose rewrite partially
+        failed is never committed.
+
         Args:
             spark: Active Spark session.
             tasks: ``(uri, read_version, task_json)`` triples flattened across the fleet.
 
         Returns:
-            The serialized rewrite results grouped by dataset URI.
+            A ``(rewrites_by_uri, errors_by_uri)`` pair: the serialized rewrite results grouped
+            by dataset URI, and the first error message per dataset URI whose rewrite failed.
         """
         config: MaintenanceConfig = self.config
         storage_options: dict[str, Any] | None = config.storage_options
 
-        def run_one(item: tuple[str, int, str]) -> tuple[str, str]:
-            """Execute one rewrite task on an executor.
+        def run_one(item: tuple[str, int, str]) -> tuple[str, str, str]:
+            """Execute one rewrite task on an executor, tagging success or failure.
 
             Args:
                 item: The ``(uri, read_version, task_json)`` triple.
 
             Returns:
-                The URI paired with the serialized rewrite result.
+                ``("ok", uri, rewrite_json)`` on success or ``("error", uri, message)`` when the
+                rewrite raised, so the driver can isolate the failing dataset.
             """
-            return execute_rewrite_task(item[0], item[1], item[2], storage_options)
+            try:
+                uri, rewrite_json = execute_rewrite_task(item[0], item[1], item[2], storage_options)
+                return "ok", uri, rewrite_json
+            except Exception as exc:
+                return "error", item[0], str(exc)
 
-        slices: int = max(1, min(config.max_tasks, len(tasks)))
-        pairs: list[tuple[str, str]] = spark.sparkContext.parallelize(tasks, slices).map(run_one).collect()
+        max_tasks_resolved: int = derive_partitions(spark, REWRITE_PARTITION_FACTOR)
+        slices: int = max(1, min(max_tasks_resolved, len(tasks)))
+        tagged: list[tuple[str, str, str]] = spark.sparkContext.parallelize(tasks, slices).map(run_one).collect()
         grouped: dict[str, list[str]] = {}
-        for uri, rewrite_json in pairs:
-            grouped.setdefault(uri, []).append(rewrite_json)
-        return grouped
+        errors_by_uri: dict[str, str] = {}
+        for tag, uri, value in tagged:
+            if tag == "ok":
+                grouped.setdefault(uri, []).append(value)
+            else:
+                errors_by_uri.setdefault(uri, value)
+        return grouped, errors_by_uri
 
     def commit_fleet(self, spark: SparkSession, pending: list[tuple[str, list[str]]]) -> list[dict[str, Any]]:
         """Commit every planned dataset's rewrites in a per-dataset executor fan-out (phase C).
@@ -568,24 +753,35 @@ class MaintenanceJob:
             pending: ``(uri, rewrite_jsons)`` pairs, one per dataset with executed rewrites.
 
         Returns:
-            One outcome dict per dataset, committed or conflict-marked.
+            One outcome dict per dataset, committed, conflict-marked, or error-marked.
         """
         config: MaintenanceConfig = self.config
 
         def partition(items: Iterable[tuple[str, list[str]]]) -> Iterator[dict[str, Any]]:
             """Commit the datasets assigned to this executor task.
 
+            A non-conflict commit failure is isolated into an error marker instead of aborting
+            the fan-out. ``commit_one_dataset`` returns its own conflict marker and only raises on
+            a genuine non-conflict error, so any exception reaching here is terminal for that
+            dataset and never re-planned.
+
             Args:
                 items: ``(uri, rewrite_jsons)`` pairs for this partition.
 
             Yields:
-                One outcome dict per dataset.
+                One outcome dict per dataset, an error marker when the commit raised.
             """
             executor_telemetry: Telemetry = Telemetry.create(config.telemetry)
             for uri, rewrite_jsons in items:
-                yield commit_one_dataset(uri, rewrite_jsons, config, executor_telemetry)
+                try:
+                    yield commit_one_dataset(uri, rewrite_jsons, config, executor_telemetry)
+                except Exception as exc:
+                    executor_telemetry.incr("dataset.commit_error")
+                    logger.warning("compaction commit failed for %s, isolating: %s", uri, exc)
+                    yield {"uri": uri, "error": str(exc), "phase": "commit", "bytes_removed": 0}
 
-        slices: int = max(1, min(config.batch_partitions, len(pending)))
+        batch_partitions_resolved: int = derive_partitions(spark, FANOUT_PARTITION_FACTOR)
+        slices: int = max(1, min(batch_partitions_resolved, len(pending)))
         return spark.sparkContext.parallelize(pending, slices).mapPartitions(partition).collect()
 
     def run_round(
@@ -597,6 +793,7 @@ class MaintenanceJob:
         base_by_uri: dict[str, dict[str, Any]],
         results_by_uri: dict[str, dict[str, Any]],
         driver_telemetry: Telemetry,
+        cleanup_slot: int,
     ) -> list[str]:
         """Run one plan-execute-commit round over the pending datasets.
 
@@ -613,18 +810,24 @@ class MaintenanceJob:
             base_by_uri: First-round TTL fields per dataset, populated in round zero.
             results_by_uri: Per-dataset terminal outcomes, mutated in place.
             driver_telemetry: The driver's telemetry facade.
+            cleanup_slot: The fleet-wide rotation slot active for this run, threaded into
+                ``plan_one_dataset`` so idle datasets outside this slot skip version cleanup.
 
         Returns:
             The datasets whose commit hit a semantic conflict, for the next round's re-plan.
         """
         config: MaintenanceConfig = self.config
         round_cutoff: datetime | None = cutoff if round_index == 0 else None
+        plan_batch_partitions: int = derive_partitions(spark, FANOUT_PARTITION_FACTOR)
         plans: list[dict[str, Any]] = fan_out_per_dataset(
             spark,
             pending_uris,
             config.telemetry,
-            lambda uri, telemetry, cutoff_value=round_cutoff: plan_one_dataset(uri, config, cutoff_value, telemetry),
-            config.batch_partitions,
+            lambda uri, telemetry, cutoff_value=round_cutoff, slot=cleanup_slot: plan_one_dataset(
+                uri, config, cutoff_value, telemetry, slot
+            ),
+            plan_batch_partitions,
+            phase="plan",
         )
         planned: list[dict[str, Any]] = []
         for plan in plans:
@@ -646,16 +849,26 @@ class MaintenanceJob:
         logger.info(
             "compaction round %d/%d: %d datasets, %d rewrite tasks",
             round_index + 1,
-            config.replan_budget,
+            REPLAN_BUDGET,
             len(planned),
             len(flat_tasks),
         )
         with driver_telemetry.timed("run.rewrite_ms"):
-            rewrites_by_uri: dict[str, list[str]] = self.execute_fleet_tasks(spark, flat_tasks)
+            rewrites_by_uri, errors_by_uri = self.execute_fleet_tasks(spark, flat_tasks)
 
-        commit_pairs: list[tuple[str, list[str]]] = [
-            (plan["uri"], rewrites_by_uri.get(plan["uri"], [])) for plan in planned
-        ]
+        commit_pairs: list[tuple[str, list[str]]] = []
+        for plan in planned:
+            planned_uri: str = plan["uri"]
+            if planned_uri in errors_by_uri:
+                results_by_uri[planned_uri] = {
+                    **base_by_uri.get(planned_uri, {}),
+                    "uri": planned_uri,
+                    "error": errors_by_uri[planned_uri],
+                    "phase": "execute",
+                    "bytes_removed": 0,
+                }
+                continue
+            commit_pairs.append((planned_uri, rewrites_by_uri.get(planned_uri, [])))
         outcomes: list[dict[str, Any]] = self.commit_fleet(spark, commit_pairs)
         conflicted: list[str] = []
         for outcome in outcomes:
@@ -669,20 +882,48 @@ class MaintenanceJob:
     def run(self, spark: SparkSession, dataset_uris: Iterable[str]) -> list[dict[str, Any]]:
         """Maintain every dataset through the unified plan-execute-commit rounds.
 
+        When :attr:`MaintenanceConfig.cluster_rewrite` is set, an opt-in clustered rewrite
+        (:func:`~lance_etl.maintenance.cluster.run_cluster_rewrites`) runs first over every
+        dataset, before round 0. A clustered or cluster-errored dataset's result lands directly in
+        the final aggregation and that dataset never enters the plan-execute-commit rounds below;
+        only the cluster-ineligible passthrough datasets do, exactly as if clustering were off.
+
         Round structure: phase P fans out per dataset (TTL runs only in the first round),
         phase E runs the whole fleet's rewrite tasks in one flat Spark job, and phase C fans the
         commits out per dataset. Datasets whose commit hit a semantic conflict re-enter the next
-        round to be re-planned against the latest version, up to ``replan_budget`` rounds, after
+        round to be re-planned against the latest version, up to :data:`REPLAN_BUDGET` rounds, after
         which they are deferred to the next scheduled run with a ``dataset.hot_skipped`` metric.
+
+        Per-dataset failure isolation: a plan, execute, or commit failure for one dataset is
+        recorded as an ``{"error", "phase"}`` marker on that dataset's result and excluded from the
+        remaining phases this run, while every other dataset still completes and commits. Failed
+        datasets carry no cursor, so the next scheduled run simply re-plans them from current
+        state. Callers detect the failures by scanning the returned dicts for the ``"error"`` key.
+        A misconfigured cleanup horizon is the one loud exception: it fails the whole run fast
+        before any dataset is touched, because it would otherwise mark every dataset identically.
 
         Args:
             spark: Active Spark session.
             dataset_uris: Datasets to maintain, typically those changed recently.
 
         Returns:
-            One statistics dictionary per dataset, in input order.
+            One statistics dictionary per dataset, in input order. A failed dataset's dictionary
+            carries an ``"error"`` message and a ``"phase"`` label.
+
+        Raises:
+            ValueError: If ``cleanup_older_than_seconds`` is set below
+                :data:`MIN_CLEANUP_HORIZON_SECONDS`, which is a misconfiguration that must fail the
+                whole run rather than mark every dataset with the same error.
         """
         config: MaintenanceConfig = self.config
+        if (
+            config.cleanup_older_than_seconds is not None
+            and config.cleanup_older_than_seconds < MIN_CLEANUP_HORIZON_SECONDS
+        ):
+            raise ValueError(
+                f"cleanup_older_than_seconds={config.cleanup_older_than_seconds} is below the safe floor of "
+                f"{MIN_CLEANUP_HORIZON_SECONDS}; cleanup horizons must exceed the longest concurrent job"
+            )
         driver_telemetry: Telemetry = Telemetry.create(config.telemetry)
         with driver_telemetry.span("lance.maintenance.run") as run_span:
             uris: list[str] = list(dataset_uris)
@@ -692,14 +933,29 @@ class MaintenanceJob:
                 return []
 
             cutoff: datetime | None = compute_cutoff() if config.ttl_active() else None
+            cleanup_slot: int = active_cleanup_slot(config, datetime.now(tz=UTC))
+            driver_telemetry.gauge("run.cleanup_slot", cleanup_slot)
             results_by_uri: dict[str, dict[str, Any]] = {}
             base_by_uri: dict[str, dict[str, Any]] = {}
             pending_uris: list[str] = uris
 
+            if config.cluster_rewrite:
+                cluster_results, pending_uris = maintenance_cluster.run_cluster_rewrites(
+                    spark, uris, config, cutoff, driver_telemetry
+                )
+                results_by_uri.update(cluster_results)
+
             with driver_telemetry.timed("run.maintain_ms"):
-                for round_index in range(config.replan_budget):
+                for round_index in range(REPLAN_BUDGET):
                     pending_uris = self.run_round(
-                        spark, round_index, pending_uris, cutoff, base_by_uri, results_by_uri, driver_telemetry
+                        spark,
+                        round_index,
+                        pending_uris,
+                        cutoff,
+                        base_by_uri,
+                        results_by_uri,
+                        driver_telemetry,
+                        cleanup_slot,
                     )
                     if not pending_uris:
                         break
@@ -709,13 +965,13 @@ class MaintenanceJob:
                 logger.warning(
                     "skipping compaction of hot dataset %s: commit conflicted in all %d rounds",
                     uri,
-                    config.replan_budget,
+                    REPLAN_BUDGET,
                 )
                 results_by_uri[uri] = {
                     **base_by_uri.get(uri, {}),
                     "uri": uri,
                     "bytes_removed": 0,
-                    "skipped": f"commit conflicted in all {config.replan_budget} re-plan rounds",
+                    "skipped": f"commit conflicted in all {REPLAN_BUDGET} re-plan rounds",
                 }
 
             results: list[dict[str, Any]] = [results_by_uri[uri] for uri in uris]
@@ -736,6 +992,16 @@ class MaintenanceJob:
             driver_telemetry.gauge("run.datasets_skipped", skipped)
             driver_telemetry.gauge("run.bytes_removed", bytes_removed)
             driver_telemetry.gauge("run.fragments_removed", fragments_removed)
+
+            report_fleet_failures(
+                results,
+                run_span,
+                driver_telemetry,
+                "maintenance run",
+                lambda item: str(item.get("phase", "unknown")),
+                logger,
+            )
+
             logger.info(
                 "maintenance run: %d datasets, %d fragments removed, %d bytes reclaimed",
                 len(results),

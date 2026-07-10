@@ -31,7 +31,7 @@ from typing import Any
 
 import numpy as np
 
-from bench.config import NAMESPACE, PROTO_PATH, TENANT_ID, BenchConfig
+from bench.config import NAMESPACE, PROTO_PATH, RECALL_CUTOFFS, TENANT_ID, BenchConfig
 from bench.groundtruth import recall_at
 from bench.grpc_client import (
     dataset_target,
@@ -49,7 +49,6 @@ from bench.results import ensure_dir, read_json, save_phase
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-RECALL_CUTOFFS: tuple[int, ...] = (1, 10, 100)
 NANOS_PER_MILLI: float = 1_000_000.0
 
 

@@ -67,7 +67,6 @@ def replan_config(telemetry_config: TelemetryConfig, **overrides: object) -> Mai
         "target_rows_per_fragment": ROWS,
         "num_threads": 1,
         "commit_backoff_seconds": 0.0,
-        "replan_budget": 3,
     }
     base.update(overrides)
     return MaintenanceConfig(**base)
@@ -90,9 +89,9 @@ def test_run_replans_until_budget_then_defers(
 
     monkeypatch.setattr(maintenance_job, "commit_one_dataset", conflicting_commit)
     results: list[dict[str, object]] = MaintenanceJob(config).run(FakeSpark(), [dataset_uri])
-    assert len(commits) == config.replan_budget
+    assert len(commits) == maintenance_job.REPLAN_BUDGET
     assert len(results) == 1
-    assert "conflicted in all 3" in str(results[0]["skipped"])
+    assert f"conflicted in all {maintenance_job.REPLAN_BUDGET}" in str(results[0]["skipped"])
     assert "fragments_removed" not in results[0]
 
 
@@ -121,21 +120,52 @@ def test_run_commits_after_one_conflict(
     assert len(lance.dataset(dataset_uri).get_fragments()) == 1
 
 
-def test_run_propagates_non_conflict_errors(
-    dataset_uri: str, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
+def test_run_isolates_non_conflict_errors(
+    dataset_uri: str, tmp_path: Path, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Errors that are not commit conflicts fail the run instead of re-planning."""
+    """A non-conflict commit error is isolated into a per-dataset marker, not raised.
 
-    def broken_commit(
+    The failing dataset lands a terminal ``{"error", "phase": "commit"}`` result and is neither
+    re-planned nor committed, while every other dataset in the same run still compacts and commits
+    normally. This is the fleet-level per-dataset failure isolation: one pathological dataset no
+    longer discards the whole round's work.
+
+    Args:
+        dataset_uri: URI of the pre-built dataset whose commit is forced to fail.
+        tmp_path: Pytest-provided temporary directory for a second, healthy dataset.
+        telemetry_config: The test telemetry configuration.
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    other_uri: str = str(tmp_path / "healthy.lance")
+    other_table: pa.Table = pa.table(
+        {
+            "id": pa.array(range(ROWS), pa.int64()),
+            "payload": pa.array([f"row{i}" for i in range(ROWS)]),
+        }
+    )
+    lance.write_dataset(other_table, other_uri, max_rows_per_file=ROWS_PER_FRAGMENT)
+    config: MaintenanceConfig = replan_config(telemetry_config)
+    real_commit = maintenance_job.commit_one_dataset
+
+    def selective_commit(
         uri: str, rewrite_jsons: list[str], cfg: MaintenanceConfig, telemetry: Telemetry
     ) -> dict[str, object]:
-        """Fail with a non-conflict error."""
-        del uri, rewrite_jsons, cfg, telemetry
-        raise RuntimeError("schema mismatch: field order differs")
+        """Fail with a non-conflict error for the target dataset, commit the rest for real."""
+        if uri == dataset_uri:
+            raise RuntimeError("schema mismatch: field order differs")
+        return real_commit(uri, rewrite_jsons, cfg, telemetry)
 
-    monkeypatch.setattr(maintenance_job, "commit_one_dataset", broken_commit)
-    with pytest.raises(RuntimeError, match="schema mismatch"):
-        MaintenanceJob(replan_config(telemetry_config)).run(FakeSpark(), [dataset_uri])
+    monkeypatch.setattr(maintenance_job, "commit_one_dataset", selective_commit)
+    results: list[dict[str, object]] = MaintenanceJob(config).run(FakeSpark(), [dataset_uri, other_uri])
+    by_uri: dict[str, dict[str, object]] = {str(result["uri"]): result for result in results}
+
+    assert "schema mismatch" in str(by_uri[dataset_uri]["error"])
+    assert by_uri[dataset_uri]["phase"] == "commit"
+    assert "fragments_removed" not in by_uri[dataset_uri]
+
+    assert "error" not in by_uri[other_uri]
+    assert by_uri[other_uri]["fragments_removed"] == ROWS // ROWS_PER_FRAGMENT
+    assert len(lance.dataset(other_uri).get_fragments()) == 1
 
 
 def test_commit_one_dataset_uses_small_budget(

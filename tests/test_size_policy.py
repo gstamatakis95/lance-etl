@@ -14,43 +14,31 @@ from lance_etl.indexing import (
     derive_num_partitions,
     plan_dataset_indexes,
 )
+from lance_etl.indexing.config import MAX_IVF_PARTITIONS, MIN_IVF_PARTITIONS, TARGET_ROWS_PER_IVF_PARTITION
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 
-def make_default_config() -> IndexJobConfig:
-    """Return an IndexJobConfig with all defaults and no columns configured.
-
-    Returns:
-        A minimal config suitable for testing policy functions.
-    """
-    return IndexJobConfig(telemetry=TelemetryConfig())
-
-
 def test_derive_clamps_to_floor() -> None:
-    """Tiny datasets clamp to the min_ivf_partitions floor."""
-    cfg: IndexJobConfig = make_default_config()
-    assert derive_num_partitions(rows=4, configured=None, config=cfg) == cfg.min_ivf_partitions
-    assert derive_num_partitions(rows=0, configured=None, config=cfg) == cfg.min_ivf_partitions
+    """Tiny datasets clamp to the MIN_IVF_PARTITIONS floor."""
+    assert derive_num_partitions(rows=4, configured=None) == MIN_IVF_PARTITIONS
+    assert derive_num_partitions(rows=0, configured=None) == MIN_IVF_PARTITIONS
 
 
 def test_derive_clamps_to_cap() -> None:
-    """Huge datasets clamp to max_ivf_partitions."""
-    cfg: IndexJobConfig = make_default_config()
-    assert derive_num_partitions(rows=1_000_000_000, configured=None, config=cfg) == cfg.max_ivf_partitions
+    """Huge datasets clamp to MAX_IVF_PARTITIONS."""
+    assert derive_num_partitions(rows=1_000_000_000, configured=None) == MAX_IVF_PARTITIONS
 
 
 def test_derive_uses_target_rows_per_partition_in_between() -> None:
-    """Mid-sized datasets use rows // target_rows_per_ivf_partition."""
-    cfg: IndexJobConfig = make_default_config()
-    assert derive_num_partitions(rows=1_000_000, configured=None, config=cfg) == 1_000_000 // 8192
-    assert derive_num_partitions(rows=10_000, configured=None, config=cfg) == cfg.min_ivf_partitions
+    """Mid-sized datasets use rows // TARGET_ROWS_PER_IVF_PARTITION."""
+    assert derive_num_partitions(rows=1_000_000, configured=None) == 1_000_000 // TARGET_ROWS_PER_IVF_PARTITION
+    assert derive_num_partitions(rows=10_000, configured=None) == MIN_IVF_PARTITIONS
 
 
 def test_derive_configured_takes_precedence() -> None:
     """An explicit configuration overrides the derived value, even outside the clamp."""
-    cfg: IndexJobConfig = make_default_config()
-    assert derive_num_partitions(rows=1_000_000, configured=8, config=cfg) == 8
-    assert derive_num_partitions(rows=10, configured=10_000, config=cfg) == 10_000
+    assert derive_num_partitions(rows=1_000_000, configured=8) == 8
+    assert derive_num_partitions(rows=10, configured=10_000) == 10_000
 
 
 def test_degrade_caps_at_supportable_rows() -> None:

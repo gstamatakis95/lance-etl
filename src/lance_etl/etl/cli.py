@@ -20,6 +20,7 @@ from lance_etl.cliutil import (
     parse_hour_tag,
     parse_key_values,
     parse_storage_options,
+    run_with_spark,
 )
 from lance_etl.etl.job import IcebergToLanceETL
 from lance_etl.etl.pivot import ETLConfig
@@ -74,17 +75,6 @@ def build_parser() -> argparse.ArgumentParser:
             "tags. Absent disables stamping."
         ),
     )
-    parser.add_argument(
-        "--spark-batches",
-        type=int,
-        default=1,
-        help=(
-            "Split the increment into this many sequential Spark-level key-hash batches, each processed as its "
-            "own Spark job over a fraction of the rows. Raise this for very large increments (tens of millions "
-            "of rows per org) so executor memory needs scale with the batch size instead of the increment size. "
-            "Default 1 processes the whole increment in a single pass."
-        ),
-    )
     return parser
 
 
@@ -98,7 +88,9 @@ def run(args: argparse.Namespace) -> None:
         args: Parsed command-line arguments.
     """
     spark = build_spark(APP_NAME)
-    try:
+
+    def work() -> None:
+        """Build the config and run the ETL job."""
         config: ETLConfig = ETLConfig(
             base_uri=args.base_uri,
             telemetry=build_telemetry_config(args),
@@ -106,15 +98,11 @@ def run(args: argparse.Namespace) -> None:
             iceberg_read_options=parse_key_values(args.iceberg_option),
             window_start=args.window_start,
             window_end=args.window_end,
-            spark_batches=args.spark_batches,
             tag_stamp=args.tag_stamp,
         )
         IcebergToLanceETL(config).run(spark, args.table, parse_epoch_ms(args.start), parse_epoch_ms(args.end))
-    except Exception:
-        logger.exception("etl job failed")
-        raise
-    finally:
-        spark.stop()
+
+    run_with_spark(spark, "etl job", logger, work)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

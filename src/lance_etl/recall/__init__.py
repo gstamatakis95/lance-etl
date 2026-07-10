@@ -1,0 +1,217 @@
+"""Offline recall audit replaying sampled vector, text, and hybrid queries against pinned Lance dataset versions.
+
+The Rust gRPC search service samples a fraction of queries onto Datadog spans, capturing the query (vector, text-query
+node tree, or both for a hybrid fusion), the RPC search parameters, the typed filter AST as JSON, the committed Lance
+dataset version that served the query, and the served result ids in rank order. :class:`RecallAuditJob` fetches those
+spans, replays each query as an exact reference computation against the dataset checked out at the recorded version,
+and reports recall@k, nDCG@k, and MRR per RPC-parameter bucket, per query type, and per organization.
+
+The implementation is split by concern:
+
+- :mod:`~lance_etl.recall.config` — :class:`RecallJobConfig` and the module-level constants shared across the
+  package (identifier and path allowlists, bounded vocabularies, BM25 parameters, and the scanner batch size).
+- :mod:`~lance_etl.recall.source` — span fetching (:class:`SpanSource`, :class:`DatadogSpanSource`,
+  :class:`InMemorySpanSource`) and parsing flat ``recall.*`` attribute dictionaries into :class:`RecallSample`.
+- :mod:`~lance_etl.recall.queries` — span-to-query translation: the typed filter AST to a Lance scanner filter
+  string, the typed text-query node tree to BM25 field clauses, text tokenization, and hybrid fusion replay.
+- :mod:`~lance_etl.recall.scoring` — exact grading: brute-force vector top-k, Okapi BM25, and the recall@k, nDCG@k,
+  and MRR math shared by every query type.
+- :mod:`~lance_etl.recall.job` — :class:`RecallAuditJob` and the two-tier Spark fan-out (a packed small tier and a
+  per-fragment large tier) that scores every sample and renders the aggregate report.
+
+Filter replay and the no-raw-SQL rule: the repository forbids accepting raw SQL strings in the gRPC filter API
+because client-supplied strings cannot be trusted. This package honors that rule even though it hands the Lance
+scanner a SQL string, because the string never crosses a trust boundary. It is generated internally from the typed
+filter AST that the Rust service captured from its own typed ``Filter`` proto. Clients never supply strings at any
+point. Every column identifier is validated against both the ``[A-Za-z_][A-Za-z0-9_]*`` allowlist and the dataset
+schema, and every literal is rendered through the typed value renderer, so the generated string is a pure function of
+validated typed data.
+"""
+
+from __future__ import annotations
+
+from lance_etl.recall.config import (
+    BATCH_SIZE,
+    BM25_B,
+    BM25_K1,
+    COMPARE_OPS,
+    DEFAULT_RRF_K,
+    DISTANCE_TYPES,
+    FILTER_COLUMN_PATTERN,
+    PATH_COMPONENT_PATTERN,
+    QUERY_TYPES,
+    SPANS_SEARCH_PATH,
+    TEXT_OPERATORS,
+    TOKEN_PATTERN,
+    RecallJobConfig,
+)
+from lance_etl.recall.job import (
+    AggregateRow,
+    RecallAuditJob,
+    RecallReport,
+    aggregate_scores,
+    combine_large_group_scores,
+    emit_bucket_metrics,
+    emit_recall_metrics,
+    format_metric,
+    format_report,
+    fragment_vector_partials,
+    mean_or_none,
+    optional_label,
+    reduce_vector_legs,
+    rpc_bucket_label,
+    sample_dataset_uri,
+    score_hybrid_sample,
+    score_sample,
+    score_text_sample,
+    score_vector_sample,
+    score_version_group,
+    summarize_bucket,
+    text_leg_samples,
+    vector_leg_samples,
+    whole_dataset_text_legs,
+)
+from lance_etl.recall.queries import (
+    FilterTranslationError,
+    FusionReplayError,
+    TextQueryTranslationError,
+    filter_ast_to_sql,
+    fuse_legs,
+    normalize_leg,
+    render_filter_column,
+    render_filter_literal,
+    resolve_filter_sql,
+    text_query_field_queries,
+    tokenize_text,
+    validate_text_column,
+)
+from lance_etl.recall.scoring import (
+    SampleScore,
+    bm25_column_scores,
+    bm25_top_k,
+    brute_force_top_k,
+    brute_force_top_k_scored,
+    compute_distances,
+    fixed_size_list_to_numpy,
+    grade_against_reference,
+    grade_hybrid_reference,
+    index_default_distance_type,
+    merge_top_k,
+    ranking_quality,
+    reduce_partial_top_k,
+    resolve_dataset,
+    scored_sample,
+    skipped_score,
+)
+from lance_etl.recall.source import (
+    DatadogSpanSource,
+    InMemorySpanSource,
+    RecallSample,
+    SampleParseError,
+    SpanSource,
+    attr_int,
+    attr_optional_int,
+    attr_path_component,
+    attr_string,
+    build_spans_request_body,
+    decode_json_attr,
+    flatten_recall_attributes,
+    parse_filter_ast,
+    parse_float_tuple_attr,
+    parse_fusion,
+    parse_query_vector,
+    parse_recall_sample,
+    parse_result_ids,
+    parse_samples,
+    parse_text_columns,
+    parse_text_query,
+)
+
+__all__ = [
+    "BATCH_SIZE",
+    "BM25_B",
+    "BM25_K1",
+    "COMPARE_OPS",
+    "DEFAULT_RRF_K",
+    "DISTANCE_TYPES",
+    "FILTER_COLUMN_PATTERN",
+    "PATH_COMPONENT_PATTERN",
+    "QUERY_TYPES",
+    "SPANS_SEARCH_PATH",
+    "TEXT_OPERATORS",
+    "TOKEN_PATTERN",
+    "AggregateRow",
+    "DatadogSpanSource",
+    "FilterTranslationError",
+    "FusionReplayError",
+    "InMemorySpanSource",
+    "RecallAuditJob",
+    "RecallJobConfig",
+    "RecallReport",
+    "RecallSample",
+    "SampleParseError",
+    "SampleScore",
+    "SpanSource",
+    "TextQueryTranslationError",
+    "aggregate_scores",
+    "attr_int",
+    "attr_optional_int",
+    "attr_path_component",
+    "attr_string",
+    "bm25_column_scores",
+    "bm25_top_k",
+    "brute_force_top_k",
+    "brute_force_top_k_scored",
+    "build_spans_request_body",
+    "combine_large_group_scores",
+    "compute_distances",
+    "decode_json_attr",
+    "emit_bucket_metrics",
+    "emit_recall_metrics",
+    "filter_ast_to_sql",
+    "fixed_size_list_to_numpy",
+    "flatten_recall_attributes",
+    "format_metric",
+    "format_report",
+    "fragment_vector_partials",
+    "fuse_legs",
+    "grade_against_reference",
+    "grade_hybrid_reference",
+    "index_default_distance_type",
+    "mean_or_none",
+    "merge_top_k",
+    "normalize_leg",
+    "optional_label",
+    "parse_filter_ast",
+    "parse_float_tuple_attr",
+    "parse_fusion",
+    "parse_query_vector",
+    "parse_recall_sample",
+    "parse_result_ids",
+    "parse_samples",
+    "parse_text_columns",
+    "parse_text_query",
+    "ranking_quality",
+    "reduce_partial_top_k",
+    "reduce_vector_legs",
+    "render_filter_column",
+    "render_filter_literal",
+    "resolve_dataset",
+    "resolve_filter_sql",
+    "rpc_bucket_label",
+    "sample_dataset_uri",
+    "score_hybrid_sample",
+    "score_sample",
+    "score_text_sample",
+    "score_vector_sample",
+    "score_version_group",
+    "scored_sample",
+    "skipped_score",
+    "summarize_bucket",
+    "text_leg_samples",
+    "text_query_field_queries",
+    "tokenize_text",
+    "validate_text_column",
+    "vector_leg_samples",
+    "whole_dataset_text_legs",
+]

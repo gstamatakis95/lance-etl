@@ -9,15 +9,15 @@ these functions are the correct pattern for that shape.
 
 Sink contract:
 
-- Idempotent LWW upsert keyed by ``config.key_col`` with ``when_matched_update_all`` guarded by
-  ``source.ts >= target.ts``, plus physical deletes via ``when_matched_delete``. Replaying a
-  window converges to the same dataset state.
+- Idempotent LWW upsert keyed by :data:`~lance_etl.etl.pivot.KEY_COL` with
+  ``when_matched_update_all`` guarded by ``source.ts >= target.ts``, plus physical deletes via
+  ``when_matched_delete``. Replaying a window converges to the same dataset state.
 - Chunked commits (``config.merge_batch_bytes``) that are order-safe because the caller's
   collapse guarantees at most one row per key per increment.
 - Grow-only schema evolution through ``add_columns``, with each new column's role (vector, text,
   or scalar) persisted into the dataset's config KV under ``lance-etl.columns``.
 - New datasets are bootstrapped with V2 manifest paths and the Lance file format from
-  ``config.data_storage_version`` (default 2.1).
+  :data:`DATA_STORAGE_VERSION` (``"2.1"``).
 - Every object-store behavior (credentials, endpoints, timeouts, retries) flows through
   ``config.storage_options``, which is forwarded verbatim to every ``lance.dataset`` and
   ``lance.write_dataset`` call. Commit conflicts are retried with
@@ -36,14 +36,25 @@ import pyarrow.compute as pc
 
 from lance_etl.column_roles import merge_column_roles
 from lance_etl.etl.pivot import (
+    DELETE_OP_VALUES,
+    KEY_COL,
+    OP_COL,
     ROUTING_COLS,
+    TTL_COL,
     ETLConfig,
     apply_ttl_cast,
     pivot_map_columns,
 )
-from lance_etl.telemetry import Telemetry, commit_with_retries
+from lance_etl.telemetry import DEFAULT_RETRY_TIMEOUT, Telemetry, commit_with_retries
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+DATA_STORAGE_VERSION: str = "2.1"
+"""Lance file format version for newly created datasets, never varied.
+
+Adopts the latest stable format with structural encodings. Existing datasets keep the format they
+were created with, and lance reads both transparently.
+"""
 
 
 def dataset_uri(config: ETLConfig, *components: str) -> str:
@@ -178,8 +189,8 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
         Counts of upserted (inserted + updated) and deleted rows.
     """
     uri: str = dataset_uri(config, *key)
-    is_delete: pa.Array = pc.is_in(group[config.op_col], value_set=pa.array(config.delete_op_values))
-    payload_cols: list[str] = [c for c in group.column_names if c != config.op_col]
+    is_delete: pa.Array = pc.is_in(group[OP_COL], value_set=pa.array(DELETE_OP_VALUES))
+    payload_cols: list[str] = [c for c in group.column_names if c != OP_COL]
 
     upserts_pre_pivot: pa.Table = group.filter(pc.invert(is_delete)).select(payload_cols)
     upserts_pivoted, pivot_counts, column_roles = pivot_map_columns(upserts_pre_pivot, config)
@@ -201,9 +212,9 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
             pivot_counts["invalid_vector_rows"],
         )
 
-    upserts: pa.Table = apply_ttl_cast(upserts_pivoted, config.ttl_col)
+    upserts: pa.Table = apply_ttl_cast(upserts_pivoted, TTL_COL)
 
-    deletes: pa.Table = group.filter(is_delete).select([config.key_col])
+    deletes: pa.Table = group.filter(is_delete).select([KEY_COL])
 
     upserted: int = 0
     deleted: int = 0
@@ -259,7 +270,7 @@ def open_or_bootstrap(uri: str, schema: pa.Schema, config: ETLConfig) -> lance.L
     Args:
         uri: Dataset URI.
         schema: Schema used to bootstrap the empty dataset.
-        config: ETL configuration supplying storage options and the data storage version.
+        config: ETL configuration supplying storage options.
 
     Returns:
         The open dataset handle.
@@ -274,7 +285,7 @@ def open_or_bootstrap(uri: str, schema: pa.Schema, config: ETLConfig) -> lance.L
                 mode="append",
                 storage_options=config.storage_options,
                 enable_v2_manifest_paths=True,
-                data_storage_version=config.data_storage_version,
+                data_storage_version=DATA_STORAGE_VERSION,
             )
         except OSError:
             return lance.dataset(uri, storage_options=config.storage_options)
@@ -314,12 +325,12 @@ def run_upsert_chunk(
     if missing_fields:
         dataset_local.add_columns(pa.schema(missing_fields))
         dataset_local = lance.dataset(uri, storage_options=config.storage_options)
-    builder = dataset_local.merge_insert(on=[config.key_col])
+    builder = dataset_local.merge_insert(on=[KEY_COL])
     builder = builder.when_matched_update_all(condition=update_condition)
     return (
         builder.when_not_matched_insert_all()
         .conflict_retries(config.conflict_retries)
-        .retry_timeout(config.retry_timeout)
+        .retry_timeout(DEFAULT_RETRY_TIMEOUT)
         .execute(chunk)
     )
 
@@ -346,10 +357,10 @@ def run_delete_chunk(config: ETLConfig, uri: str, chunk: pa.Table, chunk_index: 
     except (FileNotFoundError, ValueError):
         return {}
     return (
-        delete_dataset.merge_insert(on=[config.key_col])
+        delete_dataset.merge_insert(on=[KEY_COL])
         .when_matched_delete()
         .conflict_retries(config.conflict_retries)
-        .retry_timeout(config.retry_timeout)
+        .retry_timeout(DEFAULT_RETRY_TIMEOUT)
         .execute(chunk)
     )
 

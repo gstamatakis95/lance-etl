@@ -268,26 +268,6 @@ impl TextQuery {
             reference: DatasetRef::default(),
         }
     }
-
-    /// Returns a representative query string for reranking context, when one can be extracted.
-    ///
-    /// Walks the node tree to the first leaf carrying terms (a match, phrase, multi-match, or the
-    /// positive side of a boost / the first should-or-must clause of a boolean). `None` when no
-    /// leaf carries terms.
-    pub fn rerank_text(&self) -> Option<String> {
-        node_terms(&self.node).map(str::to_string)
-    }
-}
-
-/// Extracts the leading terms of a query node for reranking context.
-fn node_terms(node: &TextQueryNode) -> Option<&str> {
-    match node {
-        TextQueryNode::Match(spec) => Some(spec.terms.as_str()),
-        TextQueryNode::Phrase(spec) => Some(spec.terms.as_str()),
-        TextQueryNode::MultiMatch { terms, .. } => Some(terms.as_str()),
-        TextQueryNode::Boost { positive, .. } => node_terms(positive),
-        TextQueryNode::Boolean { should, must, .. } => should.iter().chain(must).find_map(node_terms),
-    }
 }
 
 /// One hybrid query: a vector leg, a text leg, and a fusion strategy.

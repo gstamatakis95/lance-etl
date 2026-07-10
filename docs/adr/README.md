@@ -12,7 +12,7 @@ The six documents:
 |---|---|
 | [etl-and-data-model.md](etl-and-data-model.md) | Iceberg reads, routing, the event-time clock, the dynamic map pivot, write-time hour tags |
 | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Job isolation, the unified pipeline, task-based fleet orchestration, TTL, coexistence, Iceberg upkeep |
-| [indexing.md](indexing.md) | Segment-API flows, sidecar-free vector artifacts, role auto-indexing, the streaming k-means bootstrap |
+| [indexing.md](indexing.md) | Segment-API flows, vector artifact storage, role auto-indexing, the streaming k-means bootstrap, the object-store centroid cache |
 | [serving-filters-and-tags.md](serving-filters-and-tags.md) | Crate layering, the typed filter AST, time ranges, blue-green serving, per-query version pinning |
 | [caching-and-observability.md](caching-and-observability.md) | The persistent cache and its pluggable backends, Prewarm, the Lance trace bridge, recall auditing |
 | [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | The stable-row-id rejection, V2 manifest paths, knob reduction, the intake service, namespace migration |
@@ -45,7 +45,7 @@ Index of every original ADR number:
 | 0022 | Lance trace-event bridge | [caching-and-observability.md](caching-and-observability.md) | Accepted |
 | 0023 | Iceberg source-table optimization job | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
 | 0024 | Dynamic per-dataset map pivot | [etl-and-data-model.md](etl-and-data-model.md) | Accepted |
-| 0025 | Sidecar-free vector artifacts | [indexing.md](indexing.md) | Accepted |
+| 0025 | Sidecar-free vector artifacts | [indexing.md](indexing.md) | Superseded by 0040 |
 | 0026 | Job isolation: separate packages and CLIs | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
 | 0027 | Unified pipeline: prune, maintenance, index, stamp | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
 | 0028 | Unified task-based fleet orchestration, format 2.1, column roles | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
@@ -54,3 +54,11 @@ Index of every original ADR number:
 | 0031 | Pluggable cache backend (disk, redis, memory) | [caching-and-observability.md](caching-and-observability.md) | Accepted |
 | 0032 | Hourly interval tags and per-query tag pinning | [etl-and-data-model.md](etl-and-data-model.md) + [serving-filters-and-tags.md](serving-filters-and-tags.md) | Accepted |
 | 0033 | ZONEMAP scalar indexes via merged segment commits | [indexing.md](indexing.md) | Accepted |
+| 0034 | Adaptive salted routing, streaming merge, and spark_batches removal | [etl-and-data-model.md](etl-and-data-model.md) | Accepted |
+| 0035 | Per-dataset failure isolation, partial-failure exit codes, and stamp gating | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
+| 0036 | Idle-dataset cleanup rotation | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
+| 0037 | Cluster-aware parallelism and discoverable partition counts | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
+| 0038 | Ingestion and the maintenance/indexing pipeline must not overlap per dataset | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
+| 0039 | Commit-retry and idempotency hardening for bootstrap and tag operations | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
+| 0040 | Object-store centroid cache for distributed vector builds | [indexing.md](indexing.md) | Accepted (supersedes 0025) |
+| 0041 | Clustered rewrite: centroid-locality dataset reorganization | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |

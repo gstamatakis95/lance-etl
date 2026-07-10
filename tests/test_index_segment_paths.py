@@ -25,7 +25,7 @@ from lance_etl.indexing import (
     LanceIndexer,
     VectorIndexHandler,
     bootstrap_vector_index,
-    centroids_from_ipc,
+    centroid_sidecar_uri,
     commit_segments,
     lance_field_id,
     load_vector_config,
@@ -241,12 +241,13 @@ def test_vector_segment_path_end_to_end(dataset_uri: str, telemetry: Telemetry) 
 
 
 def test_vector_segment_path_reuses_artifacts(dataset_uri: str, telemetry: Telemetry) -> None:
-    """Every prepare reads centroids from the committed index and the rotation from the dataset config.
+    """Every prepare reuses centroids sidecar-first and the rotation from the dataset config.
 
-    Centroids are recovered via ``get_ivf_model`` and IPC-serialized, so the round-trip is checked by
-    array equality through ``centroids_from_ipc``. The ``rabitq_model`` string must match the streaming
-    bootstrap's stored rotation so segments stay mergeable across runs. No ``.artifacts`` directory is
-    created.
+    The streaming bootstrap caches the trained centroids to the object-store sidecar keyed by
+    ``rows_at_train``. Each ``prepare`` reads them back as a ``pa.Array`` (sidecar hit), so the two
+    reads return equal arrays. The ``rabitq_model`` string must match the streaming bootstrap's
+    stored rotation so segments stay mergeable across runs, and the sidecar file exists under
+    ``{uri}.artifacts`` (ADR 0040, reversing ADR 0025's sidecar-free stance).
 
     Args:
         dataset_uri: URI of the pre-built test dataset.
@@ -266,13 +267,14 @@ def test_vector_segment_path_reuses_artifacts(dataset_uri: str, telemetry: Telem
     second: object | None = second_handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
     assert second_handler.reused_artifacts is True
 
-    assert centroids_from_ipc(first[0]).equals(centroids_from_ipc(second[0]))
+    assert first[0].equals(second[0])
     assert second[1] == first[1] == cfg["rabitq_model"]
     assert second[2] == first[2]
     assert second[3] == first[3]
 
     assert vector_config_key("vector") in lance.dataset(dataset_uri).config()
-    assert not Path(f"{dataset_uri}.artifacts").exists()
+    sidecar: str = centroid_sidecar_uri(dataset_uri, "vector_idx", int(cfg["rows_at_train"]))
+    assert Path(sidecar).exists()
 
 
 def test_btree_segment_path_end_to_end(dataset_uri: str, telemetry: Telemetry) -> None:

@@ -65,12 +65,10 @@
 //! - `serve.tag_resolved` (count, tagged `changed`): a serve-tag re-resolution after the TTL
 //!   lapsed. `changed:true` marks a replica observing a tag flip.
 //!
-//! Clusters, recall, and rerank ([`metrics::Metrics::clusters_read`], `clusters_centroids`,
-//! `recall_sample`, `rerank`):
+//! Clusters and recall ([`metrics::Metrics::clusters_read`], `clusters_centroids`,
+//! `recall_sample`):
 //! - `clusters.read.duration_ms` (distribution: centroid read duration), `clusters.centroids`
 //!   (distribution: centroid count), `recall.samples` (count, tagged `query_type`/`filtered`).
-//! - `rerank.duration_ms` (distribution) and `rerank.candidates` (distribution), both tagged
-//!   `rpc`. Emitted only when a request carries a rerank spec.
 //!
 //! Spans (via the OpenTelemetry layer) carry the high-cardinality detail: `org_id`, `tenant_id`,
 //! `namespace`, `dataset.version`, `prewarm.resolved_version`, `clusters.index`, and the gRPC

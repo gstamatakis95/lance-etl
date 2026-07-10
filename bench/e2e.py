@@ -32,7 +32,7 @@ import grpc
 import lance
 import numpy as np
 
-from bench.config import BenchConfig
+from bench.config import RECALL_CUTOFFS, BenchConfig
 from bench.groundtruth import recall_at
 from bench.grpc_client import (
     generate_stubs,
@@ -51,7 +51,6 @@ from lance_etl.pipeline import PipelineConfig, PipelineJob
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-RECALL_CUTOFFS: tuple[int, ...] = (1, 10, 100)
 E2E_NPROBES: int = 10
 """Fallback nprobes for gRPC legs when config.nprobes is empty."""
 

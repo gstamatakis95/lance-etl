@@ -204,26 +204,29 @@ def resolve_filesystem(uri: str, storage_options: dict[str, Any] | None) -> tupl
     return pa_fs.AzureFileSystem(**kwargs), path
 
 
-def dataset_paths_under(base_uri: str, storage_options: dict[str, Any] | None, subpath: str | None = None) -> set[str]:
+def list_dataset_paths(filesystem: Any, base_path: str, subpath: str | None = None) -> set[str]:
     """Flat-recursively list one location and collapse its entries to base-relative dataset paths.
 
-    One recursive listing enumerates every object under ``base_uri`` (or ``base_uri/subpath``), and each entry's path
-    is scanned for its first component ending in ``.lance`` — entries inside a dataset collapse to the dataset path,
-    and sidecar directories such as ``{dataset}.lance.artifacts`` do not match because their final component does not
-    end in ``.lance``. On object stores the flat recursive listing is the request-optimal strategy for shallow
-    datasets (one paginated LIST page per ~1000 objects), which is why discovery never walks directory-by-directory.
-    Resolves its own filesystem so the function is safe to run inside a Spark executor task without pickling a
-    filesystem handle.
+    One recursive listing enumerates every object under ``base_path`` (or ``base_path/subpath``), and each entry's
+    path is scanned for its first component ending in ``.lance`` — entries inside a dataset collapse to the dataset
+    path, and sidecar directories such as ``{dataset}.lance.artifacts`` do not match because their final component
+    does not end in ``.lance``. On object stores the flat recursive listing is the request-optimal strategy for
+    shallow datasets (one paginated LIST page per ~1000 objects), which is why discovery never walks
+    directory-by-directory.
+
+    Takes an already-resolved filesystem handle so a caller that lists many subpaths (such as the executor fan-out
+    in :func:`discover_datasets`) can resolve the filesystem once per task and reuse it across every listing,
+    instead of paying the resolution cost per subpath.
 
     Args:
-        base_uri: Root location under which datasets live, in any supported URI scheme or a local path.
-        storage_options: The same options passed to pylance, or ``None``.
+        filesystem: An already-resolved ``pyarrow.fs`` filesystem, as returned by :func:`resolve_filesystem`.
+        base_path: The provider-relative base path matching ``filesystem``, as returned by
+            :func:`resolve_filesystem`.
         subpath: Base-relative prefix to list instead of the whole base, used by the executor fan-out.
 
     Returns:
-        Distinct dataset paths relative to ``base_uri``.
+        Distinct dataset paths relative to ``base_path``.
     """
-    filesystem, base_path = resolve_filesystem(base_uri, storage_options)
     base: str = base_path.rstrip("/")
     target: str = f"{base}/{subpath}" if subpath else base
     selector: pa_fs.FileSelector = pa_fs.FileSelector(target, recursive=True, allow_not_found=True)
@@ -236,6 +239,26 @@ def dataset_paths_under(base_uri: str, storage_options: dict[str, Any] | None, s
                 datasets.add("/".join(components[: depth + 1]))
                 break
     return datasets
+
+
+def dataset_paths_under(base_uri: str, storage_options: dict[str, Any] | None, subpath: str | None = None) -> set[str]:
+    """Resolve a filesystem for ``base_uri`` and list one location's base-relative dataset paths.
+
+    Thin wrapper around :func:`list_dataset_paths` for single-shot callers. Resolves its own filesystem so the
+    function is safe to run inside a Spark executor task without pickling a filesystem handle. Callers that need to
+    list multiple subpaths in the same task should resolve the filesystem once with :func:`resolve_filesystem` and
+    call :func:`list_dataset_paths` directly for each subpath instead of calling this function in a loop.
+
+    Args:
+        base_uri: Root location under which datasets live, in any supported URI scheme or a local path.
+        storage_options: The same options passed to pylance, or ``None``.
+        subpath: Base-relative prefix to list instead of the whole base, used by the executor fan-out.
+
+    Returns:
+        Distinct dataset paths relative to ``base_uri``.
+    """
+    filesystem, base_path = resolve_filesystem(base_uri, storage_options)
+    return list_dataset_paths(filesystem, base_path, subpath)
 
 
 def discover_datasets(
@@ -288,14 +311,18 @@ def discover_datasets(
         def list_partition(part: Iterable[str]) -> Iterator[set[str]]:
             """List the first-level prefixes assigned to this executor task.
 
+            Resolves the filesystem once for the whole task and reuses it across every prefix in ``part``,
+            rather than paying the filesystem-resolution cost once per prefix.
+
             Args:
                 part: Base-relative directory prefixes for this partition.
 
             Yields:
                 One base-relative dataset-path set per prefix.
             """
+            task_filesystem, task_base_path = resolve_filesystem(base_uri, options)
             for prefix in part:
-                yield dataset_paths_under(base_uri, options, prefix)
+                yield list_dataset_paths(task_filesystem, task_base_path, prefix)
 
         slices: int = max(1, min(len(prefixes), partitions))
         found_sets: list[set[str]] = (

@@ -165,18 +165,6 @@ not just a single percentile. Latency regressions often appear in the tail befor
   Repeat for the other two types. Stacked or overlaid.
 - **Distribution widget (latency percentiles).** A top-list or distribution widget showing p50,
   p95, and p99 for each RPC type side by side. Good for quick cross-RPC comparison.
-- **Reranking latency (timeseries).** `p95:search_api.rerank.duration_ms` by `rpc`. Only emitted
-  when requests carry a rerank spec. A rising tail here means the reranker is under load.
-- **Reranking candidate count (distribution).** `search_api.rerank.candidates` by `rpc`. Spikes
-  indicate requests with unusually large candidate pools being fed to the reranker.
-
-**Reranking metrics.**
-
-| Metric | Type | Tags |
-|---|---|---|
-| `search_api.rerank.duration_ms` | distribution | `rpc` |
-| `search_api.rerank.candidates` | distribution | `rpc` |
-
 ### 4.3 Search Quality and Recall
 
 **Goal.** Track whether the search service is returning high-quality results over time, both from
@@ -184,9 +172,10 @@ the live serving capture (counters) and from the offline recall audit job (quali
 
 #### Live recall capture (Rust service)
 
-The service samples a deterministic fraction of eligible requests at rate
-`SEARCH_API_RECALL_SAMPLE_RATE` (default 0.0, must be enabled explicitly). Sampled requests
-have `recall.*` span attributes attached to their OTLP spans and also increment the counter below.
+The service samples a deterministic fraction of eligible requests at the rate fixed by the
+`DEFAULT_RECALL_SAMPLE_RATE` constant in `rust/search-api/src/config.rs` (0.0, disabled by default,
+no longer env-configurable). Sampled requests have `recall.*` span attributes attached to their
+OTLP spans and also increment the counter below.
 
 | Metric | Type | Tags | Notes |
 |---|---|---|---|
@@ -295,9 +284,9 @@ cache and tier separately.
   rate above 80%, disk hit rate above 60% for index. Bad: both tiers showing low hit rates means
   the budget is too small or the working set is too large.
 - **Disk residency (timeseries).** `search_api.cache.disk.bytes` by `cache`. Compare against the
-  configured budget (`SEARCH_API_DISK_INDEX_CACHE_BYTES`, default 8 GiB). A gauge that never
-  reaches the budget means the cache is not filling. One that is always at the ceiling means every
-  insert triggers an eviction.
+  fixed budget (`DEFAULT_DISK_INDEX_CACHE_BYTES` in `config.rs`, 8 GiB, no longer env-configurable).
+  A gauge that never reaches the budget means the cache is not filling. One that is always at the
+  ceiling means every insert triggers an eviction.
 - **Evictions by reason (timeseries).** `sum:search_api.cache.evictions by {reason}`. Sustained
   `size` evictions mean the budget is too small. `ttl` evictions are expected (7-day TTL). `corrupt`
   evictions mean serialization is failing.
@@ -305,8 +294,9 @@ cache and tier separately.
   `sum:search_api.dataset.open.duration_ms{cold:false}` overlaid. A surge in cold opens means the
   handle LRU is evicting too aggressively or a large fleet of new datasets was opened.
 - **Handle LRU size (timeseries).** `search_api.cache.handles.weighted_size`. Compare against
-  `SEARCH_API_DATASET_CACHE_CAPACITY` (default 16384 weighted units). Sustained saturation at the
-  ceiling means the LRU is evicting cheap handles, which causes cold opens.
+  the fixed capacity (`DEFAULT_DATASET_CACHE_CAPACITY` in `config.rs`, 16384 weighted units, no
+  longer env-configurable). Sustained saturation at the ceiling means the LRU is evicting cheap
+  handles, which causes cold opens.
 
 ### 4.5 Prewarm
 

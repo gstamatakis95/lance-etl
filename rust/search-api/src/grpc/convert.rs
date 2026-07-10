@@ -5,10 +5,16 @@ use serde_json::{Map, Value};
 
 use crate::domain::{
     ClusterReport, ClusterSpec, CompareOp, DatasetRef, DatasetTarget, DistanceKind, Filter, FilterMode, FusedHit,
-    FusionSpec, Fuzziness, Hit, HybridQuery, Literal, MatchSpec, PhraseSpec, PrewarmReport, PrewarmSpec, RerankSpec,
-    SearchError, TextOperator, TextQuery, TextQueryNode, TimeRange, VectorQuery,
+    FusionSpec, Fuzziness, Hit, HybridQuery, Literal, MatchSpec, PhraseSpec, PrewarmReport, PrewarmSpec, SearchError,
+    TextOperator, TextQuery, TextQueryNode, TimeRange, VectorQuery,
 };
 use crate::pb;
+
+/// Maximum nesting depth accepted for a proto FTS query tree (mirrors `MAX_FILTER_DEPTH` in
+/// `lance::filter`). Boost and Boolean nodes recurse, so an unbounded tree from a client could
+/// otherwise drive stack usage past prost's own default recursion limit before this layer ever
+/// gets a chance to reject it.
+const MAX_FTS_DEPTH: usize = 32;
 
 /// Converts an optional proto dataset target into the validated domain target.
 pub fn dataset_target_from_proto(target: Option<pb::DatasetTarget>) -> Result<DatasetTarget, SearchError> {
@@ -185,7 +191,7 @@ pub fn text_query_from_proto(
             }
             TextQueryNode::Match(MatchSpec::new(terms))
         }
-        Some(pb::text_query::Input::Fts(fts)) => fts_node_from_proto(fts)?,
+        Some(pb::text_query::Input::Fts(fts)) => fts_node_from_proto(fts, 0)?,
         None => return Err(SearchError::invalid_argument("text query input is required")),
     };
     Ok(TextQuery {
@@ -278,24 +284,30 @@ pub fn fusion_from_proto(fusion: Option<pb::Fusion>) -> Result<FusionSpec, Searc
     }
 }
 
-/// Converts a proto rerank config into the optional domain spec.
+/// Converts a proto rerank config into the optional top-n truncation count.
 ///
-/// An absent message or an unset strategy means no reranking (the result order is returned
-/// unchanged), so existing clients that never set the field keep their behavior.
-pub fn rerank_from_proto(rerank: Option<pb::Rerank>) -> Result<Option<RerankSpec>, SearchError> {
+/// An absent message or an unset strategy means no truncation (the result order and count are
+/// returned unchanged), so existing clients that never set the field keep their behavior.
+pub fn rerank_top_n_from_proto(rerank: Option<pb::Rerank>) -> Result<Option<usize>, SearchError> {
     let Some(rerank) = rerank else {
         return Ok(None);
     };
     match rerank.strategy {
-        Some(pb::rerank::Strategy::Identity(identity)) => Ok(Some(RerankSpec::Identity {
-            top_n: identity.top_n.map(|n| n as usize),
-        })),
+        Some(pb::rerank::Strategy::Identity(identity)) => Ok(identity.top_n.map(|n| n as usize)),
         None => Ok(None),
     }
 }
 
-/// Converts a proto FTS query node tree into the domain tree.
-fn fts_node_from_proto(node: pb::FtsQuery) -> Result<TextQueryNode, SearchError> {
+/// Converts a proto FTS query node tree into the domain tree, tracking nesting depth.
+///
+/// Rejects a tree past [`MAX_FTS_DEPTH`] with `InvalidArgument` rather than relying solely on
+/// prost's own default recursion limit to bound stack usage.
+fn fts_node_from_proto(node: pb::FtsQuery, depth: usize) -> Result<TextQueryNode, SearchError> {
+    if depth > MAX_FTS_DEPTH {
+        return Err(SearchError::invalid_argument(format!(
+            "fts query nesting exceeds the maximum depth of {MAX_FTS_DEPTH}"
+        )));
+    }
     match node.query {
         Some(pb::fts_query::Query::Match(query)) => Ok(TextQueryNode::Match(MatchSpec {
             terms: query.terms,
@@ -319,8 +331,8 @@ fn fts_node_from_proto(node: pb::FtsQuery) -> Result<TextQueryNode, SearchError>
                 .negative
                 .ok_or_else(|| SearchError::invalid_argument("boost query requires a negative query"))?;
             Ok(TextQueryNode::Boost {
-                positive: Box::new(fts_node_from_proto(*positive)?),
-                negative: Box::new(fts_node_from_proto(*negative)?),
+                positive: Box::new(fts_node_from_proto(*positive, depth + 1)?),
+                negative: Box::new(fts_node_from_proto(*negative, depth + 1)?),
                 negative_boost: query.negative_boost.unwrap_or(0.5),
             })
         }
@@ -331,17 +343,17 @@ fn fts_node_from_proto(node: pb::FtsQuery) -> Result<TextQueryNode, SearchError>
             operator: text_operator_from_proto(query.operator)?,
         }),
         Some(pb::fts_query::Query::Boolean(query)) => Ok(TextQueryNode::Boolean {
-            should: fts_nodes_from_proto(query.should)?,
-            must: fts_nodes_from_proto(query.must)?,
-            must_not: fts_nodes_from_proto(query.must_not)?,
+            should: fts_nodes_from_proto(query.should, depth + 1)?,
+            must: fts_nodes_from_proto(query.must, depth + 1)?,
+            must_not: fts_nodes_from_proto(query.must_not, depth + 1)?,
         }),
         None => Err(SearchError::invalid_argument("fts query node is missing its kind")),
     }
 }
 
-/// Converts a list of proto FTS query nodes.
-fn fts_nodes_from_proto(nodes: Vec<pb::FtsQuery>) -> Result<Vec<TextQueryNode>, SearchError> {
-    nodes.into_iter().map(fts_node_from_proto).collect()
+/// Converts a list of proto FTS query nodes at the given nesting depth.
+fn fts_nodes_from_proto(nodes: Vec<pb::FtsQuery>, depth: usize) -> Result<Vec<TextQueryNode>, SearchError> {
+    nodes.into_iter().map(|node| fts_node_from_proto(node, depth)).collect()
 }
 
 /// Converts a proto filter AST into the domain filter AST.
@@ -465,17 +477,7 @@ pub fn text_hit_to_proto(hit: Hit) -> pb::TextSearchResult {
     }
 }
 
-/// Lifts a single-leg hit into a fused hit so the reranker seam can treat every result family
-/// uniformly. The leg score (distance or BM25) carries over unchanged.
-pub fn hit_to_fused(hit: Hit) -> FusedHit {
-    FusedHit {
-        row_id: hit.row_id,
-        score: hit.score,
-        row: hit.row,
-    }
-}
-
-/// Lowers a fused hit back into a single-leg hit after reranking, preserving the score.
+/// Lowers a fused hit back into a single-leg hit for recall capture, preserving the score.
 pub fn fused_to_hit(hit: FusedHit) -> Hit {
     Hit {
         row_id: hit.row_id,
@@ -631,5 +633,49 @@ mod tests {
         let reference = DatasetRef::Tag("latest-prod".to_string());
         let query = text_query_from_proto(proto_query, None, reference.clone()).unwrap();
         assert_eq!(query.reference, reference);
+    }
+
+    /// Builds a leaf `MatchQuery` FTS node.
+    fn fts_match_leaf(terms: &str) -> pb::FtsQuery {
+        pb::FtsQuery {
+            query: Some(pb::fts_query::Query::Match(pb::MatchQuery {
+                terms: terms.to_string(),
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn fts_conversion_rejects_excessive_nesting() {
+        let mut node = fts_match_leaf("base");
+        for _ in 0..(MAX_FTS_DEPTH + 2) {
+            node = pb::FtsQuery {
+                query: Some(pb::fts_query::Query::Boost(Box::new(pb::BoostQuery {
+                    positive: Some(Box::new(node)),
+                    negative: Some(Box::new(fts_match_leaf("negative"))),
+                    negative_boost: None,
+                }))),
+            };
+        }
+        let err = fts_node_from_proto(node, 0).unwrap_err();
+        assert!(
+            matches!(err, SearchError::InvalidArgument(_)),
+            "deep fts nesting must be rejected"
+        );
+    }
+
+    #[test]
+    fn fts_conversion_accepts_nesting_within_the_limit() {
+        let mut node = fts_match_leaf("base");
+        for _ in 0..MAX_FTS_DEPTH {
+            node = pb::FtsQuery {
+                query: Some(pb::fts_query::Query::Boost(Box::new(pb::BoostQuery {
+                    positive: Some(Box::new(node)),
+                    negative: Some(Box::new(fts_match_leaf("negative"))),
+                    negative_boost: None,
+                }))),
+            };
+        }
+        fts_node_from_proto(node, 0).unwrap();
     }
 }

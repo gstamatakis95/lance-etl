@@ -13,21 +13,27 @@ from __future__ import annotations
 import argparse
 import logging
 from collections.abc import Sequence
+from typing import Any
 
 from lance_etl.cliutil import (
     add_common_arguments,
     add_dataset_arguments,
     add_index_column_arguments,
+    add_ttl_arguments,
     build_spark,
     build_telemetry_config,
     configure_logging_from_args,
-    load_dataset_uris,
+    index_config_from_args,
+    load_uris_or_none,
     parse_storage_options,
     parse_window_tag,
+    resolve_exit_code,
+    run_with_spark,
 )
 from lance_etl.indexing.config import IndexJobConfig
 from lance_etl.maintenance.job import MaintenanceConfig
 from lance_etl.pipeline.job import PipelineConfig, PipelineJob
+from lance_etl.telemetry import TelemetryConfig
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -57,22 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_arguments(run_parser)
     add_dataset_arguments(run_parser)
     add_index_column_arguments(run_parser)
-    run_parser.add_argument(
-        "--ttl-column",
-        default=None,
-        help=(
-            "Per-row TTL column holding each row's lifetime as an Arrow Duration. When set, rows are expired before "
-            "compaction by the predicate ts-column + ttl-column < now. Absent (the default) turns TTL off."
-        ),
-    )
-    run_parser.add_argument(
-        "--ts-column",
-        default="event_timestamp",
-        help=(
-            "Event timestamp column used as the TTL clock. Must match ETLConfig.ts_col. Only used when --ttl-column "
-            "is set. Default: event_timestamp."
-        ),
-    )
+    add_ttl_arguments(run_parser)
     run_parser.add_argument(
         "--rebuild",
         action="store_true",
@@ -109,63 +100,51 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run_run(args: argparse.Namespace) -> None:
+def run_run(args: argparse.Namespace) -> int:
     """Execute the pipeline run subcommand.
 
     Loads dataset URIs, builds both sub-configurations, constructs a
     :class:`~lance_etl.pipeline.job.PipelineConfig`, and dispatches to
-    :class:`~lance_etl.pipeline.job.PipelineJob`.
+    :class:`~lance_etl.pipeline.job.PipelineJob`. Per-dataset failures are isolated by the fleet
+    phases rather than aborting the run, so this returns the pipeline's ``counts["failed"]`` count
+    for the operator alert instead of raising.
 
     Args:
         args: Parsed command-line arguments.
+
+    Returns:
+        The number of datasets that failed in isolation, ``0`` when all succeeded.
     """
     spark = build_spark()
-    uris: list[str] = load_dataset_uris(args, spark)
-    if not uris:
-        logger.info("pipeline run: no datasets in the URI list, nothing to do")
-        spark.stop()
-        return
 
-    tag_keep_last: int | None = args.tag_keep_last if args.tag_keep_last != 0 else None
-    telemetry = build_telemetry_config(args)
-    storage_options = parse_storage_options(args)
+    def work() -> int:
+        """Load the fleet, run the four pipeline phases, and return the failed-dataset count."""
+        uris: list[str] | None = load_uris_or_none(args, spark, "pipeline run", logger)
+        if uris is None:
+            return 0
+        tag_keep_last: int | None = args.tag_keep_last if args.tag_keep_last != 0 else None
+        maintenance_config: MaintenanceConfig = MaintenanceConfig(
+            telemetry=TelemetryConfig(),
+            ttl_column=args.ttl_column,
+            ts_column=args.ts_column,
+        )
+        indexing_config: IndexJobConfig = index_config_from_args(args, TelemetryConfig(), rebuild=args.rebuild)
+        config: PipelineConfig = PipelineConfig(
+            telemetry=build_telemetry_config(args),
+            storage_options=parse_storage_options(args),
+            maintenance=maintenance_config,
+            indexing=indexing_config,
+            tag_keep_last=tag_keep_last,
+            tag_stamp=args.tag_stamp,
+            serve_tag=args.serve_tag,
+        )
+        result: dict[str, Any] = PipelineJob(config).run(spark, uris)
+        failed: int = int(result["counts"]["failed"])
+        if failed:
+            logger.warning("pipeline run: %d datasets failed and will be retried next run", failed)
+        return failed
 
-    maintenance_config: MaintenanceConfig = MaintenanceConfig(
-        telemetry=telemetry,
-        storage_options=storage_options,
-        ttl_column=args.ttl_column,
-        ts_column=args.ts_column,
-    )
-    indexing_config: IndexJobConfig = IndexJobConfig(
-        telemetry=telemetry,
-        storage_options=storage_options,
-        vector_columns=list(args.vector_column or []),
-        metric=args.metric,
-        scalar_columns=list(args.scalar_column or []),
-        bitmap_columns=list(args.bitmap_column or []),
-        zonemap_columns=list(args.zonemap_column or []),
-        text_columns=list(args.text_column or []),
-        fts_base_tokenizer=args.fts_base_tokenizer,
-        fts_language=args.fts_language,
-        rebuild=args.rebuild,
-    )
-    config: PipelineConfig = PipelineConfig(
-        telemetry=telemetry,
-        storage_options=storage_options,
-        maintenance=maintenance_config,
-        indexing=indexing_config,
-        tag_keep_last=tag_keep_last,
-        tag_stamp=args.tag_stamp,
-        serve_tag=args.serve_tag,
-    )
-
-    try:
-        PipelineJob(config).run(spark, uris)
-    except Exception:
-        logger.exception("pipeline run failed")
-        raise
-    finally:
-        spark.stop()
+    return run_with_spark(spark, "pipeline run", logger, work)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -175,7 +154,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         argv: Optional argument vector. Defaults to ``sys.argv``.
 
     Returns:
-        A process exit code.
+        A process exit code: ``0`` when every dataset succeeded, ``1`` when the run itself raised
+        an unhandled exception, and :data:`~lance_etl.cliutil.EXIT_PARTIAL_FAILURE` (``3``) when
+        the run completed but one or more datasets failed in isolation and will be retried by the
+        next scheduled run.
     """
     args: argparse.Namespace = build_parser().parse_args(argv)
     configure_logging_from_args(args)
@@ -183,7 +165,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "run": run_run,
     }
     try:
-        runners[args.command](args)
-        return 0
+        return resolve_exit_code(runners[args.command](args))
     except Exception:
         return 1

@@ -93,11 +93,8 @@ class IcebergOptimizeConfig:
         expire_snapshots: Prune snapshot history beyond the retention horizon.
         remove_orphan_files: Delete files no live snapshot references. Opt-in because it is the only step that can
             delete data outright. Off by default.
-        target_file_size_bytes: Target output file size for ``rewrite_data_files``.
-        min_input_files: Minimum files in a bin-pack group before ``rewrite_data_files`` rewrites it.
         expire_retain_last: Snapshots always retained by ``expire_snapshots`` regardless of age.
         expire_older_than_days: Age horizon in days for ``expire_snapshots``.
-        orphan_older_than_days: Age horizon in days for ``remove_orphan_files``, matching Iceberg's safety default.
     """
 
     table: str
@@ -106,11 +103,8 @@ class IcebergOptimizeConfig:
     rewrite_manifests: bool = True
     expire_snapshots: bool = True
     remove_orphan_files: bool = False
-    target_file_size_bytes: int = DEFAULT_TARGET_FILE_SIZE_BYTES
-    min_input_files: int = DEFAULT_MIN_INPUT_FILES
     expire_retain_last: int = DEFAULT_EXPIRE_RETAIN_LAST
     expire_older_than_days: int = DEFAULT_EXPIRE_OLDER_THAN_DAYS
-    orphan_older_than_days: int = DEFAULT_ORPHAN_OLDER_THAN_DAYS
 
 
 @dataclass
@@ -240,8 +234,8 @@ class IcebergOptimizer:
             The step result.
         """
         options: str = (
-            f"map('min-input-files', '{int(self.config.min_input_files)}', "
-            f"'target-file-size-bytes', '{int(self.config.target_file_size_bytes)}')"
+            f"map('min-input-files', '{DEFAULT_MIN_INPUT_FILES}', "
+            f"'target-file-size-bytes', '{DEFAULT_TARGET_FILE_SIZE_BYTES}')"
         )
         statement: str = (
             f"CALL {self.catalog}.system.rewrite_data_files(table => '{self.table_argument}', options => {options})"
@@ -286,8 +280,8 @@ class IcebergOptimizer:
     def remove_orphan_files(self, spark: SparkSession, telemetry: Telemetry) -> IcebergStepResult:
         """Delete files no live snapshot references via ``remove_orphan_files``.
 
-        Only files older than ``now - orphan_older_than_days`` are removed, matching Iceberg's own safety default so an
-        in-flight write is never mistaken for an orphan.
+        Only files older than ``now - `` :data:`DEFAULT_ORPHAN_OLDER_THAN_DAYS` are removed, matching Iceberg's own
+        safety default so an in-flight write is never mistaken for an orphan.
 
         Args:
             spark: Active Spark session.
@@ -296,7 +290,7 @@ class IcebergOptimizer:
         Returns:
             The step result, whose ``orphan_files_removed`` metric counts the removed files.
         """
-        older_than: str = timestamp_literal(self.config.orphan_older_than_days)
+        older_than: str = timestamp_literal(DEFAULT_ORPHAN_OLDER_THAN_DAYS)
         statement: str = (
             f"CALL {self.catalog}.system.remove_orphan_files("
             f"table => '{self.table_argument}', "

@@ -127,9 +127,11 @@ def job_config(tmp_path: Path, telemetry_config: TelemetryConfig) -> RecallJobCo
         telemetry_config: The test telemetry configuration.
 
     Returns:
-        A configuration with a small batch size so multi-batch merging is exercised.
+        The configuration. Multi-batch merging of the brute-force scan is exercised directly against
+        :func:`~lance_etl.recall.brute_force_top_k` with an explicit small ``batch_size`` elsewhere in this file,
+        since the scanner batch size is a hardcoded module constant rather than a configuration knob.
     """
-    return RecallJobConfig(base_uri=str(tmp_path), telemetry=telemetry_config, batch_size=16)
+    return RecallJobConfig(base_uri=str(tmp_path), telemetry=telemetry_config)
 
 
 @pytest.fixture

@@ -74,18 +74,6 @@ def test_etl_has_no_ingested_at_flag() -> None:
     assert not hasattr(args, "ingested_at_col")
 
 
-def test_etl_spark_batches_defaults_to_single_pass() -> None:
-    """Without the flag, ``--spark-batches`` is 1 so the increment is processed in one pass."""
-    args = etl_cli.build_parser().parse_args(REQUIRED_ETL_ARGV)
-    assert args.spark_batches == 1
-
-
-def test_etl_spark_batches_is_parsed_as_int() -> None:
-    """``--spark-batches 8`` parses to the integer batch count."""
-    args = etl_cli.build_parser().parse_args([*REQUIRED_ETL_ARGV, "--spark-batches", "8"])
-    assert args.spark_batches == 8
-
-
 def test_etl_tag_stamp_defaults_off() -> None:
     """Without the flag, ``--tag-stamp`` is None so the ETL stamps no tags."""
     args = etl_cli.build_parser().parse_args(REQUIRED_ETL_ARGV)
@@ -126,6 +114,36 @@ def test_maintenance_ttl_column_flag() -> None:
     )
     assert args.ttl_column == "ttl"
     assert args.ts_column == "event_time"
+
+
+def test_maintenance_cluster_rewrite_defaults_off() -> None:
+    """``--cluster-rewrite`` defaults to False and the other cluster flags default to off/None."""
+    args = maintenance_cli.build_parser().parse_args(REQUIRED_MAINTENANCE_RUN_ARGV)
+    assert args.cluster_rewrite is False
+    assert args.cluster_column is None
+    assert args.cluster_serve_tag is False
+
+
+def test_maintenance_cluster_rewrite_flag() -> None:
+    """``--cluster-rewrite`` turns on the clustered full rewrite."""
+    args = maintenance_cli.build_parser().parse_args([*REQUIRED_MAINTENANCE_RUN_ARGV, "--cluster-rewrite"])
+    assert args.cluster_rewrite is True
+
+
+def test_maintenance_cluster_column_flag() -> None:
+    """``--cluster-column`` overrides the auto-selected vector column."""
+    args = maintenance_cli.build_parser().parse_args(
+        [*REQUIRED_MAINTENANCE_RUN_ARGV, "--cluster-rewrite", "--cluster-column", "embedding"]
+    )
+    assert args.cluster_column == "embedding"
+
+
+def test_maintenance_cluster_serve_tag_flag() -> None:
+    """``--cluster-serve-tag`` turns on the blue-green HEAD flip after a clustered rebuild."""
+    args = maintenance_cli.build_parser().parse_args(
+        [*REQUIRED_MAINTENANCE_RUN_ARGV, "--cluster-rewrite", "--cluster-serve-tag"]
+    )
+    assert args.cluster_serve_tag is True
 
 
 def test_ttl_subcommand_removed() -> None:

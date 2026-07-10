@@ -7,7 +7,7 @@ use std::time::Duration;
 use search_api::config::Config;
 use search_api::domain::{DatasetRef, DatasetTarget, PrewarmSpec, Prewarmer, StdoutSink};
 use search_api::grpc::{IntakeGrpc, SearchGrpc};
-use search_api::lance::{AnnDefaults, CachingDatasetProvider, LanceSearchBackend};
+use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
 use search_api::pb::intake_service_server::IntakeServiceServer;
 use search_api::pb::search_service_server::SearchServiceServer;
 use search_api::telemetry::{self, Metrics, RecallCapture};
@@ -24,8 +24,8 @@ type Backend = LanceSearchBackend<CachingDatasetProvider>;
 /// Lance reads `LANCE_IO_THREADS` lazily at every `ObjectStore::io_parallelism()` call and
 /// `OBJECT_STORE_CLIENT_RETRY_TIMEOUT` when it builds S3/GCS/Azure clients.  Setting them
 /// here, before any dataset opens or object-store construction, ensures every thread in the
-/// process sees a consistent value sourced from the service's own config rather than whatever
-/// the operator's shell happened to export.
+/// process sees a consistent value.  Both knobs are fixed constants (no longer env-configurable),
+/// so no `Config` is needed to compute them.
 ///
 /// This must run while the process is still single-threaded, before the tokio runtime spawns
 /// any worker thread.  `set_var` is unsound once other threads exist, because a worker racing
@@ -34,10 +34,12 @@ type Backend = LanceSearchBackend<CachingDatasetProvider>;
 ///
 /// Knobs stamped here must not already be set in the environment; if they are (e.g. in a
 /// Kubernetes pod spec that overrides the default), `set_var` would silently overwrite them.
-/// The semantics are intentional: `SEARCH_API_*` vars take precedence over ambient env.
-fn apply_lance_io_env(config: &Config) {
+fn apply_lance_io_env() {
     unsafe {
-        std::env::set_var("LANCE_IO_THREADS", config.io_concurrency.to_string());
+        std::env::set_var(
+            "LANCE_IO_THREADS",
+            search_api::config::DEFAULT_IO_CONCURRENCY.to_string(),
+        );
         std::env::set_var(
             "OBJECT_STORE_CLIENT_RETRY_TIMEOUT",
             search_api::config::DEFAULT_OBJECT_STORE_TIMEOUT_SECS.to_string(),
@@ -51,12 +53,12 @@ fn apply_lance_io_env(config: &Config) {
 /// service. The intake service uses the placeholder [`StdoutSink`]; a future Kafka sink drops in
 /// at this construction site without any other change.
 ///
-/// IO tuning: three process-global Lance knobs are stamped into the environment before any
+/// IO tuning: two process-global Lance knobs are stamped into the environment before any
 /// dataset opens, so that Lance reads them consistently across every thread.
 ///
 /// - `LANCE_IO_THREADS` — read by `ObjectStore::io_parallelism()` on every scan; controls
-///   the number of parallel in-flight object-store requests.  Sourced from
-///   `SEARCH_API_IO_CONCURRENCY` (default 256).
+///   the number of parallel in-flight object-store requests.  Fixed at
+///   [`search_api::config::DEFAULT_IO_CONCURRENCY`] (256).
 /// - `OBJECT_STORE_CLIENT_RETRY_TIMEOUT` — picked up by S3/GCS/Azure client builders inside
 ///   Lance; the total retry-window budget in seconds.  Fixed at
 ///   [`search_api::config::DEFAULT_OBJECT_STORE_TIMEOUT_SECS`] (120).
@@ -72,7 +74,7 @@ fn apply_lance_io_env(config: &Config) {
 /// fail requests.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
-    apply_lance_io_env(&config);
+    apply_lance_io_env();
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(serve(config))
 }
@@ -130,20 +132,13 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             search_api::config::DEFAULT_DISK_CACHE_SWEEP_SECS,
         ));
     }
-    let ann_defaults = AnnDefaults::from_config(&config);
-    let backend = Arc::new(
-        LanceSearchBackend::new(provider)
-            .with_prewarm_concurrency(config.prewarm_concurrency)
-            .with_metrics(metrics.clone())
-            .with_event_timestamp_column(config.event_timestamp_column.clone())
-            .with_ann_defaults(ann_defaults),
-    );
+    let backend = Arc::new(LanceSearchBackend::new(provider).with_metrics(metrics.clone()));
 
     if let Some(targets_path) = &config.prewarm_targets_path {
         let targets = parse_prewarm_targets(targets_path);
         if !targets.is_empty() {
             let backend_for_prewarm = backend.clone();
-            let concurrency = config.prewarm_concurrency;
+            let concurrency = search_api::config::DEFAULT_PREWARM_CONCURRENCY;
             tokio::spawn(async move {
                 let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
                 let mut tasks = tokio::task::JoinSet::new();
@@ -183,7 +178,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let recall = RecallCapture::new(
-        config.recall_sample_rate,
+        search_api::config::DEFAULT_RECALL_SAMPLE_RATE,
         search_api::config::DEFAULT_ID_COLUMN,
         metrics.clone(),
     );
@@ -197,12 +192,10 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .set_serving::<IntakeServiceServer<IntakeGrpc<StdoutSink>>>()
         .await;
     tracing::info!(address = %addr, "search-api listening");
-    let mut server_builder = Server::builder()
-        .concurrency_limit_per_connection(config.concurrency_limit_per_connection)
-        .max_concurrent_streams(config.max_concurrent_streams);
-    if config.request_timeout_ms > 0 {
-        server_builder = server_builder.timeout(Duration::from_millis(config.request_timeout_ms));
-    }
+    let server_builder = Server::builder()
+        .concurrency_limit_per_connection(search_api::config::DEFAULT_CONCURRENCY_LIMIT_PER_CONNECTION)
+        .max_concurrent_streams(search_api::config::DEFAULT_MAX_CONCURRENT_STREAMS)
+        .timeout(Duration::from_millis(search_api::config::DEFAULT_REQUEST_TIMEOUT_MS));
     server_builder
         .layer(OtelGrpcLayer::default().filter(reject_healthcheck))
         .add_service(health_service)

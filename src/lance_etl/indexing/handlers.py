@@ -16,18 +16,21 @@ from lance.dataset import Index
 from lance.indices import IndicesBuilder
 
 from lance_etl.indexing.config import (
+    IVF_RQ_NUM_BITS,
+    RETRAIN_GROWTH_FACTOR,
     IndexJobConfig,
     config_reusable,
 )
 from lance_etl.indexing.optimize import (
     drop_existing_index,
+    load_centroids,
     load_vector_config,
+    save_centroids,
 )
 from lance_etl.indexing.segments import (
     all_fragment_ids,
     build_scalar_segment,
     build_vector_segment,
-    centroids_to_ipc,
     commit_index_with_retries,
     lance_field_id,
     live_fragment_ids,
@@ -174,16 +177,18 @@ class IndexHandler:
 
 
 class VectorIndexHandler(IndexHandler):
-    """Builds an IVF_RQ vector index, storing artifacts in the dataset's own config KV.
+    """Builds an IVF_RQ vector index, reusing centroids from an object-store sidecar cache.
 
-    On the first build the IVF centroids and RaBitQ model are trained and written once via
-    :func:`~lance_etl.indexing.optimize.write_vector_config` under the key
-    ``lance-etl.vector.{column}``. On every subsequent incremental run the config is read back
-    with :func:`~lance_etl.indexing.optimize.load_vector_config`, the centroids are recovered from
-    the committed index via :meth:`lance.LanceDataset.get_ivf_model`, and no external writes are
-    made. No sidecar files or directories are created. The ``cached_artifacts`` field memoizes the
-    prepare result within one build call so the replan loop does not retrain when a stale-fragment
-    rebuild triggers a second ``prepare``.
+    On the first build the RaBitQ model and the ``rows_at_train`` fingerprint are trained and
+    written once via :func:`~lance_etl.indexing.optimize.write_vector_config` under the key
+    ``lance-etl.vector.{column}``, and the trained centroids are cached to the object-store sidecar
+    keyed by that fingerprint (ADR 0040). On every subsequent incremental run the config is read
+    back with :func:`~lance_etl.indexing.optimize.load_vector_config` and the centroids are read
+    sidecar-first with :func:`~lance_etl.indexing.optimize.load_centroids`, falling back to the
+    committed index via :meth:`lance.LanceDataset.get_ivf_model` and backfilling the sidecar
+    best-effort on a miss. The ``cached_artifacts`` field memoizes the prepare result within one
+    build call so the replan loop does not re-read when a stale-fragment rebuild triggers a second
+    ``prepare``.
     """
 
     def __init__(self, config: IndexJobConfig, column: str, index_name: str) -> None:
@@ -196,7 +201,6 @@ class VectorIndexHandler(IndexHandler):
         """
         super().__init__(config, column, index_name)
         self.reused_artifacts: bool = False
-        self.num_partitions_used: int | None = None
         self.cached_artifacts: tuple | None = None
 
     def index_type(self) -> str:
@@ -268,7 +272,7 @@ class VectorIndexHandler(IndexHandler):
         rows_at_train: Any = cfg.get("rows_at_train")
         if rows_at_train is None:
             return True
-        return rows > self.config.retrain_growth_factor * int(rows_at_train)
+        return rows > RETRAIN_GROWTH_FACTOR * int(rows_at_train)
 
     def needs_bootstrap(self, dataset: lance.LanceDataset) -> bool:
         """Decide whether this index must be rebuilt through a streaming bootstrap.
@@ -277,7 +281,7 @@ class VectorIndexHandler(IndexHandler):
         so any artifact trigger routes the whole index back to the committed streaming
         ``create_index`` bootstrap (ADR 0030). Three triggers fire it. A non-reusable config
         (changed dimension, metric, or num_bits) means the index must self-heal rather than
-        remain broken. Growth past ``retrain_growth_factor`` times the recorded ``rows_at_train``
+        remain broken. Growth past ``RETRAIN_GROWTH_FACTOR`` times the recorded ``rows_at_train``
         means the centroids are stale. An existing index with no stored config at all gets the
         same treatment: it was built by a plain ``create_index`` under its own private model, so
         appending segments built from freshly trained artifacts would create deltas whose IVF
@@ -302,7 +306,7 @@ class VectorIndexHandler(IndexHandler):
                 )
                 return True
             return False
-        if not config_reusable(cfg, self.dimension(dataset), self.config.metric, self.config.ivf_rq_num_bits):
+        if not config_reusable(cfg, self.dimension(dataset), self.config.metric, IVF_RQ_NUM_BITS):
             logger.warning(
                 "stored vector config for %s on %s no longer matches the current configuration; "
                 "the index will be retrained and fully rebuilt",
@@ -312,14 +316,63 @@ class VectorIndexHandler(IndexHandler):
             return True
         return self.growth_requires_retrain(cfg, dataset.count_rows())
 
-    def prepare(self, dataset: lance.LanceDataset, uri: str, telemetry: Telemetry) -> tuple:
-        """Load the reusable IVF_RQ artifacts for this dataset's vector column.
+    def resolve_centroids(
+        self, dataset: lance.LanceDataset, uri: str, cfg: dict[str, Any], telemetry: Telemetry
+    ) -> pa.Array:
+        """Resolve the reusable IVF centroids sidecar-first, falling back to the committed index.
 
-        Returns the memoized result immediately on subsequent calls within the same build.
-        Centroids are read back from the committed index via
-        :meth:`lance.LanceDataset.get_ivf_model` and IPC-serialized for the build tasks using
-        :func:`~lance_etl.indexing.segments.centroids_to_ipc`. The ``rabitq_model`` string comes
-        from the stored config, and ``num_partitions`` is derived as ``len(centroids)``.
+        Reads the centroids from the object-store sidecar keyed by the stored ``rows_at_train``
+        fingerprint (:func:`~lance_etl.indexing.optimize.load_centroids`). On a miss it reads them
+        from the committed index via :meth:`lance.LanceDataset.get_ivf_model` and backfills the
+        sidecar best-effort so later shards and runs reuse it (ADR 0040). The backfill never fails
+        the build: a sidecar-write error is counted and logged, and the freshly read centroids are
+        returned regardless.
+
+        Args:
+            dataset: The dataset whose committed index carries the centroids.
+            uri: Dataset URI, for the sidecar path and error messages.
+            cfg: The stored, already-validated reusable vector config.
+            telemetry: Telemetry facade for the current process.
+
+        Returns:
+            The IVF centroid ``pa.Array``.
+
+        Raises:
+            RuntimeError: If the committed index carries no reusable centroids. The plan phase
+                should have chosen a bootstrap build for this index.
+        """
+        config: IndexJobConfig = self.config
+        rows_at_train: Any = cfg.get("rows_at_train")
+        if rows_at_train is not None:
+            cached: pa.Array | None = load_centroids(uri, self.index_name, int(rows_at_train), config.storage_options)
+            if cached is not None:
+                return cached
+        ivf_model = dataset.get_ivf_model(self.index_name)
+        if ivf_model is None or ivf_model.centroids is None:
+            raise RuntimeError(
+                f"vector artifacts for {self.index_name} on {uri} are not reusable; "
+                "the plan phase should have chosen a streaming bootstrap build"
+            )
+        centroids: pa.Array = ivf_model.centroids
+        if rows_at_train is not None:
+            try:
+                save_centroids(
+                    uri, self.index_name, centroids, config.metric, int(rows_at_train), config.storage_options
+                )
+                telemetry.incr("artifacts.centroid_sidecar_backfilled")
+            except Exception as exc:
+                telemetry.incr("index.centroid_sidecar_write_error")
+                logger.warning("centroid sidecar backfill failed for %s on %s: %s", self.index_name, uri, exc)
+        return centroids
+
+    def prepare(self, dataset: lance.LanceDataset, uri: str, telemetry: Telemetry) -> tuple:
+        """Resolve this dataset's reusable IVF_RQ artifacts, reading centroids sidecar-first.
+
+        Returns the memoized result immediately on subsequent calls within the same build. The
+        centroids come from :meth:`resolve_centroids` (sidecar cache first, committed-index
+        fallback with best-effort backfill), the ``rabitq_model`` string from the stored config,
+        and the partition count as ``len(centroids)`` (equal to the stored ``num_partitions`` by
+        the bootstrap invariant, and always consistent with the centroid array).
 
         This is reuse-only by invariant: the plan phase routes any dataset whose artifacts are
         absent, mismatched, or growth-stale to a streaming bootstrap build instead (ADR 0030),
@@ -327,12 +380,12 @@ class VectorIndexHandler(IndexHandler):
         bug and raises.
 
         Args:
-            dataset: The dataset whose committed index carries the centroids.
-            uri: Dataset URI, for error messages.
+            dataset: The dataset whose committed index and sidecar carry the centroids.
+            uri: Dataset URI, for the sidecar path and error messages.
             telemetry: Telemetry facade for the current process.
 
         Returns:
-            The centroids IPC bytes, the RaBitQ model JSON string, num_bits, and the IVF
+            The centroid ``pa.Array``, the RaBitQ model JSON string, num_bits, and the IVF
             partition count.
 
         Raises:
@@ -347,23 +400,21 @@ class VectorIndexHandler(IndexHandler):
         committed: set[str] = {description.name for description in dataset.describe_indices()}
         reusable: bool = (
             cfg is not None
-            and config_reusable(cfg, self.dimension(dataset), config.metric, config.ivf_rq_num_bits)
+            and config_reusable(cfg, self.dimension(dataset), config.metric, IVF_RQ_NUM_BITS)
             and self.index_name in committed
         )
-        ivf_model = dataset.get_ivf_model(self.index_name) if reusable else None
-        if ivf_model is None or ivf_model.centroids is None:
+        if not reusable or cfg is None:
             raise RuntimeError(
                 f"vector artifacts for {self.index_name} on {uri} are not reusable; "
                 "the plan phase should have chosen a streaming bootstrap build"
             )
-        centroids: pa.Array = ivf_model.centroids
+        centroids: pa.Array = self.resolve_centroids(dataset, uri, cfg, telemetry)
         self.reused_artifacts = True
-        self.num_partitions_used = len(centroids)
         telemetry.incr("artifacts.reused")
         self.cached_artifacts = (
-            centroids_to_ipc(centroids),
+            centroids,
             cfg["rabitq_model"],
-            config.ivf_rq_num_bits,
+            IVF_RQ_NUM_BITS,
             len(centroids),
         )
         return self.cached_artifacts
@@ -378,8 +429,8 @@ class VectorIndexHandler(IndexHandler):
         Args:
             dataset: A dataset handle pinned to the build version.
             fragment_ids: The fragment ids for this shard.
-            artifacts: The centroids bytes, the shared RaBitQ model string, num_bits, and the IVF
-                partition count.
+            artifacts: The centroids ``pa.Array``, the shared RaBitQ model string, num_bits, and
+                the IVF partition count.
 
         Returns:
             The uncommitted segment metadata.
@@ -419,9 +470,11 @@ class BTreeIndexHandler(IndexHandler):
 class BitmapIndexHandler(IndexHandler):
     """Builds a bitmap scalar index through the segment API.
 
-    Each shard calls ``create_index_uncommitted`` and the driver merges the collected segments into
-    one with ``merge_existing_index_segments`` before publishing via
-    ``commit_existing_index_segments``. The segment build and incremental fragment coverage are
+    Each shard calls ``create_index_uncommitted`` and the driver publishes the collected segments
+    with ``commit_existing_index_segments``. BITMAP segments commit unmerged like BTREE (see
+    :meth:`merges`), so there is no driver-side ``merge_existing_index_segments`` step: Lance
+    unions the per-shard segments at query time and the delta-merge maintenance pass consolidates
+    them on an executor (ADR 0033). The segment build and incremental fragment coverage are
     inherited from :class:`IndexHandler`.
     """
 

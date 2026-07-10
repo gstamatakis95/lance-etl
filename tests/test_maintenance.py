@@ -98,13 +98,31 @@ class TestPredicateSafety:
         """build_ttl_predicate renders timestamp-plus-duration arithmetic against a typed literal."""
         cutoff: datetime = datetime(2025, 3, 15, 12, 30, 45, 123456, tzinfo=UTC)
         predicate: str = build_ttl_predicate("ts", "ttl", cutoff)
-        assert predicate == "ts + ttl < TIMESTAMP '2025-03-15T12:30:45.123456'"
+        assert predicate == (
+            "arrow_cast(ts + ttl, 'Timestamp(Microsecond, \"UTC\")') < "
+            "arrow_cast('2025-03-15T12:30:45.123456', 'Timestamp(Microsecond, \"UTC\")')"
+        )
 
     def test_build_predicate_converts_to_utc(self) -> None:
         """build_ttl_predicate converts a non-UTC cutoff to UTC."""
         eastern: datetime = datetime(2025, 3, 15, 8, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
         predicate: str = build_ttl_predicate("event_time", "lifetime", eastern)
         assert "2025-03-15T13:00:00.000000" in predicate
+
+    def test_build_predicate_is_explicitly_utc(self) -> None:
+        """build_ttl_predicate forces both comparison sides to an explicit UTC timestamp type.
+
+        A bare ``TIMESTAMP '...'`` literal is always timezone-naive, so the predicate wraps BOTH
+        the column-side arithmetic and the cutoff literal in
+        ``arrow_cast(..., 'Timestamp(Microsecond, "UTC")')``. The comparison is then a direct
+        UTC-instant comparison with no naive operand and no reliance on implicit coercion with
+        whatever timezone the column happens to carry.
+        """
+        cutoff: datetime = datetime(2025, 3, 15, 12, 30, 45, 123456, tzinfo=UTC)
+        predicate: str = build_ttl_predicate("ts", "ttl", cutoff)
+        assert "arrow_cast(ts + ttl, 'Timestamp(Microsecond, \"UTC\")')" in predicate
+        assert "arrow_cast('2025-03-15T12:30:45.123456', 'Timestamp(Microsecond, \"UTC\")')" in predicate
+        assert "TIMESTAMP '" not in predicate
 
     def test_validate_rejects_injection(self, tmp_path: Path) -> None:
         """validate_column_name raises KeyError for names not present in the schema, including injection attempts."""
@@ -219,10 +237,14 @@ class TestRunOrdering:
         processed: list[str] = []
 
         def record_plan(
-            uri: str, config: MaintenanceConfig, cutoff: datetime | None, tel: Telemetry
+            uri: str,
+            config: MaintenanceConfig,
+            cutoff: datetime | None,
+            tel: Telemetry,
+            cleanup_slot: int | None = None,
         ) -> dict[str, object]:
             """Record that plan_one_dataset was called for this URI."""
-            del config, cutoff, tel
+            del config, cutoff, tel, cleanup_slot
             processed.append(uri)
             return {"uri": uri, "tasks": 0, "bytes_removed": 0, "fragments_removed": 0}
 

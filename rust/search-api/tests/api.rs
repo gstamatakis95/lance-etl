@@ -7,7 +7,6 @@ use std::sync::Arc;
 use arrow_array::types::Float32Type;
 use arrow_array::{FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use async_trait::async_trait;
 use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
@@ -17,7 +16,6 @@ use lance_index::scalar::InvertedIndexParams;
 use lance_linalg::distance::DistanceType as LanceDistanceType;
 use prost_types::value::Kind;
 use search_api::config::Config;
-use search_api::domain::{FusedHit, RerankRequest, Reranker, SearchError};
 use search_api::grpc::SearchGrpc;
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
 use search_api::pb::search_service_client::SearchServiceClient;
@@ -131,17 +129,11 @@ async fn serve(tmp: &TempDir) -> Channel {
 
 /// Like [`serve`] but emitting per-RPC metrics through the given facade.
 async fn serve_with_metrics(tmp: &TempDir, metrics: Arc<Metrics>) -> Channel {
-    serve_full(tmp, metrics, None, None).await
+    serve_full(tmp, metrics, None).await
 }
 
-/// Like [`serve_with_metrics`] but optionally enabling sampled-query recall capture and a custom
-/// post-fusion reranker.
-async fn serve_full(
-    tmp: &TempDir,
-    metrics: Arc<Metrics>,
-    recall: Option<RecallCapture>,
-    reranker: Option<Arc<dyn Reranker>>,
-) -> Channel {
+/// Like [`serve_with_metrics`] but optionally enabling sampled-query recall capture.
+async fn serve_full(tmp: &TempDir, metrics: Arc<Metrics>, recall: Option<RecallCapture>) -> Channel {
     drop(telemetry::init_tracing(true, metrics.clone()));
     let config = Config {
         base_uri: tmp.path().display().to_string(),
@@ -155,23 +147,11 @@ async fn serve_full(
         cache_backend: search_api::config::CacheBackendKind::Disk,
         redis_url: None,
         redis_namespace: search_api::config::DEFAULT_REDIS_NAMESPACE.to_string(),
-        prewarm_concurrency: 4,
         statsd_addr: "127.0.0.1:8125".to_string(),
         telemetry_disabled: true,
-        recall_sample_rate: 0.0,
-        io_concurrency: search_api::config::DEFAULT_IO_CONCURRENCY,
         serve_by_tag: search_api::config::DEFAULT_SERVE_BY_TAG,
         serve_tag: search_api::config::DEFAULT_SERVE_TAG.to_string(),
         serve_tag_ttl_secs: search_api::config::DEFAULT_SERVE_TAG_TTL_SECS,
-        event_timestamp_column: search_api::config::DEFAULT_EVENT_TIMESTAMP_COLUMN.to_string(),
-        default_minimum_nprobes: search_api::config::DEFAULT_MINIMUM_NPROBES,
-        default_maximum_nprobes: search_api::config::DEFAULT_MAXIMUM_NPROBES,
-        nprobes_ceiling: search_api::config::DEFAULT_NPROBES_CEILING,
-        default_refine_factor: search_api::config::DEFAULT_REFINE_FACTOR,
-        fast_search_default: search_api::config::DEFAULT_FAST_SEARCH,
-        request_timeout_ms: search_api::config::DEFAULT_REQUEST_TIMEOUT_MS,
-        max_concurrent_streams: search_api::config::DEFAULT_MAX_CONCURRENT_STREAMS,
-        concurrency_limit_per_connection: search_api::config::DEFAULT_CONCURRENCY_LIMIT_PER_CONNECTION,
         prewarm_targets_path: None,
     };
     let provider = CachingDatasetProvider::with_telemetry(&config, metrics.clone()).await;
@@ -179,9 +159,6 @@ async fn serve_full(
     let mut service = SearchGrpc::with_metrics(backend, metrics);
     if let Some(recall) = recall {
         service = service.with_recall(recall);
-    }
-    if let Some(reranker) = reranker {
-        service = service.with_reranker(reranker);
     }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -814,6 +791,75 @@ async fn missing_dataset_and_bad_target_return_proper_status_codes() {
 }
 
 #[tokio::test]
+async fn k_and_offset_above_the_configured_ceiling_are_rejected() {
+    let tmp = TempDir::new().unwrap();
+    build_test_dataset(&org1_uri(&tmp)).await;
+    let channel = serve(&tmp).await;
+    let mut client = SearchServiceClient::new(channel);
+    let max_k = search_api::config::DEFAULT_SEARCH_MAX_K as u32;
+
+    let status = client
+        .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
+            target: target("org1"),
+            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], max_k + 1)),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(status.message().contains('k'), "unexpected error: {status}");
+
+    let status = client
+        .text_search(TextSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
+            target: target("org1"),
+            query: Some(simple_text_query("lemon", max_k + 1)),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    let status = client
+        .hybrid_search(HybridSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
+            target: target("org1"),
+            vector: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 0)),
+            text: Some(simple_text_query("lemon", 0)),
+            k: max_k + 1,
+            fusion: None,
+            filter: None,
+            filter_mode: 0,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    let mut query = vector_query(vec![1.0, 0.0, 0.0, 0.0], 5);
+    query.offset = Some(u64::MAX);
+    let status = client
+        .vector_search(VectorSearchRequest {
+            rerank: None,
+            time_range: None,
+            version_ref: None,
+            target: target("org1"),
+            query: Some(query),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        status.code(),
+        Code::InvalidArgument,
+        "an absurd offset must be rejected, not overflow: {status}"
+    );
+}
+
+#[tokio::test]
 async fn recall_capture_samples_vector_searches() {
     let tmp = TempDir::new().unwrap();
     build_test_dataset(&org1_uri(&tmp)).await;
@@ -824,7 +870,7 @@ async fn recall_capture_samples_vector_searches() {
     let recall = RecallCapture::new(1.0, "vector_id", metrics.clone()).with_hook(Arc::new(move |record| {
         records_sink.lock().unwrap().push(record.clone());
     }));
-    let channel = serve_full(&tmp, metrics, Some(recall), None).await;
+    let channel = serve_full(&tmp, metrics, Some(recall)).await;
     let mut client = SearchServiceClient::new(channel);
 
     let mut query = vector_query(vec![1.0, 0.0, 0.0, 0.0], 2);
@@ -933,7 +979,7 @@ async fn recall_capture_samples_text_and_hybrid_with_new_attributes() {
     let recall = RecallCapture::new(1.0, "vector_id", metrics.clone()).with_hook(Arc::new(move |record| {
         records_sink.lock().unwrap().push(record.clone());
     }));
-    let channel = serve_full(&tmp, metrics, Some(recall), None).await;
+    let channel = serve_full(&tmp, metrics, Some(recall)).await;
     let mut client = SearchServiceClient::new(channel);
 
     client
@@ -1285,27 +1331,6 @@ async fn hybrid_request_level_filter_applies_to_both_legs() {
     );
 }
 
-/// A reranker that reverses the candidate order, used to prove the post-fusion seam is exercised.
-struct ReverseReranker;
-
-#[async_trait]
-impl Reranker for ReverseReranker {
-    async fn rerank(&self, _request: &RerankRequest, mut hits: Vec<FusedHit>) -> Result<Vec<FusedHit>, SearchError> {
-        hits.reverse();
-        Ok(hits)
-    }
-}
-
-/// A reranker that always fails, used to prove rerank errors map onto a tonic status.
-struct FailingReranker;
-
-#[async_trait]
-impl Reranker for FailingReranker {
-    async fn rerank(&self, _request: &RerankRequest, _hits: Vec<FusedHit>) -> Result<Vec<FusedHit>, SearchError> {
-        Err(SearchError::internal("reranker model unavailable"))
-    }
-}
-
 /// Builds an identity rerank spec proto, optionally truncating to `top_n`.
 fn identity_rerank(top_n: Option<u64>) -> Option<Rerank> {
     Some(Rerank {
@@ -1314,16 +1339,10 @@ fn identity_rerank(top_n: Option<u64>) -> Option<Rerank> {
 }
 
 #[tokio::test]
-async fn rerank_seam_reorders_only_when_a_spec_is_set() {
+async fn rerank_top_n_truncates_and_absent_top_n_leaves_results_unchanged() {
     let tmp = TempDir::new().unwrap();
     build_test_dataset(&org1_uri(&tmp)).await;
-    let channel = serve_full(
-        &tmp,
-        Arc::new(Metrics::disabled()),
-        None,
-        Some(Arc::new(ReverseReranker)),
-    )
-    .await;
+    let channel = serve(&tmp).await;
     let mut client = SearchServiceClient::new(channel);
 
     let baseline = client
@@ -1332,76 +1351,15 @@ async fn rerank_seam_reorders_only_when_a_spec_is_set() {
             time_range: None,
             version_ref: None,
             target: target("org1"),
-            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 3)),
+            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 4)),
         })
         .await
         .unwrap()
         .into_inner();
     let baseline_ids: Vec<f64> = baseline.results.iter().map(|hit| row_number(&hit.row, "id")).collect();
-    assert_eq!(
-        baseline_ids[0], 1.0,
-        "without a rerank spec the reranker must not run, so order is unchanged"
-    );
+    assert_eq!(baseline_ids.len(), 4, "without a rerank spec no truncation must occur");
 
-    let reranked = client
-        .vector_search(VectorSearchRequest {
-            rerank: identity_rerank(None),
-            time_range: None,
-            version_ref: None,
-            target: target("org1"),
-            query: Some(vector_query(vec![1.0, 0.0, 0.0, 0.0], 3)),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    let reranked_ids: Vec<f64> = reranked.results.iter().map(|hit| row_number(&hit.row, "id")).collect();
-    let mut expected = baseline_ids.clone();
-    expected.reverse();
-    assert_eq!(
-        reranked_ids, expected,
-        "with a spec set the injected reranker must reorder the candidates"
-    );
-}
-
-#[tokio::test]
-async fn rerank_errors_map_to_a_tonic_status() {
-    let tmp = TempDir::new().unwrap();
-    build_test_dataset(&org1_uri(&tmp)).await;
-    let channel = serve_full(
-        &tmp,
-        Arc::new(Metrics::disabled()),
-        None,
-        Some(Arc::new(FailingReranker)),
-    )
-    .await;
-    let mut client = SearchServiceClient::new(channel);
-
-    let status = client
-        .text_search(TextSearchRequest {
-            rerank: identity_rerank(None),
-            time_range: None,
-            version_ref: None,
-            target: target("org1"),
-            query: Some(simple_text_query("lemon", 3)),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(
-        status.code(),
-        Code::Internal,
-        "a reranker error must surface as INTERNAL"
-    );
-    assert!(status.message().contains("reranker model unavailable"));
-}
-
-#[tokio::test]
-async fn default_identity_reranker_truncates_to_top_n() {
-    let tmp = TempDir::new().unwrap();
-    build_test_dataset(&org1_uri(&tmp)).await;
-    let channel = serve(&tmp).await;
-    let mut client = SearchServiceClient::new(channel);
-
-    let response = client
+    let truncated = client
         .vector_search(VectorSearchRequest {
             rerank: identity_rerank(Some(2)),
             time_range: None,
@@ -1412,12 +1370,12 @@ async fn default_identity_reranker_truncates_to_top_n() {
         .await
         .unwrap()
         .into_inner();
+    let truncated_ids: Vec<f64> = truncated.results.iter().map(|hit| row_number(&hit.row, "id")).collect();
     assert_eq!(
-        response.results.len(),
-        2,
-        "the default identity reranker must truncate to top_n while preserving order"
+        truncated_ids,
+        baseline_ids[..2],
+        "an identity rerank spec with top_n must keep the leading candidates in order"
     );
-    assert_eq!(row_number(&response.results[0].row, "id"), 1.0);
 }
 
 #[tokio::test]

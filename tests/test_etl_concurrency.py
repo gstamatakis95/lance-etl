@@ -599,3 +599,25 @@ def test_null_target_ts_is_not_overwritten(ts_config: ETLConfig, telemetry: Tele
     uri: str = dataset_uri(ts_config, *ROUTING_KEY)
     table: pa.Table = lance.dataset(uri).to_table()
     assert table["value"].to_pylist() == [0.0]
+
+
+def test_stale_cross_window_delete_removes_newer_row(ts_config: ETLConfig, telemetry: Telemetry) -> None:
+    """A delete carrying an older timestamp still removes a newer stored row.
+
+    This pins the documented cross-window stale-delete gap (ADR 0034, docs/adr/etl-and-data-model.md).
+    Upserts are guarded by ``source.ts >= target.ts`` so an older update cannot overwrite a newer
+    row, but ``when_matched_delete`` takes no condition parameter in Lance 8.0.0, so a stale delete
+    is not guarded and removes the row regardless of its timestamp. This is the accepted current
+    behavior, not a bug: the test asserts it so any future change to the delete guard is caught.
+
+    Args:
+        ts_config: The timestamp-guarded ETL configuration fixture.
+        telemetry: The telemetry facade fixture.
+    """
+    apply_merge(ts_config, telemetry, ROUTING_KEY, make_ts_group(["k1"], ts_values=[200], value=9.0))
+    upserted, deleted = apply_merge(
+        ts_config, telemetry, ROUTING_KEY, make_ts_group(["k1"], ts_values=[100], op="delete")
+    )
+    assert (upserted, deleted) == (0, 1)
+    uri: str = dataset_uri(ts_config, *ROUTING_KEY)
+    assert lance.dataset(uri).count_rows() == 0

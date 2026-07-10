@@ -5,6 +5,9 @@ Exposes the ``main()`` entry point consumed by the ``lance-etl-maintenance`` scr
 
 ``run`` applies maintenance to a fleet of datasets: per-row TTL expiration (when ``--ttl-column``
 names a per-row TTL column), unified distributed compaction, and version cleanup in that order.
+``--cluster-rewrite`` opts a run into an occasional, operator-triggered full rewrite that reorders
+same-centroid rows into shared fragments before normal compaction (ADR 0041); it requires the
+targeted datasets quiesced (no concurrent ETL writer) and is not exposed on the pipeline CLI.
 
 ``tag`` flips a serving tag (default ``HEAD``) to a target dataset version for blue-green
 promotion.  With no ``--tag-version`` the tag is moved to each dataset's latest version.
@@ -23,12 +26,17 @@ from collections.abc import Sequence
 from lance_etl.cliutil import (
     add_common_arguments,
     add_dataset_arguments,
+    add_ttl_arguments,
     build_spark,
     build_telemetry_config,
     configure_logging_from_args,
     load_dataset_uris,
+    load_uris_or_none,
     parse_storage_options,
+    resolve_exit_code,
+    run_with_spark,
 )
+from lance_etl.fanout import count_failed
 from lance_etl.maintenance.job import MaintenanceConfig, MaintenanceJob
 from lance_etl.maintenance.tools import migrate_manifest_paths, update_serving_tags
 
@@ -59,20 +67,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_common_arguments(run_parser)
     add_dataset_arguments(run_parser)
+    add_ttl_arguments(run_parser)
     run_parser.add_argument(
-        "--ttl-column",
-        default=None,
+        "--cluster-rewrite",
+        action="store_true",
         help=(
-            "Per-row TTL column holding each row's lifetime as an Arrow Duration. When set, rows are expired before "
-            "compaction by the predicate ts-column + ttl-column < now. Absent (the default) turns TTL off."
+            "Opt-in occasional, operator-triggered full rewrite that reorders rows so same-centroid rows share "
+            "fragments (ADR 0041). Subsumes normal compaction for the datasets it rewrites. Non-transactional: "
+            "requires the targeted datasets quiesced, with no concurrent ETL writer, for the duration of the run."
         ),
     )
     run_parser.add_argument(
-        "--ts-column",
-        default="event_timestamp",
+        "--cluster-column",
+        default=None,
         help=(
-            "Event timestamp column used as the TTL clock. Must match ETLConfig.ts_col. Only used when --ttl-column "
-            "is set. Default: event_timestamp."
+            "Explicit vector column to cluster on. Defaults to the single vector-role column stored in the "
+            "dataset's column roles; ambiguous or missing roles skip the dataset back into normal compaction."
+        ),
+    )
+    run_parser.add_argument(
+        "--cluster-serve-tag",
+        action="store_true",
+        help=(
+            "Advance the HEAD serving tag blue-green after a clustered rewrite's vector index rebuild commits. "
+            "Off by default; the pipeline's stamp phase is the normal promotion path."
         ),
     )
 
@@ -106,82 +124,106 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run_run(args: argparse.Namespace) -> None:
+def run_run(args: argparse.Namespace) -> int:
     """Execute the maintenance run subcommand.
 
     Loads dataset URIs, builds the config, and dispatches to
-    :class:`~lance_etl.maintenance.job.MaintenanceJob`.
+    :class:`~lance_etl.maintenance.job.MaintenanceJob`. A single dataset's failure is isolated
+    into an error marker by the fleet phases rather than aborting the run, so this returns the
+    count of failed datasets for the operator alert instead of raising.
 
     Args:
         args: Parsed command-line arguments.
+
+    Returns:
+        The number of datasets that failed in isolation, ``0`` when all succeeded.
     """
     spark = build_spark()
-    uris: list[str] = load_dataset_uris(args, spark)
-    if not uris:
-        logger.info("maintenance run: no datasets in the URI list, nothing to do")
-        spark.stop()
-        return
-    try:
+
+    def work() -> int:
+        """Load the fleet, run maintenance, and return the failed-dataset count."""
+        uris: list[str] | None = load_uris_or_none(args, spark, "maintenance run", logger)
+        if uris is None:
+            return 0
         config: MaintenanceConfig = MaintenanceConfig(
             telemetry=build_telemetry_config(args),
             storage_options=parse_storage_options(args),
             ttl_column=args.ttl_column,
             ts_column=args.ts_column,
+            cluster_rewrite=args.cluster_rewrite,
+            cluster_column=args.cluster_column,
+            cluster_serve_tag=args.cluster_serve_tag,
         )
-        MaintenanceJob(config).run(spark, uris)
-    except Exception:
-        logger.exception("maintenance run failed")
-        raise
-    finally:
-        spark.stop()
+        failed: int = count_failed(MaintenanceJob(config).run(spark, uris))
+        if failed:
+            logger.warning("maintenance run: %d datasets failed and will be retried next run", failed)
+        return failed
+
+    return run_with_spark(spark, "maintenance run", logger, work)
 
 
-def run_tag(args: argparse.Namespace) -> None:
+def run_tag(args: argparse.Namespace) -> int:
     """Execute the serving-tag subcommand.
 
     Flips the configured tag across all selected datasets and logs the safe operational sequence.
+    A single dataset's tag flip failing is isolated into an error marker by the fleet fan-out.
 
     Args:
         args: Parsed command-line arguments.
+
+    Returns:
+        The number of datasets whose tag flip failed in isolation, ``0`` when all succeeded.
     """
     spark = build_spark()
-    try:
-        update_serving_tags(
-            spark,
-            load_dataset_uris(args, spark),
-            build_telemetry_config(args),
-            parse_storage_options(args),
-            tag=args.tag,
-            target_version=args.tag_version,
+
+    def work() -> int:
+        """Flip serving tags across the fleet and return the failed-dataset count."""
+        failed: int = count_failed(
+            update_serving_tags(
+                spark,
+                load_dataset_uris(args, spark),
+                build_telemetry_config(args),
+                parse_storage_options(args),
+                tag=args.tag,
+                target_version=args.tag_version,
+            )
         )
-    except Exception:
-        logger.exception("maintenance tag failed")
-        raise
-    finally:
-        spark.stop()
+        if failed:
+            logger.warning("maintenance tag: %d datasets failed the tag flip", failed)
+        return failed
+
+    return run_with_spark(spark, "maintenance tag", logger, work)
 
 
-def run_migrate_manifests(args: argparse.Namespace) -> None:
+def run_migrate_manifests(args: argparse.Namespace) -> int:
     """Execute the manifest-migration subcommand.
 
-    Migrates every selected dataset to the V2 manifest naming scheme.
+    Migrates every selected dataset to the V2 manifest naming scheme. A single dataset's migration
+    failure is isolated into an error marker by the fleet fan-out.
 
     Args:
         args: Parsed command-line arguments.
+
+    Returns:
+        The number of datasets whose migration failed in isolation, ``0`` when all succeeded.
     """
     spark = build_spark()
-    try:
-        migrate_manifest_paths(
-            spark,
-            load_dataset_uris(args, spark),
-            build_telemetry_config(args),
-            parse_storage_options(args),
+
+    def work() -> int:
+        """Migrate manifest paths across the fleet and return the failed-dataset count."""
+        failed: int = count_failed(
+            migrate_manifest_paths(
+                spark,
+                load_dataset_uris(args, spark),
+                build_telemetry_config(args),
+                parse_storage_options(args),
+            )
         )
-    except Exception:
-        logger.exception("maintenance migrate-manifests failed")
-        raise
-    finally:
-        spark.stop()
+        if failed:
+            logger.warning("maintenance migrate-manifests: %d datasets failed to migrate", failed)
+        return failed
+
+    return run_with_spark(spark, "maintenance migrate-manifests", logger, work)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -191,7 +233,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         argv: Optional argument vector. Defaults to ``sys.argv``.
 
     Returns:
-        A process exit code.
+        A process exit code: ``0`` when every dataset succeeded, ``1`` when the run itself raised
+        an unhandled exception, and :data:`~lance_etl.cliutil.EXIT_PARTIAL_FAILURE` (``3``) when
+        the run completed but one or more datasets failed in isolation and will be retried by the
+        next scheduled run.
     """
     args: argparse.Namespace = build_parser().parse_args(argv)
     configure_logging_from_args(args)
@@ -201,7 +246,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "migrate-manifests": run_migrate_manifests,
     }
     try:
-        runners[args.command](args)
-        return 0
+        return resolve_exit_code(runners[args.command](args))
     except Exception:
         return 1

@@ -7,12 +7,18 @@ use lance_index::scalar::inverted::query::{
 
 use crate::domain::{Fuzziness, SearchError, TextOperator, TextQuery, TextQueryNode};
 
+/// Maximum nesting depth accepted for a domain FTS query tree (mirrors `MAX_FILTER_DEPTH` in
+/// `lance::filter` and `MAX_FTS_DEPTH` in `grpc::convert`). Boost and Boolean nodes recurse, so
+/// this bounds stack usage independently of the depth already enforced when the tree was first
+/// decoded off the wire.
+const MAX_FTS_DEPTH: usize = 32;
+
 /// Builds a Lance [`FullTextSearchQuery`] from a domain text query, including limit, wand factor,
 /// and default-column fill-in.
 ///
 /// `limit` is the number of hits the FTS stage must produce (already including any offset).
 pub fn text_query_to_fts(query: &TextQuery, limit: usize) -> Result<FullTextSearchQuery, SearchError> {
-    let node = node_to_fts(&query.node)?;
+    let node = node_to_fts(&query.node, 0)?;
     let mut fts = FullTextSearchQuery::new_query(node)
         .limit(Some(limit as i64))
         .wand_factor(query.wand_factor);
@@ -24,8 +30,15 @@ pub fn text_query_to_fts(query: &TextQuery, limit: usize) -> Result<FullTextSear
     Ok(fts)
 }
 
-/// Recursively converts a domain query node into a Lance [`FtsQuery`].
-fn node_to_fts(node: &TextQueryNode) -> Result<FtsQuery, SearchError> {
+/// Recursively converts a domain query node into a Lance [`FtsQuery`], tracking nesting depth.
+///
+/// Rejects a tree past [`MAX_FTS_DEPTH`] with `InvalidArgument` instead of recursing unbounded.
+fn node_to_fts(node: &TextQueryNode, depth: usize) -> Result<FtsQuery, SearchError> {
+    if depth > MAX_FTS_DEPTH {
+        return Err(SearchError::invalid_argument(format!(
+            "fts query nesting exceeds the maximum depth of {MAX_FTS_DEPTH}"
+        )));
+    }
     match node {
         TextQueryNode::Match(spec) => {
             if spec.terms.is_empty() {
@@ -56,8 +69,8 @@ fn node_to_fts(node: &TextQueryNode) -> Result<FtsQuery, SearchError> {
             negative,
             negative_boost,
         } => {
-            let positive = node_to_fts(positive)?;
-            let negative = node_to_fts(negative)?;
+            let positive = node_to_fts(positive, depth + 1)?;
+            let negative = node_to_fts(negative, depth + 1)?;
             Ok(FtsQuery::Boost(BoostQuery::new(
                 positive,
                 negative,
@@ -89,17 +102,17 @@ fn node_to_fts(node: &TextQueryNode) -> Result<FtsQuery, SearchError> {
                 ));
             }
             Ok(FtsQuery::Boolean(BooleanQuery {
-                should: nodes_to_fts(should)?,
-                must: nodes_to_fts(must)?,
-                must_not: nodes_to_fts(must_not)?,
+                should: nodes_to_fts(should, depth + 1)?,
+                must: nodes_to_fts(must, depth + 1)?,
+                must_not: nodes_to_fts(must_not, depth + 1)?,
             }))
         }
     }
 }
 
-/// Converts a list of domain query nodes.
-fn nodes_to_fts(nodes: &[TextQueryNode]) -> Result<Vec<FtsQuery>, SearchError> {
-    nodes.iter().map(node_to_fts).collect()
+/// Converts a list of domain query nodes at the given nesting depth.
+fn nodes_to_fts(nodes: &[TextQueryNode], depth: usize) -> Result<Vec<FtsQuery>, SearchError> {
+    nodes.iter().map(|node| node_to_fts(node, depth)).collect()
 }
 
 /// Maps the domain term operator onto the Lance operator.
@@ -151,7 +164,7 @@ mod tests {
             })],
             must_not: Vec::new(),
         };
-        let fts = node_to_fts(&node).unwrap();
+        let fts = node_to_fts(&node, 0).unwrap();
         match fts {
             FtsQuery::Boolean(inner) => {
                 assert_eq!(inner.should.len(), 1);
@@ -170,14 +183,45 @@ mod tests {
 
     #[test]
     fn empty_terms_and_empty_boolean_are_rejected() {
-        let err = node_to_fts(&TextQueryNode::Match(MatchSpec::new(""))).unwrap_err();
+        let err = node_to_fts(&TextQueryNode::Match(MatchSpec::new("")), 0).unwrap_err();
         assert!(matches!(err, SearchError::InvalidArgument(_)));
-        let err = node_to_fts(&TextQueryNode::Boolean {
-            should: Vec::new(),
-            must: Vec::new(),
-            must_not: Vec::new(),
-        })
+        let err = node_to_fts(
+            &TextQueryNode::Boolean {
+                should: Vec::new(),
+                must: Vec::new(),
+                must_not: Vec::new(),
+            },
+            0,
+        )
         .unwrap_err();
         assert!(matches!(err, SearchError::InvalidArgument(_)));
+    }
+
+    /// Wraps `node` in `depth` levels of `Boost`, alternating in a fresh negative leaf each time.
+    fn nest_in_boost(mut node: TextQueryNode, depth: usize) -> TextQueryNode {
+        for _ in 0..depth {
+            node = TextQueryNode::Boost {
+                positive: Box::new(node),
+                negative: Box::new(TextQueryNode::Match(MatchSpec::new("negative"))),
+                negative_boost: 0.5,
+            };
+        }
+        node
+    }
+
+    #[test]
+    fn excessive_nesting_is_rejected() {
+        let deep = nest_in_boost(TextQueryNode::Match(MatchSpec::new("base")), MAX_FTS_DEPTH + 2);
+        let err = node_to_fts(&deep, 0).unwrap_err();
+        assert!(
+            matches!(err, SearchError::InvalidArgument(_)),
+            "deep fts nesting must be rejected"
+        );
+    }
+
+    #[test]
+    fn nesting_within_the_limit_is_accepted() {
+        let within_limit = nest_in_boost(TextQueryNode::Match(MatchSpec::new("base")), MAX_FTS_DEPTH);
+        node_to_fts(&within_limit, 0).unwrap();
     }
 }

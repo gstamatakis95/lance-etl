@@ -10,7 +10,6 @@
 //! - [`fusion`]: hybrid leg fusion strategies (RRF and weighted score fusion).
 //! - [`backend`]: the [`SearchBackend`] trait every engine implements.
 //! - [`intake`]: record-write types and the [`RecordSink`] write seam.
-//! - [`rerank`]: post-fusion reranking types and the [`Reranker`] trait.
 //! - [`prewarm`]: cache prewarming types and the [`Prewarmer`] trait.
 //! - [`clusters`]: IVF centroid introspection types and the [`ClusterReader`] trait.
 //! - [`error`]: the single domain error type shared below the transport.
@@ -23,7 +22,6 @@ pub mod fusion;
 pub mod intake;
 pub mod prewarm;
 pub mod query;
-pub mod rerank;
 pub mod target;
 
 pub use backend::SearchBackend;
@@ -37,5 +35,4 @@ pub use query::{
     DistanceKind, FilterMode, FusedHit, Fuzziness, Hit, HybridQuery, HybridSearchOutcome, MatchSpec, PhraseSpec,
     TextOperator, TextQuery, TextQueryNode, TextSearchOutcome, TimeRange, VectorQuery, VectorSearchOutcome,
 };
-pub use rerank::{IdentityReranker, RerankRequest, RerankSpec, Reranker};
 pub use target::{DatasetRef, DatasetTarget};

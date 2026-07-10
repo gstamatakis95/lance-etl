@@ -1,9 +1,9 @@
 # Indexing — architecture decisions
 
 This document consolidates the decisions behind index construction: the distributed segment
-flows, sidecar-free vector artifacts, role-driven auto-indexing, and the streaming k-means
-bootstrap. Each section keeps its original ADR number so references like "ADR 0030" resolve
-here.
+flows, vector artifact storage, role-driven auto-indexing, the streaming k-means bootstrap, and
+the object-store centroid cache. Each section keeps its original ADR number so references like
+"ADR 0030" resolve here.
 
 ## ADR 0001 — Distributed indexing via the Lance segment API
 
@@ -33,7 +33,8 @@ which would diverge after schema evolution.
 
 ## ADR 0025 — Sidecar-free vector artifacts
 
-Status: Accepted
+Status: Superseded by ADR 0040 (the "centroids are never persisted, no sidecar" stance is
+reversed. The config-KV storage of `rabitq_model` and the `rows_at_train` fingerprint is retained)
 
 Vector artifacts live exclusively in the dataset's own transactional config KV under
 `lance-etl.vector.{column}` — no `.artifacts/` sidecar files, no separate filesystem access, no
@@ -114,3 +115,54 @@ As with BTREE and BITMAP, `create_scalar_index(fragment_ids=)` and `merge_index_
 never used for ZONEMAP — both raise on current lance main. No version gate is needed:
 the repository pins `pylance>=8.0.0`, the first release with the ZONEMAP type and segment
 merging.
+
+## ADR 0040 — Object-store centroid cache for distributed vector builds
+
+Status: Accepted (supersedes ADR 0025's sidecar-free stance, amends ADR 0030, depends on
+lance >= 8.0.0)
+
+The unified indexer previously collected every active vector org's IVF centroids to the driver
+into one fleet-wide `artifacts` dict and broadcast that whole dict to every executor, even though
+each build task needs only its own dataset's centroids. Driver memory scaled with fleet
+composition, the broadcast was recreated every replan round and never `destroy()`ed, and a
+JVM-level executor OOM in that broadcast failed the stage and aborted the whole isolated run. This
+ADR removes the fleet artifact phase entirely. Each vector segment shard resolves its OWN
+dataset's centroids from the already-open, version-pinned handle it builds against.
+
+Centroids are read sidecar-first. `VectorIndexHandler.prepare` calls `load_centroids`, which reads
+a native `lance.indices.IvfModel` single file from an object-store sidecar keyed by the stored
+`rows_at_train` fingerprint. On a hit the shard reuses those centroids without re-opening the
+committed index. On a miss it falls back to `get_ivf_model` on the open handle and backfills the
+sidecar best-effort. The streaming bootstrap (ADR 0030) writes the sidecar once after it commits
+and stores the config, so the steady state is a hit.
+
+Four properties make this safe and cheap:
+
+- **Correctness is independent of the cache.** The `get_ivf_model` fallback always produces the
+  committed centroids, so a missing, partial, or version-incompatible sidecar only costs one index
+  read, never a wrong result. `load_centroids` swallows every read error and returns `None`.
+- **Liveness is independent of the cache.** Every sidecar write — the bootstrap write and the
+  fallback backfill — is best-effort. A write failure is counted and logged, never re-raised, so a
+  read-only object store or a transient error never fails a build. The index is already committed
+  and the rotation plus fingerprint already live in the config KV.
+- **Invalidation is automatic.** The `rows_at_train` fingerprint is part of the sidecar path
+  (`{uri}.artifacts/{index_name}.{rows_at_train}.ivf`), so a retrain writes a new path and a stale
+  generation can never be mistaken for the current one. Reuse and invalidation need no separate
+  bookkeeping.
+- **The sidecar is invisible to discovery.** The `{uri}.artifacts` directory is a sibling of the
+  `.lance` dataset directory whose final path component ends in `.artifacts`, not `.lance`, so
+  `discover_datasets` skips it.
+
+This reverses ADR 0025's "no external state" stance, which was chosen when centroids were only ever
+re-read per run through `get_ivf_model`. The mitigations above address the reasons ADR 0025 avoided
+sidecars: the fallback keeps correctness, the best-effort writes keep liveness, the fingerprint in
+the path makes reuse and invalidation automatic, and orphaned old-generation sidecars are bounded
+by the number of retrains and are tiny centroid files rather than accumulating unbounded state.
+Dropping an index also leaves its sidecar orphaned, because the sidecar lives outside the Lance
+manifest and is reclaimed by neither Lance version cleanup nor the maintenance job. This is the
+same bounded, cosmetic residue as a retrain orphan and does not affect correctness. The
+`rabitq_model` rotation and the `rows_at_train` fingerprint stay in the transactional config KV as
+ADR 0025 defined. Only the centroids move to the sidecar. Per-index failure isolation is preserved
+by the existing per-shard build guard: a vector index whose centroids cannot be resolved now raises
+inside its build shard, is caught as a `"phase": "build"` per-index error, and is excluded from the
+commit phase, replacing the deleted fleet artifact phase's isolation.

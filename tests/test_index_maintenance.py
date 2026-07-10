@@ -23,6 +23,7 @@ from lance_etl.indexing import (
     IndexJobConfig,
     VectorIndexHandler,
     bootstrap_vector_index,
+    centroid_sidecar_uri,
     commit_segments,
     index_delta_count,
     load_vector_config,
@@ -296,12 +297,14 @@ def test_within_growth_factor_reuses_artifacts(dataset_uri: str, telemetry: Tele
 
 
 def test_vector_config_key_is_stored_in_dataset(dataset_uri: str, telemetry: Telemetry) -> None:
-    """After the bootstrap, the vector config key is present in the dataset config KV with no sidecar directory."""
+    """After the bootstrap the vector config key is in the config KV and the centroid sidecar exists."""
     config: IndexJobConfig = maintenance_config()
     bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
     stored: dict[str, str] = lance.dataset(dataset_uri).config()
     assert vector_config_key("vector") in stored
-    assert not Path(f"{dataset_uri}.artifacts").exists()
+    cfg: dict[str, object] | None = load_vector_config(lance.dataset(dataset_uri), "vector")
+    assert cfg is not None
+    assert Path(centroid_sidecar_uri(dataset_uri, "vector_idx", int(cfg["rows_at_train"]))).exists()
 
 
 def test_fts_maintainable_gates(dataset_uri: str) -> None:

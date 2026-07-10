@@ -19,10 +19,12 @@ import pytest
 from conftest import make_vector_table
 from pyspark.sql import SparkSession
 
+import lance_etl.migrate_namespace as migrate_namespace_module
 from lance_etl.indexing import IndexJobConfig, bitmap_index_name
 from lance_etl.migrate_namespace import (
     MigrateConfig,
     NamespaceMigrator,
+    build_dataset_uri,
     source_dataset_uris,
     target_uri_for,
     validate_config,
@@ -100,9 +102,40 @@ class TestValidateConfig:
             validate_config(base_config("/tmp/x", telemetry_config, source_namespace="ns", target_namespace="ns"))
 
     def test_namespace_col_must_be_partition_col(self, telemetry_config: TelemetryConfig) -> None:
-        """The namespace column must be one of the partition columns."""
+        """The fixed "namespace" partition column must be present in partition_cols."""
         with pytest.raises(ValueError, match="not in partition_cols"):
-            validate_config(base_config("/tmp/x", telemetry_config, namespace_col="missing"))
+            validate_config(base_config("/tmp/x", telemetry_config, partition_cols=["org_id", "tenant_id"]))
+
+    @pytest.mark.parametrize("traversal", [".", ".."])
+    def test_target_namespace_rejects_traversal(self, telemetry_config: TelemetryConfig, traversal: str) -> None:
+        """A ``.`` or ``..`` target_namespace is rejected instead of escaping the base_uri tree."""
+        with pytest.raises(ValueError, match="non-traversal"):
+            validate_config(base_config("/tmp/x", telemetry_config, source_namespace="ns", target_namespace=traversal))
+
+    @pytest.mark.parametrize("traversal", [".", ".."])
+    def test_source_namespace_rejects_traversal(self, telemetry_config: TelemetryConfig, traversal: str) -> None:
+        """A ``.`` or ``..`` source_namespace is rejected instead of escaping the base_uri tree."""
+        with pytest.raises(ValueError, match="non-traversal"):
+            validate_config(base_config("/tmp/x", telemetry_config, source_namespace=traversal, target_namespace="ns"))
+
+
+class TestBuildDatasetUri:
+    """build_dataset_uri confines every routing component to a real path segment."""
+
+    def test_rejects_empty_component(self) -> None:
+        """An empty routing component is rejected."""
+        with pytest.raises(ValueError, match="invalid routing component"):
+            build_dataset_uri("/data", ["org1", "", "ns1"])
+
+    @pytest.mark.parametrize("traversal", [".", ".."])
+    def test_rejects_traversal_component(self, traversal: str) -> None:
+        """A ``.`` or ``..`` routing component is rejected instead of escaping the base_uri prefix."""
+        with pytest.raises(ValueError, match="invalid routing component"):
+            build_dataset_uri("/data", ["org1", traversal, "ns1"])
+
+    def test_accepts_normal_components(self) -> None:
+        """Ordinary routing components build the expected dataset URI."""
+        assert build_dataset_uri("/data", ["org1", "tenant1", "ns1"]) == "/data/org1/tenant1/ns1.lance"
 
 
 class TestPathHelpers:
@@ -167,12 +200,14 @@ class TestEndToEnd:
         assert target_ids == list(range(15))
 
     def test_large_tier_distributed_copy_matches_rows(
-        self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
+        self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A multi-fragment dataset copied through the distributed large tier keeps all rows."""
+        monkeypatch.setattr(migrate_namespace_module, "LARGE_DATASET_FRAGMENT_THRESHOLD", 1)
+        monkeypatch.setattr(migrate_namespace_module, "NUM_SHARDS", 3)
         base: str = str(tmp_path)
         write_source_dataset(base, ["org1", "tenant1", "nsA"], rows=40, max_rows_per_file=8)
-        config: MigrateConfig = base_config(base, telemetry_config, large_dataset_fragment_threshold=1, num_shards=3)
+        config: MigrateConfig = base_config(base, telemetry_config)
 
         NamespaceMigrator(config).run(spark)
 
@@ -180,12 +215,13 @@ class TestEndToEnd:
         assert target_ids == list(range(40))
 
     def test_recompact_reduces_fragments(
-        self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
+        self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """With recompact on, a target written as many fragments ends compacted to one."""
+        """With recompact on, a target copied through the large tier as many fragments ends compacted to one."""
+        monkeypatch.setattr(migrate_namespace_module, "LARGE_DATASET_FRAGMENT_THRESHOLD", 1)
         base: str = str(tmp_path)
-        write_source_dataset(base, ["org1", "tenant1", "nsA"], rows=40)
-        config: MigrateConfig = base_config(base, telemetry_config, recompact=True, max_rows_per_file=5)
+        write_source_dataset(base, ["org1", "tenant1", "nsA"], rows=40, max_rows_per_file=5)
+        config: MigrateConfig = base_config(base, telemetry_config, recompact=True)
 
         report = NamespaceMigrator(config).run(spark)
 

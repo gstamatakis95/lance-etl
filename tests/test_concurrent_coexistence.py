@@ -82,6 +82,7 @@ from conftest import compact_dataset_inline
 from lance.optimize import Compaction, CompactionTask
 
 import lance_etl.indexing.segments as indexing_segments
+import lance_etl.maintenance.job as maintenance_job
 from lance_etl.etl import ETLConfig, apply_merge, dataset_uri
 from lance_etl.indexing import (
     BTreeIndexHandler,
@@ -99,13 +100,13 @@ from lance_etl.indexing import (
     optimize_existing_index,
     plan_dataset_indexes,
     publish_fts_index,
-    resolve_vector_artifacts,
     scalar_index_name,
     serialize_segment,
     shard_count,
     split_evenly,
     vector_index_name,
 )
+from lance_etl.indexing.config import MAX_STALE_REPLANS
 from lance_etl.maintenance import MaintenanceConfig, cleanup_dataset, commit_one_dataset
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
@@ -322,8 +323,8 @@ def compact_head_with_replan(uri: str, config: MaintenanceConfig, telemetry: Tel
     Mirrors :meth:`MaintenanceJob.run` for one dataset without Spark: the rewrite tasks execute
     in process and the commit goes through the production :func:`commit_one_dataset` with its
     deliberately small manifest-race budget. A semantic commit conflict triggers a re-plan at
-    the latest version instead of a re-commit, up to the configured ``replan_budget``, after
-    which the dataset is skipped for this sweep.
+    the latest version instead of a re-commit, up to :data:`~lance_etl.maintenance.job.REPLAN_BUDGET`
+    rounds, after which the dataset is skipped for this sweep.
 
     Args:
         uri: Dataset URI.
@@ -335,7 +336,7 @@ def compact_head_with_replan(uri: str, config: MaintenanceConfig, telemetry: Tel
         re-plan cycle conflicted.
     """
     cycles: int = 0
-    while cycles < config.replan_budget:
+    while cycles < maintenance_job.REPLAN_BUDGET:
         cycles += 1
         dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
         plan = Compaction.plan(dataset, options=config.execute_options())
@@ -422,7 +423,7 @@ def build_segment_index(uri: str, handler: IndexHandler, config: IndexJobConfig,
             documents.append(serialize_segment(handler.build_segment(shard, list(group), artifacts)))
         return documents
 
-    for attempt in range(config.max_stale_replans):
+    for attempt in range(MAX_STALE_REPLANS):
         del attempt
         current: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
         targets: list[int] = handler.target_fragments(current)
@@ -450,8 +451,8 @@ def index_tail_dataset(uri: str, config: IndexJobConfig, telemetry: Telemetry) -
     """Index one tail dataset through the unified plan-build-commit functions, fully in process.
 
     Mirrors :meth:`LanceIndexer.run` for a single dataset without Spark: the plan phase resolves
-    targets and shards, vector artifacts resolve through the production reuse-or-train path, each
-    shard builds through :func:`lance_etl.indexing.build_one_shard`, and every index publishes
+    targets and shards, each shard builds through :func:`lance_etl.indexing.build_one_shard` (a
+    vector shard resolving its own centroids sidecar-first, ADR 0040), and every index publishes
     through :func:`lance_etl.indexing.commit_one_index`.
 
     Args:
@@ -462,19 +463,14 @@ def index_tail_dataset(uri: str, config: IndexJobConfig, telemetry: Telemetry) -
     plan: dict[str, object] = plan_dataset_indexes(uri, config, telemetry)
     if "skipped" in plan:
         return
-    artifacts: dict[tuple[str, str], tuple] = {}
-    for spec in plan["specs"]:
-        if spec["kind"] == "vector" and spec["mode"] == "segments":
-            _, _, artifact, _, _ = resolve_vector_artifacts(uri, spec["column"], spec["index_name"], config)
-            artifacts[(uri, spec["column"])] = artifact
     for spec in plan["specs"]:
         base: dict[str, object] = {**spec, "uri": uri, "version": plan["version"]}
         if not spec["shards"]:
-            build_one_shard({**base, "shard": []}, artifacts, config, telemetry)
+            build_one_shard({**base, "shard": []}, config, telemetry)
             continue
         payloads: list[dict[str, object]] = []
         for shard in spec["shards"]:
-            _, _, payload = build_one_shard({**base, "shard": list(shard)}, artifacts, config, telemetry)
+            _, _, payload = build_one_shard({**base, "shard": list(shard)}, config, telemetry)
             payloads.append(payload)
         commit_one_index(uri, spec, payloads, config, telemetry)
 
@@ -665,7 +661,9 @@ def assert_full_index_coverage(uri: str, required_names: set[str]) -> None:
         "pylance 8.0.0 wheel regression: concurrent merge_insert against a dataset carrying BTREE "
         "index deltas raises the internal error 'RowAddrTreeMap::from_sorted_iter called with "
         "non-sorted input' (lance-index scalar/btree/flat.rs via merge_insert.rs). The failure is "
-        "loud (the merge errors, no silent corruption). Remove this marker once an upstream fix ships."
+        "loud (the merge errors, no silent corruption). The fix is expected in pylance 9: upstream "
+        "PRs #7429, #7480, and #7484 rework the indexed-scan merge path. Remove this marker once "
+        "that upstream fix ships."
     ),
     strict=False,
 )
@@ -695,6 +693,7 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
         original_incr(self, name, value, tags)
 
     monkeypatch.setattr(Telemetry, "incr", counting_incr)
+    monkeypatch.setattr(maintenance_job, "REPLAN_BUDGET", 4)
 
     telemetry_config: TelemetryConfig = TelemetryConfig(service="coexistence-test", env="test")
     telemetry: Telemetry = Telemetry.create(telemetry_config, attach_lance_bridge=False)
@@ -710,7 +709,6 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
         target_rows_per_fragment=HEAD_TARGET_ROWS_PER_FRAGMENT,
         commit_backoff_seconds=0.05,
         large_commit_retries=2,
-        replan_budget=4,
     )
     tail_compaction_config: MaintenanceConfig = MaintenanceConfig(
         telemetry=telemetry_config,
@@ -939,7 +937,7 @@ def deterministic_vector(identifier: int, dim: int) -> list[float]:
     return [generator.random() for _ in range(dim)]
 
 
-def make_vector_table(start: int, count: int, dim: int) -> pa.Table:
+def make_vector_range_table(start: int, count: int, dim: int) -> pa.Table:
     """Build a contiguous block of id and vector rows.
 
     Args:
@@ -967,8 +965,8 @@ def write_two_fragment_dataset(uri: str) -> None:
     Args:
         uri: Dataset URI.
     """
-    lance.write_dataset(make_vector_table(0, 300, DIM), uri, mode="create", max_rows_per_file=1_000_000)
-    lance.write_dataset(make_vector_table(300, 200, DIM), uri, mode="append", max_rows_per_file=1_000_000)
+    lance.write_dataset(make_vector_range_table(0, 300, DIM), uri, mode="create", max_rows_per_file=1_000_000)
+    lance.write_dataset(make_vector_range_table(300, 200, DIM), uri, mode="append", max_rows_per_file=1_000_000)
 
 
 def racing_compaction_commit(

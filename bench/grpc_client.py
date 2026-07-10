@@ -178,17 +178,39 @@ def text_query(pb2: ModuleType, terms: str, k: int, projection: tuple[str, ...] 
 def result_vector_ids(results: Any) -> np.ndarray:
     """Extract the ``vector_id`` column from search results as global int ids.
 
+    Every call site projects ``vector_id`` explicitly (see the default ``projection`` of
+    :func:`vector_query` and :func:`text_query`), so every result row is expected to carry it as
+    the ``string_value`` oneof. A row missing that field, or carrying it under a different oneof,
+    means the server's schema or wire encoding drifted from what the benchmark assumes. Dropping
+    such rows silently would shrink the retrieved-id list and deflate recall, FTS, and hybrid
+    numbers without ever raising, so this helper fails loud instead.
+
     Args:
         results: The repeated result messages, each carrying a ``row`` struct.
 
     Returns:
-        An int64 array of global vector ids in result order.
+        An int64 array of global vector ids in result order, one entry per input result.
+
+    Raises:
+        ValueError: If any result is missing ``vector_id`` or carries it as something other than
+            the ``string_value`` oneof.
     """
     ids: list[int] = []
+    malformed: list[str] = []
+    total: int = 0
     for result in results:
         field = result.row.fields.get("vector_id")
-        if field is not None and field.WhichOneof("kind") == "string_value":
+        kind: str | None = field.WhichOneof("kind") if field is not None else None
+        if kind == "string_value":
             ids.append(int(field.string_value))
+        else:
+            malformed.append(f"result[{total}] vector_id kind={kind!r}")
+        total += 1
+    if malformed:
+        raise ValueError(
+            f"{len(malformed)} of {total} results carried a missing or mistyped vector_id "
+            f"(expected the string_value oneof); offenders: {malformed[:5]}"
+        )
     return np.asarray(ids, dtype=np.int64)
 
 

@@ -1,17 +1,14 @@
 """Indexing job package: distributed vector, scalar, and full-text index builds for Lance datasets.
 
-Re-exports the public API so callers can write
+Re-exports the consumer API so callers can write
 ``from lance_etl.indexing import LanceIndexer, IndexJobConfig``.
 """
 
 from __future__ import annotations
 
 from lance_etl.indexing.config import (
-    FTS_OPTIONAL_PARAMS,
-    METRIC_TO_DISTANCE,
     IndexJobConfig,
     bitmap_index_name,
-    config_reusable,
     degrade_num_partitions,
     derive_num_partitions,
     fts_index_name,
@@ -27,14 +24,13 @@ from lance_etl.indexing.handlers import (
     IndexHandler,
     VectorIndexHandler,
     ZonemapIndexHandler,
-    commit_fts_index,
     publish_fts_index,
 )
 from lance_etl.indexing.optimize import (
-    drop_existing_index,
+    centroid_sidecar_uri,
     index_delta_count,
+    load_centroids,
     load_vector_config,
-    maintain_index_locally,
     merge_index_deltas,
     optimize_existing_index,
     write_vector_config,
@@ -44,34 +40,20 @@ from lance_etl.indexing.runner import (
     bootstrap_vector_index,
     build_one_shard,
     commit_one_index,
-    index_skip_reason,
     merge_deltas_if_needed,
     plan_dataset_indexes,
     resolve_index_targets,
-    resolve_vector_artifacts,
     shard_count,
 )
 from lance_etl.indexing.segments import (
-    STALE_FRAGMENT_MARKERS,
-    all_fragment_ids,
-    build_scalar_segment,
-    build_vector_segment,
-    centroids_from_ipc,
-    centroids_to_ipc,
-    commit_index_with_retries,
     commit_segments,
-    deserialize_segment,
     is_stale_fragment_error,
     lance_field_id,
-    live_fragment_ids,
     serialize_segment,
     split_evenly,
 )
 
 __all__ = [
-    "FTS_OPTIONAL_PARAMS",
-    "METRIC_TO_DISTANCE",
-    "STALE_FRAGMENT_MARKERS",
     "IndexJobConfig",
     "IndexHandler",
     "VectorIndexHandler",
@@ -81,7 +63,6 @@ __all__ = [
     "FtsIndexHandler",
     "LanceIndexer",
     "bitmap_index_name",
-    "config_reusable",
     "degrade_num_partitions",
     "derive_num_partitions",
     "fts_index_name",
@@ -89,35 +70,24 @@ __all__ = [
     "vector_config_key",
     "vector_index_name",
     "zonemap_index_name",
-    "drop_existing_index",
+    "centroid_sidecar_uri",
     "index_delta_count",
+    "load_centroids",
     "load_vector_config",
-    "maintain_index_locally",
     "merge_index_deltas",
     "optimize_existing_index",
     "write_vector_config",
     "bootstrap_vector_index",
     "build_one_shard",
-    "commit_fts_index",
     "commit_one_index",
-    "index_skip_reason",
     "merge_deltas_if_needed",
     "plan_dataset_indexes",
     "resolve_index_targets",
-    "resolve_vector_artifacts",
     "publish_fts_index",
     "shard_count",
-    "all_fragment_ids",
-    "build_scalar_segment",
-    "build_vector_segment",
-    "centroids_from_ipc",
-    "centroids_to_ipc",
-    "commit_index_with_retries",
     "commit_segments",
-    "deserialize_segment",
     "is_stale_fragment_error",
     "lance_field_id",
-    "live_fragment_ids",
     "serialize_segment",
     "split_evenly",
 ]

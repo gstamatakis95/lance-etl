@@ -138,7 +138,7 @@ Source files: `src/grpc/mod.rs`, `src/lance/backend.rs`, `src/lance/provider.rs`
 
 | Span name | Created by | What it covers | Key attributes | Parent |
 |-----------|------------|----------------|----------------|--------|
-| *(server span, name set by OtelGrpcLayer to the gRPC method path)* | `OtelGrpcLayer` tower middleware | The entire lifetime of one gRPC request, from wire receipt to response flush | `rpc.method`, `rpc.service`, `rpc.grpc.status_code` (set by `record_outcome`), `org_id`, `tenant_id`, `namespace` (set by `annotate_request_span`), `search.k` (set per RPC handler), `search.hybrid` (HybridSearch only), `rerank.candidates` (when a rerank spec is present), `prewarm.index_count` + `prewarm.resolved_version` (Prewarm only), `clusters.count` (Clusters only), `recall.*` attributes (sampled requests) | None (root of the trace or child of the inbound traceparent) |
+| *(server span, name set by OtelGrpcLayer to the gRPC method path)* | `OtelGrpcLayer` tower middleware | The entire lifetime of one gRPC request, from wire receipt to response flush | `rpc.method`, `rpc.service`, `rpc.grpc.status_code` (set by `record_outcome`), `org_id`, `tenant_id`, `namespace` (set by `annotate_request_span`), `search.k` (set per RPC handler), `search.hybrid` (HybridSearch only), `prewarm.index_count` + `prewarm.resolved_version` (Prewarm only), `clusters.count` (Clusters only), `recall.*` attributes (sampled requests) | None (root of the trace or child of the inbound traceparent) |
 | `backend.vector_search` | `#[tracing::instrument]` on `LanceSearchBackend::vector_search` | Lance vector ANN query lifecycle: dataset resolution plus query execution | `org_id`, `search.k` | Server span |
 | `backend.text_search` | `#[tracing::instrument]` on `LanceSearchBackend::text_search` | Lance full-text query lifecycle: dataset resolution plus query execution | `org_id`, `search.k` | Server span |
 | `backend.hybrid_search` | `#[tracing::instrument]` on `LanceSearchBackend::hybrid_search` | Concurrent vector and text query legs plus fusion | `org_id`, `search.k` | Server span |
@@ -285,9 +285,9 @@ A precise GET/HEAD/LIST breakdown is not exposed through this path.
 Source: `rust/search-api/src/telemetry/recall.rs`.
 
 A deterministic, allocation-free sampler selects a fraction of `VectorSearch`, `TextSearch`, and
-`HybridSearch` requests for recall capture. The fraction is set by `SEARCH_API_RECALL_SAMPLE_RATE`
-(default 0, meaning disabled). Each query type has its own independent counter so the three streams
-sample independently.
+`HybridSearch` requests for recall capture. The fraction is fixed by the `DEFAULT_RECALL_SAMPLE_RATE`
+constant in `rust/search-api/src/config.rs` (0.0, meaning disabled), no longer env-configurable. Each
+query type has its own independent counter so the three streams sample independently.
 
 When a request is sampled, the following flat set of attributes is attached to the current server
 span (the `OtelGrpcLayer` span at the root of the trace) after the results are served. Attributes
@@ -377,8 +377,6 @@ capture throughput without storing any query content.
 | `search_api.prewarm.warmed_bytes` | distribution | (none) | Cache bytes resident after prewarm |
 | `search_api.prewarm.last_version` | gauge | (none) | Most recently prewarmed dataset version |
 | `search_api.recall.samples` | counter | `query_type`, `filtered` | Recall capture throughput |
-| `search_api.rerank.duration_ms` | distribution | `rpc` | Post-fusion reranker latency |
-| `search_api.rerank.candidates` | distribution | `rpc` | Candidate count fed to the reranker |
 | `search_api.clusters.read.duration_ms` | distribution | (none) | Clusters centroid-read latency |
 | `search_api.clusters.centroids` | distribution | (none) | Centroid count returned |
 

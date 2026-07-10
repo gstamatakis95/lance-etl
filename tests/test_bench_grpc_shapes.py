@@ -198,3 +198,24 @@ class TestResultParsing:
         ids: np.ndarray = result_vector_ids(results)
         assert ids.tolist() == [7, 11]
         assert ids.dtype == np.int64
+
+    def test_result_vector_ids_missing_field_raises(self, pb2: ModuleType) -> None:
+        """A result row missing vector_id raises instead of being silently dropped."""
+        row_ok = struct_pb2.Struct()
+        row_ok.fields["vector_id"].string_value = "7"
+        row_missing = struct_pb2.Struct()
+        row_missing.fields["other_column"].string_value = "unused"
+        results: list[Any] = [
+            pb2.VectorSearchResult(row=row_ok, distance=0.1),
+            pb2.VectorSearchResult(row=row_missing, distance=0.2),
+        ]
+        with pytest.raises(ValueError, match="vector_id"):
+            result_vector_ids(results)
+
+    def test_result_vector_ids_mistyped_field_raises(self, pb2: ModuleType) -> None:
+        """A vector_id carried under a non-string oneof (e.g. server-side type drift) raises."""
+        row = struct_pb2.Struct()
+        row.fields["vector_id"].number_value = 7
+        results: list[Any] = [pb2.VectorSearchResult(row=row, distance=0.1)]
+        with pytest.raises(ValueError, match="vector_id"):
+            result_vector_ids(results)

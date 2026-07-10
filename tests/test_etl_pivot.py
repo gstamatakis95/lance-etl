@@ -39,6 +39,7 @@ import lance_etl.etl.pivot as pivot_module
 from lance_etl.cliutil import SPARK_CONF_DEFAULTS
 from lance_etl.etl import ETLConfig, IcebergToLanceETL, dataset_uri
 from lance_etl.etl.pivot import ROUTING_COLS, group_by_routing
+from lance_etl.etl.plan import RoutingPlan, compute_routing_plan
 from lance_etl.telemetry import TelemetryConfig
 
 DIMENSION: int = 8
@@ -317,7 +318,7 @@ class TestGroupByRouting:
 
 
 class TestShuffleWidth:
-    """route_batch honors an explicit partition count and AQE-sizes when the count is None.
+    """route_increment honors an explicit num_partitions and otherwise follows the planned width.
 
     Both width assertions toggle AQE off for the measurement because ``DataFrame.rdd`` under
     adaptive execution reports the post-coalesce count, which would make the expected widths
@@ -325,7 +326,7 @@ class TestShuffleWidth:
     """
 
     def routed_partitions(self, spark: SparkSession, config: ETLConfig) -> int:
-        """Build a small increment, route it, and count its shuffle partitions without AQE.
+        """Build a small increment, plan and route it, and count its shuffle partitions without AQE.
 
         Args:
             spark: The module-scoped local Spark session.
@@ -340,7 +341,8 @@ class TestShuffleWidth:
         original: str = str(spark.conf.get("spark.sql.adaptive.enabled"))
         spark.conf.set("spark.sql.adaptive.enabled", "false")
         try:
-            return IcebergToLanceETL(config).route_batch(frame).rdd.getNumPartitions()
+            plan: RoutingPlan = compute_routing_plan(frame, config)
+            return IcebergToLanceETL(config).route_increment(frame, plan).rdd.getNumPartitions()
         finally:
             spark.conf.set("spark.sql.adaptive.enabled", original)
 
@@ -351,13 +353,13 @@ class TestShuffleWidth:
         config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config, num_partitions=2)
         assert self.routed_partitions(spark, config) == 2
 
-    def test_default_none_follows_session_shuffle_width(
+    def test_default_plan_sizes_a_tiny_increment_to_one_partition(
         self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
     ) -> None:
-        """num_partitions=None omits the explicit count, deferring to the session's shuffle sizing."""
+        """num_partitions=None lets the plan size the shuffle; a tiny single-trio increment gets one partition."""
         config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config)
         assert config.num_partitions is None
-        assert self.routed_partitions(spark, config) == int(spark.conf.get("spark.sql.shuffle.partitions"))
+        assert self.routed_partitions(spark, config) == 1
 
     def test_conf_defaults_seed_a_wide_initial_partition_count(self) -> None:
         """SPARK_CONF_DEFAULTS carries the high AQE initial partition count coalescing shrinks from."""
@@ -538,8 +540,8 @@ class TestCollapseGuarantee:
         assert dataset.count_rows() == 10
 
 
-class TestSparkBatches:
-    """spark_batches splits the increment into key-hash batches without changing the merged result."""
+class TestSaltedEquivalence:
+    """Salting a big dataset across key-hash sub-buckets yields the same merged result as no salt."""
 
     def nullable_routing_schema(self) -> StructType:
         """Return the pivot source schema with nullable routing columns.
@@ -580,15 +582,18 @@ class TestSparkBatches:
         rows.append(("vnull", None, "t1", "n1", TS, TS, "insert", None, {"text": "dropped"}, {}))
         return rows
 
-    def test_batched_run_matches_single_pass(
+    def test_salted_run_matches_unsalted(
         self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
     ) -> None:
-        """spark_batches=3 produces datasets identical to the single-pass run.
+        """A salted run produces datasets identical to an unsalted run over the same input.
 
-        Covers the order-safety invariant of the split: the duplicate key collapses to its newest
-        row even though the increment is processed as three separate Spark jobs, because the
-        key-hash bucketing puts both duplicate events in the same batch. The null-routing row is
-        dropped by the Spark-level filter in both runs.
+        The salted config picks a ``bucket_rows`` small enough that both orgs exceed it, so the
+        plan fans each dataset across up to ``max_buckets_per_dataset`` key-hash sub-buckets. The
+        unsalted config keeps the default multi-million ``bucket_rows`` so no dataset is big and
+        the shuffle carries no salt. Because the salt is a pure function of the merge key, every
+        row of a key lands in one partition, so both runs write the same rows and the same
+        last-write-wins winner per key. The null-routing row is dropped by the Spark-level filter
+        in both runs.
 
         Args:
             spark: The module-scoped local Spark session.
@@ -596,46 +601,44 @@ class TestSparkBatches:
             telemetry_config: The test telemetry configuration.
         """
         frame = spark.createDataFrame(self.make_rows(), self.nullable_routing_schema())
-        batched_config: ETLConfig = ETLConfig(
-            base_uri=str(tmp_path / "batched"),
+        salted_config: ETLConfig = ETLConfig(
+            base_uri=str(tmp_path / "salted"),
             telemetry=telemetry_config,
             num_partitions=2,
-            spark_batches=3,
+            bucket_rows=5,
+            max_buckets_per_dataset=4,
         )
-        single_config: ETLConfig = ETLConfig(
-            base_uri=str(tmp_path / "single"),
+        unsalted_config: ETLConfig = ETLConfig(
+            base_uri=str(tmp_path / "unsalted"),
             telemetry=telemetry_config,
             num_partitions=2,
-            spark_batches=1,
         )
-        IcebergToLanceETL(batched_config).run_on_dataframe(frame)
-        IcebergToLanceETL(single_config).run_on_dataframe(frame)
+        IcebergToLanceETL(salted_config).run_on_dataframe(frame)
+        IcebergToLanceETL(unsalted_config).run_on_dataframe(frame)
 
         for org, expected_rows in (("o1", 24), ("o2", 8)):
-            batched: pa.Table = (
-                lance.dataset(dataset_uri(batched_config, org, "t1", "n1")).to_table().sort_by("vector_id")
+            salted: pa.Table = (
+                lance.dataset(dataset_uri(salted_config, org, "t1", "n1")).to_table().sort_by("vector_id")
             )
-            single: pa.Table = (
-                lance.dataset(dataset_uri(single_config, org, "t1", "n1")).to_table().sort_by("vector_id")
+            unsalted: pa.Table = (
+                lance.dataset(dataset_uri(unsalted_config, org, "t1", "n1")).to_table().sort_by("vector_id")
             )
-            assert batched.num_rows == expected_rows
-            assert sorted(batched.schema.names) == sorted(single.schema.names)
-            ordered_names: list[str] = sorted(batched.schema.names)
-            assert batched.select(ordered_names).equals(single.select(ordered_names))
+            assert salted.num_rows == expected_rows
+            assert sorted(salted.schema.names) == sorted(unsalted.schema.names)
+            ordered_names: list[str] = sorted(salted.schema.names)
+            assert salted.select(ordered_names).equals(unsalted.select(ordered_names))
 
-        o1_table: pa.Table = lance.dataset(dataset_uri(batched_config, "o1", "t1", "n1")).to_table()
+        o1_table: pa.Table = lance.dataset(dataset_uri(salted_config, "o1", "t1", "n1")).to_table()
         text_by_id: dict[str, str | None] = dict(
             zip(o1_table["vector_id"].to_pylist(), o1_table["text"].to_pylist(), strict=True)
         )
         assert text_by_id["v01"] == "word1", "the stale duplicate must lose to the newer event"
         assert "vnull" not in text_by_id
 
-    def test_select_batch_partitions_all_rows_exactly_once(
+    def test_plan_identifies_the_big_dataset(
         self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
     ) -> None:
-        """The key-hash buckets are disjoint and their union covers every input row.
-
-        Also verifies that batch_count=1 returns the source plan unchanged.
+        """compute_routing_plan flags the org that exceeds bucket_rows and salts it across sub-buckets.
 
         Args:
             spark: The module-scoped local Spark session.
@@ -643,17 +646,17 @@ class TestSparkBatches:
             telemetry_config: The test telemetry configuration.
         """
         frame = spark.createDataFrame(self.make_rows(), self.nullable_routing_schema())
-        config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config)
-        etl: IcebergToLanceETL = IcebergToLanceETL(config)
-        assert etl.select_batch(frame, 0, 1) is frame
+        config: ETLConfig = ETLConfig(
+            base_uri=str(tmp_path),
+            telemetry=telemetry_config,
+            bucket_rows=5,
+            max_buckets_per_dataset=4,
+        )
+        plan: RoutingPlan = compute_routing_plan(frame, config)
 
-        batch_count: int = 4
-        batch_sizes: list[int] = [etl.select_batch(frame, index, batch_count).count() for index in range(batch_count)]
-        assert sum(batch_sizes) == frame.count()
-
-        duplicated_key_batches: list[int] = [
-            etl.select_batch(frame, index, batch_count).where("vector_id = 'v01'").count()
-            for index in range(batch_count)
-        ]
-        assert sorted(duplicated_key_batches)[-1] == 2, "both events for a duplicated key must share one batch"
-        assert sum(duplicated_key_batches) == 2
+        assert plan.trio_count == 2
+        assert plan.total_rows == 33
+        assert plan.null_routing_rows == 1
+        big: dict[tuple[str, str, str], int] = {(o, t, n): k for (o, t, n, k) in plan.big_trios}
+        assert big[("o1", "t1", "n1")] == 4
+        assert big[("o2", "t1", "n1")] == 2

@@ -16,20 +16,24 @@ import numpy as np
 import pytest
 
 import bench.e2e as bench_e2e
-from bench.config import BenchConfig
+from bench.config import RECALL_CUTOFFS, BenchConfig
 from bench.groundtruth import brute_force_topk, brute_force_topk_scored, merge_topk_partials
 
 
 def alignment_config(tmp_path_str: str) -> BenchConfig:
     """Build a single-tenant bench configuration for the alignment test.
 
+    ``search_k`` covers the deepest :data:`RECALL_CUTOFFS` depth so ``BenchConfig`` construction
+    passes its own validation. The stubbed search in this module ignores the ``k`` argument
+    entirely, so the exact value carries no bearing on what is asserted here.
+
     Args:
         tmp_path_str: Workspace directory for the config.
 
     Returns:
-        A configuration with one org and ``search_k`` of 3.
+        A configuration with one org and a ``search_k`` covering every recall cutoff.
     """
-    return BenchConfig(command="e2e", workspace=tmp_path_str, tenants=1, search_k=3)
+    return BenchConfig(command="e2e", workspace=tmp_path_str, tenants=1, search_k=max(RECALL_CUTOFFS))
 
 
 class TestOrgRecallAlignment:

@@ -12,41 +12,59 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import timedelta
 from typing import Any
 
 import pyarrow as pa
 import pyarrow.compute as pc
 
 from lance_etl.column_roles import SCALAR_ROLE, TEXT_ROLE, VECTOR_ROLE
-from lance_etl.telemetry import DEFAULT_CONFLICT_RETRIES, DEFAULT_RETRY_TIMEOUT, TelemetryConfig
+from lance_etl.telemetry import DEFAULT_CONFLICT_RETRIES, TelemetryConfig
 
 ROUTING_COLS: tuple[str, str, str] = ("org_id", "tenant_id", "namespace")
 """Fixed routing columns per the source contract in docs/iceberg-source-table.sql."""
+
+KEY_COL: str = "vector_id"
+"""Unique vector id column and per-dataset merge key, per the source contract."""
+
+OP_COL: str = "op"
+"""Operation column carrying insert, update, or delete, per the source contract."""
+
+DELETE_OP_VALUES: list[str] = ["delete", "DELETE", "d"]
+"""Operation values treated as deletes, per the source contract.
+
+Kept as a ``list`` rather than a ``tuple`` because :meth:`pyspark.sql.Column.isin` only unpacks a
+single ``list`` or ``set`` argument, not a tuple.
+"""
+
+TTL_COL: str = "ttl"
+"""Optional per-row lifetime column (BIGINT seconds). Cast to ``pa.duration("s")`` when present."""
 
 
 @dataclass
 class ETLConfig:
     """Configuration for :class:`lance_etl.etl.job.IcebergToLanceETL`.
 
+    The schema-contract columns (:data:`KEY_COL`, :data:`OP_COL`, :data:`DELETE_OP_VALUES`,
+    :data:`TTL_COL`) and the operational constants (``MAX_SHUFFLE_PARTITIONS`` in
+    :mod:`lance_etl.etl.plan`, ``MAX_BULK_TASKS_PER_DATASET`` and ``DATA_STORAGE_VERSION`` in
+    :mod:`lance_etl.etl.bulk` and :mod:`lance_etl.etl.sink`) are fixed module-level constants, not
+    fields, because they are never varied.
+
     Attributes:
         base_uri: Root location under which per-tenant datasets live.
         telemetry: Telemetry configuration.
-        key_col: Unique vector id column and per-dataset merge key.
         ts_col: Source event timestamp — single canonical clock for collapse and range queries.
-        op_col: Operation column carrying insert, update, or delete.
-        delete_op_values: Operation values treated as deletes.
-        ttl_col: Optional per-row lifetime column (BIGINT seconds). Cast to ``pa.duration("s")`` when present.
         storage_options: Object-store options forwarded to pylance.
-        num_partitions: Shuffle partitions for routing co-location. ``None`` (the default)
-            omits the explicit count so Spark AQE sizes the routing shuffle by bytes
-            (``advisoryPartitionSizeInBytes``, seeded from
-            ``coalescePartitions.initialPartitionNum`` and coalesced down), which scales the
-            task count with the increment instead of pinning it. AQE coalescing merges whole
-            hash buckets and never splits one, so every routing key still lands in exactly one
-            partition. An explicit integer keeps a fixed-width shuffle.
+        num_partitions: Manual override of the adaptive routing-shuffle width. ``None`` (the
+            default) lets :func:`lance_etl.etl.plan.compute_routing_plan` size the shuffle by both
+            rows and trio count. An explicit integer pins a fixed-width shuffle.
+        bucket_rows: Target rows per merge-writer sub-bucket and per shuffle task; the unit sizing
+            both K (buckets per big dataset) and N (shuffle partitions).
+        max_buckets_per_dataset: Cap on concurrent merge writers per dataset, bounding
+            commit-conflict retries and BTREE-delta contention risk.
+        datasets_per_task: Partition-floor divisor keeping per-dataset commit fixed cost (~1-2s)
+            to roughly 1-2 minutes per task at fleet scale.
         conflict_retries: Retry budget for concurrent merge commits.
-        retry_timeout: Total time budget for conflict retries.
         iceberg_read_options: Extra Iceberg reader options merged into the read.
         window_start: ISO-8601 inclusive lower bound for the window pushdown filter. Open when absent.
         window_end: ISO-8601 exclusive upper bound for the window pushdown filter. Open when absent.
@@ -58,18 +76,8 @@ class ETLConfig:
             bytes) yields ~131 K rows/chunk whose hash-join build side peaks around 67 MB — well
             under the 100 MB default pool that the sift1m repro exhausted at 97.7 MB. None disables
             chunking.
-        data_storage_version: Lance file format version for newly created datasets. The default
-            ``"2.1"`` adopts the latest stable format with structural encodings. Existing
-            datasets keep the format they were created with, and lance reads both transparently.
-        spark_batches: Number of sequential Spark-level batches the increment is split into before
-            collapse. Each batch keeps the rows whose ``pmod(xxhash64(key_col), spark_batches)``
-            equals the batch index, so every event for a vector id lands in exactly one batch and
-            per-batch collapse equals global collapse restricted to that batch — last-write-wins
-            is preserved. Each batch runs the full collapse-shuffle-merge flow as its own Spark job
-            over roughly ``1/spark_batches`` of the increment, so executor memory needs scale with
-            the batch size instead of the increment size. Raise this to absorb increments of tens
-            of millions of rows per org without raising executor memory limits. 1 (the default)
-            processes the whole increment in a single pass.
+        bulk_append: Enable the parallel ``write_fragments`` + single ``commit_batch`` fast path
+            for big NEW or empty datasets (operational kill switch).
         tag_stamp: Pre-formatted interval tag name (``%Y%m%dT%H%M%SZ``, typically the run's
             truncated hour via ``cliutil.parse_hour_tag``) stamped on every dataset the run
             wrote, after all batches commit. Create-or-move semantics: a later run in the same
@@ -79,23 +87,20 @@ class ETLConfig:
 
     base_uri: str
     telemetry: TelemetryConfig
-    key_col: str = "vector_id"
     ts_col: str = "event_timestamp"
-    op_col: str = "op"
-    delete_op_values: list[str] = field(default_factory=lambda: ["delete", "DELETE", "d"])
-    ttl_col: str = "ttl"
     storage_options: dict[str, Any] | None = None
     num_partitions: int | None = None
+    bucket_rows: int = 2_000_000
+    max_buckets_per_dataset: int = 32
+    datasets_per_task: int = 64
     conflict_retries: int = DEFAULT_CONFLICT_RETRIES
-    retry_timeout: timedelta = DEFAULT_RETRY_TIMEOUT
     iceberg_read_options: dict[str, str] = field(default_factory=dict)
     window_start: str | None = None
     window_end: str | None = None
     window_column: str = "processing_timestamp"
     retry_backoff_seconds: float = 0.5
     merge_batch_bytes: int | None = 64 * 1024 * 1024
-    data_storage_version: str = "2.1"
-    spark_batches: int = 1
+    bulk_append: bool = True
     tag_stamp: str | None = None
 
 
@@ -124,26 +129,36 @@ def apply_fsl_cast(
     table: pa.Table,
     col_name: str,
     invalid_counts: dict[str, int],
+    dim: int | None = None,
 ) -> pa.Table:
-    """Cast a vector column to ``fixed_size_list<float32, dim>``, inferring dim from first non-null value.
+    """Cast a vector column to ``fixed_size_list<float32, dim>``.
 
-    Rows whose length differs from the inferred dimension are nulled out and counted into
-    ``invalid_counts``. A fully-null column is returned unchanged (no dimension to infer).
+    When ``dim`` is ``None`` the dimension is inferred from the first non-null value and a
+    fully-null column is returned unchanged (no dimension to infer). When ``dim`` is given the
+    inference is skipped and that dimension is used, so a fully-null column is still cast to the
+    requested fixed size. In both modes rows whose length differs from the target dimension are
+    nulled out and counted into ``invalid_counts``.
+
+    The explicit ``dim`` path exists for the bulk-append fast path, where every parallel task must
+    cast a vector key to the one canonical dimension derived on the driver rather than to whatever
+    length happens to arrive first in that task's slice.
 
     Args:
         table: Table containing the column.
         col_name: Name of the column to cast.
         invalid_counts: Mutable accumulator for wrong-dimension row counts, updated in place.
+        dim: Target dimension. ``None`` infers it from the first non-null value.
 
     Returns:
         Table with the column cast, or unchanged when no dimension can be inferred.
     """
     column: pa.ChunkedArray = table.column(col_name)
     lengths: pa.ChunkedArray = pc.list_value_length(column)
-    observed: pa.ChunkedArray = lengths.drop_null()
-    if len(observed) == 0:
-        return table
-    dim: int = int(observed[0].as_py())
+    if dim is None:
+        observed: pa.ChunkedArray = lengths.drop_null()
+        if len(observed) == 0:
+            return table
+        dim = int(observed[0].as_py())
     matches: pa.ChunkedArray = pc.equal(lengths, dim)
     mismatches: int = int(pc.sum(pc.invert(matches)).as_py() or 0)
     if mismatches:
@@ -153,7 +168,9 @@ def apply_fsl_cast(
     return table.set_column(col_idx, col_name, column.cast(pa.list_(pa.float32(), dim)))
 
 
-def pivot_map_columns(table: pa.Table, config: ETLConfig) -> tuple[pa.Table, dict[str, int], dict[str, str]]:
+def pivot_map_columns(
+    table: pa.Table, config: ETLConfig, vector_dims: dict[str, int] | None = None
+) -> tuple[pa.Table, dict[str, int], dict[str, str]]:
     """Expand every map column into concrete per-key columns for this dataset group.
 
     Processes ``vectors``, ``texts``, and ``metadata`` in order. For each map column, all distinct
@@ -169,15 +186,20 @@ def pivot_map_columns(table: pa.Table, config: ETLConfig) -> tuple[pa.Table, dic
     Args:
         table: The upsert table for one dataset group, after Spark serialisation.
         config: ETL configuration providing the set of reserved column names.
+        vector_dims: Optional map of vector key to canonical dimension. When a vector key is
+            present, its dimension is forwarded to :func:`apply_fsl_cast` instead of being
+            inferred from this slice, so every parallel bulk-append task casts to the same
+            driver-derived dimension. Keys absent from the map fall back to per-slice inference.
 
     Returns:
         ``(result_table, counts, roles)`` where ``counts`` carries ``"invalid_map_keys"`` and
         ``"invalid_vector_rows"`` when non-zero, and ``roles`` maps each created column to its
         role string.
     """
+    dims: dict[str, int] = vector_dims or {}
     routing_reserved: set[str] = {
-        config.key_col,
-        config.op_col,
+        KEY_COL,
+        OP_COL,
         config.ts_col,
         config.window_column,
         *ROUTING_COLS,
@@ -217,7 +239,7 @@ def pivot_map_columns(table: pa.Table, config: ETLConfig) -> tuple[pa.Table, dic
             roles[key] = role
 
             if role == VECTOR_ROLE:
-                result = apply_fsl_cast(result, key, fsl_invalid_counts)
+                result = apply_fsl_cast(result, key, fsl_invalid_counts, dims.get(key))
 
         col_idx: int = result.schema.get_field_index(map_col)
         result = result.remove_column(col_idx)
@@ -288,12 +310,89 @@ def group_by_routing(table: pa.Table, routing_cols: list[str]) -> Iterator[tuple
         yield key, table.slice(start, stop - start)
 
 
+def stream_routing_groups(
+    batches: Iterator[pa.RecordBatch],
+    routing_cols: list[str],
+    flush_bytes: int | None,
+    counters: dict[str, int] | None = None,
+) -> Iterator[tuple[tuple[Any, ...], pa.Table]]:
+    """Stream routing-key groups from an iterator of batches without materializing the partition.
+
+    Streaming counterpart of :func:`group_by_routing`: consumes an iterator of Arrow batches
+    sorted by ``routing_cols`` and yields ``(key, sub_table)`` groups while holding at most one
+    group (or one flush's worth) in memory, so executor memory scales with one dataset group
+    rather than the whole partition. Cost is ``O(rows)``.
+
+    Because collapse runs before this stage, each key is already exactly one atomic row, so a
+    byte-budget flush mid-run never splits a key across upsert commits. When one key does span
+    multiple flushes, it yields multiple groups over disjoint rows, and the downstream idempotent
+    :func:`~lance_etl.etl.sink.apply_merge` calls converge — the same degradation contract as
+    :func:`group_by_routing`.
+
+    Byte accounting uses each batch's mean row width (``nbytes // num_rows``) rather than a
+    per-slice ``.nbytes``, which over-counts zero-copy slices.
+
+    Args:
+        batches: Iterator of Arrow batches, sorted by the routing columns.
+        routing_cols: The routing key columns.
+        flush_bytes: Approximate byte budget that forces a mid-run flush, or ``None`` to disable.
+        counters: Optional accumulator mutated in place. ``"flushes"`` counts yielded groups and
+            ``"peak_buffered_bytes"`` records the high-water buffered byte estimate.
+
+    Yields:
+        ``(key_values, sub_table)`` for each contiguous routing-key run, split further whenever the
+        buffered byte estimate reaches ``flush_bytes``.
+    """
+    current_key: tuple[Any, ...] | None = None
+    buffer: list[pa.RecordBatch] = []
+    buffered_bytes: int = 0
+
+    def flush() -> Iterator[tuple[tuple[Any, ...], pa.Table]]:
+        """Yield the buffered rows as one group, then reset the buffer and byte counter.
+
+        Increments ``counters["flushes"]`` on each emitted group so the flush count equals the
+        number of yielded groups by construction. Does not reset ``current_key``.
+
+        Yields:
+            One ``(current_key, buffered_table)`` group when the buffer is non-empty.
+        """
+        nonlocal buffered_bytes
+        if not buffer:
+            return
+        if counters is not None:
+            counters["flushes"] = counters.get("flushes", 0) + 1
+        yield current_key, pa.Table.from_batches(buffer)  # type: ignore[misc]
+        buffer.clear()
+        buffered_bytes = 0
+
+    for batch in batches:
+        if batch.num_rows == 0:
+            continue
+        width: int = max(1, batch.nbytes // batch.num_rows)
+        single: pa.Table = pa.Table.from_batches([batch])
+        starts: list[int] = group_run_starts(single, routing_cols)
+        for position, start in enumerate(starts):
+            stop: int = starts[position + 1] if position + 1 < len(starts) else batch.num_rows
+            run_key: tuple[Any, ...] = tuple(batch.column(c)[start].as_py() for c in routing_cols)
+            if current_key is not None and run_key != current_key:
+                yield from flush()
+            current_key = run_key
+            run_rows: int = stop - start
+            buffer.append(batch.slice(start, run_rows))
+            buffered_bytes += run_rows * width
+            if counters is not None:
+                counters["peak_buffered_bytes"] = max(counters.get("peak_buffered_bytes", 0), buffered_bytes)
+            if flush_bytes is not None and buffered_bytes >= flush_bytes:
+                yield from flush()
+    yield from flush()
+
+
 def apply_ttl_cast(table: pa.Table, ttl_col: str) -> pa.Table:
     """Cast the integer TTL column to ``pa.duration("s")`` so Arrow time arithmetic works natively.
 
     Args:
         table: The upsert table after pivot.
-        ttl_col: Name of the TTL column per ``ETLConfig.ttl_col``.
+        ttl_col: Name of the TTL column, per :data:`TTL_COL`.
 
     Returns:
         Table with the TTL column cast to ``pa.duration("s")``, or unchanged when absent or
@@ -303,6 +402,39 @@ def apply_ttl_cast(table: pa.Table, ttl_col: str) -> pa.Table:
         return table
     idx: int = table.schema.get_field_index(ttl_col)
     return table.set_column(idx, ttl_col, table.column(ttl_col).cast(pa.duration("s")))
+
+
+def align_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
+    """Conform a pivoted per-bucket slice to a driver-derived canonical schema.
+
+    Returns a table whose columns exactly match ``schema`` in name, order, and type. For each
+    field in ``schema`` the table's column is reused (cast to the field type when it differs and
+    the cast is safe), or a full-null column of the field type is synthesised when the table lacks
+    it. Columns present in the table but absent from ``schema`` are dropped.
+
+    This makes each parallel bulk-append task's pivoted slice union-compatible with every other
+    task's slice, so their ``write_fragments`` outputs share one schema and commit as a single
+    ``commit_batch`` append. Different slices see different subsets of map keys, so without this
+    alignment they would produce structurally incompatible fragments.
+
+    Args:
+        table: The pivoted-and-cast slice for one bucket of one dataset.
+        schema: The canonical schema for that dataset, derived on the driver.
+
+    Returns:
+        A table matching ``schema`` exactly.
+    """
+    present: set[str] = set(table.schema.names)
+    columns: list[pa.Array | pa.ChunkedArray] = []
+    for target in schema:
+        if target.name in present:
+            column: pa.ChunkedArray = table.column(target.name)
+            if not column.type.equals(target.type):
+                column = column.cast(target.type)
+            columns.append(column)
+        else:
+            columns.append(pa.nulls(table.num_rows, target.type))
+    return pa.table(columns, schema=schema)
 
 
 def build_stats_batch(rows: list[tuple[Any, ...]], schema: pa.Schema) -> pa.RecordBatch:

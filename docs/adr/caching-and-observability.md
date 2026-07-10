@@ -83,7 +83,7 @@ jobs bridge Lance trace events on first `Telemetry.create` per process. The Rust
 per-RPC traces and typed, infallible metric emitters with a disabled mode for tests.
 
 For recall auditing, the service deterministically samples a fraction of queries
-(`SEARCH_API_RECALL_SAMPLE_RATE`, exactly `floor(N x rate)`, no RNG) onto the request span,
+(`DEFAULT_RECALL_SAMPLE_RATE` in `config.rs`, exactly `floor(N x rate)`, no RNG) onto the request span,
 recording the query, served ids and distances, params, the typed filter AST, and the dataset
 version that served the query. The offline `recall` job pulls those spans from the Datadog
 Spans API, opens each dataset PINNED at the recorded version, brute-forces exact top-k

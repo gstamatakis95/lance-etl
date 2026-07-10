@@ -42,7 +42,7 @@ Five-layer design over tonic:
 
 | Layer | Crate path | Responsibility |
 |---|---|---|
-| `domain` | `crate::domain` | Engine-agnostic types: `Filter` AST, query types, rerank seam, intake record/sink, traits |
+| `domain` | `crate::domain` | Engine-agnostic types: `Filter` AST, query types, intake record/sink, traits |
 | `cache` | `crate::cache` | Hybrid Moka + pluggable persistent (disk/redis) caches, plugged into Lance seams |
 | `lance` | `crate::lance` | `LanceSearchBackend`, `CachingDatasetProvider`, typed AST -> DataFusion `Expr` |
 | `grpc` | `crate::grpc` | Tonic adapters: `SearchGrpc<B>` (search) and `IntakeGrpc<S>` (intake) |
@@ -62,8 +62,8 @@ cached.
 
 Blue-green serving: a `HEAD` tag (or any named tag) is updated atomically with `tags.update`. When
 `SEARCH_API_SERVE_BY_TAG=true`, the provider resolves the tag to a concrete version, keys its LRU
-and caches on that version, and re-reads the tag after `SEARCH_API_SERVE_TAG_TTL_SECS` seconds so
-a flip propagates within the TTL. The correct operational sequence is: build the green version,
+and caches on that version, and re-reads the tag after the fixed serve-tag TTL (10s) so a flip
+propagates within that window. The correct operational sequence is: build the green version,
 prewarm every replica against the green version explicitly (use the `version` or `tag` field in
 `PrewarmRequest`), then flip the tag. Never flip then warm.
 
@@ -89,7 +89,7 @@ pinned version's entries directly. A hybrid pin opens both legs at the same snap
 | `pipeline/` | `PipelineConfig`, `PipelineJob` | Serialized fleet phases: prune tags, maintenance, index, stamp |
 | `column_roles.py` | `load_column_roles`, `merge_column_roles` | Per-column role metadata (`lance-etl.columns`) driving automatic index target discovery |
 | `fanout.py` | `fan_out_per_dataset` | Shared per-dataset Spark fan-out backing the maintenance, indexing, and operator-tool fleet phases |
-| `recall.py` | `RecallAuditJob`, `RecallJobConfig` | Offline recall@k / nDCG@k / MRR audit from Datadog spans |
+| `recall/` | `RecallAuditJob`, `RecallJobConfig` | Offline recall@k / nDCG@k / MRR audit from Datadog spans, split into config/source/queries/scoring/job modules |
 | `telemetry.py` | `Telemetry`, `TelemetryConfig` | ddtrace spans, DogStatsD, Lance event bridge |
 | `cloud_storage.py` | `resolve_filesystem`, `discover_datasets` | pyarrow filesystem + recursive dataset discovery, executor-fanned when a Spark session is passed |
 | `iceberg_optimize.py` | `IcebergOptimizer`, `IcebergOptimizeConfig`, `IcebergOptimizeReport` | Source Iceberg table maintenance via `CALL` procedures (`rewrite_data_files`, `rewrite_manifests`, `expire_snapshots`, opt-in `remove_orphan_files`). Distinct from the Lance maintenance job. |
@@ -106,7 +106,6 @@ pinned version's entries directly. A hybrid pin opens both legs at the same snap
 | `domain/prewarm.rs` | `PrewarmSpec`, `PrewarmReport`, `Prewarmer` trait |
 | `domain/clusters.rs` | `ClusterSpec`, `ClusterReport`, `ClusterReader` trait |
 | `domain/fusion.rs` | `FusionSpec` (Rrf and Weighted variants) and within-dataset fusion logic |
-| `domain/rerank.rs` | `Reranker` seam, `IdentityReranker` (no-op default) |
 | `domain/intake.rs` | `IntakeBatch`, `Record`, `RecordWrite`, `WriteOp`, `RecordSink` trait, `StdoutSink` placeholder |
 | `cache/entry_store.rs` | `EntryStore` trait: the persistent byte-store seam beneath both cache tiers |
 | `cache/disk_store.rs` | Local-disk `EntryStore` (the default backend) |
@@ -115,7 +114,7 @@ pinned version's entries directly. A hybrid pin opens both legs at the same snap
 | `cache/store_cache.rs` | Read-through byte cache for immutable metadata |
 | `cache/layout.rs` | Versioned stamp naming, key hashing, framing, atomic writes, TTL/budget sweep |
 | `cache/janitor.rs` | Periodic TTL + byte-budget sweep loop over the disk tiers |
-| `lance/backend.rs` | `LanceSearchBackend<P>` — single-dataset dispatch, post-fusion rerank |
+| `lance/backend.rs` | `LanceSearchBackend<P>` — single-dataset dispatch, vector/text/hybrid fusion |
 | `lance/provider.rs` | `DatasetProvider` trait, `CachingDatasetProvider`, tag-version TTL cache |
 | `lance/filter.rs` | `filter_to_expr`: domain filter -> DataFusion `Expr` |
 | `lance/text.rs` | FTS query node tree -> Lance FTS parameters |
@@ -242,7 +241,6 @@ Full `etl` flag reference:
 | `--end` | (required) | Iceberg snapshot window end (ISO 8601 or epoch ms) |
 | `--base-uri` | (required) | Root URI for per-tenant Lance datasets |
 | `--iceberg-option` | none | Repeatable `key=value` Iceberg read option |
-| `--spark-batches` | `1` | Sequential key-hash batches the increment is split into (raise for very large increments) |
 | `--window-start` | none | Inclusive lower bound for the window pushdown filter |
 | `--window-end` | none | Exclusive upper bound for the window pushdown filter |
 | `--tag-stamp` | none | ISO 8601 datetime whose truncated UTC hour names the interval tag stamped on every written dataset |
@@ -328,9 +326,7 @@ lance-etl-tools recall \
 | `--base-uri` | (required) | Root URI for per-tenant Lance datasets |
 | `--dd-site` | `datadoghq.com` | Datadog site domain for the Spans search API |
 | `--max-samples` | `10000` | Cap on sampled spans fetched |
-| `--id-column` | `vector_id` | Unique id column matched against served result ids |
 | `--vector-column` | `vector` | Fixed-size-list vector column for brute-force distances |
-| `--batch-size` | `8192` | Scanner batch size for the brute-force scan |
 
 What it measures:
 
@@ -468,25 +464,21 @@ Environment variables (`LANCE_ETL_BASE_URI` is required. All others are optional
 |---|---|---|
 | `LANCE_ETL_BASE_URI` | (required) | Base URI all dataset paths are resolved under |
 | `SEARCH_API_PORT` | `8080` | TCP port |
-| `SEARCH_API_DATASET_CACHE_CAPACITY` | `1024` | Max open dataset handles in the LRU |
-| `SEARCH_API_INDEX_CACHE_BYTES` | `1073741824` (1 GiB) | In-memory index cache budget |
-| `SEARCH_API_METADATA_CACHE_BYTES` | `268435456` (256 MiB) | In-memory metadata cache budget |
 | `SEARCH_API_CACHE_BACKEND` | `disk` | Persistent cache backend: `disk`, `redis`, or `memory` |
 | `SEARCH_API_REDIS_URL` | (none) | Redis connection URL (`redis://` or `rediss://`), required for the `redis` backend |
 | `SEARCH_API_REDIS_NAMESPACE` | `search-api` | Key namespace prepended to every Redis cache key |
 | `SEARCH_API_CACHE_DIR` | `/tmp/rust-search/cache` | Root directory for the `disk` backend's caches |
-| `SEARCH_API_DISK_INDEX_CACHE_BYTES` | `8589934592` (8 GiB) | Disk budget for the index cache tier |
-| `SEARCH_API_DISK_STORE_CACHE_BYTES` | `2147483648` (2 GiB) | Disk budget for the metadata byte cache |
 | `SEARCH_API_DISK_CACHE_DISABLED` | `false` | Deprecated alias for `SEARCH_API_CACHE_BACKEND=memory` |
-| `SEARCH_API_PREWARM_CONCURRENCY` | `4` | Indexes warmed concurrently per Prewarm RPC |
-| `SEARCH_API_IO_CONCURRENCY` | `256` | Parallel in-flight object-store requests per dataset |
-| `SEARCH_API_RECALL_SAMPLE_RATE` | `0.0` (off) | Fraction of requests sampled for offline recall |
 | `SEARCH_API_SERVE_BY_TAG` | `false` | Resolve the serve tag instead of opening latest |
 | `SEARCH_API_SERVE_TAG` | `HEAD` | Tag name resolved when `SEARCH_API_SERVE_BY_TAG=true` |
-| `SEARCH_API_SERVE_TAG_TTL_SECS` | `10` | Seconds a resolved tag version is trusted |
-| `SEARCH_API_EVENT_TIMESTAMP_COLUMN` | `event_timestamp` | Column that request `TimeRange` filters are applied to |
+| `SEARCH_API_PREWARM_TARGETS_PATH` | (empty, disabled) | Path to a startup prewarm-targets file (one `{org_id}/{tenant_id}/{namespace}` per line), prewarmed in the background before those datasets would otherwise be opened cold |
 | `SEARCH_API_STATSD_ADDR` | `127.0.0.1:8125` | DogStatsD UDP address (honors `DD_AGENT_HOST`) |
 | `SEARCH_API_TELEMETRY_DISABLED` | `false` | Disable trace export and DogStatsD (JSON logs only) |
+
+Every other knob (dataset-handle cache sizing, index/metadata/disk cache budgets, the serve-tag
+TTL, IO concurrency, ANN probe/refine/fast-search defaults, gRPC timeout and concurrency limits,
+the event-timestamp column, recall sampling, and the search `k` ceiling) is a fixed constant in
+`rust/search-api/src/config.rs` and is no longer env-configurable.
 
 `DD_AGENT_HOST` is read by the default statsd address resolver: when set, the default becomes
 `${DD_AGENT_HOST}:8125`. `SEARCH_API_STATSD_ADDR` overrides it unconditionally.
@@ -518,11 +510,10 @@ oneof) — raw SQL strings are never accepted. String equality (`column = "value
 injection-safe: the literal is transported verbatim and becomes a typed DataFusion expression,
 never SQL. Event-time windowing is expressed as an optional
 `TimeRange { optional int64 start_ms; optional int64 end_ms }` (epoch milliseconds, start
-inclusive, end exclusive, either bound optional). The window always applies to the event-timestamp
-column (name from `SEARCH_API_EVENT_TIMESTAMP_COLUMN`, default `event_timestamp`) and is
-translated to a typed range predicate ANDed with any `Filter`, pruned by a BTREE or zone-map on
-that column. A `TimeRange` absent from the request leaves every search path behaving exactly as
-before.
+inclusive, end exclusive, either bound optional). The window always applies to the fixed
+event-timestamp column (`event_timestamp`) and is translated to a typed range predicate ANDed
+with any `Filter`, pruned by a BTREE or zone-map on that column. A `TimeRange` absent from the
+request leaves every search path behaving exactly as before.
 
 `HybridSearch` also accepts a request-level `filter` (field 8) and `filter_mode` (field 9) that
 are ANDed into both the vector leg and the text leg independently. When a leg already carries its

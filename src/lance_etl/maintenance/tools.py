@@ -17,11 +17,21 @@ layer reads stays readable until the tag moves to a newer one.
 tags whose names are classified by :func:`datetime.strptime` against the
 ``%Y%m%dT%H%M%SZ`` format, keeping only the newest ``tag_keep_last`` tags.  Tags that
 do not match the format (``HEAD`` and other non-interval tags) are never touched.
+
+``dataset.tags.create/update/delete`` are plain object-store put/delete calls on
+``_refs/tags/<name>`` files, not optimistic-concurrency manifest commits, so they never
+raise the "commit conflict" markers that :func:`~lance_etl.telemetry.commit_with_retries`
+looks for. Lost races surface instead as a ``ValueError`` whose message contains
+:data:`TAG_EXISTS_MARKER` (a create raced against a create or a move) or
+:data:`TAG_MISSING_MARKER` (an update or delete raced against a delete). Both
+:func:`update_serving_tag` and :func:`prune_interval_tags` match on those substrings to
+resolve the lost race idempotently instead of failing the fleet run.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
@@ -34,6 +44,11 @@ from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+TAG_EXISTS_MARKER: str = "already exists"
+TAG_MISSING_MARKER: str = "does not exist"
+MAX_TAG_RACE_ATTEMPTS: int = 3
+TAG_RACE_BACKOFF_SECONDS: float = 0.05
+
 
 def migrate_dataset_manifest_paths(
     uri: str, storage_options: dict[str, Any] | None, telemetry: Telemetry
@@ -45,7 +60,13 @@ def migrate_dataset_manifest_paths(
     LIST. Datasets created before that default still carry V1 names. This helper calls
     ``LanceDataset.migrate_manifest_paths_v2``, which renames every V1 manifest to the
     V2 inverted-version name. The call is idempotent, so re-running it on an
-    already-migrated or freshly-bootstrapped dataset is a cheap no-op.
+    already-migrated or freshly-bootstrapped dataset is a cheap no-op. It needs no
+    lost-race resolver of its own: a manifest-path rename has no commit-conflict
+    surface to lose a race against, so a retried task simply converges instead of
+    corrupting state, the same idempotency the fleet-level fan-out in
+    :func:`migrate_manifest_paths` already relies on. A single dataset's migration failure is
+    isolated by that fan-out into a ``{"uri", "error", "phase": "migrate"}`` marker and does not
+    abort the run, so the other datasets still migrate.
 
     DANGER: this is not transactional. Lance documents that it must not run while other
     operations touch the dataset and must run to completion before any resume. Schedule
@@ -104,10 +125,60 @@ def migrate_manifest_paths(
                 telemetry_config,
                 lambda uri, telemetry: migrate_dataset_manifest_paths(uri, storage_options, telemetry),
                 partitions,
+                phase="migrate",
             )
         driver_telemetry.gauge("run.manifests_migrated", len(results))
         logger.info("manifest migration: %d datasets migrated to V2 paths", len(results))
         return results
+
+
+def resolve_serving_tag(dataset: lance.LanceDataset, tag: str, version: int, created: bool) -> bool:
+    """Create or move one serving tag, with a single-level lost-race fallback.
+
+    ``created`` reflects a caller's earlier ``dataset.tags.list()`` snapshot, which can be stale
+    by the time the write lands because another writer (a concurrent ETL stamp DAG, a retried
+    Spark task, or the separately scheduled pipeline) moved the tag in between. If ``created`` is
+    ``True`` but ``dataset.tags.create`` reports the tag already exists
+    (:data:`TAG_EXISTS_MARKER`), the create lost the race, so the tag is moved with
+    ``dataset.tags.update`` instead. Symmetrically, if ``created`` is ``False`` but
+    ``dataset.tags.update`` reports the tag is missing (:data:`TAG_MISSING_MARKER`), a concurrent
+    prune or delete raced ahead, so the tag is recreated with ``dataset.tags.create``. Both
+    fallbacks are safe: a tag move is last-writer-wins on the stored version, and every caller
+    passes the version it actually intends the tag to point at, so whichever write lands last is
+    the correct outcome regardless of which branch produced it.
+
+    Args:
+        dataset: The open Lance dataset.
+        tag: Serving-tag name to create or move.
+        version: Target version for the tag.
+        created: Whether the tag was absent in the caller's ``dataset.tags.list()`` snapshot.
+
+    Returns:
+        ``True`` if a create ultimately landed, ``False`` if an update did.
+
+    Raises:
+        ValueError: The fallback write itself lost the race, which signals a pathological
+            double race for the caller's bounded retry loop to resolve, or either write failed
+            for a reason unrelated to a lost race.
+        OSError: Any other object-store failure.
+    """
+    if created:
+        try:
+            dataset.tags.create(tag, version)
+            return True
+        except ValueError as exc:
+            if TAG_EXISTS_MARKER not in str(exc):
+                raise
+            dataset.tags.update(tag, version)
+            return False
+    try:
+        dataset.tags.update(tag, version)
+        return False
+    except ValueError as exc:
+        if TAG_MISSING_MARKER not in str(exc):
+            raise
+        dataset.tags.create(tag, version)
+        return True
 
 
 def update_serving_tag(
@@ -126,6 +197,18 @@ def update_serving_tag(
     regardless of age, so the version a serving layer reads stays readable across
     maintenance until the tag is flipped to a newer one.
 
+    The create-or-update decision is resolved idempotently through :func:`resolve_serving_tag`:
+    a lost race between this call's ``tags.list()`` snapshot and its write is self-healed by
+    falling back to the complementary operation, and the returned ``created`` flag reflects
+    whichever write actually landed rather than the stale snapshot. This is safe because a tag
+    move is last-writer-wins on the target version, which every caller supplies explicitly. The
+    fallback itself is wrapped in a small bounded retry loop (:data:`MAX_TAG_RACE_ATTEMPTS`) to
+    cover the pathological double race where the fallback also loses (for example create loses to
+    an existing tag, the fallback update then loses because the tag was deleted again in between):
+    each further attempt re-reads ``tags.list()`` and tries again after a short fixed backoff
+    (:data:`TAG_RACE_BACKOFF_SECONDS`), and the last exception is re-raised only once every
+    attempt is exhausted.
+
     The safe blue-green operational sequence is logged on every call because a tag move
     alone changes nothing for a running serving process. Build the green version (ETL
     plus index plus compaction), prewarm the serving layer against that explicit version,
@@ -142,7 +225,8 @@ def update_serving_tag(
         tag: Serving-tag name to create or move. Defaults to ``"HEAD"``.
 
     Returns:
-        A statistics dictionary with keys ``uri``, ``tag``, ``version``, and ``created``.
+        A statistics dictionary with keys ``uri``, ``tag``, ``version``, and ``created``, where
+        ``created`` reflects the write that actually landed.
     """
     dataset: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
     version: int = dataset.version if target_version is None else target_version
@@ -157,14 +241,29 @@ def update_serving_tag(
         tag,
         version,
     )
+    actual_created: bool = created
+    last_exc: ValueError | None = None
     with telemetry.timed("dataset.tag_update_ms", tags=[f"tag:{tag}"]):
-        if created:
-            dataset.tags.create(tag, version)
+        for attempt in range(MAX_TAG_RACE_ATTEMPTS):
+            attempt_created: bool = created if attempt == 0 else tag not in dataset.tags.list()
+            try:
+                actual_created = resolve_serving_tag(dataset, tag, version, attempt_created)
+                last_exc = None
+                break
+            except ValueError as exc:
+                message: str = str(exc)
+                if TAG_EXISTS_MARKER not in message and TAG_MISSING_MARKER not in message:
+                    raise
+                last_exc = exc
+                if attempt < MAX_TAG_RACE_ATTEMPTS - 1:
+                    time.sleep(TAG_RACE_BACKOFF_SECONDS)
+        if last_exc is not None:
+            raise last_exc
+        if actual_created:
             telemetry.incr("dataset.tag_created", tags=[f"tag:{tag}"])
         else:
-            dataset.tags.update(tag, version)
             telemetry.incr("dataset.tag_updated", tags=[f"tag:{tag}"])
-    return {"uri": uri, "tag": tag, "version": version, "created": created}
+    return {"uri": uri, "tag": tag, "version": version, "created": actual_created}
 
 
 def update_serving_tags(
@@ -212,6 +311,7 @@ def update_serving_tags(
                 telemetry_config,
                 lambda uri, telemetry: update_serving_tag(uri, target_version, storage_options, telemetry, tag),
                 partitions,
+                phase="tag",
             )
         driver_telemetry.gauge("run.tags_flipped", len(results))
         logger.info("serving-tag flip: tag %r moved on %d datasets", tag, len(results))
@@ -232,6 +332,12 @@ def prune_interval_tags(
     never considered for deletion.  The matching tags are sorted descending by parsed
     time, the newest ``tag_keep_last`` are kept, and the rest are deleted via
     ``dataset.tags.delete(name)``.
+
+    Deletion is idempotent: if ``dataset.tags.delete`` raises a ``ValueError`` containing
+    :data:`TAG_MISSING_MARKER`, another pruner or a retried Spark task already removed the tag,
+    so the delete is treated as a no-op success (counted under
+    ``dataset.interval_tag_already_pruned`` instead of ``dataset.interval_tag_pruned``) rather
+    than failing the fleet run. Any other exception still propagates.
 
     Args:
         uri: Dataset URI.
@@ -261,7 +367,13 @@ def prune_interval_tags(
 
     with telemetry.timed("dataset.prune_tags_ms"):
         for name in to_delete:
-            dataset.tags.delete(name)
+            try:
+                dataset.tags.delete(name)
+            except ValueError as exc:
+                if TAG_MISSING_MARKER not in str(exc):
+                    raise
+                telemetry.incr("dataset.interval_tag_already_pruned")
+                continue
             telemetry.incr("dataset.interval_tag_pruned")
 
     logger.info(
@@ -312,6 +424,7 @@ def prune_interval_tags_fleet(
                 telemetry_config,
                 lambda uri, telemetry: prune_interval_tags(uri, storage_options, tag_keep_last, telemetry),
                 partitions,
+                phase="prune",
             )
         pruned_total: int = sum(int(r.get("tags_pruned", 0)) for r in results)
         driver_telemetry.gauge("run.interval_tags_pruned", pruned_total)

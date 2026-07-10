@@ -11,12 +11,14 @@ before touching any file.
 lance-etl/
   src/lance_etl/          Python package (production sources)
     etl/                  ETL job package (python -m lance_etl.etl)
-      __init__.py         Re-exports: IcebergToLanceETL, ETLConfig, ROUTING_COLS, apply_merge, and helpers
+      __init__.py         Re-exports: IcebergToLanceETL, ETLConfig, ROUTING_COLS, apply_merge, apply_ttl_cast, dataset_uri, derive_bulk_schemas, pivot_map_columns, plan_bulk_append, snapshot_id_bounds
       cli.py              Entry point for lance-etl-etl script and python -m lance_etl.etl
       __main__.py         Calls cli.main()
-      job.py              IcebergToLanceETL: read_increment, collapse, spark_batches split, route_batch (AQE-sized shuffle + partition sort), merge fan-out, hourly interval-tag stamp (stamp_interval_tags)
-      pivot.py            ETLConfig, ROUTING_COLS, pivot_map_columns (returns column roles), group_by_routing (sorted-run split), apply_fsl_cast, apply_ttl_cast
-      sink.py             The Lance sink seam: apply_merge, table_chunks, build_update_condition, dataset_uri (format 2.1 bootstrap, role writes)
+      job.py              IcebergToLanceETL: read_increment, collapse, adaptive-plan routing (explicit N salted shuffle + partition sort), bulk-append fast path before the merge (run_bulk_phase + exclude_bulk_trios), streaming merge fan-out (merge_partition), hourly interval-tag stamp (stamp_interval_tags)
+      plan.py             ETLConfig-driven adaptive routing: RoutingPlan, compute_routing_plan (per-trio count aggregation), apply_salted_shuffle (big-dataset key-hash sub-bucketing), bucket_count/shuffle_partition_count sizing
+      bulk.py             Bulk-append fast path for big NEW or empty datasets: plan_bulk_append (absent-or-empty eligibility), derive_bulk_schemas (one canonical per-trio schema), bootstrap_bulk_datasets (empty bootstrap + re-check demotion), run_bulk_append (parallel write_fragments fan-out), commit_bulk_transactions (single commit_batch + role merge)
+      pivot.py            ETLConfig, ROUTING_COLS, pivot_map_columns (returns column roles, canonical vector dims), align_to_schema (null-fill/reorder/cast a slice to the driver-derived canonical schema), group_by_routing (sorted-run split), stream_routing_groups (streaming counterpart of group_by_routing), apply_fsl_cast, apply_ttl_cast
+      sink.py             The Lance sink seam: apply_merge, table_chunks, build_update_condition, dataset_uri (format 2.1 bootstrap, role writes), open_or_bootstrap (used by the bulk-append bootstrap)
     indexing/             Indexing job package (python -m lance_etl.indexing)
       __init__.py         Re-exports: LanceIndexer, IndexJobConfig, all handlers, segments, optimize helpers
       cli.py              Entry point for lance-etl-index script and python -m lance_etl.indexing
@@ -24,14 +26,15 @@ lance-etl/
       config.py           IndexJobConfig, METRIC_TO_DISTANCE, FTS_OPTIONAL_PARAMS, index-name helpers
       handlers.py         IndexHandler, VectorIndexHandler, BTreeIndexHandler, BitmapIndexHandler, ZonemapIndexHandler, FtsIndexHandler, commit_fts_index, publish_fts_index
       optimize.py         load_vector_config, write_vector_config, drop_existing_index, optimize_existing_index, merge_index_deltas, maintain_index_locally
-      runner.py           LanceIndexer fleet phases: plan_dataset_indexes, bootstrap_vector_index (streaming k-means), resolve_vector_artifacts, build_one_shard, commit_one_index, merge_deltas_if_needed, role-based target discovery
+      runner.py           LanceIndexer fleet phases: plan_dataset_indexes, bootstrap_vector_index (streaming k-means), persist_bootstrap_centroids, build_one_shard, commit_one_index, merge_deltas_if_needed, role-based target discovery
       segments.py         build_vector_segment, build_scalar_segment, commit_segments, split_evenly, stale-fragment guards
     maintenance/          Maintenance job package (python -m lance_etl.maintenance)
-      __init__.py         Re-exports: MaintenanceJob, MaintenanceConfig, plan_one_dataset, commit_one_dataset, fan_out_per_dataset, update_serving_tag, compaction_skip_reason, and helpers
+      __init__.py         Re-exports: MaintenanceJob, MaintenanceConfig, plan_one_dataset, commit_one_dataset, fan_out_per_dataset, update_serving_tag, and helpers
       cli.py              Entry point for lance-etl-maintenance script and python -m lance_etl.maintenance
       __main__.py         Calls cli.main()
       job.py              MaintenanceJob fleet phases: plan_one_dataset, execute_rewrite_task, commit_one_dataset, cleanup_dataset, run_ttl_on_open_dataset, compaction_skip_reason (derived-state skip: dataset_stats num_fragments)
       tools.py            update_serving_tag, update_serving_tags, migrate_dataset_manifest_paths, migrate_manifest_paths, prune_interval_tags, prune_interval_tags_fleet
+      cluster.py          Clustered rewrite fleet phases: plan_cluster_rewrite, partition_histogram, derive_buckets, rewrite shuffle, commit_cluster_overwrite, preserved-centroid index rebuild, run_cluster_rewrites
     pipeline/             Unified pipeline job package (python -m lance_etl.pipeline)
       __init__.py         Re-exports: PipelineJob, PipelineConfig, prune_interval_tags, prune_interval_tags_fleet, stamp_eligible
       cli.py              Entry point for lance-etl-pipeline script and python -m lance_etl.pipeline
@@ -44,7 +47,13 @@ lance-etl/
     cliutil.py            Shared CLI helpers: add_common_arguments, add_dataset_arguments, add_index_column_arguments, build_spark (memory-safe SQL defaults), build_telemetry_config, load_dataset_uris, parse_* helpers
     column_roles.py       Column-role metadata (lance-etl.columns): load_column_roles, merge_column_roles
     fanout.py             Shared per-dataset Spark fan-out (fan_out_per_dataset) used by the maintenance, indexing, and operator-tool fleet phases
-    recall.py             RecallAuditJob, RecallJobConfig, DatadogSpanSource: replay Datadog spans, score recall@k/nDCG@k/MRR
+    recall/               Offline recall audit package (invoked via python -m lance_etl.tools recall)
+      __init__.py         Re-exports: RecallAuditJob, RecallJobConfig, RecallSample, DatadogSpanSource, scoring and query-translation helpers
+      config.py           RecallJobConfig, identifier/path allowlists, BM25 params, scanner batch size
+      source.py           SpanSource, DatadogSpanSource, InMemorySpanSource: fetch and parse recall.* span attributes into RecallSample
+      queries.py          filter_ast_to_sql, text_query_field_queries, tokenize_text, fuse_legs: span-to-query replay translation
+      scoring.py          brute_force_top_k, bm25_top_k, grade_against_reference, grade_hybrid_reference: recall@k/nDCG@k/MRR scoring
+      job.py              RecallAuditJob: two-tier Spark fan-out that scores every sample and renders the aggregate report
     telemetry.py          Telemetry, TelemetryConfig, LanceRuntimeConfig, commit_with_retries
     cloud_storage.py      resolve_filesystem + discover_datasets (driver walk or executor-fanned listing) for pyarrow filesystem I/O
     iceberg_optimize.py   IcebergOptimizer + IcebergOptimizeConfig: source Iceberg table maintenance via CALL procedures (rewrite_data_files, rewrite_manifests, expire_snapshots, opt-in remove_orphan_files)
@@ -76,7 +85,6 @@ lance-etl/
       prewarm.rs          PrewarmSpec, PrewarmReport, Prewarmer trait
       clusters.rs         ClusterSpec, ClusterReport, ClusterReader trait
       fusion.rs           FusionSpec (Rrf and Weighted variants) and within-dataset fusion logic
-      rerank.rs           Reranker seam, IdentityReranker (no-op default)
       intake.rs           IntakeBatch, Record, RecordWrite, WriteOp, RecordSink trait, StdoutSink placeholder
       error.rs            SearchError
     src/cache/            Persistent two-tier caching layer (index + metadata, no raw data), pluggable disk/redis backends
@@ -88,7 +96,7 @@ lance-etl/
       store_cache.rs      Read-through byte cache for immutable metadata of wrapped stores
       janitor.rs          Periodic TTL + budget sweep over the disk tiers (redis needs none)
     src/lance/            Lance backend implementations
-      backend.rs          LanceSearchBackend — single-dataset dispatch, post-fusion rerank
+      backend.rs          LanceSearchBackend — single-dataset dispatch, vector/text/hybrid fusion
       provider.rs         DatasetProvider trait, CachingDatasetProvider (shared session + LRU)
       filter.rs           filter_to_expr: domain Filter -> DataFusion Expr
       text.rs             Domain text query tree -> Lance FTS parameters
@@ -205,6 +213,11 @@ The only correct distributed index paths are:
 3. Commit fan-out: `dataset.merge_existing_index_segments(segments)` then
    `dataset.commit_existing_index_segments(name, column, [merged])` on an executor.
    The segment path hard-requires precomputed centroids, so training never happens there.
+4. Clustered-rewrite rebuild (ADR 0041): after a clustered Overwrite drops the IVF_RQ index, it
+   is rebuilt with the PRESERVED centroids and stored `rabitq_model` via
+   `create_index_uncommitted(..., ivf_centroids=, rabitq_model=, fragment_ids=shard)` per shard,
+   then `merge_existing_index_segments`, then `commit_existing_index_segments`. No training
+   occurs.
 
 **BTREE / BITMAP / ZONEMAP:**
 Same shard/commit flow but no `index_uuid`. Do not call `create_scalar_index(fragment_ids=)` or
@@ -322,6 +335,10 @@ Key facts to internalize:
 - V2 manifest paths default on (`enable_v2_manifest_paths=True` at dataset creation). New datasets
   use V2. Existing datasets migrate via `migrate_manifest_paths_v2`. V2 makes every dataset open
   a single object-store request regardless of version-history depth.
+- `lance.indices.IvfModel.save(uri, *, storage_options=)` / `IvfModel.load(uri, *,
+  storage_options=)` persist and read IVF centroids through lance's own object-store layer in a
+  single-file format. This is the centroid sidecar mechanism (ADR 0040). Never use
+  `create_index`'s `ivf_centroids_file` parameter, which bypasses `storage_options`.
 
 ---
 

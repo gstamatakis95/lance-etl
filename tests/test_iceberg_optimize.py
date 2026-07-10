@@ -34,6 +34,8 @@ from bench.spark_session import build_spark
 from lance_etl.iceberg_optimize import (
     DEFAULT_EXPIRE_OLDER_THAN_DAYS,
     DEFAULT_EXPIRE_RETAIN_LAST,
+    DEFAULT_MIN_INPUT_FILES,
+    DEFAULT_TARGET_FILE_SIZE_BYTES,
     IcebergOptimizeConfig,
     IcebergOptimizer,
     timestamp_literal,
@@ -81,16 +83,14 @@ def mock_spark_returning(rows: list[Row]) -> MagicMock:
 
 def test_rewrite_data_files_statement_and_metrics(telemetry: Telemetry) -> None:
     """``rewrite_data_files`` builds a typed CALL with the bin-pack options and parses integer result columns."""
-    config: IcebergOptimizeConfig = IcebergOptimizeConfig(
-        table="bench.db.t", telemetry=TelemetryConfig(), min_input_files=2, target_file_size_bytes=1024
-    )
+    config: IcebergOptimizeConfig = IcebergOptimizeConfig(table="bench.db.t", telemetry=TelemetryConfig())
     spark: MagicMock = mock_spark_returning([Row(rewritten_data_files_count=4, added_data_files_count=1)])
     result = IcebergOptimizer(config).rewrite_data_files(spark, telemetry)
     statement: str = spark.sql.call_args[0][0]
     assert statement.startswith("CALL bench.system.rewrite_data_files(")
     assert "table => 'db.t'" in statement
-    assert "'min-input-files', '2'" in statement
-    assert "'target-file-size-bytes', '1024'" in statement
+    assert f"'min-input-files', '{DEFAULT_MIN_INPUT_FILES}'" in statement
+    assert f"'target-file-size-bytes', '{DEFAULT_TARGET_FILE_SIZE_BYTES}'" in statement
     assert result.metrics == {"rewritten_data_files_count": 4, "added_data_files_count": 1}
     assert result.ran is True
 
@@ -232,28 +232,28 @@ def test_optimizer_compacts_data_files(tmp_path: Path) -> None:
         spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {config.catalog}.db")
         spark.sql(f"DROP TABLE IF EXISTS {table}")
         spark.sql(f"CREATE TABLE {table} (id bigint, val string) USING iceberg")
-        for index in range(4):
+        row_count: int = DEFAULT_MIN_INPUT_FILES + 1
+        for index in range(row_count):
             spark.sql(f"INSERT INTO {table} VALUES ({index}, 'v{index}')")
 
         files_before: int = data_file_count(spark, table)
-        assert files_before >= 4
+        assert files_before >= row_count
 
         opt_config: IcebergOptimizeConfig = IcebergOptimizeConfig(
             table=table,
             telemetry=TelemetryConfig(service="test", env="test"),
             rewrite_manifests=False,
             expire_snapshots=False,
-            min_input_files=2,
         )
         report = IcebergOptimizer(opt_config).run(spark)
 
         assert [step.step for step in report.steps] == ["rewrite_data_files"]
         rewrite_step = report.steps[0]
         assert rewrite_step.ran is True
-        assert rewrite_step.metrics.get("rewritten_data_files_count", 0) >= 2
+        assert rewrite_step.metrics.get("rewritten_data_files_count", 0) > 0
 
         files_after: int = data_file_count(spark, table)
         assert 1 <= files_after < files_before
-        assert spark.sql(f"SELECT count(*) AS c FROM {table}").collect()[0]["c"] == 4
+        assert spark.sql(f"SELECT count(*) AS c FROM {table}").collect()[0]["c"] == row_count
     finally:
         spark.stop()

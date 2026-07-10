@@ -57,7 +57,9 @@ pub fn time_range_to_expr(range: &TimeRange, column: &str, data_type: &DataType)
 /// A timestamp column yields a [`ScalarValue`] timestamp scaled to the column's [`TimeUnit`] and
 /// carrying the column's timezone, so the comparison is exact with no coercion. An integer column
 /// (epoch milliseconds stored as an integer) yields a plain integer literal. Any other column type
-/// is rejected as an invalid argument.
+/// is rejected as an invalid argument. Scaling to microsecond or nanosecond resolution goes through
+/// `checked_mul`: an epoch-millisecond bound near `i64::MAX` would otherwise wrap in release builds
+/// and silently produce the wrong time predicate, so an out-of-range bound is rejected instead.
 fn time_literal(epoch_ms: i64, data_type: &DataType) -> Result<Expr, SearchError> {
     match data_type {
         DataType::Timestamp(unit, tz) => {
@@ -65,9 +67,11 @@ fn time_literal(epoch_ms: i64, data_type: &DataType) -> Result<Expr, SearchError
                 TimeUnit::Second => ScalarValue::TimestampSecond(Some(epoch_ms / MILLIS_PER_SECOND), tz.clone()),
                 TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(Some(epoch_ms), tz.clone()),
                 TimeUnit::Microsecond => {
-                    ScalarValue::TimestampMicrosecond(Some(epoch_ms * MICROS_PER_MILLI), tz.clone())
+                    ScalarValue::TimestampMicrosecond(Some(scaled_epoch(epoch_ms, MICROS_PER_MILLI)?), tz.clone())
                 }
-                TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(Some(epoch_ms * NANOS_PER_MILLI), tz.clone()),
+                TimeUnit::Nanosecond => {
+                    ScalarValue::TimestampNanosecond(Some(scaled_epoch(epoch_ms, NANOS_PER_MILLI)?), tz.clone())
+                }
             };
             Ok(lit(scalar))
         }
@@ -77,6 +81,16 @@ fn time_literal(epoch_ms: i64, data_type: &DataType) -> Result<Expr, SearchError
             "event-timestamp column has unsupported type for a time range: {other:?}"
         ))),
     }
+}
+
+/// Scales an epoch-millisecond bound by `factor`, rejecting the bound when the multiplication
+/// would overflow `i64` instead of silently wrapping to an unrelated time.
+fn scaled_epoch(epoch_ms: i64, factor: i64) -> Result<i64, SearchError> {
+    epoch_ms.checked_mul(factor).ok_or_else(|| {
+        SearchError::invalid_argument(format!(
+            "event-timestamp bound {epoch_ms} overflows at the column's time resolution"
+        ))
+    })
 }
 
 /// Recursive worker for [`filter_to_expr`] tracking nesting depth.
@@ -394,6 +408,31 @@ mod tests {
             },
             "event_timestamp",
             &DataType::Utf8,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SearchError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn time_range_bound_overflowing_the_column_resolution_is_rejected() {
+        let err = time_range_to_expr(
+            &TimeRange {
+                start_ms: Some(i64::MAX),
+                end_ms: None,
+            },
+            "event_timestamp",
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SearchError::InvalidArgument(_)));
+
+        let err = time_range_to_expr(
+            &TimeRange {
+                start_ms: Some(i64::MIN),
+                end_ms: None,
+            },
+            "event_timestamp",
+            &DataType::Timestamp(TimeUnit::Nanosecond, None),
         )
         .unwrap_err();
         assert!(matches!(err, SearchError::InvalidArgument(_)));

@@ -28,9 +28,11 @@ from lance_etl.cliutil import (
     build_spark,
     build_telemetry_config,
     configure_logging_from_args,
+    index_config_from_args,
     parse_epoch_ms,
     parse_partition_cols,
     parse_storage_options,
+    run_with_spark,
 )
 from lance_etl.etl import ROUTING_COLS
 from lance_etl.iceberg_optimize import (
@@ -80,13 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     recall_parser.add_argument(
         "--max-samples", type=int, default=10_000, help="Cap on sampled spans fetched. Default 10000."
     )
-    recall_parser.add_argument(
-        "--id-column", default="vector_id", help="Unique id column matched against served result ids"
-    )
     recall_parser.add_argument("--vector-column", default="vector", help="Fixed-size-list vector column to scan")
-    recall_parser.add_argument(
-        "--batch-size", type=int, default=8192, help="Scanner batch size for the brute-force scan"
-    )
 
     migrate_namespace_parser: argparse.ArgumentParser = subparsers.add_parser(
         "migrate-namespace",
@@ -184,23 +180,21 @@ def run_recall(args: argparse.Namespace) -> None:
         args: Parsed command-line arguments.
     """
     spark = build_spark()
-    try:
+
+    def work() -> None:
+        """Build the config and run the recall audit."""
         config: RecallJobConfig = RecallJobConfig(
             base_uri=args.base_uri,
             telemetry=build_telemetry_config(args),
             storage_options=parse_storage_options(args),
-            id_column=args.id_column,
+            id_column="vector_id",
             vector_column=args.vector_column,
             max_samples=args.max_samples,
-            batch_size=args.batch_size,
         )
         source: DatadogSpanSource = DatadogSpanSource(site=args.dd_site)
         RecallAuditJob(config).run(spark, source, parse_epoch_ms(args.from_ts), parse_epoch_ms(args.to_ts))
-    except Exception:
-        logger.exception("recall failed")
-        raise
-    finally:
-        spark.stop()
+
+    run_with_spark(spark, "recall", logger, work)
 
 
 def run_migrate_namespace(args: argparse.Namespace) -> None:
@@ -218,19 +212,7 @@ def run_migrate_namespace(args: argparse.Namespace) -> None:
         args.vector_column or args.scalar_column or args.bitmap_column or args.zonemap_column or args.text_column
     )
     if has_index_columns:
-        index_config = IndexJobConfig(
-            telemetry=build_telemetry_config(args),
-            storage_options=parse_storage_options(args),
-            vector_columns=list(args.vector_column or []),
-            metric=args.metric,
-            scalar_columns=list(args.scalar_column or []),
-            bitmap_columns=list(args.bitmap_column or []),
-            zonemap_columns=list(args.zonemap_column or []),
-            text_columns=list(args.text_column or []),
-            fts_base_tokenizer=args.fts_base_tokenizer,
-            fts_language=args.fts_language,
-            rebuild=False,
-        )
+        index_config = index_config_from_args(args, build_telemetry_config(args), parse_storage_options(args))
     partition_cols: list[str] | None = parse_partition_cols(args.partition_by)
     config: MigrateConfig = MigrateConfig(
         source_namespace=args.source_namespace,
@@ -245,14 +227,13 @@ def run_migrate_namespace(args: argparse.Namespace) -> None:
         index=index_config,
     )
     spark = build_spark()
-    try:
+
+    def work() -> None:
+        """Run the namespace migration and log its report."""
         report = NamespaceMigrator(config).run(spark)
         logger.info("migrate-namespace report: %s", report)
-    except Exception:
-        logger.exception("migrate-namespace failed")
-        raise
-    finally:
-        spark.stop()
+
+    run_with_spark(spark, "migrate-namespace", logger, work)
 
 
 def run_optimize_iceberg(args: argparse.Namespace) -> None:
@@ -264,7 +245,9 @@ def run_optimize_iceberg(args: argparse.Namespace) -> None:
         args: Parsed command-line arguments.
     """
     spark = build_spark()
-    try:
+
+    def work() -> None:
+        """Build the config, run the Iceberg optimization, and log its report."""
         config: IcebergOptimizeConfig = IcebergOptimizeConfig(
             table=args.table,
             telemetry=build_telemetry_config(args),
@@ -277,11 +260,8 @@ def run_optimize_iceberg(args: argparse.Namespace) -> None:
         )
         report = IcebergOptimizer(config).run(spark)
         logger.info("optimize-iceberg report: %s", report)
-    except Exception:
-        logger.exception("optimize-iceberg failed")
-        raise
-    finally:
-        spark.stop()
+
+    run_with_spark(spark, "optimize-iceberg", logger, work)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -255,9 +255,9 @@ def config_for(tmp_path: Path, telemetry_config: TelemetryConfig, **overrides: A
         overrides: Configuration overrides applied on top of the defaults.
 
     Returns:
-        The configuration with a small batch size so multi-batch merging is exercised.
+        The configuration.
     """
-    fields: dict[str, Any] = {"base_uri": str(tmp_path), "telemetry": telemetry_config, "batch_size": 8}
+    fields: dict[str, Any] = {"base_uri": str(tmp_path), "telemetry": telemetry_config}
     fields.update(overrides)
     return RecallJobConfig(**fields)
 
@@ -328,6 +328,49 @@ class TestExactness:
         assert leg["status"] == "leg"
         assert leg["ids"] == whole_ids
         assert leg["count"] == whole_count
+
+    def test_stale_fragment_index_skips_instead_of_raising(
+        self, tmp_path: Path, telemetry_config: TelemetryConfig
+    ) -> None:
+        """A fragment_index beyond the freshly-opened dataset's fragment count skips rather than raising.
+
+        Stands in for a concurrent compaction shrinking the fragment count between the
+        ``classify_groups`` probe (which planned this index) and this task's own dataset open: the
+        dataset here genuinely has one fragment, so index 5 is out of range and must not raise
+        ``IndexError``.
+        """
+        uri, ids, vectors = tied_dataset(tmp_path, fragments=1, rows_per_fragment=10, tie_span=3)
+        version: int = lance.dataset(uri).version
+        query: np.ndarray = make_vectors(1, DIM, 71)[0].astype(np.float64)
+        served: list[int] = oracle_top_k(ids, vectors, query, 10)
+        sample: RecallSample = make_sample(0, version, query, served, namespace="whale")
+        config: RecallJobConfig = config_for(tmp_path, telemetry_config)
+        partials: dict[str, dict[str, Any]] = fragment_vector_partials(uri, version, 5, [sample], config)
+        assert partials[sample.sample_id] == {"status": "skip", "reason": "fragment_missing"}
+
+    def test_stale_fragment_index_skip_propagates_through_reduce(
+        self, tmp_path: Path, telemetry_config: TelemetryConfig
+    ) -> None:
+        """A fragment_missing partial among otherwise-valid partials still skips the whole reduced leg.
+
+        Mirrors :meth:`reduce_vector_legs`'s existing rule that any skip among a sample's per-fragment
+        partials skips the whole leg, so a mid-flight shrink degrades to an honest skip instead of a
+        recall score computed from an incomplete fragment scan.
+        """
+        uri, ids, vectors = tied_dataset(tmp_path, fragments=2, rows_per_fragment=10, tie_span=3)
+        version: int = lance.dataset(uri).version
+        query: np.ndarray = make_vectors(1, DIM, 71)[0].astype(np.float64)
+        served: list[int] = oracle_top_k(ids, vectors, query, 10)
+        sample: RecallSample = make_sample(0, version, query, served, namespace="whale")
+        config: RecallJobConfig = config_for(tmp_path, telemetry_config)
+        valid_partials: dict[str, dict[str, Any]] = fragment_vector_partials(uri, version, 0, [sample], config)
+        missing_partials: dict[str, dict[str, Any]] = fragment_vector_partials(uri, version, 9, [sample], config)
+        fragment_partials: list[tuple[int, dict[str, Any]]] = [
+            (0, valid_partials[sample.sample_id]),
+            (9, missing_partials[sample.sample_id]),
+        ]
+        leg: dict[str, Any] = reduce_vector_legs(sample, fragment_partials)
+        assert leg == {"status": "skip", "reason": "fragment_missing"}
 
 
 class TestSmallTier:
