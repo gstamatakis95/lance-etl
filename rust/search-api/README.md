@@ -1,12 +1,10 @@
 # search-api
 
 A tonic gRPC service that serves vector, full-text, and hybrid search over per-tenant Lance
-datasets. It is the read (and light-write) path of the `lance-etl` project: the PySpark ETL and
-indexing jobs under `src/lance_etl/` build and maintain the Lance datasets and their IVF_RQ /
-BTREE / BITMAP / ZONEMAP / FTS indices offline, and this service is what queries them online. It
-never writes indices and never runs Spark. The one write path it exposes, `IntakeService`, is a
-thin validate-and-forward seam in front of a pluggable `RecordSink`, not a replacement for the ETL
-job.
+datasets. It is the read path of the `lance-etl` project: the PySpark ETL and indexing jobs under
+`src/lance_etl/` build and maintain the Lance datasets and their IVF_RQ / BTREE / BITMAP / ZONEMAP /
+FTS indices offline, and this service is what queries them online. It never writes indices, accepts
+record writes, or runs Spark.
 
 Package name: `search-api` (binary `search-api`, library crate `search_api`).
 
@@ -14,8 +12,7 @@ Package name: `search-api` (binary `search-api`, library crate `search_api`).
 
 ## What it serves
 
-Two gRPC services defined in one proto file, `proto/lance_etl/v1/lance_etl.proto` (package
-`lance_etl.v1`), sharing one `DatasetTarget` message:
+One gRPC service defined in `proto/lance_etl/v1/lance_etl.proto` (package `lance_etl.v1`):
 
 | RPC | Purpose |
 |---|---|
@@ -24,8 +21,6 @@ Two gRPC services defined in one proto file, `proto/lance_etl/v1/lance_etl.proto
 | `SearchService/HybridSearch` | Fused vector + text (RRF or weighted), optional request-level typed filter applied to both legs |
 | `SearchService/Prewarm` | Pulls caches for a dataset at an explicit version or tag |
 | `SearchService/Clusters` | Reads the IVF centroid vectors of a vector index |
-| `IntakeService/Write` | Applies one batch of record writes (UPSERT/DELETE) to a single dataset |
-| `IntakeService/WriteStream` | Client-streaming batches of record writes, one aggregated response on half-close |
 
 Every request carries a `DatasetTarget` (`org_id`, `tenant_id`, `namespace`) that resolves to
 exactly one dataset at `{base_uri}/{org_id}/{tenant_id}/{namespace}.lance`. There is no
@@ -63,7 +58,6 @@ new fusion strategy is a variant on `domain::FusionSpec`.
 | `domain::prewarm` | `PrewarmSpec`, `PrewarmReport`, `Prewarmer` | Cache-warming trait |
 | `domain::clusters` | `ClusterSpec`, `ClusterReport`, `ClusterReader` | IVF centroid introspection trait |
 | `domain::fusion` | `FusionSpec` (`Rrf`, `Weighted`) | Within-dataset hybrid fusion, a pure function of the leg lists |
-| `domain::intake` | `IntakeBatch`, `Record`, `RecordWrite`, `WriteOp`, `RecordSink`, `StdoutSink` | Write-path domain types and the sink seam |
 | `cache::entry_store` | `EntryStore` | The persistent byte-store trait beneath both cache tiers |
 | `cache::disk_store` | `DiskEntryStore` | Local-disk backend (the default) |
 | `cache::redis_store` | `RedisEntryStore` | Shared-Redis backend: one Redis HASH per dir, native TTL, registry hygiene |
@@ -80,10 +74,8 @@ new fusion strategy is a variant on `domain::FusionSpec`.
 | `lance::index_reader` | `ClusterReader` impl | IVF centroid extraction |
 | `grpc::mod` | `SearchGrpc<B>` | Tonic adapter for `SearchService`, generic over `SearchBackend` |
 | `grpc::convert` | (proto <-> domain) | Conversion for the search service |
-| `grpc::intake` | `IntakeGrpc<S>` | Tonic adapter for `IntakeService`, generic over `RecordSink` |
-| `grpc::intake_convert` | (proto <-> domain) | Conversion for the intake service |
 | `telemetry::traces` | `init_tracing`, `LanceEventMetricsLayer` | OTLP span export, JSON stdout logs, bridges Lance throttle/io/dataset/file-audit trace events into metrics |
-| `telemetry::metrics` | `Metrics`, `Rpc`, `IntakeRpc`, `CacheName`, `Tier` | Typed DogStatsD facade |
+| `telemetry::metrics` | `Metrics`, `Rpc`, `CacheName`, `Tier` | Typed DogStatsD facade |
 | `telemetry::recall` | `RecallCapture`, `RecallRecord` | Deterministic sampled-query capture into `recall.*` span attributes |
 | `config` | `Config`, `CacheBackendKind` | Environment-driven runtime configuration |
 
@@ -227,12 +219,6 @@ LANCE_ETL_BASE_URI=s3://my-bucket/lance \
   ./target/release/search-api
 ```
 
-The intake service is wired to `StdoutSink`, a structured-print placeholder. A future `KafkaSink`
-implements the same `RecordSink` trait and replaces it at the construction site in `main` without
-any change to the proto, transport, or domain types.
-
----
-
 ## Observability
 
 Traces export over OTLP gRPC to the Datadog Agent (`init_tracing` in `src/telemetry/traces.rs`).
@@ -245,7 +231,7 @@ lifecycle, file audit) into DogStatsD metrics without the telemetry layer depend
 types.
 
 Metrics go through the typed `Metrics` facade in `src/telemetry/metrics.rs`, all `search_api.*`
-prefixed and tagged with small closed enums (`Rpc`, `IntakeRpc`, `CacheName`, `Tier`) rather than
+prefixed and tagged with small closed enums (`Rpc`, `CacheName`, `Tier`) rather than
 free-form strings, keeping cardinality bounded by construction.
 
 `telemetry::recall::RecallCapture` deterministically samples a slice of `VectorSearch`,

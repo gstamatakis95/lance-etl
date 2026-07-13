@@ -17,7 +17,7 @@ duplicate it here. This file is agent-facing and complementary.
 
 ```
 rust/search-api/        Rust gRPC search service (tonic, lance crate)
-  proto/                lance_etl/v1/lance_etl.proto (one file: SearchService + IntakeService, shared DatasetTarget)
+  proto/                lance_etl/v1/lance_etl.proto (SearchService and DatasetTarget)
   src/domain/           Transport-agnostic types and traits
     target.rs           DatasetTarget, DatasetRef — dataset addressing (one dataset per request)
     query.rs            VectorQuery, TextQuery, HybridQuery, Hit, FusedHit
@@ -26,7 +26,6 @@ rust/search-api/        Rust gRPC search service (tonic, lance crate)
     prewarm.rs          PrewarmSpec, PrewarmReport, Prewarmer trait
     clusters.rs         ClusterSpec, ClusterReport, ClusterReader trait
     fusion.rs           FusionSpec (Rrf and Weighted variants) and within-dataset fusion logic
-    intake.rs           IntakeBatch, Record, RecordWrite, WriteOp, RecordSink trait, StdoutSink placeholder
     error.rs            SearchError
   src/cache/            Persistent two-tier caching layer (index + metadata, no raw data), pluggable disk/redis backends
     layout.rs           Versioned stamp naming, key hashing, framing, atomic writes, TTL/budget sweep
@@ -46,13 +45,11 @@ rust/search-api/        Rust gRPC search service (tonic, lance crate)
     index_reader.rs     IVF centroid extraction, ClusterReader impl
     error.rs            Lance error classification into SearchError
   src/grpc/             Tonic transport
-    mod.rs              SearchGrpc<B>: tonic service adapter (search) + IntakeGrpc<S> (intake)
+    mod.rs              SearchGrpc<B>: tonic service adapter
     convert.rs          Proto <-> domain conversion for the search service
-    intake.rs           IntakeGrpc<S>: tonic adapter over any RecordSink
-    intake_convert.rs   Proto <-> domain conversion for the intake service
   src/telemetry/        Datadog observability
     traces.rs           OTLP span export, JSON stdout logs with trace correlation
-    metrics.rs          Typed DogStatsD facade (Metrics struct + Rpc + IntakeRpc tag enums)
+    metrics.rs          Typed DogStatsD facade (Metrics struct + Rpc tag enum)
     recall.rs           Deterministic sampled-query capture into recall.* span attributes
   src/config.rs         Config from env vars
   src/lib.rs            Crate root
@@ -127,8 +124,8 @@ not just an internal detail.
 ## Telemetry conventions (Rust)
 
 - The service emits `search_api.*` metrics via the typed `Metrics` facade in
-  `src/telemetry/metrics.rs`, tagged with small closed enums (`Rpc`, `IntakeRpc`, `CacheName`,
-  `Tier`) rather than free-form strings.
+  `src/telemetry/metrics.rs`, tagged with small closed enums (`Rpc`, `CacheName`, `Tier`) rather
+  than free-form strings.
 - All metric emitters are infallible. An unreachable Datadog Agent never panics and never fails a
   request. The same degrade-not-fail rule applies to the Redis `EntryStore`: a Redis round-trip
   error becomes a cache miss or dropped write, counted by `cache.backend_errors`, never a failed
@@ -157,18 +154,6 @@ variable table. These finer-grained normative facts are recorded here so they ar
   and `filter_mode` (field 9) that are ANDed into both the vector leg and the text leg
   independently. When a leg already carries its own filter the two predicates are combined with a
   typed `AND` node. Absent means no additional predicate beyond what each leg specifies.
-- **Intake records.** Each `RecordWrite` carries an `op` (`WriteOp`: UPSERT or DELETE) and a
-  `Record`. A `Record` contains a string `id`, an `event_timestamp_ms` (epoch milliseconds, the
-  canonical ETL clock, no separate ingestion timestamp), a `metadata` string map, a `vectors` map
-  of named fixed-dimension float arrays (one per vector column), and a `texts` map of named text
-  fields (one per FTS column). The dataset `target` on the request names `org_id`, `tenant_id`, and
-  `namespace` and is never duplicated onto individual records. `WriteRecordsResponse` returns only
-  record ids: `succeeded_ids` for records the sink accepted and `failed_ids` for records that
-  failed validation or sink acceptance. A record whose id is itself empty or invalid cannot be
-  reported by id and is omitted from `failed_ids`. The only shipped sink is `StdoutSink`, a
-  structured-print placeholder. A future `KafkaSink` implements the same `RecordSink` trait and
-  replaces it at the construction site in `main` without changing the proto, transport, or domain
-  types.
 - **Fusion and rerank.** `RrfFusion` (default, reciprocal-rank fusion with configurable `rrf_k`) or
   `WeightedFusion` (min-max normalized legs combined by `vector_weight`). Post-fusion reranking:
   `IdentityRerank` (no-op identity, with optional `top_n` truncation) is the only shipped strategy

@@ -17,10 +17,10 @@ tonic adapter and the only place proto types appear, and `cache` and `telemetry`
 Filtering uses a typed `Filter` AST (comparison, in-list, is-null, between, and/or/not), never a
 SQL string. Column names are validated against the dataset schema and the identifier allowlist
 `[A-Za-z_][A-Za-z0-9_]*`, literals become typed DataFusion `lit` expressions, and injection
-attempts are rejected at the allowlist (covered by tests). The `SearchService` and
-`IntakeService` share one proto file (`proto/lance_etl/v1/lance_etl.proto`) and one
-`DatasetTarget` message. `HybridSearchRequest` additionally accepts a request-level typed filter
-that is ANDed into both legs before either index search runs.
+attempts are rejected at the allowlist (covered by tests). The `SearchService` is defined in
+`proto/lance_etl/v1/lance_etl.proto` and uses one `DatasetTarget` message across its RPCs.
+`HybridSearchRequest` additionally accepts a request-level typed filter that is ANDed into both
+legs before either index search runs.
 
 ## ADR 0014 — One dataset per target, time queries as scalar filters
 

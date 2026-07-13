@@ -4,8 +4,8 @@ Client stubs are generated at runtime with ``grpcio-tools`` from the repository'
 copied flat into a generation directory before compilation because its natural package path (``lance_etl/v1``) would
 collide with the installed ``lance_etl`` Python package. The flattened modules (``lance_etl_pb2`` /
 ``lance_etl_pb2_grpc``) are imported off ``sys.path`` instead. This is simpler and more deterministic than server
-reflection, which would make the benchmark depend on the server having reflection enabled. The one proto carries both
-the ``SearchService`` and the ``IntakeService``; the benchmark only drives the search side.
+reflection, which would make the benchmark depend on the server having reflection enabled. The proto carries the
+``SearchService`` contract exercised by the benchmark.
 
 Every request message addresses its dataset through a ``DatasetTarget`` built by :func:`dataset_target`, matching the
 ``{base}/{org_id}/{tenant_id}/{namespace}.lance`` layout the benchmark ingest phase writes. :func:`prewarm_dataset`

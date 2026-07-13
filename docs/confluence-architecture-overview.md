@@ -37,7 +37,6 @@ lance-etl turns raw source data into fast, searchable, per-customer datasets.
   - **Full-text search**: "find the items that mention these words" (classic keyword search).
   - **Hybrid search**: both at once, intelligently blended into one ranked list.
 - A separate, fast **gRPC search service** (written in Rust) serves those queries to applications in real time.
-- A companion **intake service** accepts new records, updates, and deletes over the same wire protocol.
 
 ### The scale it is built for
 
@@ -85,7 +84,7 @@ lance-etl turns raw source data into fast, searchable, per-customer datasets.
 The system has two halves that meet at the Lance datasets in object storage.
 
 - **The Python data plane** builds and maintains the datasets. It runs as scheduled batch jobs on Apache Spark. It reads from Iceberg, writes to Lance, builds indexes, compacts, expires old data, and migrates datasets.
-- **The Rust serving plane** answers live queries and accepts live record mutations. It is a small, fast gRPC service that reads (and, through intake, forwards writes to) the same Lance datasets.
+- **The Rust serving plane** answers live queries. It is a small, fast gRPC service that reads the same Lance datasets.
 
 The data plane is about throughput over thousands of datasets. The serving plane is about low-latency responses to individual requests. Keeping them separate lets each be tuned for its own job.
 
@@ -116,13 +115,13 @@ The data plane is about throughput over thousands of datasets. The serving plane
                  |   base/<org>/<tenant>/       |
                  |        <namespace>.lance     |
                  +--------------+--------------+
-                       reads ^  | writes forwarded (future: Kafka)
-                             |  |
+                       reads ^
+                             |
    ============== RUST SERVING PLANE (tonic gRPC) ===============
    |                                                             |
-   |   SearchService            IntakeService                    |
-   |   - VectorSearch           - Write                          |
-   |   - TextSearch             - WriteStream                    |
+   |   SearchService                                             |
+   |   - VectorSearch                                            |
+   |   - TextSearch                                              |
    |   - HybridSearch                                            |
    |   - Prewarm            +-- two-tier disk + memory cache     |
    |   - Clusters           +-- typed filter AST (no raw SQL)    |
@@ -137,7 +136,7 @@ The data plane is about throughput over thousands of datasets. The serving plane
 ### Split of responsibilities
 
 - **Driver vs executors (Spark).** The Spark driver only plans, broadcasts small read-only artifacts (such as trained centroids and version pins), and commits. All heavy reads, writes, index builds, and compaction run inside executor tasks. The driver never opens a dataset for row-level work.
-- **Read vs write (serving).** The SearchService only reads. The IntakeService only accepts record writes and forwards them to a pluggable sink. Neither opens a dataset for the other's job.
+- **Read-only serving.** The SearchService reads versioned Lance datasets. Durable writes enter through Iceberg and the Spark ETL path.
 - **Engine vs transport (Rust).** The Rust crate is layered so that the query engine, the wire protocol, and the caching layer never leak into each other.
 
 ### Engineer-facing detail
@@ -177,10 +176,10 @@ The `bench` package (`python -m bench`) drives the real pipeline and the live se
 
 | Layer | Responsibility |
 |---|---|
-| `domain/` | Engine- and transport-agnostic types and traits: `DatasetTarget`, query types, the typed `Filter` AST, `SearchBackend`, `DatasetProvider`, fusion, prewarm, clusters, intake (`RecordSink`), and the single `SearchError`. References neither proto, tonic, nor Lance. |
+| `domain/` | Engine- and transport-agnostic types and traits: `DatasetTarget`, query types, the typed `Filter` AST, `SearchBackend`, `DatasetProvider`, fusion, prewarm, clusters, and the single `SearchError`. References neither proto, tonic, nor Lance. |
 | `cache/` | Persistent two-tier caching: a disk-backed index cache (`disk_cache.rs`), a path-filtered metadata byte cache (`store_cache.rs`), shared on-disk layout (`layout.rs`), and a background janitor (`janitor.rs`). Caches index and metadata only, never raw data. |
 | `lance/` | The only layer that touches Lance, Arrow, and DataFusion. `provider.rs` (resolution, shared session, handle LRU), `backend.rs` (the `SearchBackend`), `filter.rs` (AST to DataFusion expr), `text.rs` (FTS translation), `rows.rs` (Arrow to JSON), `prewarm.rs`, `index_reader.rs` (IVF centroid extraction). |
-| `grpc/` | Thin tonic transport. `mod.rs` (`SearchGrpc<B>`), `intake.rs` (`IntakeGrpc<S>`), and pure proto-to-domain conversions. The only place proto and tonic types appear. |
+| `grpc/` | Thin tonic transport. `mod.rs` contains `SearchGrpc<B>` and pure proto-to-domain conversions. This is the only place proto and tonic types appear. |
 | `telemetry/` | Datadog observability: OTLP trace export, JSON logs with trace correlation, a typed DogStatsD metrics facade, and sampled-query recall capture. Every emitter is infallible. |
 | `config.rs` | Environment-driven runtime configuration. |
 
@@ -242,29 +241,11 @@ Key points:
 | **BITMAP** (scalar) | low-cardinality columns | Efficient equality and category filtering. |
 | **INVERTED** (FTS) | text columns | Full-text BM25 search, optionally with positions for phrase queries. |
 
-### The intake `Record` contract
-
-The wire-level record the IntakeService accepts mirrors the dataset model exactly:
-
-```proto
-message Record {
-  string id = 1;                       // client-assigned vector id
-  int64 event_timestamp_ms = 2;        // canonical event clock (no ingest clock)
-  map<string, string> metadata = 3;    // -> Arrow Map<Utf8, Utf8>
-  map<string, FloatVector> vectors = 4;// named fixed-dimension vectors
-  map<string, string> texts = 5;       // named text fields, keyed by FTS column name
-}
-```
-
-Validation rejects an upsert with an empty id, an upsert carrying no metadata, vectors, or texts at all, and any named vector whose values list is empty. A delete needs only a non-empty id.
-
----
-
 ## 6. gRPC endpoints and contracts
 
 *Audience: engineers*
 
-Two services share one binary, one port, one router, one health endpoint, and one telemetry pipeline. They also share one proto file, `proto/lance_etl/v1/lance_etl.proto` (package `lance_etl.v1`), and one `DatasetTarget` message referenced by both.
+The search service runs as one binary with one port, one health endpoint, and one telemetry pipeline. Its proto is `proto/lance_etl/v1/lance_etl.proto` in package `lance_etl.v1`.
 
 ### SearchService
 
@@ -276,13 +257,6 @@ Two services share one binary, one port, one router, one health endpoint, and on
 | **Prewarm** | Pulls one dataset's metadata and index structures into local caches before traffic arrives. | Request: target, what to warm, and an optional explicit version or tag. Response: per-index outcomes, durations, cache size, and the resolved version warmed. |
 | **Clusters** | Reads the IVF centroids of a vector index. | Request: target, optional index name. Response: centroids in partition order, dimension, index name, partition count. |
 
-### IntakeService
-
-| RPC | Purpose | Request / response shape (high level) |
-|---|---|---|
-| **Write** | Apply one batch of record writes to a single dataset. | Request: target plus a list of `RecordWrite` (a `WriteOp` op plus a record). Response: `succeeded_ids` and `failed_ids` (record ids only). |
-| **WriteStream** | High-throughput client-streaming of record-write batches across possibly several datasets. | Stream of `WriteRecordsRequest`, each with its own target. One aggregated `WriteRecordsResponse` on half-close. |
-
 ### Notable contract rules
 
 - **Typed filter AST, no raw SQL.** Filters are a typed predicate tree (`Comparison`, `InList`, `IsNull`, `IsNotNull`, `Between`, `and`, `or`, `not`). Column names are validated against the dataset schema and an identifier allowlist. Literals become typed DataFusion `lit` expressions. Clients can never inject expression text (ADR 0005). An injection attempt such as a column named `id; DROP TABLE users` is rejected at the allowlist. String equality (`column = "value"`) is fully supported on all search RPCs. The string literal is transported verbatim through `LiteralValue.string_value` and becomes a typed DataFusion expression, never raw SQL.
@@ -290,9 +264,6 @@ Two services share one binary, one port, one router, one health endpoint, and on
 - **Event-time windowing via TimeRange.** The three search RPCs accept an optional `TimeRange { optional int64 start_ms; optional int64 end_ms }` (epoch milliseconds, start inclusive, end exclusive, either bound optional). The window always applies to the event-timestamp column, fixed to the `DEFAULT_EVENT_TIMESTAMP_COLUMN` constant in `config.rs` (`event_timestamp`), no longer env-configurable. The range is translated into a typed predicate ANDed with any caller-provided `Filter`, never as raw SQL. A BTREE or zone-map on that column prunes the scan. An absent `TimeRange` leaves every search path behaving exactly as before (ADR 0021).
 - **Fusion specs.** Hybrid fusion offers two strategies. **RRF** sums `1 / (rrf_k + rank)` across legs (default `rrf_k = 60`). **Weighted** min-max normalizes each leg into `[0, 1]` and combines them with a vector weight (default `0.7`). RRF is the default when no fusion message is set.
 - **Rerank field.** Every search RPC accepts an optional `Rerank`. The only strategy is `IdentityRerank` (keep order, optionally truncate to `top_n`), implemented as a plain `truncate_to_top_n` helper in `grpc/mod.rs`. The earlier async `Reranker` trait and `IdentityReranker` seam (`domain/rerank.rs`) were removed since truncation was the only effect that trait ever had in production.
-- **Intake record writes.** `WRITE_OP_UPSERT` carries the full record (create or replace). `WRITE_OP_DELETE` reads only the id. Bad record writes fail per item rather than failing the whole batch, which suits streaming ingestion. The response reports only ids: `succeeded_ids` for accepted records and `failed_ids` for failures. A record whose id is itself empty or invalid is omitted from `failed_ids`. A bad target or a whole-sink failure still fails the request.
-- **RecordSink seam.** The write destination sits behind one domain trait, `RecordSink`. Today the only implementation is `StdoutSink`, which prints each record write as one structured line. A future `KafkaSink` implements the same trait and replaces it at the single construction site in `main` with no other change (ADR 0017).
-- **Canonical clock.** The intake record carries `event_timestamp_ms` only. There is no ingest timestamp, consistent with the ETL.
 - **Pre-release proto.** The proto carries no backward-compatibility guarantee. Breaking reshapes have been taken freely where warranted.
 
 ---
@@ -394,9 +365,9 @@ Each decision below cites its ADR. Accepted unless noted.
 ### Knob reduction (ADR 0015)
 - Roughly 30 rarely-varied knobs were removed. Universally-correct constants (for example `num_bits=1`, V2 manifest paths, compaction mode) became module constants. Schema column names and fine-grained tokenizer toggles became code-level dataclass fields, not CLI flags. Retry budgets were consolidated into single named constants in `telemetry.py`.
 
-### Intake service with a pluggable sink (ADR 0017)
-- A second gRPC service accepts UPSERT and DELETE record writes over `Write` and `WriteStream`. It shares the single `lance_etl.v1` proto and the `DatasetTarget` message with the search service, and its response returns only `succeeded_ids` and `failed_ids`.
-- The destination sits behind the `RecordSink` trait. `StdoutSink` today, `KafkaSink` later, swappable in one line with no proto change. Intake never opens a dataset, so it carries no Lance dependency.
+### Intake service removed (ADR 0017 superseded)
+- The placeholder service could acknowledge writes without a durable destination. It was removed before release.
+- Iceberg is the only durable ingestion source. Any future online-write API requires a fresh ADR with durable transport and replay semantics.
 
 ### Per-row TTL folded into maintenance (ADR 0018)
 - Each row carries its own lifetime in a dedicated Arrow `Duration` column. The delete predicate is `ts_column + ttl_column < TIMESTAMP 'now'`, evaluated natively by Lance/DataFusion as timestamp-plus-duration column arithmetic.
@@ -485,7 +456,7 @@ Both planes report to Datadog. Every emitter on the Rust side is infallible by c
 
 ### Metrics (DogStatsD)
 
-- A typed `Metrics` facade emits `search_api.*` and `intake.*` metrics.
+- A typed `Metrics` facade emits `search_api.*` metrics.
 - **Tag cardinality is kept deliberately low: rpc and status only, never org or tenant.** This keeps the metrics bill and cardinality bounded across 30k tenants.
 - Several Lance trace surfaces are tapped by the `LanceEventMetricsLayer`: per-query execution stats (`query.iops`, `query.bytes_read`, `query.parts_loaded`), the object-store throttle target (`throttle.errors`, `throttle.new_rate`), and the `lance::io_events`, `lance::dataset_events`, and `lance::file_audit` targets (`lance.io_events` tagged `io_type`, `lance.dataset_events` tagged `event`, `lance.file_audit` tagged `mode` and `type`).
 
@@ -571,7 +542,6 @@ Note: the serving-side tag resolution and prewarm-before-flip safety are still *
 
 These are honest, verified against the ADRs.
 
-- **The intake sink is stdout-only today.** The IntakeService validates and routes record writes, but the only sink is `StdoutSink`, which prints them. The planned `KafkaSink` (for the ETL to consume) is a one-line swap behind the same trait, but it is not built yet (ADR 0017).
 - **Blue-green serving is still Proposed, not implemented.** The Python tag helper and the design are ready, but the Rust serving-side tag resolution and prewarm-before-flip safety are not done. A prior attempt was interrupted and backed out to keep the crate compiling (ADR 0013).
 - **Reindex during migrate needs explicit index columns.** A namespace copy carries no indexes, and the columns to rebuild cannot be guessed, so reindex is skipped with a warning unless index column flags are supplied (ADR 0019).
 - **No receipt-based (ingest-age) TTL.** There is no ingest-time column by design, so TTL is driven by each row's own lifetime column relative to its event timestamp. Adding ingest-age TTL would require a fresh ADR with an explicit ingest-time design, not a revival of the removed `_ingested_at` column (ADR 0016, ADR 0018).

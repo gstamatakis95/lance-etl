@@ -36,25 +36,6 @@ impl Rpc {
     }
 }
 
-/// Intake RPC names used as the `rpc` metric tag on `intake.*` metrics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IntakeRpc {
-    /// `IntakeService/Write`.
-    Write,
-    /// `IntakeService/WriteStream`.
-    WriteStream,
-}
-
-impl IntakeRpc {
-    /// Tag value for this RPC.
-    pub fn as_tag(self) -> &'static str {
-        match self {
-            Self::Write => "write",
-            Self::WriteStream => "write_stream",
-        }
-    }
-}
-
 /// Cache identities used as the `cache` metric tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheName {
@@ -694,50 +675,6 @@ impl Metrics {
     pub fn clusters_centroids(&self, count: u64) {
         self.client.distribution_with_tags("clusters.centroids", count).send();
     }
-
-    /// One finished intake RPC: request count and latency distribution tagged by `rpc` and
-    /// `status`, plus an error count for non-`ok` statuses. Mirrors [`Metrics::rpc`].
-    pub fn intake_rpc(&self, rpc: IntakeRpc, status: &'static str, duration: Duration) {
-        self.client
-            .count_with_tags("intake.requests", 1)
-            .with_tag("rpc", rpc.as_tag())
-            .with_tag("status", status)
-            .send();
-        self.client
-            .distribution_with_tags("intake.duration_ms", millis(duration))
-            .with_tag("rpc", rpc.as_tag())
-            .with_tag("status", status)
-            .send();
-        if status != "ok" {
-            self.client
-                .count_with_tags("intake.errors", 1)
-                .with_tag("rpc", rpc.as_tag())
-                .with_tag("status", status)
-                .send();
-        }
-    }
-
-    /// Per-batch intake outcome tagged by `rpc`: the batch size distribution plus upsert, delete,
-    /// and reject counts. Zero counts are skipped to keep the timeseries quiet. No org/tenant tags:
-    /// per-tenant detail lives on the span.
-    pub fn intake_batch(&self, rpc: IntakeRpc, upserts: u64, deletes: u64, rejected: u64, batch_size: u64) {
-        self.client
-            .distribution_with_tags("intake.batch_size", batch_size)
-            .with_tag("rpc", rpc.as_tag())
-            .send();
-        for (name, count) in [
-            ("intake.upserts", upserts),
-            ("intake.deletes", deletes),
-            ("intake.rejected", rejected),
-        ] {
-            if count > 0 {
-                self.client
-                    .count_with_tags(name, count as i64)
-                    .with_tag("rpc", rpc.as_tag())
-                    .send();
-            }
-        }
-    }
 }
 
 /// Converts a duration to whole milliseconds for distributions.
@@ -1008,62 +945,6 @@ mod tests {
     }
 
     #[test]
-    fn intake_metrics_render_expected_names_and_tags() {
-        let (metrics, drain) = spy_metrics();
-        metrics.intake_rpc(IntakeRpc::Write, "ok", Duration::from_millis(6));
-        metrics.intake_batch(IntakeRpc::Write, 3, 1, 2, 6);
-        let lines = drain();
-        let expect = [
-            ("search_api.intake.requests:1|c", vec!["rpc:write", "status:ok"]),
-            ("search_api.intake.duration_ms:6|d", vec!["rpc:write"]),
-            ("search_api.intake.batch_size:6|d", vec!["rpc:write"]),
-            ("search_api.intake.upserts:3|c", vec!["rpc:write"]),
-            ("search_api.intake.deletes:1|c", vec!["rpc:write"]),
-            ("search_api.intake.rejected:2|c", vec!["rpc:write"]),
-        ];
-        for (head, tags) in expect {
-            assert!(
-                lines
-                    .iter()
-                    .any(|line| line.starts_with(head) && tags.iter().all(|tag| line.contains(tag))),
-                "missing {head} with {tags:?} in {lines:?}"
-            );
-        }
-        assert!(
-            !lines.iter().any(|line| line.contains("intake.errors")),
-            "ok status must not count as an error: {lines:?}"
-        );
-        assert!(
-            !lines.iter().any(|line| line.contains("org")),
-            "intake metrics must never carry org/tenant tags: {lines:?}"
-        );
-    }
-
-    #[test]
-    fn intake_errors_and_zero_counts_behave_like_the_search_path() {
-        let (metrics, drain) = spy_metrics();
-        metrics.intake_rpc(IntakeRpc::WriteStream, "invalid_argument", Duration::from_millis(1));
-        metrics.intake_batch(IntakeRpc::WriteStream, 0, 0, 0, 0);
-        let lines = drain();
-        assert!(
-            lines.iter().any(
-                |line| line.starts_with("search_api.intake.errors:1|c") && line.contains("status:invalid_argument")
-            ),
-            "missing intake error counter: {lines:?}"
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.starts_with("search_api.intake.batch_size:0|d") && line.contains("rpc:write_stream")),
-            "batch size must always be emitted: {lines:?}"
-        );
-        assert!(
-            !lines.iter().any(|line| line.contains("intake.upserts")),
-            "zero upsert counts must not be emitted: {lines:?}"
-        );
-    }
-
-    #[test]
     fn lance_event_metrics_render_expected_names_and_tags() {
         let (metrics, drain) = spy_metrics();
         metrics.lance_io_event(LanceIoType::OpenVectorIndex);
@@ -1114,8 +995,6 @@ mod tests {
         assert_eq!(Rpc::VectorSearch.as_tag(), "vector_search");
         assert_eq!(Rpc::Prewarm.as_tag(), "prewarm");
         assert_eq!(Rpc::Clusters.as_tag(), "clusters");
-        assert_eq!(IntakeRpc::Write.as_tag(), "write");
-        assert_eq!(IntakeRpc::WriteStream.as_tag(), "write_stream");
         assert_eq!(CacheName::Handles.as_tag(), "handles");
         assert_eq!(Tier::Disk.as_tag(), "disk");
         assert_eq!(EvictionReason::Corrupt.as_tag(), "corrupt");

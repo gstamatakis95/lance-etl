@@ -57,8 +57,8 @@ pub mod grpc;
 pub mod lance;
 pub mod telemetry;
 
-/// Generated protobuf and gRPC types for `lance_etl.v1`, covering both the `SearchService` and the
-/// `IntakeService` defined in the single `lance_etl.proto` file.
+/// Generated protobuf and gRPC types for the `lance_etl.v1.SearchService` defined in
+/// `lance_etl.proto`.
 pub mod pb {
     tonic::include_proto!("lance_etl.v1");
 }

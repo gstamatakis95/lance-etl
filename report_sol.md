@@ -996,7 +996,7 @@ Allowed states are NOT_STARTED, IN_PROGRESS, DONE, and BLOCKED.
 
 | Stage | State | Verification | Notes or blocker |
 |---|---|---|---|
-| Safety removal | IN_PROGRESS | | |
+| Safety removal | IN_PROGRESS | Python gates and Rust intake gates green | Bulk append defaults off, clustered rewrite CLI removed, and placeholder intake removed. Fixed HEAD and explicit promotion remain. |
 | STATE-01 | NOT_STARTED | | |
 | SOURCE-01 | NOT_STARTED | | |
 | MUTATION-01 | NOT_STARTED | | |

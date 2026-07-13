@@ -2,9 +2,8 @@
 //!
 //! A single global tonic timeout cannot serve this API: search RPCs need a tight sub-second
 //! budget while `SearchService/Prewarm` legitimately loads every requested IVF partition and
-//! BTree page over the object store, and `IntakeService/WriteStream` spans an entire client
-//! stream. [`RouteTimeoutLayer`] therefore matches the gRPC method path of each request and
-//! applies the default search budget to everything except the routes in
+//! BTree page over the object store. [`RouteTimeoutLayer`] therefore matches the gRPC method path
+//! of each request and applies the default search budget to everything except the routes in
 //! [`LONG_TIMEOUT_ROUTES`], which get the long budget instead. A request that exceeds its budget
 //! is answered with a `DEADLINE_EXCEEDED` gRPC status, never a hung connection.
 
@@ -20,13 +19,9 @@ use crate::config::{DEFAULT_LONG_REQUEST_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS}
 
 /// gRPC method paths that get the long timeout budget instead of the search default.
 ///
-/// `Prewarm` walks every requested index over the object store and `WriteStream`'s single
-/// response only completes after the whole client stream is consumed, so both would be killed
-/// mid-flight by the sub-second search budget.
-pub const LONG_TIMEOUT_ROUTES: [&str; 2] = [
-    "/lance_etl.v1.SearchService/Prewarm",
-    "/lance_etl.v1.IntakeService/WriteStream",
-];
+/// `Prewarm` walks every requested index over the object store, so it would be killed mid-flight
+/// by the sub-second search budget.
+pub const LONG_TIMEOUT_ROUTES: [&str; 1] = ["/lance_etl.v1.SearchService/Prewarm"];
 
 /// Tower layer applying a per-route server-side timeout to every request.
 ///
@@ -172,12 +167,10 @@ mod tests {
         let default = Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS);
         let long = Duration::from_millis(DEFAULT_LONG_REQUEST_TIMEOUT_MS);
         assert_eq!(layer.budget_for("/lance_etl.v1.SearchService/Prewarm"), long);
-        assert_eq!(layer.budget_for("/lance_etl.v1.IntakeService/WriteStream"), long);
         assert_eq!(layer.budget_for("/lance_etl.v1.SearchService/VectorSearch"), default);
         assert_eq!(layer.budget_for("/lance_etl.v1.SearchService/TextSearch"), default);
         assert_eq!(layer.budget_for("/lance_etl.v1.SearchService/HybridSearch"), default);
         assert_eq!(layer.budget_for("/lance_etl.v1.SearchService/Clusters"), default);
-        assert_eq!(layer.budget_for("/lance_etl.v1.IntakeService/Write"), default);
         assert_eq!(layer.budget_for("/grpc.health.v1.Health/Check"), default);
     }
 

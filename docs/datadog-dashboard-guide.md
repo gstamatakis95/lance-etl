@@ -333,38 +333,7 @@ successfully, and keeping the index cache warm so serving does not pay cold-star
   Compare against the current serving version (from traces). They should be equal or the prewarm
   version should lead.
 
-### 4.6 Intake
-
-**Goal.** Monitor the write path: throughput, latency, and the ratio of upserts to deletes and
-rejections.
-
-**Metrics.**
-
-| Metric | Type | Tags | What it measures |
-|---|---|---|---|
-| `search_api.intake.requests` | count | `rpc`, `status` | Intake RPC throughput. `rpc`: `write`, `write_stream`. |
-| `search_api.intake.errors` | count | `rpc`, `status` | Intake error throughput. |
-| `search_api.intake.duration_ms` | distribution | `rpc`, `status` | Intake RPC latency in milliseconds. |
-| `search_api.intake.batch_size` | distribution | `rpc` | Records in each intake batch. Always emitted. |
-| `search_api.intake.upserts` | count | `rpc` | Upserted (inserted or updated) records per batch. Skipped when zero. |
-| `search_api.intake.deletes` | count | `rpc` | Deleted records per batch. Skipped when zero. |
-| `search_api.intake.rejected` | count | `rpc` | Rejected records per batch. Skipped when zero. |
-
-**Widgets.**
-
-- **Intake throughput (timeseries).** `sum:search_api.intake.requests by {rpc}.as_rate()`. Watch
-  for drops that indicate producers have stopped sending.
-- **Intake error rate (timeseries).** `sum:search_api.intake.errors by {status}.as_rate()`.
-- **Batch composition (stacked timeseries).** `sum:search_api.intake.upserts`,
-  `search_api.intake.deletes`, and `search_api.intake.rejected` stacked. A surge in `rejected`
-  means records are failing validation. A drop in both `upserts` and `deletes` means batches are
-  empty or producers are slow.
-- **Batch size distribution (distribution widget).** `search_api.intake.batch_size`. Helps identify
-  whether producers are sending micro-batches (too small, high overhead) or over-sized batches
-  (too large, memory pressure).
-- **Intake latency (timeseries).** `p95:search_api.intake.duration_ms by {rpc}`.
-
-### 4.7 ETL Pipeline
+### 4.6 ETL Pipeline
 
 **Goal.** Monitor the incremental Iceberg-to-Lance ETL job: how many datasets were touched, how
 many rows were upserted and deleted, how long merges took, and whether commit conflicts are
@@ -404,7 +373,7 @@ added by the calling code at emit time (e.g. a `conflicts:` bucket tag on merge 
 - **Row throughput (timeseries).** `avg:lance.pipeline.dataset.upserted` and
   `avg:lance.pipeline.dataset.deleted` overlaid.
 
-### 4.8 Compaction (Maintenance)
+### 4.7 Compaction (Maintenance)
 
 **Goal.** Confirm that the compaction job is keeping fragment counts under control and that its
 commit conflicts and errors are within tolerance.
@@ -461,7 +430,7 @@ names below as they appear in the code.
 - **Tag flips (timeseries).** `sum:lance.pipeline.run.tags_flipped`. When using blue-green
   deployment, this shows how many datasets were promoted to the new version after compaction.
 
-### 4.9 TTL Expiry
+### 4.8 TTL Expiry
 
 **Goal.** Confirm the TTL delete step is expiring rows on schedule and that it is not silently
 skipping datasets or piling up commit conflicts.
@@ -498,7 +467,7 @@ it is one phase of the same per-dataset task.
   `ttl_column_missing` count means `--ttl-column` (or the Datadog-configured timestamp column) does
   not match the dataset's actual schema and should be corrected.
 
-### 4.10 Indexing
+### 4.9 Indexing
 
 **Goal.** Track how long index builds take, whether training artifacts are being reused or
 retrained, and whether index commits are succeeding.
@@ -549,7 +518,7 @@ These metrics originate from `src/lance_etl/indexing.py` and cover all index typ
 - **Stale replans (timeseries).** `sum:lance.pipeline.index.stale_fragment_replan`. Consistently
   non-zero means the dataset is changing between index build and commit, forcing replans.
 
-### 4.11 Errors and Saturation
+### 4.10 Errors and Saturation
 
 **Goal.** Aggregate all error signals in one place so on-call engineers can identify whether an
 alert is from the search serving plane, the ETL, the indexes, or the cache.
@@ -558,7 +527,6 @@ alert is from the search serving plane, the ETL, the indexes, or the cache.
 
 - **Error rate by source (timeseries, stacked).** Combine:
   - `sum:search_api.rpc.errors.as_rate()` (serving)
-  - `sum:search_api.intake.errors.as_rate()` (intake)
   - `sum:lance.pipeline.errors.as_rate()` (ETL, indexing)
 - **Throttle events (timeseries).** `sum:search_api.throttle.errors` and
   `avg:search_api.throttle.new_rate`. The throttle layer is Lance's AIMD object-store rate limiter.
@@ -575,7 +543,7 @@ alert is from the search serving plane, the ETL, the indexes, or the cache.
   (indexing), `lance.pipeline.dataset.commit_conflict` (compaction), and
   `lance.pipeline.ttl.commit_conflict` (TTL). This shows which job is under the most write contention.
 
-### 4.12 Resource and IO
+### 4.11 Resource and IO
 
 **Goal.** Understand how much data and how many object-store operations each query or pipeline run
 generates, and whether the object store is becoming a bottleneck.

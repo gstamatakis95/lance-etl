@@ -51,10 +51,10 @@ Five-layer design over tonic, each layer with a one-directional dependency on th
 
 | Layer | Responsibility |
 |---|---|
-| `domain` | Engine-agnostic types: `Filter` AST, query types, intake record/sink, traits |
+| `domain` | Engine-agnostic types: `Filter` AST, query types, and traits |
 | `cache` | Hybrid Moka + pluggable persistent (disk/redis) caches, plugged into Lance seams |
 | `lance` | `LanceSearchBackend`, `CachingDatasetProvider`, typed AST -> DataFusion `Expr` |
-| `grpc` | Tonic adapters: `SearchGrpc<B>` (search) and `IntakeGrpc<S>` (intake) |
+| `grpc` | Tonic adapter: `SearchGrpc<B>` |
 | `telemetry` | OTLP traces, DogStatsD metrics, JSON logs with trace correlation |
 
 Filters are a typed AST — raw SQL is never accepted or constructed. Every request carries exactly

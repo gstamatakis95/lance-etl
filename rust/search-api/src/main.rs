@@ -4,10 +4,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use search_api::config::Config;
-use search_api::domain::{DatasetRef, DatasetTarget, PrewarmSpec, Prewarmer, StdoutSink};
-use search_api::grpc::{IntakeGrpc, RouteTimeoutLayer, SearchGrpc};
+use search_api::domain::{DatasetRef, DatasetTarget, PrewarmSpec, Prewarmer};
+use search_api::grpc::{RouteTimeoutLayer, SearchGrpc};
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
-use search_api::pb::intake_service_server::IntakeServiceServer;
 use search_api::pb::search_service_server::SearchServiceServer;
 use search_api::telemetry::{self, Metrics, RecallCapture};
 use tokio::sync::Semaphore;
@@ -48,9 +47,7 @@ fn apply_lance_io_env() {
 
 /// Reads configuration from the environment, initializes Datadog telemetry (OTLP traces, JSON
 /// logs, DogStatsD metrics), wires provider -> backend -> transport, spawns the disk-cache
-/// janitor, and serves the search and intake gRPC APIs together with the standard gRPC health
-/// service. The intake service uses the placeholder [`StdoutSink`]; a future Kafka sink drops in
-/// at this construction site without any other change.
+/// janitor, and serves the search gRPC API together with the standard gRPC health service.
 ///
 /// IO tuning: two process-global Lance knobs are stamped into the environment before any
 /// dataset opens, so that Lance reads them consistently across every thread.
@@ -182,13 +179,9 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         metrics.clone(),
     );
     let service = SearchGrpc::with_metrics(backend, metrics.clone()).with_recall(recall);
-    let intake = IntakeGrpc::with_metrics(Arc::new(StdoutSink), metrics);
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
         .set_serving::<SearchServiceServer<SearchGrpc<Backend>>>()
-        .await;
-    health_reporter
-        .set_serving::<IntakeServiceServer<IntakeGrpc<StdoutSink>>>()
         .await;
     tracing::info!(address = %addr, "search-api listening");
     let server_builder = Server::builder()
@@ -199,7 +192,6 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .layer(RouteTimeoutLayer::from_defaults())
         .add_service(health_service)
         .add_service(SearchServiceServer::new(service))
-        .add_service(IntakeServiceServer::new(intake))
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
     tracing::info!("in-flight requests drained, flushing telemetry and exiting");

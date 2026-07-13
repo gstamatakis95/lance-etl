@@ -18,21 +18,7 @@ service SearchService {
   rpc Clusters(ClustersRequest) returns (ClustersResponse);
 }
 
-// Record intake into per-tenant Lance datasets: batched upsert/delete record writes.
-//
-// The service validates and routes record writes to a pluggable sink. The current sink prints the
-// writes; a future sink writes them to Kafka for the ETL to consume. The wire contract does not
-// change when the sink does.
-service IntakeService {
-  // Applies one batch of record writes addressed to a single dataset in one call.
-  rpc Write(WriteRecordsRequest) returns (WriteRecordsResponse);
-  // Applies a high-throughput stream of record-write batches, returning one aggregated response
-  // when the client half-closes the stream. Each request in the stream carries its own target, so
-  // a single stream may feed several datasets.
-  rpc WriteStream(stream WriteRecordsRequest) returns (WriteRecordsResponse);
-}
-
-// Addresses the dataset a request operates on. Shared by SearchService and IntakeService.
+// Addresses the dataset a request operates on.
 //
 // The target resolves to the single dataset at
 // {base}/{org_id}/{tenant_id}/{namespace}.lance.
@@ -598,74 +584,4 @@ message HybridSearchResult {
   google.protobuf.Struct row = 1;
   // Fused score under the configured strategy (larger is better).
   double fused_score = 2;
-}
-
-// The kind of write to apply to a record.
-enum WriteOp {
-  // Invalid; record writes using it are rejected.
-  WRITE_OP_UNSPECIFIED = 0;
-  // Create the record if absent, otherwise replace it. Carries the full record.
-  WRITE_OP_UPSERT = 1;
-  // Delete the record by id. Only the record id is read.
-  WRITE_OP_DELETE = 2;
-}
-
-// A fixed-length float array: one named vector column's values for a record.
-//
-// The length is the vector dimension. It must be non-empty on an upsert. Dimension consistency
-// across records is enforced downstream by the dataset schema, not by this service.
-message FloatVector {
-  // Vector components. Must be non-empty when the enclosing vector entry is present.
-  repeated float values = 1;
-}
-
-// One record to create, update, or (by id) delete.
-//
-// The record mirrors the ETL and search data model: a string id, an event-time clock, a metadata
-// map, zero or more named fixed-dimension vectors, and zero or more named text fields. The
-// addressing (org, tenant, namespace) lives on the request-level DatasetTarget and is never
-// duplicated onto each record.
-message Record {
-  // Client-assigned vector id. Transported verbatim and never interpreted as an expression.
-  string id = 1;
-  // Source event timestamp in epoch milliseconds. This is the canonical clock for the ETL; there
-  // is no separate ingestion timestamp.
-  int64 event_timestamp_ms = 2;
-  // Record metadata. Lands as an Arrow Map<Utf8, Utf8> column downstream. Keys and values are
-  // transported verbatim and never interpreted as expressions. May be empty.
-  map<string, string> metadata = 3;
-  // Named vector columns, each a fixed-length float array. Optional: an upsert may carry zero
-  // vectors. When present, every named vector must be non-empty. Each key is the vector column
-  // name in the dataset. Ignored for a delete.
-  map<string, FloatVector> vectors = 4;
-  // Named text fields. Optional: an upsert may carry zero text fields. Each key is a text column
-  // name, mirroring the search side's full-text convention: an intake text field under key "body"
-  // lands in the "body" column, which a TextSearch then queries by naming that same column. Values
-  // are transported verbatim and never interpreted as expressions. Ignored for a delete.
-  map<string, string> texts = 5;
-}
-
-// One record write: an operation paired with the record it acts on.
-message RecordWrite {
-  // Operation to apply.
-  WriteOp op = 1;
-  // The record. For an upsert this is the full record. For a delete only `id` is read.
-  Record record = 2;
-}
-
-// Request for IntakeService.Write and one element of the IntakeService.WriteStream stream.
-message WriteRecordsRequest {
-  // Dataset the record writes in this request belong to.
-  DatasetTarget target = 1;
-  // Record writes to apply, batched in one call.
-  repeated RecordWrite writes = 2;
-}
-
-// Response for IntakeService.Write and IntakeService.WriteStream.
-message WriteRecordsResponse {
-  // Ids of records successfully accepted by the sink.
-  repeated string succeeded_ids = 1;
-  // Ids of records that failed validation or sink acceptance. A record whose id is itself
-  // empty or invalid cannot be reported by id and is omitted from this list.
-  repeated string failed_ids = 2;
 }

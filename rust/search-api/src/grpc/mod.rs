@@ -11,18 +11,12 @@
 //!
 //! Submodules:
 //! - [`convert`]: pure conversions between search protobuf messages and domain types.
-//! - [`intake`]: the [`intake::IntakeGrpc`] transport over the [`crate::domain::RecordSink`] seam,
-//!   serving the `Write` and `WriteStream` RPCs.
-//! - [`intake_convert`]: pure conversions between intake protobuf messages and domain types.
 //! - [`timeout`]: the per-route request-timeout tower layer applied by `main` (and by any test
 //!   that mirrors the production server stack).
 
 pub mod convert;
-pub mod intake;
-pub mod intake_convert;
 pub mod timeout;
 
-pub use intake::IntakeGrpc;
 pub use timeout::RouteTimeoutLayer;
 
 use std::sync::Arc;

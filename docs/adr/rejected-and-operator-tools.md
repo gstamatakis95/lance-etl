@@ -72,17 +72,13 @@ parameters on `IndexJobConfig`), and `INGESTED_AT_COLUMN` was removed with the c
 
 ## ADR 0017 — Rust intake service with a pluggable record sink
 
-Status: Accepted (amended to the write vocabulary)
+Status: Superseded (2026-07-13)
 
-The `IntakeService` accepts record writes ahead of the eventual Kafka destination without
-committing to one: `Write(WriteRecordsRequest)` and `WriteStream(...)` carry
-`RecordWrite { WriteOp op; Record record; }` (`WRITE_OP_UPSERT`, `WRITE_OP_DELETE`), responses
-return `succeeded_ids` / `failed_ids` (a record whose id is itself invalid cannot be reported
-by id and is omitted). The destination sits behind the domain `RecordSink` trait with
-`StdoutSink` as the placeholder, so swapping in Kafka reshapes nothing on the wire or in the
-transport. The service shares the search side's proto file and `DatasetTarget`, its hard rules
-(no raw SQL, domain free of tonic and Lance, infallible low-cardinality telemetry), and its
-layering.
+The placeholder-only `IntakeService`, its `RecordSink` abstraction, and `StdoutSink` were removed
+before release. Accepting a write over gRPC without a durable destination could report success
+without creating replayable source state. Iceberg is now the only durable ingestion source. A
+future online-write design requires a fresh ADR with a real durable transport, idempotency keys,
+and reconciliation semantics before any public write RPC is added.
 
 ## ADR 0019 — Namespace copy/migrate utility
 

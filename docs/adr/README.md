@@ -15,7 +15,7 @@ The six documents:
 | [indexing.md](indexing.md) | Segment-API flows, vector artifact storage, role auto-indexing, the streaming k-means bootstrap, the object-store centroid cache |
 | [serving-filters-and-tags.md](serving-filters-and-tags.md) | Crate layering, the typed filter AST, time ranges, blue-green serving, per-query version pinning |
 | [caching-and-observability.md](caching-and-observability.md) | The persistent cache and its pluggable backends, Prewarm, the Lance trace bridge, recall auditing |
-| [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | The stable-row-id rejection, V2 manifest paths, knob reduction, the intake service, namespace migration |
+| [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | The stable-row-id rejection, V2 manifest paths, knob reduction, the retired intake decision, namespace migration |
 
 Index of every original ADR number:
 
@@ -37,7 +37,7 @@ Index of every original ADR number:
 | 0014 | One dataset per target, time queries as scalar filters | [serving-filters-and-tags.md](serving-filters-and-tags.md) | Accepted |
 | 0015 | CLI and config knob reduction | [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | Accepted |
 | 0016 | Event-time canonical clock | [etl-and-data-model.md](etl-and-data-model.md) | Accepted |
-| 0017 | Rust intake service with a pluggable record sink | [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | Accepted |
+| 0017 | Rust intake service with a pluggable record sink | [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | Superseded |
 | 0018 | Per-row TTL expiration inside maintenance | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
 | 0019 | Namespace copy/migrate utility | [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | Accepted |
 | 0020 | Static declared-field map pivot | [etl-and-data-model.md](etl-and-data-model.md) | Superseded by 0024 |

@@ -167,9 +167,8 @@ pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 800;
 /// Fixed long request timeout in milliseconds for the drain-heavy RPCs (10 minutes).
 ///
 /// `SearchService/Prewarm` loads every requested IVF partition and BTree page over the object
-/// store, and `IntakeService/WriteStream` is bounded by the whole client stream, so neither can
-/// live under the 800 ms search budget. Hardcoded: no deployment has ever retuned this, so it is
-/// not an env knob.
+/// store, so it cannot live under the 800 ms search budget. Hardcoded: no deployment has ever
+/// retuned this, so it is not an env knob.
 pub const DEFAULT_LONG_REQUEST_TIMEOUT_MS: u64 = 600_000;
 
 /// Fixed TTL in seconds for the negative cache of failed dataset opens (NotFound only).

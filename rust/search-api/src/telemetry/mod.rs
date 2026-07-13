@@ -79,8 +79,8 @@ pub mod recall;
 pub mod traces;
 
 pub use metrics::{
-    CacheName, DatasetEvent, EvictionReason, FileAuditMode, FileAuditType, IntakeRpc, LanceIoType, Metrics,
-    PrewarmIndexKind, PrewarmStatus, Rpc, StoreOp, Tier,
+    CacheName, DatasetEvent, EvictionReason, FileAuditMode, FileAuditType, LanceIoType, Metrics, PrewarmIndexKind,
+    PrewarmStatus, Rpc, StoreOp, Tier,
 };
 pub use recall::{RecallCapture, RecallHook, RecallQueryType, RecallRecord};
 pub use traces::{LanceEventMetricsLayer, TelemetryGuard, init_tracing};
