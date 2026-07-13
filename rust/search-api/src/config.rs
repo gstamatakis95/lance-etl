@@ -156,11 +156,29 @@ pub const DEFAULT_REFINE_FACTOR: u32 = 2;
 /// longer an env knob.
 pub const DEFAULT_FAST_SEARCH: bool = true;
 
-/// Fixed request timeout in milliseconds applied to every incoming gRPC call.
+/// Fixed request timeout in milliseconds applied to search-tier gRPC calls.
 ///
-/// 800 ms sits comfortably below the 1 s client-side deadline most callers use. Hardcoded: no
-/// deployment has ever retuned this, so it is no longer an env knob.
+/// 800 ms sits comfortably below the 1 s client-side deadline most callers use. Applied per
+/// route by [`crate::grpc::RouteTimeoutLayer`]: the drain-heavy RPCs listed in
+/// [`crate::grpc::timeout::LONG_TIMEOUT_ROUTES`] get [`DEFAULT_LONG_REQUEST_TIMEOUT_MS`]
+/// instead. Hardcoded: no deployment has ever retuned this, so it is no longer an env knob.
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 800;
+
+/// Fixed long request timeout in milliseconds for the drain-heavy RPCs (10 minutes).
+///
+/// `SearchService/Prewarm` loads every requested IVF partition and BTree page over the object
+/// store, and `IntakeService/WriteStream` is bounded by the whole client stream, so neither can
+/// live under the 800 ms search budget. Hardcoded: no deployment has ever retuned this, so it is
+/// not an env knob.
+pub const DEFAULT_LONG_REQUEST_TIMEOUT_MS: u64 = 600_000;
+
+/// Fixed TTL in seconds for the negative cache of failed dataset opens (NotFound only).
+///
+/// Bounds how long a hot loop of requests for a nonexistent dataset is answered without touching
+/// the object store, and equally how long a freshly created dataset can be reported missing by a
+/// replica that probed it just before creation. Hardcoded: no deployment has ever retuned this,
+/// so it is not an env knob.
+pub const DEFAULT_NEGATIVE_OPEN_TTL_SECS: u64 = 5;
 
 /// Fixed maximum concurrent streams (and connections) the gRPC server admits.
 ///

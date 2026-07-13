@@ -2,11 +2,10 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use search_api::config::Config;
 use search_api::domain::{DatasetRef, DatasetTarget, PrewarmSpec, Prewarmer, StdoutSink};
-use search_api::grpc::{IntakeGrpc, SearchGrpc};
+use search_api::grpc::{IntakeGrpc, RouteTimeoutLayer, SearchGrpc};
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
 use search_api::pb::intake_service_server::IntakeServiceServer;
 use search_api::pb::search_service_server::SearchServiceServer;
@@ -194,15 +193,103 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(address = %addr, "search-api listening");
     let server_builder = Server::builder()
         .concurrency_limit_per_connection(search_api::config::DEFAULT_CONCURRENCY_LIMIT_PER_CONNECTION)
-        .max_concurrent_streams(search_api::config::DEFAULT_MAX_CONCURRENT_STREAMS)
-        .timeout(Duration::from_millis(search_api::config::DEFAULT_REQUEST_TIMEOUT_MS));
+        .max_concurrent_streams(search_api::config::DEFAULT_MAX_CONCURRENT_STREAMS);
     server_builder
         .layer(OtelGrpcLayer::default().filter(reject_healthcheck))
+        .layer(RouteTimeoutLayer::from_defaults())
         .add_service(health_service)
         .add_service(SearchServiceServer::new(service))
         .add_service(IntakeServiceServer::new(intake))
-        .serve(addr)
+        .serve_with_shutdown(addr, shutdown_signal())
         .await?;
+    tracing::info!("in-flight requests drained, flushing telemetry and exiting");
     drop(telemetry_guard);
     Ok(())
+}
+
+/// Resolves when the process receives SIGTERM or ctrl-c (SIGINT), starting the graceful drain.
+///
+/// Kubernetes (and most process supervisors) deliver SIGTERM on deploy or scale-down. Wiring the
+/// signal into `serve_with_shutdown` lets tonic stop accepting new requests while in-flight
+/// requests complete, and the explicit `drop(telemetry_guard)` afterwards flushes the tracer
+/// provider so drain-window spans are exported instead of lost. A SIGTERM handler that cannot be
+/// installed degrades to ctrl-c handling alone with a warning, never a startup failure.
+async fn shutdown_signal() {
+    tokio::select! {
+        _ = terminate_signal() => {},
+        _ = interrupt_signal() => {},
+    }
+    tracing::info!("shutdown signal received, draining in-flight requests");
+}
+
+/// Resolves when ctrl-c (SIGINT) is delivered.
+///
+/// A ctrl-c handler that cannot be installed degrades to a never-resolving future with a warning,
+/// symmetrically with [`terminate_signal`], so a failed install never fires the shutdown select at
+/// boot — never a startup failure. `ctrl_c().await` returning `Ok(())` means the signal arrived.
+async fn interrupt_signal() {
+    degrade_on_install_error(
+        tokio::signal::ctrl_c().await,
+        "failed to install the ctrl-c handler, relying on SIGTERM only",
+    )
+    .await;
+}
+
+/// Resolves immediately on `Ok`, or logs `warning` and never resolves on `Err`.
+///
+/// Shared degrade path for a signal source whose readiness IS its install result (ctrl-c): a
+/// successful install that has already fired resolves the shutdown select, and a failed install
+/// warns once and awaits [`std::future::pending`] so it can never fire.
+async fn degrade_on_install_error<T>(result: std::io::Result<T>, warning: &str) {
+    if let Err(err) = result {
+        tracing::warn!(error = %err, "{}", warning);
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Resolves when SIGTERM is delivered (unix targets).
+#[cfg(unix)]
+async fn terminate_signal() {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut stream) => {
+            stream.recv().await;
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to install the SIGTERM handler, relying on ctrl-c only");
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Never resolves on targets without unix signals, leaving ctrl-c as the only trigger.
+#[cfg(not(unix))]
+async fn terminate_signal() {
+    std::future::pending::<()>().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::degrade_on_install_error;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn install_success_resolves_immediately() {
+        let outcome =
+            tokio::time::timeout(Duration::from_millis(100), degrade_on_install_error(Ok(()), "unused")).await;
+        assert!(outcome.is_ok(), "a successful install must resolve the shutdown arm");
+    }
+
+    #[tokio::test]
+    async fn install_failure_never_resolves() {
+        let err = std::io::Error::other("handler install failed");
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(100),
+            degrade_on_install_error::<()>(Err(err), "degraded"),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "a failed install must never fire the shutdown select, only warn and pend"
+        );
+    }
 }

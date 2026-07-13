@@ -43,28 +43,47 @@ pub fn time_range_to_expr(range: &TimeRange, column: &str, data_type: &DataType)
     let mut bounds: Vec<Expr> = Vec::new();
     if let Some(start) = range.start_ms {
         let column_expr = Expr::Column(Column::from_name(column));
-        bounds.push(column_expr.gt_eq(time_literal(start, data_type)?));
+        bounds.push(column_expr.gt_eq(time_literal(start, data_type, TimeBound::Start)?));
     }
     if let Some(end) = range.end_ms {
         let column_expr = Expr::Column(Column::from_name(column));
-        bounds.push(column_expr.lt(time_literal(end, data_type)?));
+        bounds.push(column_expr.lt(time_literal(end, data_type, TimeBound::End)?));
     }
     Ok(bounds.into_iter().reduce(Expr::and))
+}
+
+/// Which side of the half-open `[start, end)` window a bound literal sits on.
+///
+/// Needed by resolutions coarser than a millisecond: the start bound rounds down and the end
+/// bound rounds up, so the coarse predicate covers a superset of the requested window instead of
+/// silently dropping rows whose second-resolution value truncated past a bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeBound {
+    /// The inclusive lower bound (`column >= start`).
+    Start,
+    /// The exclusive upper bound (`column < end`).
+    End,
 }
 
 /// Builds a typed literal for an epoch-millisecond bound matching the event-timestamp column type.
 ///
 /// A timestamp column yields a [`ScalarValue`] timestamp scaled to the column's [`TimeUnit`] and
-/// carrying the column's timezone, so the comparison is exact with no coercion. An integer column
-/// (epoch milliseconds stored as an integer) yields a plain integer literal. Any other column type
-/// is rejected as an invalid argument. Scaling to microsecond or nanosecond resolution goes through
-/// `checked_mul`: an epoch-millisecond bound near `i64::MAX` would otherwise wrap in release builds
-/// and silently produce the wrong time predicate, so an out-of-range bound is rejected instead.
-fn time_literal(epoch_ms: i64, data_type: &DataType) -> Result<Expr, SearchError> {
+/// carrying the column's timezone, so the comparison is exact with no coercion. An `Int64` column
+/// (epoch milliseconds stored as an integer) yields a plain integer literal, while an `Int32`
+/// column cannot represent realistic epoch-millisecond values at all, so a bound outside the
+/// `i32` range is rejected instead of being silently wrapped into an arbitrary predicate. Any
+/// other column type is rejected as an invalid argument. Scaling to microsecond or nanosecond
+/// resolution goes through `checked_mul`: an epoch-millisecond bound near `i64::MAX` would
+/// otherwise wrap in release builds and silently produce the wrong time predicate, so an
+/// out-of-range bound is rejected instead. Scaling down to second resolution rounds according to
+/// `bound` (start floors, end ceils), keeping the coarse window conservative-correct.
+fn time_literal(epoch_ms: i64, data_type: &DataType, bound: TimeBound) -> Result<Expr, SearchError> {
     match data_type {
         DataType::Timestamp(unit, tz) => {
             let scalar = match unit {
-                TimeUnit::Second => ScalarValue::TimestampSecond(Some(epoch_ms / MILLIS_PER_SECOND), tz.clone()),
+                TimeUnit::Second => {
+                    ScalarValue::TimestampSecond(Some(epoch_ms_to_seconds(epoch_ms, bound)), tz.clone())
+                }
                 TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(Some(epoch_ms), tz.clone()),
                 TimeUnit::Microsecond => {
                     ScalarValue::TimestampMicrosecond(Some(scaled_epoch(epoch_ms, MICROS_PER_MILLI)?), tz.clone())
@@ -76,10 +95,30 @@ fn time_literal(epoch_ms: i64, data_type: &DataType) -> Result<Expr, SearchError
             Ok(lit(scalar))
         }
         DataType::Int64 => Ok(lit(epoch_ms)),
-        DataType::Int32 => Ok(lit(epoch_ms as i32)),
+        DataType::Int32 => i32::try_from(epoch_ms).map(lit).map_err(|_| {
+            SearchError::invalid_argument(format!(
+                "event-timestamp bound {epoch_ms} does not fit the dataset's Int32 event-timestamp column"
+            ))
+        }),
         other => Err(SearchError::invalid_argument(format!(
             "event-timestamp column has unsupported type for a time range: {other:?}"
         ))),
+    }
+}
+
+/// Converts an epoch-millisecond bound to whole seconds with bound-aware rounding.
+///
+/// The start bound floors and the end bound ceils, so the second-resolution window
+/// `[floor(start), ceil(end))` is a superset of the requested millisecond window: a
+/// second-resolution row overlapping the requested window is never excluded. Both roundings use
+/// euclidean division so negative (pre-epoch) bounds round in the same direction as positive
+/// ones.
+fn epoch_ms_to_seconds(epoch_ms: i64, bound: TimeBound) -> i64 {
+    let floor = epoch_ms.div_euclid(MILLIS_PER_SECOND);
+    match bound {
+        TimeBound::Start => floor,
+        TimeBound::End if epoch_ms.rem_euclid(MILLIS_PER_SECOND) == 0 => floor,
+        TimeBound::End => floor + 1,
     }
 }
 
@@ -433,6 +472,102 @@ mod tests {
             },
             "event_timestamp",
             &DataType::Timestamp(TimeUnit::Nanosecond, None),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SearchError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn time_range_on_a_second_resolution_column_rounds_conservatively() {
+        let seconds = DataType::Timestamp(TimeUnit::Second, None);
+        let expr = time_range_to_expr(
+            &TimeRange {
+                start_ms: Some(1_500),
+                end_ms: Some(2_500),
+            },
+            "event_timestamp",
+            &seconds,
+        )
+        .unwrap()
+        .unwrap();
+        let expected = col("event_timestamp")
+            .gt_eq(lit(ScalarValue::TimestampSecond(Some(1), None)))
+            .and(col("event_timestamp").lt(lit(ScalarValue::TimestampSecond(Some(3), None))));
+        assert_eq!(
+            expr, expected,
+            "the start bound must floor and the end bound must ceil so the coarse window is a superset"
+        );
+
+        let exact = time_range_to_expr(
+            &TimeRange {
+                start_ms: Some(2_000),
+                end_ms: Some(3_000),
+            },
+            "event_timestamp",
+            &seconds,
+        )
+        .unwrap()
+        .unwrap();
+        let expected_exact = col("event_timestamp")
+            .gt_eq(lit(ScalarValue::TimestampSecond(Some(2), None)))
+            .and(col("event_timestamp").lt(lit(ScalarValue::TimestampSecond(Some(3), None))));
+        assert_eq!(exact, expected_exact, "exact-second bounds must not be widened");
+
+        let negative = time_range_to_expr(
+            &TimeRange {
+                start_ms: Some(-1_500),
+                end_ms: Some(-500),
+            },
+            "event_timestamp",
+            &seconds,
+        )
+        .unwrap()
+        .unwrap();
+        let expected_negative = col("event_timestamp")
+            .gt_eq(lit(ScalarValue::TimestampSecond(Some(-2), None)))
+            .and(col("event_timestamp").lt(lit(ScalarValue::TimestampSecond(Some(0), None))));
+        assert_eq!(
+            negative, expected_negative,
+            "pre-epoch bounds must round in the same conservative directions"
+        );
+    }
+
+    #[test]
+    fn time_range_int32_bounds_are_range_checked_instead_of_wrapping() {
+        let in_range = time_range_to_expr(
+            &TimeRange {
+                start_ms: Some(42),
+                end_ms: None,
+            },
+            "event_timestamp",
+            &DataType::Int32,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(in_range, col("event_timestamp").gt_eq(lit(42_i32)));
+
+        let realistic_epoch_ms = 1_770_000_000_000_i64;
+        let err = time_range_to_expr(
+            &TimeRange {
+                start_ms: Some(realistic_epoch_ms),
+                end_ms: None,
+            },
+            "event_timestamp",
+            &DataType::Int32,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SearchError::InvalidArgument(_)),
+            "an epoch-ms bound beyond i32 must be rejected, not wrapped: {err:?}"
+        );
+
+        let err = time_range_to_expr(
+            &TimeRange {
+                start_ms: None,
+                end_ms: Some(i64::MIN),
+            },
+            "event_timestamp",
+            &DataType::Int32,
         )
         .unwrap_err();
         assert!(matches!(err, SearchError::InvalidArgument(_)));

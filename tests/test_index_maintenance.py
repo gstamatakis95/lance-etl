@@ -36,6 +36,7 @@ from lance_etl.indexing import (
     vector_config_key,
     write_vector_config,
 )
+from lance_etl.indexing.handlers import commit_fts_index
 from lance_etl.maintenance import MaintenanceConfig
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
@@ -386,6 +387,63 @@ def test_fts_commit_index_raises_on_missing_fragments(dataset_uri: str, telemetr
         publish_fts_index(
             dataset_uri, "text", "text_fts_idx", "00000000-0000-0000-0000-000000000000", stale_ids, config, telemetry
         )
+
+
+def test_fts_rebuild_swaps_old_index_atomically(dataset_uri: str, telemetry: Telemetry) -> None:
+    """An FTS rebuild replaces the old inverted index in one commit with no index-less window.
+
+    The old drop-then-publish flow spent two commits, leaving a window with no FTS index that
+    became permanent if the publish failed non-stale. The rebuild now lists the old index's
+    committed segments at publish time and passes them as the ``removed_indices`` of the same
+    ``CreateIndex`` operation that publishes the rebuilt index. This test builds an initial
+    inverted index, rebuilds it through the production per-fragment shared-uuid path plus
+    :func:`commit_fts_index`, and pins the atomicity: exactly one dataset version is created by
+    the swap, the old segment uuid is gone, only the new shared uuid remains, and the rebuilt
+    index covers every fragment.
+
+    Args:
+        dataset_uri: URI of the pre-built test dataset.
+        telemetry: The telemetry facade fixture.
+    """
+    config: IndexJobConfig = maintenance_config()
+    index_name: str = "text_fts_idx"
+    lance.dataset(dataset_uri).create_scalar_index("text", "INVERTED", name=index_name)
+    old_uuids: set[str] = {
+        segment.uuid
+        for description in lance.dataset(dataset_uri).describe_indices()
+        if description.name == index_name
+        for segment in description.segments
+    }
+    assert old_uuids
+
+    dataset: lance.LanceDataset = lance.dataset(dataset_uri)
+    fragment_ids: list[int] = fragment_ids_of(dataset_uri)
+    pinned: lance.LanceDataset = lance.dataset(dataset_uri, version=dataset.version)
+    shared_uuid: str = "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f"
+    for fragment_id in fragment_ids:
+        pinned.create_scalar_index(
+            column="text",
+            index_type="INVERTED",
+            name=index_name,
+            replace=True,
+            index_uuid=shared_uuid,
+            fragment_ids=[fragment_id],
+            **config.fts_params(),
+        )
+
+    version_before: int = lance.dataset(dataset_uri).version
+    commit_fts_index(dataset_uri, "text", index_name, shared_uuid, fragment_ids, config, telemetry)
+
+    after: lance.LanceDataset = lance.dataset(dataset_uri)
+    assert after.version == version_before + 1
+    descriptions: list[object] = [
+        description for description in after.describe_indices() if description.name == index_name
+    ]
+    assert len(descriptions) == 1
+    current_uuids: set[str] = {segment.uuid for description in descriptions for segment in description.segments}
+    assert current_uuids == {shared_uuid}
+    assert current_uuids.isdisjoint(old_uuids)
+    assert index_coverage(dataset_uri, index_name) == set(fragment_ids)
 
 
 def test_artifact_less_index_plans_bootstrap(dataset_uri: str, telemetry: Telemetry) -> None:

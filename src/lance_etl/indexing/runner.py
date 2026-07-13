@@ -25,8 +25,10 @@ APIs, and a small dataset is simply the one-shard case:
   accumulated index deltas once they exceed ``max_index_deltas``.
 
 :meth:`LanceIndexer.run` repeats plan-build-commit for stale indexes up to
-:data:`~lance_etl.indexing.config.MAX_STALE_REPLANS` rounds, then defers the survivors to the next
-scheduled run.
+:data:`~lance_etl.indexing.config.MAX_STALE_REPLANS` rounds. A dataset still stale after every
+round is recorded as a failed dataset (:data:`STALE_REPLAN_EXHAUSTED_PHASE`) rather than deferred
+silently, so the fleet's failed-dataset count, the ``index.stale_replans_exhausted`` metric, and the
+CLI exit code all reflect the partially indexed dataset instead of a clean run masking it.
 """
 
 from __future__ import annotations
@@ -115,6 +117,12 @@ KIND_TO_HANDLER: dict[str, type[IndexHandler]] = {
     FTS_KIND: FtsIndexHandler,
 }
 """Maps an index kind to the handler class owning its type-specific logic."""
+
+STALE_REPLAN_EXHAUSTED_PHASE: str = "index-stale-exhausted"
+"""``error_phase`` marker for a dataset still stale after :data:`MAX_STALE_REPLANS` rounds."""
+
+STALE_REPLANS_EXHAUSTED_METRIC: str = "index.stale_replans_exhausted"
+"""Metric incremented once per dataset that exhausts every stale-replan round unresolved."""
 
 
 def index_failure_phase(result: dict[str, Any]) -> str:
@@ -335,8 +343,8 @@ def plan_dataset_indexes(
     Returns:
         A dict with ``uri`` and either ``skipped`` or ``version`` plus per-index ``specs``.
         Each spec carries ``kind``, ``column``, ``index_name``, ``mode``, ``shards``, and the
-        FTS extras (``index_uuid``, ``has_existing``). Indexes with nothing to do land in
-        ``done`` as finished stats.
+        FTS rebuild extra ``index_uuid``. Indexes with nothing to do land in ``done`` as
+        finished stats.
     """
     try:
         dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
@@ -383,7 +391,6 @@ def plan_dataset_indexes(
                     "shards": split_evenly(fragment_ids, shard_count(len(fragment_ids), config)),
                     "fragments": fragment_ids,
                     "index_uuid": str(uuid.uuid4()),
-                    "has_existing": bool(fts_handler.covered_fragments(dataset)),
                 }
             )
             continue
@@ -632,10 +639,11 @@ def commit_one_index(
     Segment kinds go through the production :func:`commit_segments`. Whether segments are merged
     before publishing is decided by the index kind's handler ``merges()`` (vector and zonemap
     merge, BTREE and BITMAP commit unmerged deltas instead) — running here keeps the merge off the
-    driver. FTS rebuilds drop
-    the old index only now, after the executor builds finished, then merge the per-fragment
-    metadata and publish, so the old index stayed live for the whole build. A stale-fragment
-    error returns a ``stale`` marker so the fleet re-plans this index in the next round.
+    driver. FTS rebuilds merge the per-fragment metadata and publish through a single
+    ``CreateIndex`` commit that atomically removes the old same-name index, so the old index
+    stayed live for the whole build and there is never a window without a committed FTS index. A
+    stale-fragment error returns a ``stale`` marker so the fleet re-plans this index in the next
+    round.
 
     Args:
         uri: Dataset URI.
@@ -660,7 +668,6 @@ def commit_one_index(
                 index_name,
                 spec["index_uuid"],
                 spec["fragments"],
-                spec["has_existing"],
                 config,
                 telemetry,
             )
@@ -1163,9 +1170,14 @@ class LanceIndexer:
         Per-dataset failure isolation: a dataset whose plan failed carries a dataset-level
         ``"error"`` key, and a dataset with a failed index carries an error entry in its
         ``indexes`` list. Either way the dataset still lands one terminal record and every other
-        dataset completes. The failed datasets are re-planned by the next scheduled run, since the
-        job is cursor-free. Callers detect failures by scanning for a dataset-level ``"error"`` or
-        a per-index ``"error"`` entry.
+        dataset completes. Callers detect failures by scanning for a dataset-level ``"error"`` or
+        a per-index ``"error"`` entry. A dataset still stale after every
+        :data:`~lance_etl.indexing.config.MAX_STALE_REPLANS` round is folded into the same
+        dataset-level ``"error"`` shape (``error_phase="index-stale-exhausted"``) rather than
+        silently deferred, so it counts toward the failed-dataset total the caller reports through
+        :func:`~lance_etl.fanout.count_failed` and the CLI's ``EXIT_PARTIAL_FAILURE`` exit code.
+        Every other failed dataset is re-planned by the next scheduled run, since the job is
+        cursor-free.
 
         Args:
             spark: Active Spark session.
@@ -1196,10 +1208,16 @@ class LanceIndexer:
             for uri in pending_uris:
                 logger.warning(
                     "index build on %s still has uncovered fragments after %d stale-replan rounds; "
-                    "next scheduled run re-covers",
+                    "marking the dataset failed so this run's exit code and metrics reflect it",
                     uri,
                     MAX_STALE_REPLANS,
                 )
+                stats_by_uri[uri]["error"] = (
+                    f"stale-replan exhausted after {MAX_STALE_REPLANS} rounds: a concurrent compaction kept "
+                    "invalidating the planned fragment set before every index could commit"
+                )
+                stats_by_uri[uri]["error_phase"] = STALE_REPLAN_EXHAUSTED_PHASE
+                driver_telemetry.incr(STALE_REPLANS_EXHAUSTED_METRIC)
 
             delta_entries: list[tuple[str, str]] = sorted(
                 {

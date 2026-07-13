@@ -77,6 +77,10 @@ class ETLConfig:
             chunking.
         bulk_append: Enable the parallel ``write_fragments`` + single ``commit_batch`` fast path
             for big NEW or empty datasets (operational kill switch).
+        max_bulk_tasks_per_dataset: Cap on parallel bulk-append tasks per bulk-eligible dataset;
+            appends carry no per-key commit contention, so this sits far above the merge-writer cap.
+        max_keys_per_map: Upper bound on distinct keys per source map column, enforced at the pivot
+            and schema-derivation boundary to reject per-row-unique keys that would OOM the driver.
         tag_stamp: Pre-formatted interval tag name (``%Y%m%dT%H%M%SZ``, typically the run's
             truncated hour via ``cliutil.parse_hour_tag``) stamped on every dataset the run
             wrote, after all batches commit. Create-or-move semantics: a later run in the same
@@ -100,6 +104,8 @@ class ETLConfig:
     retry_backoff_seconds: float = 0.5
     merge_batch_bytes: int | None = 64 * 1024 * 1024
     bulk_append: bool = True
+    max_bulk_tasks_per_dataset: int = 1024
+    max_keys_per_map: int = 4096
     tag_stamp: str | None = None
 
 
@@ -139,21 +145,49 @@ def routing_stats_ddl(extra_columns: list[tuple[str, str]]) -> str:
 
 
 def stats_schema() -> pa.Schema:
-    """Build the per-dataset stats schema (routing columns + upserted/deleted counters).
+    """Build the per-dataset stats schema (routing columns + upserted/deleted/failed counters).
+
+    The ``failed`` counter is the merge path's isolated-failure channel: a dataset group whose
+    merge raised is reported as a ``failed`` stats row instead of failing the whole run, and the
+    driver surfaces the aggregate failed-dataset count through the partial-failure exit code.
 
     Returns:
-        A schema with one string column per routing column plus ``upserted`` and ``deleted``.
+        A schema with one string column per routing column plus ``upserted``, ``deleted``, and
+        ``failed``.
     """
-    return routing_stats_schema([("upserted", pa.int64()), ("deleted", pa.int64())])
+    return routing_stats_schema([("upserted", pa.int64()), ("deleted", pa.int64()), ("failed", pa.int64())])
 
 
 def stats_spark_ddl() -> str:
     """Return the Spark DDL string matching :func:`stats_schema` for use as ``mapInArrow`` output schema.
 
     Returns:
-        A DDL string with routing columns as string plus upserted/deleted as bigint.
+        A DDL string with routing columns as string plus upserted/deleted/failed as bigint.
     """
-    return routing_stats_ddl([("upserted", "bigint"), ("deleted", "bigint")])
+    return routing_stats_ddl([("upserted", "bigint"), ("deleted", "bigint"), ("failed", "bigint")])
+
+
+def enforce_map_key_bound(column: str, key_count: int, max_keys: int) -> None:
+    """Reject a map column whose distinct-key count exceeds the configured bound.
+
+    Boundary contract enforcement, not defensive validation. A source map carrying per-row-unique
+    keys would materialise a million-column, irreversible grow-only schema and OOM the driver during
+    schema derivation. The bound fails the run loudly and names the offending column so the source
+    can be fixed rather than silently absorbing an unbounded schema.
+
+    Args:
+        column: The source map column being pivoted.
+        key_count: The number of distinct keys observed for that column.
+        max_keys: The configured per-map key cap (``ETLConfig.max_keys_per_map``).
+
+    Raises:
+        ValueError: When ``key_count`` exceeds ``max_keys``.
+    """
+    if key_count > max_keys:
+        raise ValueError(
+            f"map column {column!r} has {key_count} distinct keys, exceeding max_keys_per_map={max_keys}: "
+            "the source is emitting near-unique map keys, which would create a runaway grow-only schema"
+        )
 
 
 def apply_fsl_cast(
@@ -259,6 +293,7 @@ def pivot_map_columns(
             for key_val in pc.unique(chunk.keys).to_pylist():
                 if key_val is not None:
                     raw_keys.add(str(key_val))
+        enforce_map_key_bound(map_col, len(raw_keys), config.max_keys_per_map)
 
         for key in sorted(raw_keys):
             if key in seen_names or key in routing_reserved:

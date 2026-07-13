@@ -27,6 +27,19 @@ APP_NAME: str = "lance-pipeline"
 EXIT_PARTIAL_FAILURE: int = 3
 """Process exit code when a fleet run completed but one or more datasets failed in isolation."""
 
+SPARK_CORE_CONF_PINS: dict[str, str] = {
+    "spark.speculation": "false",
+}
+"""Correctness pins applied on the session builder, before the SparkContext starts.
+
+``spark.speculation`` must stay off: a speculative or zombie duplicate task attempt would run the
+same routing keys' ``merge_insert`` commits concurrently with the original attempt, breaking the
+key-disjointness guarantee that makes concurrent merge writers safe (ADR 0034) and silently
+duplicating rows. Unlike :data:`SPARK_CONF_DEFAULTS` these are correctness invariants rather than
+tunable defaults, and core scheduler configs cannot be modified on a running session, so they are
+pinned at builder time.
+"""
+
 SPARK_CONF_DEFAULTS: dict[str, str] = {
     "spark.sql.adaptive.enabled": "true",
     "spark.sql.adaptive.advisoryPartitionSizeInBytes": "64m",
@@ -343,13 +356,23 @@ def build_spark(app_name: str | None = None) -> SparkSession:
     configuration always wins. Explicitly-set keys are detected through the SparkContext's
     ``SparkConf``, which carries only explicit settings and not Spark's built-in defaults.
 
+    The :data:`SPARK_CORE_CONF_PINS` entries (``spark.speculation=false``) are set on the builder
+    instead, because core scheduler configs raise ``CANNOT_MODIFY_CONFIG`` when set on a running
+    session. They are correctness invariants, not defaults: speculative or zombie duplicate task
+    attempts would run the same routing keys' merges concurrently and break the merge-insert
+    key-disjointness guarantee (ADR 0034), so they take effect whenever this call creates the
+    SparkContext. A pre-existing context keeps its own values, which spark-submit must then pin.
+
     Args:
         app_name: Spark application name. Defaults to :data:`APP_NAME`.
 
     Returns:
         An active SparkSession.
     """
-    session: SparkSession = SparkSession.builder.appName(app_name or APP_NAME).getOrCreate()
+    builder: SparkSession.Builder = SparkSession.builder.appName(app_name or APP_NAME)
+    for pin_key, pin_value in SPARK_CORE_CONF_PINS.items():
+        builder = builder.config(pin_key, pin_value)
+    session: SparkSession = builder.getOrCreate()
     explicit = session.sparkContext.getConf()
     for conf_key, conf_value in SPARK_CONF_DEFAULTS.items():
         if not explicit.contains(conf_key):

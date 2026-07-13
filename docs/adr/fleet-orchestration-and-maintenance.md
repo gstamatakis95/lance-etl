@@ -327,13 +327,64 @@ recovery is automatic: the next indexing run sees no vector index, plans a boots
 the centroid sidecar still holds the old centroids in case an operator wants to re-drive the
 rebuild manually instead of waiting for the retrain.
 
-Serving-tag promotion is a separate opt-in, `cluster_serve_tag`, default off. When enabled, `HEAD`
-only advances via `update_serving_tag` after a dataset's index rebuild commits successfully, never
-after a rebuild failure, so a query never sees a clustered-but-unindexed generation as the served
-one. Left off, the normal `PipelineJob` stamp phase remains the promotion path, and it already
-excludes error-marked datasets from stamping (ADR 0035). Because the old tags keep the
-pre-rewrite version readable, storage roughly doubles for a rewritten dataset until interval-tag
-pruning and the cleanup horizon retire the pre-rewrite generation.
+Serving-tag promotion happens exclusively through the `PipelineJob` stamp phase, which runs after
+the index phase in the `prune -> maintenance -> index -> stamp` sequence and already excludes
+error-marked datasets from stamping (ADR 0035). The clustered rewrite itself never touches any
+serving tag. An earlier `cluster_serve_tag` opt-in flipped `HEAD` right after the vector-index
+rebuild committed, but that point in time is still before the scalar and FTS rebuilds (deferred to
+the next indexing run, below), so a text query could see a clustered-but-text-unindexed generation
+as the served one. The knob was removed as behavior: `MaintenanceConfig` now rejects
+`cluster_serve_tag=True` at construction with a pointer to the stamp phase. Because the old tags
+keep the pre-rewrite version readable, storage roughly doubles for a rewritten dataset until
+interval-tag pruning and the cleanup horizon retire the pre-rewrite generation.
+
+**Serve-LATEST exposure.** Between the Overwrite commit and the index rebuilds, a default
+serve-latest reader (one not pinned to a tag) sees the freshly clustered generation with NO
+indexes at all: the vector gap lasts until the same maintenance phase's rebuild commits, and the
+scalar/FTS gap lasts until the next indexing run. Clustered-rewrite fleets must therefore serve by
+tag. Within the pipeline this is enforced at config time: `PipelineConfig.validate_cluster_serving`
+rejects `maintenance.cluster_rewrite=True` unless BOTH `serve_tag=True` AND `tag_stamp` is set,
+since promotion only happens when the two hold together. The stamp phase returns early when
+`tag_stamp` is `None`, so `serve_tag=True` with `tag_stamp=None` would pass a promotion-disabled
+config that never advances `HEAD` and never serves the clustered generation. Requiring both is the
+in-config signal that promotion goes through the post-index stamp phase rather than readers
+following latest. A standalone `maintenance run --cluster-rewrite` carries no such signal, so the
+quiescence contract below is what protects it: it is a maintenance-window operation and the window
+must extend until the following indexing run restores the scalar and FTS indexes.
+
+**Derived-state skip.** `commit_cluster_overwrite` stamps a generation fingerprint (the committed
+generation's sorted data-fragment id list and logical row count) into the dataset config KV under
+`lance-etl.cluster_generation`, through the same retried `update_config` path as the vector
+artifact config. The next clustered-rewrite plan reads the fingerprint from the already-open
+manifest and skips the dataset as a terminal `skipped` outcome when it still matches, so leaving
+`cluster_rewrite` enabled on a scheduled pipeline does not re-rewrite the whole eligible fleet
+every run. The two fingerprint halves catch disjoint kinds of write, closing the gap a bare
+`(fragment_count, row_count)` fingerprint left open. Fragment ids are minted monotonically and
+never reused, so any fragment-replacing write mints new ids and diverges the id list even when the
+count is preserved — a full re-ingest merge that drops the one old fragment and writes one new
+fragment with an identical row count still invalidates the match. A pure delete leaves the ids
+untouched but lowers the row count, so it invalidates through the count half. Either kind of write
+re-enables eligibility. The stamp lands right after the Overwrite, before the index rebuild,
+deliberately: a failed rebuild leaves the data clustered, and re-clustering would not repair the
+missing index anyway — the next indexing run does. The index rebuild adds only index segments, not
+data fragments, so it leaves the fingerprint matching. A skipped already-clustered dataset does
+not pass through into normal compaction, which would re-merge its fragments toward insertion order,
+but it is not fully skipped: the plan phase still runs the same rotation-gated idle version cleanup
+the normal compaction-skip path uses (`idle_cleanup_bytes`), so the pre-rewrite generation the
+Overwrite left behind is reclaimed on a later run once it ages past the cleanup horizon and its
+pinning tags are gone, rather than being pinned forever. One accepted trade-off remains: the skip
+check runs before TTL, so an idle already-clustered dataset still defers time-based row expiry
+until a write re-enables it — only version cleanup runs while it stays clustered, not TTL.
+
+**Driver memory.** Each of the three flat phases (histogram, rewrite shuffle, index rebuild)
+broadcasts the per-dataset centroid map, roughly 100 MB per large dataset in a generation. Each
+broadcast is destroyed (`Broadcast.destroy`) as soon as its phase's collect returns, so the driver
+holds at most ONE live generation of centroid broadcasts instead of accumulating all three. The
+residual bound is that one generation: the driver still materializes every eligible dataset's
+centroids at once during a phase, so an operator sizing a fleet-wide clustered run should budget
+driver heap for the sum of centroid sizes across the datasets clustered in the same run. Moving to
+per-plan sidecar reads on the executors (the ADR 0040 pattern) would remove even that bound and
+remains the follow-up if fleets outgrow it.
 
 Scalar and FTS index rebuilding is deliberately left to the indexing job the next time
 `PipelineJob` runs after maintenance, rather than being folded into the clustered rewrite itself.
@@ -347,7 +398,8 @@ Clustered rewrite is a non-transactional, quiescence-requiring operation, like t
 migration tools. A concurrent ETL write between the pinned read version and the Overwrite commit
 is clobbered, so it depends on the same ingestion/pipeline non-overlap contract ADR 0038 already
 states, and it is operator-triggered and off by default rather than something the scheduled
-pipeline runs on its own.
+pipeline runs on its own. When it is left enabled on a schedule, the derived-state skip above
+keeps every unwritten dataset a cheap no-op.
 
 ## Superseded decisions
 

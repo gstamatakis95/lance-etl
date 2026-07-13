@@ -16,7 +16,7 @@ use lance_index::scalar::InvertedIndexParams;
 use lance_linalg::distance::DistanceType as LanceDistanceType;
 use prost_types::value::Kind;
 use search_api::config::Config;
-use search_api::grpc::SearchGrpc;
+use search_api::grpc::{RouteTimeoutLayer, SearchGrpc};
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
 use search_api::pb::search_service_client::SearchServiceClient;
 use search_api::pb::search_service_server::SearchServiceServer;
@@ -121,8 +121,9 @@ async fn build_test_dataset(uri: &str) {
 /// Serves the gRPC API on an ephemeral local port and returns a connected channel.
 ///
 /// The server stack mirrors production: telemetry is initialized in disabled (log-only) mode and
-/// every request flows through the OpenTelemetry tower layer, so each test doubles as a
-/// pass-through assertion for the instrumentation layer.
+/// every request flows through the OpenTelemetry tower layer plus the production per-route
+/// timeout layer, so each test doubles as a pass-through assertion for both layers (every search
+/// here completes inside the default budget).
 async fn serve(tmp: &TempDir) -> Channel {
     serve_with_metrics(tmp, Arc::new(Metrics::disabled())).await
 }
@@ -169,6 +170,7 @@ async fn serve_full(tmp: &TempDir, metrics: Arc<Metrics>, recall: Option<RecallC
     tokio::spawn(
         Server::builder()
             .layer(OtelGrpcLayer::default().filter(reject_healthcheck))
+            .layer(RouteTimeoutLayer::from_defaults())
             .add_service(health_service)
             .add_service(SearchServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener)),

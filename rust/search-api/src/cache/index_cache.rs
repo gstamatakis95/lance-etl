@@ -24,8 +24,45 @@ use crate::telemetry::{CacheName, EvictionReason, Metrics, Tier};
 pub struct HybridIndexCacheBackend {
     store: Arc<dyn EntryStore>,
     memory_tier: MokaCacheBackend,
-    inflight: tokio::sync::Mutex<HashMap<InternalCacheKey, Arc<tokio::sync::Mutex<()>>>>,
+    inflight: InflightMap,
     metrics: Arc<Metrics>,
+}
+
+/// Per-key single-flight registry: one shared async mutex per key currently being loaded.
+///
+/// Guarded by a synchronous mutex because every access is a quick map operation with no await
+/// point, and a synchronous lock is usable from [`InflightGuard::drop`], which is what removes a
+/// task's claim even when the owning request future is cancelled mid-load.
+type InflightMap = std::sync::Mutex<HashMap<InternalCacheKey, Arc<tokio::sync::Mutex<()>>>>;
+
+/// Removes one task's claim on an inflight-map entry when the task's `get_or_insert` future
+/// completes — or is cancelled at any await point (client disconnect, request deadline).
+///
+/// The cleanup relies on a strong-count invariant made authoritative by dropping this guard's own
+/// `lock` clone WHILE the `inflight` mutex is held: with the guard's clone gone, a remaining count
+/// of exactly 1 means only the map entry itself still holds the Arc, i.e. no other waiter is
+/// claiming it. Every other task clones the Arc only while holding that same `inflight` mutex, so
+/// the count cannot change between the release, the check, and the `remove`. Because the map keeps
+/// its own clone until `remove` runs, the entry is gone before the Arc refcount can reach zero, so
+/// a concurrent caller inserts a fresh entry instead of resurrecting a dying one.
+struct InflightGuard<'a> {
+    inflight: &'a InflightMap,
+    key: InternalCacheKey,
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl Drop for InflightGuard<'_> {
+    /// Drops the guard's claim, removing the map entry when no other task is waiting on it.
+    fn drop(&mut self) {
+        let mut inflight = self.inflight.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        drop(self.lock.take());
+        let no_other_waiters = inflight
+            .get(&self.key)
+            .is_some_and(|existing| Arc::strong_count(existing) == 1);
+        if no_other_waiters {
+            inflight.remove(&self.key);
+        }
+    }
 }
 
 impl std::fmt::Debug for HybridIndexCacheBackend {
@@ -51,7 +88,7 @@ impl HybridIndexCacheBackend {
         Self {
             store,
             memory_tier: MokaCacheBackend::with_capacity(memory_bytes),
-            inflight: tokio::sync::Mutex::new(HashMap::new()),
+            inflight: std::sync::Mutex::new(HashMap::new()),
             metrics,
         }
     }
@@ -157,15 +194,12 @@ impl CacheBackend for HybridIndexCacheBackend {
         }
     }
 
-    /// Single-flights the loader per key through an `inflight` map of per-key mutexes.
+    /// Single-flights the loader per key through the `inflight` map of per-key mutexes.
     ///
-    /// The cleanup after `drop(guard)` relies on a strong-count invariant: the count is exactly 2
-    /// when only the `inflight` map entry and this task's local `lock` hold the Arc, and every
-    /// other task clones the Arc only while holding the `inflight` mutex — the same mutex held
-    /// here — so the count cannot change between the check and the `remove`. The local `lock` is
-    /// dropped only after `inflight.remove(key)`, intentionally, so the map entry is gone before
-    /// the Arc refcount can reach zero and any concurrent caller inserts a fresh entry instead of
-    /// resurrecting a dying one.
+    /// The map entry's lifetime is owned by [`InflightGuard`]: every waiter holds one guard, and
+    /// the last guard to drop removes the entry. Because the cleanup lives in `Drop`, a request
+    /// future cancelled at any await point (lock acquisition, cache read, the loader itself)
+    /// still releases its claim instead of leaking the entry forever.
     #[tracing::instrument(
         name = "index_cache.get_or_insert",
         level = "trace",
@@ -181,14 +215,24 @@ impl CacheBackend for HybridIndexCacheBackend {
         let Some(codec) = codec else {
             return self.memory_tier.get_or_insert(key, loader, None).await;
         };
-        let lock = {
-            let mut inflight = self.inflight.lock().await;
-            inflight
+        let guard = {
+            let mut inflight = self.inflight.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let lock = inflight
                 .entry(key.clone())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
+                .clone();
+            InflightGuard {
+                inflight: &self.inflight,
+                key: key.clone(),
+                lock: Some(lock),
+            }
         };
-        let guard = lock.lock().await;
+        let permit = guard
+            .lock
+            .as_ref()
+            .expect("inflight lock held until guard drop")
+            .lock()
+            .await;
         let result = async {
             if let Some(entry) = self.get(key, Some(codec)).await {
                 return Ok((entry, true));
@@ -198,15 +242,8 @@ impl CacheBackend for HybridIndexCacheBackend {
             Ok((entry, false))
         }
         .await;
+        drop(permit);
         drop(guard);
-        let mut inflight = self.inflight.lock().await;
-        let no_other_waiters = inflight
-            .get(key)
-            .is_some_and(|existing| Arc::strong_count(existing) == 2);
-        if no_other_waiters {
-            inflight.remove(key);
-        }
-        drop(lock);
         result
     }
 
@@ -451,6 +488,82 @@ mod tests {
             task.await.unwrap();
         }
         assert_eq!(loader_runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_get_or_insert_does_not_leak_the_inflight_entry() {
+        let store = Arc::new(MemoryEntryStore::default());
+        let backend = Arc::new(HybridIndexCacheBackend::new(
+            store,
+            1024 * 1024,
+            Arc::new(Metrics::disabled()),
+        ));
+        let codec = CacheCodec::from_impl::<Payload>();
+        let cache_key = key("s3://bucket/ds.lance/", "page-cancelled");
+        let task = tokio::spawn({
+            let backend = backend.clone();
+            let cache_key = cache_key.clone();
+            async move {
+                let loader = Box::pin(async move {
+                    std::future::pending::<()>().await;
+                    Ok((Arc::new(Payload(Vec::new())) as CacheEntry, 0usize))
+                });
+                backend.get_or_insert(&cache_key, loader, Some(codec)).await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        let outcome = task.await;
+        assert!(outcome.is_err(), "the loading task must have been aborted");
+        assert!(
+            backend
+                .inflight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "cancellation mid-load must remove the inflight-map entry"
+        );
+        let loader = Box::pin(async move { Ok((Arc::new(Payload(vec![9u8; 4])) as CacheEntry, 4usize)) });
+        let (entry, was_cached) = backend.get_or_insert(&cache_key, loader, Some(codec)).await.unwrap();
+        assert!(!was_cached, "the cancelled load must not have populated the cache");
+        assert_eq!(entry.downcast_ref::<Payload>().unwrap().0, vec![9u8; 4]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_single_flight_leaves_inflight_map_empty() {
+        let store = Arc::new(MemoryEntryStore::default());
+        let backend = Arc::new(HybridIndexCacheBackend::new(
+            store,
+            1024 * 1024,
+            Arc::new(Metrics::disabled()),
+        ));
+        let codec = CacheCodec::from_impl::<Payload>();
+        for round in 0..100 {
+            let cache_key = key(&format!("s3://bucket/ds.lance@{round}/"), "page-shared");
+            let mut tasks = Vec::new();
+            for _ in 0..8 {
+                let backend = backend.clone();
+                let cache_key = cache_key.clone();
+                tasks.push(tokio::spawn(async move {
+                    let loader = Box::pin(async {
+                        tokio::task::yield_now().await;
+                        Ok((Arc::new(Payload(vec![1u8; 8])) as CacheEntry, 8usize))
+                    });
+                    backend.get_or_insert(&cache_key, loader, Some(codec)).await.unwrap()
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
+            assert!(
+                backend
+                    .inflight
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_empty(),
+                "after all concurrent waiters on a version-scoped key finish, the inflight entry must be removed"
+            );
+        }
     }
 
     #[tokio::test]

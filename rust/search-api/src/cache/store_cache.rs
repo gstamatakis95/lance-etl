@@ -3,6 +3,13 @@
 //! Caches immutable metadata reads (version manifests, transactions, index file ranges) in the
 //! configured persistent [`EntryStore`] and passes every other operation, including all raw data
 //! reads under `data/`, straight through to the wrapped store.
+//!
+//! Entries are keyed by `(store_prefix, path)` with no etag or generation binding, relying on
+//! Lance's naming discipline: everything cached here is written once and never rewritten in
+//! place. That assumption breaks only if a dataset is dropped and recreated at the same URI,
+//! which restarts version numbering and would let cached manifests of the dead dataset serve
+//! phantom fragments until the TTL expires. Reusing a dataset URI is therefore an operational
+//! prohibition (see `README.md` and `AGENTS.md` in the crate root).
 
 use std::sync::Arc;
 

@@ -35,7 +35,7 @@ src/lance_etl/          Python package (production sources)
     __main__.py         Calls cli.main()
     config.py           IndexJobConfig, METRIC_TO_DISTANCE, FTS_OPTIONAL_PARAMS, growth_exceeds_retrain_factor, index-name helpers
     handlers.py         IndexHandler, VectorIndexHandler, BTreeIndexHandler, BitmapIndexHandler, ZonemapIndexHandler, FtsIndexHandler, commit_fts_index, publish_fts_index. Each handler exposes prepare / build_segment / merges().
-    optimize.py         load_vector_config, write_vector_config, drop_existing_index, optimize_existing_index, merge_index_deltas, maintain_index_locally
+    optimize.py         load_vector_config, write_vector_config, optimize_existing_index, merge_index_deltas, maintain_index_locally
     runner.py           LanceIndexer fleet phases: make_handler (kind -> IndexHandler dispatch), plan_dataset_indexes, bootstrap_vector_index (streaming k-means), persist_bootstrap_centroids, build_one_shard, commit_one_index, merge_deltas_if_needed, role-based target discovery
     segments.py         build_vector_segment, build_scalar_segment, commit_segments, split_evenly, lance_field_id, stale-fragment guards
   maintenance/          Maintenance job package (python -m lance_etl.maintenance)
@@ -44,7 +44,7 @@ src/lance_etl/          Python package (production sources)
     __main__.py         Calls cli.main()
     job.py              MaintenanceJob fleet phases: plan_one_dataset, execute_rewrite_task, commit_one_dataset, cleanup_dataset, run_ttl_on_open_dataset, compaction_skip_reason (derived-state skip: dataset_stats num_fragments)
     tools.py            update_serving_tag / update_serving_tags (both take tags: Sequence[str], default ("HEAD",), and flip every named tag in ONE dataset open), flip_one_tag, migrate_dataset_manifest_paths, migrate_manifest_paths, prune_interval_tags, prune_interval_tags_fleet
-    cluster.py          Clustered rewrite fleet phases: plan_cluster_rewrite, partition_histogram, read_shard_tasks (shared by histogram and rewrite scans), derive_buckets, rewrite shuffle (read fan-out sized by derive_partitions(REWRITE_PARTITION_FACTOR), decoupled from write bucket count, global-bucket map broadcast), commit_cluster_overwrite, preserved-centroid index rebuild, run_cluster_rewrites
+    cluster.py          Clustered rewrite fleet phases: plan_cluster_rewrite, partition_histogram, read_shard_tasks (shared by histogram and rewrite scans), derive_buckets, rewrite shuffle (read fan-out sized by derive_partitions(REWRITE_PARTITION_FACTOR), decoupled from write bucket count, global-bucket map broadcast), commit_cluster_overwrite (stamps a lance-etl.cluster_generation fingerprint = sorted fragment ids + row count, stored as raw JSON so it survives cross-executor comparison), fragment_id_signature, cluster_generation_skip_reason (already-clustered idle datasets still run rotation-gated version cleanup, but skip re-clustering and normal compaction), preserved-centroid index rebuild, run_cluster_rewrites
   pipeline/             Unified pipeline job package (python -m lance_etl.pipeline)
     __init__.py         Re-exports: PipelineJob, PipelineConfig, prune_interval_tags, prune_interval_tags_fleet, stamp_eligible
     cli.py              Entry point for lance-etl-pipeline script and python -m lance_etl.pipeline
@@ -142,25 +142,28 @@ you are unsure whether an API exists or what its signature is, read that checkou
 ## Build and test commands
 
 ```bash
-# Install (editable) with dev dependencies
-uv pip install -e ".[dev]"
+# Install (editable) with dev dependencies (dev/bench/airflow are PEP 735 groups, not extras)
+uv pip install -e . --group dev
 
-# Install bench extras
+# Install bench dependencies
 uv pip install --group bench
+
+# Install airflow dependencies (only needed to run tests/test_airflow_dags.py unskipped)
+uv pip install --group airflow
 
 # Lint and format (must pass before any commit)
 uvx ruff format src/ tests/ airflow/ bench/
 uvx ruff check src/ tests/ airflow/ bench/
 
 # Run tests
-.venv/bin/pytest
+.venv/bin/pytest -m "not integration"
 ```
 
-pylance `>=8.0.0` installs from PyPI (8.0.0 released 2026-07-01, superseding the
+pylance `>=8.0.0,<9` installs from PyPI (8.0.0 released 2026-07-01, superseding the
 build-from-checkout requirement of the 8.0.0b6 era):
 
 ```bash
-uv pip install "pylance>=8.0.0"
+uv pip install "pylance>=8.0.0,<9"
 ```
 
 The Rust service sources the lance crates from crates.io at the same version. Bump the two

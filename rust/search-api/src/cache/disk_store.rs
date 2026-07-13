@@ -180,10 +180,14 @@ impl EntryStore for DiskEntryStore {
     /// The write lock is held only for the in-memory map update, then dropped before the
     /// synchronous filesystem write. Holding the lock across `std::fs::write` would block every
     /// concurrent insert for the entire disk-flush duration — exactly the mass-cold-open
-    /// scenario where many inserts fire at once. The sidecar is a rebuildable hint: a lost
-    /// write between the lock drop and the file write means prefix invalidation may miss some
-    /// directories on the next process start, but the janitor sweep reconciles the map from
-    /// the actual directory listing, so eventual consistency is acceptable.
+    /// scenario where many inserts fire at once. The sidecar is a best-effort hint, not a
+    /// reconciled index: a row lost between the lock drop and the file write (or to a crash
+    /// before the flush lands) is gone after the next process start, because directory names are
+    /// one-way hashes of their prefixes and cannot be mapped back. The sweep only *prunes* rows
+    /// whose directory no longer exists — it never rebuilds lost rows — so prefix invalidation
+    /// misses the affected directories until a fresh insert under the same prefix re-registers
+    /// them or the TTL sweep ages their entries out. That bounded staleness is the accepted
+    /// trade-off for lock-free disk flushes.
     async fn register_prefix(&self, prefix: &str, dir: &str) {
         {
             let map = self

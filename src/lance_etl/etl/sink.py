@@ -56,6 +56,36 @@ were created with, and lance reads both transparently.
 """
 
 
+DATASET_NOT_FOUND_MARKER: str = "was not found"
+"""Substring lance renders into the load error for a genuinely absent dataset (lance 8.0.0).
+
+pylance maps every dataset-load failure to :class:`ValueError`, so credentials errors, object-store
+throttling (S3 503), and corrupt manifests are indistinguishable from a missing dataset by type
+alone. The absent-dataset message reads ``Dataset at path <uri> was not found: ...``; matching this
+marker lets the sink treat a true absence as a no-op while re-raising every transient or fatal open
+error instead of silently skipping a compliance-sensitive delete.
+"""
+
+
+def dataset_absent(error: BaseException) -> bool:
+    """Return True only when an open error signals a genuinely absent dataset.
+
+    A :class:`FileNotFoundError` is an unambiguous absence. A :class:`ValueError` is absence only
+    when it carries the lance not-found marker (:data:`DATASET_NOT_FOUND_MARKER`); every other
+    ``ValueError`` (transient object-store fault, bad credentials, corrupt manifest) is a real
+    failure the caller must re-raise rather than treat as a no-op.
+
+    Args:
+        error: The exception raised while opening a dataset.
+
+    Returns:
+        True when the error means the dataset does not exist, False otherwise.
+    """
+    if isinstance(error, FileNotFoundError):
+        return True
+    return isinstance(error, ValueError) and DATASET_NOT_FOUND_MARKER in str(error)
+
+
 def dataset_uri(config: ETLConfig, *components: str) -> str:
     """Build the validated dataset URI ``base_uri/org_id/tenant_id/namespace.lance``.
 
@@ -246,7 +276,7 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
                 config,
                 telemetry,
                 deletes,
-                lambda chunk, index, total: run_delete_chunk(config, uri, chunk, index, total),
+                lambda chunk, index, total: run_delete_chunk(config, telemetry, uri, chunk, index, total),
                 lambda stats: stats.get("num_deleted_rows", 0),
             )
 
@@ -258,9 +288,11 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
 def open_or_bootstrap(uri: str, schema: pa.Schema, config: ETLConfig) -> lance.LanceDataset:
     """Open the dataset, creating it empty when absent.
 
-    New datasets are created with V2 manifest paths and the configured Lance file format. A
-    concurrent-bootstrap race surfaces as ``OSError`` from the losing writer, which falls back
-    to opening the winner's dataset.
+    New datasets are created with V2 manifest paths and the configured Lance file format. Only a
+    genuinely absent dataset (:func:`dataset_absent`) is bootstrapped; a transient or fatal open
+    error (bad credentials, object-store throttling, corrupt manifest) is re-raised rather than
+    masked by a spurious empty-dataset write. A concurrent-bootstrap race surfaces as ``OSError``
+    from the losing writer, which falls back to opening the winner's dataset.
 
     Args:
         uri: Dataset URI.
@@ -272,7 +304,9 @@ def open_or_bootstrap(uri: str, schema: pa.Schema, config: ETLConfig) -> lance.L
     """
     try:
         return lance.dataset(uri, storage_options=config.storage_options)
-    except (FileNotFoundError, ValueError):
+    except (FileNotFoundError, ValueError) as error:
+        if not dataset_absent(error):
+            raise
         try:
             return lance.write_dataset(
                 schema.empty_table(),
@@ -330,14 +364,25 @@ def run_upsert_chunk(
     )
 
 
-def run_delete_chunk(config: ETLConfig, uri: str, chunk: pa.Table, chunk_index: int, num_chunks: int) -> dict[str, Any]:
-    """Execute ``when_matched_delete`` for one key-only chunk, a no-op when the dataset is absent.
+def run_delete_chunk(
+    config: ETLConfig,
+    telemetry: Telemetry,
+    uri: str,
+    chunk: pa.Table,
+    chunk_index: int,
+    num_chunks: int,
+) -> dict[str, Any]:
+    """Execute ``when_matched_delete`` for one key-only chunk, a no-op only when the dataset is absent.
 
     Re-opens the dataset on every call so retries and sequential chunk commits see the latest
-    version.
+    version. A genuinely absent dataset (:func:`dataset_absent`) makes the delete a no-op, because
+    there is nothing to delete. Any other open error — bad credentials, object-store throttling
+    (S3 503), corrupt manifest — is re-raised after incrementing ``dataset.delete_open_failed``,
+    so a transient fault never silently skips a compliance-sensitive delete.
 
     Args:
         config: ETL configuration.
+        telemetry: Telemetry facade for the current executor.
         uri: Dataset URI.
         chunk: Key-only delete slice.
         chunk_index: Zero-based position in the chunk sequence, used for logging.
@@ -349,8 +394,11 @@ def run_delete_chunk(config: ETLConfig, uri: str, chunk: pa.Table, chunk_index: 
     logger.debug("dataset %s: delete chunk %d/%d (%d rows)", uri, chunk_index + 1, num_chunks, chunk.num_rows)
     try:
         delete_dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-    except (FileNotFoundError, ValueError):
-        return {}
+    except (FileNotFoundError, ValueError) as error:
+        if dataset_absent(error):
+            return {}
+        telemetry.incr("dataset.delete_open_failed")
+        raise
     return (
         delete_dataset.merge_insert(on=[KEY_COL])
         .when_matched_delete()

@@ -113,7 +113,7 @@ time the way BTREE and BITMAP deltas are, so leaving ZONEMAP unmerged would leav
 pruning degraded across shards instead of merely deferred to the delta-merge maintenance pass.
 As with BTREE and BITMAP, `create_scalar_index(fragment_ids=)` and `merge_index_metadata` are
 never used for ZONEMAP — both raise on current lance main. No version gate is needed:
-the repository pins `pylance>=8.0.0`, the first release with the ZONEMAP type and segment
+the repository pins `pylance>=8.0.0,<9`, the first release with the ZONEMAP type and segment
 merging.
 
 ## ADR 0040 — Object-store centroid cache for distributed vector builds

@@ -1,6 +1,31 @@
 # How-to: date and time lifecycle at the orchestrator layer
 
-*This document predates the unified architecture (ADR 0028) and needs a refresh.*
+> **OUTDATED — verify every command below against the current code before relying on it.**
+> This document predates the unified architecture (ADR 0028) and several details are now wrong,
+> not just stale in tone.
+>
+> - **Option A** (the recommended default, "one dataset per routing key") is accurate. Its
+>   description of scalar range filters, the typed `Filter` AST, and the BTREE index still matches
+>   the current code.
+> - **Option B** ("physically separate per-date datasets") describes a CLI surface and Airflow
+>   Variable that do not exist. The `--partition-by` flag on the sample per-date DAG is not an ETL
+>   CLI flag. It belongs only to the `migrate-namespace` operator tool
+>   (`src/lance_etl/tools/cli.py`), not to `python -m lance_etl.etl`, which has no partitioning flag
+>   at all. The `lance_etl_partition_by` Airflow Variable referenced in the sample DAG does not
+>   exist anywhere in `airflow/`. The referenced module path
+>   `/opt/lance-etl/src/lance_etl/cli.py` and DAG file `lance_etl_dag.py` do not exist either. The
+>   real DAG files are `airflow/lance_etl_etl_dag.py` and `airflow/lance_etl_pipeline_dag.py`, and
+>   the real Spark application entry points are `lance_etl/etl/__main__.py` and
+>   `lance_etl/pipeline/__main__.py` (see `AGENTS.md` for the current layout).
+> - More fundamentally, routing is no longer configurable. `ROUTING_COLS` in
+>   `src/lance_etl/etl/pivot.py` is a fixed three-tuple (`org_id`, `tenant_id`, `namespace`), so
+>   Option B's premise (injecting an extra orchestrator-controlled routing column) is no longer
+>   something the ETL supports. Achieving Option B today would require adding a fourth fixed
+>   routing column in code, not an orchestrator-side flag, which is a larger change than this
+>   how-to implies.
+>
+> Treat Option B as a design sketch of an approach that could be rebuilt, not as a working
+> recipe. Option A remains the supported, working path.
 
 This document is for teams that previously relied on by-date physical partitioning (one Lance dataset
 per calendar day) and need to understand how to achieve equivalent data-lifecycle goals now that the

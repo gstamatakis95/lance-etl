@@ -3,9 +3,11 @@
 Covers eligibility skips falling through to normal compaction, the happy-path invariants (row
 multiset preservation, non-decreasing partition ids across fragment order, surviving config KVs,
 an identically-centroided rebuilt vector index, and true nearest-neighbor correctness against a
-brute-force numpy check), null-vector rows landing in the tail region, second-run idempotency, and
-per-dataset failure isolation at the rebuild-commit, rewrite-read, and segment-build phases that
-keeps every healthy dataset clustering and every poisoned dataset intact while the run never raises.
+brute-force numpy check), null-vector rows landing in the tail region, the derived-state skip (a
+second run over an unwritten dataset is a cheap no-op and a post-rewrite write re-enables
+eligibility), the removed cluster_serve_tag knob being rejected at construction, and per-dataset
+failure isolation at the rebuild-commit, rewrite-read, and segment-build phases that keeps every
+healthy dataset clustering and every poisoned dataset intact while the run never raises.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from lance_etl.column_roles import COLUMN_ROLES_KEY, VECTOR_ROLE, merge_column_r
 from lance_etl.indexing import IndexJobConfig, bootstrap_vector_index, load_vector_config, plan_dataset_indexes
 from lance_etl.maintenance import MaintenanceConfig, MaintenanceJob, plan_cluster_rewrite
 from lance_etl.maintenance import cluster as cluster_module
+from lance_etl.maintenance import job as maintenance_job_module
 from lance_etl.maintenance.cli import count_failed
 from lance_etl.maintenance.cluster import centroids_to_matrix, commit_cluster_overwrite, partition_ids_for_batch
 from lance_etl.telemetry import Telemetry, TelemetryConfig
@@ -273,8 +276,8 @@ def test_null_vector_rows_placed_in_tail(tmp_path: Path, telemetry: Telemetry) -
     assert first_null_index == base_rows, "null-vector rows are not placed after every real partition"
 
 
-def test_second_run_is_idempotent(tmp_path: Path, telemetry: Telemetry) -> None:
-    """Running the clustered rewrite twice keeps every invariant intact after the second pass."""
+def test_second_run_skips_already_clustered(tmp_path: Path, telemetry: Telemetry) -> None:
+    """The second run over an unwritten dataset skips via the generation stamp, invariants intact."""
     uri: str = str(tmp_path / "cluster_idempotent.lance")
     build_cluster_ready_dataset(uri, ROWS, DIM, telemetry)
 
@@ -285,10 +288,16 @@ def test_second_run_is_idempotent(tmp_path: Path, telemetry: Telemetry) -> None:
     config: MaintenanceConfig = cluster_config()
     first: list[dict[str, object]] = MaintenanceJob(config).run(FakeSpark(), [uri])
     assert "error" not in first[0]
+    assert first[0]["clustered"] is True
+    first_version: int = lance.dataset(uri).version
+    assert lance.dataset(uri).config().get(cluster_module.CLUSTER_GENERATION_KEY) is not None
 
     second: list[dict[str, object]] = MaintenanceJob(config).run(FakeSpark(), [uri])
     assert "error" not in second[0]
-    assert second[0]["clustered"] is True
+    assert "clustered" not in second[0]
+    assert "already clustered" in str(second[0]["skipped"])
+    assert count_failed(second) == 0
+    assert lance.dataset(uri).version == first_version, "the skipped run must commit nothing"
 
     post_dataset: lance.LanceDataset = lance.dataset(uri)
     assert set(post_dataset.to_table(columns=["id"]).column("id").to_pylist()) == pre_ids
@@ -297,6 +306,56 @@ def test_second_run_is_idempotent(tmp_path: Path, telemetry: Telemetry) -> None:
     assert INDEX_NAME in names
     post_centroids: np.ndarray = centroids_to_matrix(post_dataset.get_ivf_model(INDEX_NAME).centroids)
     np.testing.assert_allclose(post_centroids, pre_centroids)
+
+
+def test_write_after_cluster_reenables_eligibility(tmp_path: Path, telemetry: Telemetry) -> None:
+    """An append after a clustered rewrite invalidates the generation stamp and re-clusters."""
+    uri: str = str(tmp_path / "cluster_reenable.lance")
+    build_cluster_ready_dataset(uri, ROWS, DIM, telemetry)
+    pre_centroids: np.ndarray = centroids_to_matrix(lance.dataset(uri).get_ivf_model(INDEX_NAME).centroids)
+
+    config: MaintenanceConfig = cluster_config()
+    first: list[dict[str, object]] = MaintenanceJob(config).run(FakeSpark(), [uri])
+    assert first[0]["clustered"] is True
+
+    extra_rows: int = 64
+    extra: pa.Table = make_vector_table(rows=extra_rows, dim=DIM, seed=41)
+    reindexed: pa.Table = extra.set_column(0, "id", pa.array(range(ROWS, ROWS + extra_rows), pa.int64()))
+    lance.write_dataset(reindexed, uri, mode="append")
+
+    plan: dict[str, object] = plan_cluster_rewrite(uri, config, None, telemetry)
+    assert "cluster_current" not in plan
+    assert "cluster_skipped" not in plan
+
+    second: list[dict[str, object]] = MaintenanceJob(config).run(FakeSpark(), [uri])
+    assert "error" not in second[0]
+    assert second[0]["clustered"] is True
+
+    post_dataset: lance.LanceDataset = lance.dataset(uri)
+    assert post_dataset.count_rows() == ROWS + extra_rows
+    assert_pids_non_decreasing_across_fragments(post_dataset, pre_centroids, "l2")
+
+
+def test_cluster_serve_tag_rejected_at_construction() -> None:
+    """The removed cluster_serve_tag knob fails loudly instead of silently mis-promoting."""
+    with pytest.raises(ValueError, match="cluster_serve_tag"):
+        MaintenanceConfig(telemetry=TelemetryConfig(), cluster_rewrite=True, cluster_serve_tag=True)
+
+
+def test_already_clustered_dataset_not_passed_to_normal_compaction(tmp_path: Path, telemetry: Telemetry) -> None:
+    """A generation-stamped dataset is terminal-skipped, never compacted back toward insertion order."""
+    uri: str = str(tmp_path / "cluster_no_compact.lance")
+    build_cluster_ready_dataset(uri, ROWS, DIM, telemetry)
+
+    config: MaintenanceConfig = cluster_config()
+    first: list[dict[str, object]] = MaintenanceJob(config).run(FakeSpark(), [uri])
+    assert first[0]["clustered"] is True
+    clustered_fragments: int = len(lance.dataset(uri).get_fragments())
+    assert clustered_fragments > 1
+
+    second: list[dict[str, object]] = MaintenanceJob(config).run(FakeSpark(), [uri])
+    assert "already clustered" in str(second[0]["skipped"])
+    assert len(lance.dataset(uri).get_fragments()) == clustered_fragments
 
 
 def test_rebuild_failure_is_isolated_and_data_intact(
@@ -437,3 +496,73 @@ def test_commit_cluster_overwrite_preserves_config(tmp_path: Path, telemetry: Te
     refreshed: lance.LanceDataset = lance.dataset(uri)
     assert refreshed.count_rows() == 64
     assert refreshed.config().get(COLUMN_ROLES_KEY) is not None
+
+
+def test_idle_clustered_dataset_still_runs_version_cleanup(
+    tmp_path: Path, telemetry: Telemetry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A later run over an already-clustered dataset still runs idle version cleanup, not a full skip.
+
+    D2: the terminal ``cluster_current`` skip used to bypass cleanup entirely, so the pre-rewrite
+    generation the Overwrite left was never reclaimed once its tags unpinned it. The skip now routes
+    through the same rotation-gated idle cleanup the normal compaction-skip path uses.
+    ``cleanup_rotation_slots=1`` makes the rotation deterministic so the cleanup always fires.
+    """
+    uri: str = str(tmp_path / "cluster_idle_cleanup.lance")
+    build_cluster_ready_dataset(uri, ROWS, DIM, telemetry)
+
+    config: MaintenanceConfig = cluster_config(cleanup_rotation_slots=1)
+    first: list[dict[str, object]] = MaintenanceJob(config).run(FakeSpark(), [uri])
+    assert first[0]["clustered"] is True
+
+    real_cleanup = maintenance_job_module.cleanup_dataset
+    cleaned: list[str] = []
+
+    def spy_cleanup(
+        cleanup_uri: str, cfg: MaintenanceConfig, tel: Telemetry, dataset: lance.LanceDataset | None = None
+    ) -> int:
+        """Record every version-cleanup call and delegate to the real implementation."""
+        cleaned.append(cleanup_uri)
+        return real_cleanup(cleanup_uri, cfg, tel, dataset)
+
+    monkeypatch.setattr(maintenance_job_module, "cleanup_dataset", spy_cleanup)
+
+    second: list[dict[str, object]] = MaintenanceJob(config).run(FakeSpark(), [uri])
+    assert "clustered" not in second[0]
+    assert "already clustered" in str(second[0]["skipped"])
+    assert uri in cleaned, "an idle already-clustered dataset must still run version cleanup"
+
+
+def test_count_preserving_merge_invalidates_fingerprint(tmp_path: Path, telemetry: Telemetry) -> None:
+    """A full-refresh merge that preserves row and fragment counts still re-enables re-clustering.
+
+    D3: the old ``(num_fragments, num_rows)`` fingerprint false-matched a re-ingest merge that
+    dropped the one old fragment and wrote one new fragment with identical counts, so a dataset
+    whose every row changed was permanently excluded from re-clustering. The fragment-id signature
+    invalidates on the new fragment id while an untouched dataset still matches.
+    """
+    uri: str = str(tmp_path / "cluster_fingerprint.lance")
+    table: pa.Table = make_vector_table(rows=64, dim=DIM)
+    lance.write_dataset(table, uri, max_rows_per_file=1000)
+    assert len(lance.dataset(uri).get_fragments()) == 1
+
+    config: MaintenanceConfig = cluster_config()
+    cluster_module.stamp_cluster_generation(uri, config, telemetry)
+
+    stamped: lance.LanceDataset = lance.dataset(uri)
+    assert cluster_module.cluster_generation_skip_reason(stamped) is not None, "an untouched dataset must still skip"
+    before_ids: list[int] = sorted(fragment.fragment_id for fragment in stamped.get_fragments())
+    before_rows: int = stamped.count_rows()
+
+    category_index: int = table.schema.get_field_index("category")
+    refreshed_table: pa.Table = table.set_column(
+        category_index, "category", pa.array([f"changed{i}" for i in range(before_rows)])
+    )
+    stamped.merge_insert(on="id").when_matched_update_all().when_not_matched_insert_all().execute(refreshed_table)
+
+    reopened: lance.LanceDataset = lance.dataset(uri)
+    after_ids: list[int] = sorted(fragment.fragment_id for fragment in reopened.get_fragments())
+    assert reopened.count_rows() == before_rows, "the merge must preserve the row count"
+    assert len(after_ids) == len(before_ids), "the merge must preserve the fragment count"
+    assert after_ids != before_ids, "the merge must mint a new fragment id"
+    assert cluster_module.cluster_generation_skip_reason(reopened) is None, "re-clustering must be eligible again"

@@ -35,9 +35,12 @@ from conftest import FakeSpark, make_vector_table, write_fragmented_dataset
 import lance_etl.indexing.cli as indexing_cli
 import lance_etl.indexing.runner as indexing_runner
 import lance_etl.maintenance.job as maintenance_job
+from lance_etl.cliutil import resolve_exit_code
+from lance_etl.fanout import count_failed
 from lance_etl.indexing.config import IndexJobConfig
-from lance_etl.indexing.runner import LanceIndexer
+from lance_etl.indexing.runner import STALE_REPLAN_EXHAUSTED_PHASE, LanceIndexer
 from lance_etl.indexing.runner import build_one_shard as real_build_one_shard
+from lance_etl.indexing.runner import commit_one_index as real_commit_one_index
 from lance_etl.indexing.runner import plan_dataset_indexes as real_plan_dataset_indexes
 from lance_etl.maintenance.job import MaintenanceConfig, MaintenanceJob
 from lance_etl.maintenance.job import commit_one_dataset as real_commit_one_dataset
@@ -356,3 +359,55 @@ def test_cli_main_returns_0_when_clean(tmp_path: Path, monkeypatch: pytest.Monke
     monkeypatch.setattr(indexing_cli, "build_spark", fake_build_spark)
     argv: list[str] = ["--dataset-uri", first, "--dataset-uri", second, "--scalar-column", "id"]
     assert indexing_cli.main(argv) == 0
+
+
+def test_indexing_stale_replan_exhaustion_fails_dataset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dataset that stays stale through every replan round becomes a failed dataset, not a clean exit.
+
+    ``commit_one_index`` is patched to return a stale marker for the poisoned dataset on every
+    round, simulating a compaction that keeps rewriting the planned fragments before each commit.
+    After ``MAX_STALE_REPLANS`` rounds the run must record a dataset-level error with the
+    ``index-stale-exhausted`` phase instead of silently deferring: the dataset counts toward the
+    failed total (so the CLI exits ``3`` through :func:`resolve_exit_code`) and is excluded from
+    stamping and HEAD promotion by :func:`stamp_eligible`, while the healthy dataset commits its
+    index in the first round and stays eligible.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    healthy: str = write_vector_dataset(tmp_path, "healthy.lance")
+    poison: str = write_vector_dataset(tmp_path, "poison.lance")
+
+    def stale_commit(
+        uri: str, spec: dict[str, Any], payloads: list[dict[str, Any]], config: IndexJobConfig, telemetry: Any
+    ) -> dict[str, Any]:
+        """Return a permanently stale outcome for the poisoned dataset, delegating for the rest."""
+        if uri == poison:
+            return {
+                "column": spec["column"],
+                "index": spec["index_name"],
+                "segments": 0,
+                "fragments": 0,
+                "stale": True,
+            }
+        return real_commit_one_index(uri, spec, payloads, config, telemetry)
+
+    monkeypatch.setattr(indexing_runner, "commit_one_index", stale_commit)
+    config: IndexJobConfig = indexing_config(vector_columns=[], scalar_columns=["id"])
+    results: list[dict[str, Any]] = LanceIndexer(config).run(FakeSpark(), [healthy, poison])
+
+    by_uri: dict[str, dict[str, Any]] = {result["uri"]: result for result in results}
+    poison_result: dict[str, Any] = by_uri[poison]
+    healthy_result: dict[str, Any] = by_uri[healthy]
+
+    assert "stale-replan exhausted" in poison_result["error"]
+    assert poison_result["error_phase"] == STALE_REPLAN_EXHAUSTED_PHASE
+    assert "error" not in healthy_result
+    assert any(index["index"] == "id_idx" for index in healthy_result["indexes"])
+
+    failed: int = count_failed(results)
+    assert failed == 1
+    assert resolve_exit_code(failed) == 3
+    assert stamp_eligible(poison_result) is False
+    assert stamp_eligible(healthy_result) is True

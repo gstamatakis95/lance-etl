@@ -48,6 +48,10 @@ pub struct ReadCounts {
     pub manifest_reads: AtomicU64,
     /// Non-head reads under `data/`.
     pub data_reads: AtomicU64,
+    /// Every store operation that reached the real store: all reads (including head and paths
+    /// outside the buckets above) plus list calls. Lets a test assert that an operation touched
+    /// the store at all, e.g. that a negatively cached open issues zero requests.
+    pub total_operations: AtomicU64,
 }
 
 impl ReadCounts {
@@ -58,6 +62,11 @@ impl ReadCounts {
             self.manifest_reads.load(Ordering::SeqCst),
             self.data_reads.load(Ordering::SeqCst),
         )
+    }
+
+    /// Total store operations observed so far.
+    pub fn total(&self) -> u64 {
+        self.total_operations.load(Ordering::SeqCst)
     }
 }
 
@@ -130,6 +139,7 @@ impl ObjectStore for CountingStore {
     }
 
     async fn get_opts(&self, location: &ObjectPath, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        self.counts.total_operations.fetch_add(1, Ordering::SeqCst);
         if !options.head {
             self.record(location);
         }
@@ -141,6 +151,7 @@ impl ObjectStore for CountingStore {
         location: &ObjectPath,
         ranges: &[std::ops::Range<u64>],
     ) -> ObjectStoreResult<Vec<Bytes>> {
+        self.counts.total_operations.fetch_add(1, Ordering::SeqCst);
         for _ in ranges {
             self.record(location);
         }
@@ -155,6 +166,7 @@ impl ObjectStore for CountingStore {
     }
 
     fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.counts.total_operations.fetch_add(1, Ordering::SeqCst);
         self.inner.list(prefix)
     }
 
@@ -163,10 +175,12 @@ impl ObjectStore for CountingStore {
         prefix: Option<&ObjectPath>,
         offset: &ObjectPath,
     ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.counts.total_operations.fetch_add(1, Ordering::SeqCst);
         self.inner.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&ObjectPath>) -> ObjectStoreResult<ListResult> {
+        self.counts.total_operations.fetch_add(1, Ordering::SeqCst);
         self.inner.list_with_delimiter(prefix).await
     }
 

@@ -95,9 +95,12 @@ class MaintenanceConfig:
         max_source_fragments: Cap on source fragments consumed per run for incremental
             compaction; ``None`` is unbounded, ``0`` is rejected.
         num_threads: Worker threads inside a single rewrite task.
-        cleanup_older_than_seconds: Age threshold for version cleanup; default ``172_800`` (2
-            days) with the HEAD-tag exemption keeps rollback headroom while cutting manifest
-            storage. ``None`` defers to lance's 14-day default. Values below
+        cleanup_older_than_seconds: Age threshold for version cleanup; default ``216_000`` (60
+            hours) with the HEAD-tag exemption keeps rollback headroom while cutting manifest
+            storage. The 60-hour default deliberately exceeds the pipeline's interval-tag
+            retention window (``tag_keep_last`` hourly tags plus slack, ADR 0013) so a run that
+            prunes the oldest interval tag never also reclaims the version that tag pinned while a
+            replica mid-scan still holds it. ``None`` defers to lance's 14-day default. Values below
             :data:`MIN_CLEANUP_HORIZON_SECONDS` are rejected.
         retain_versions: Number of recent versions to retain regardless of age.
         commit_retries: Retry budget for TTL delete commit conflicts.
@@ -113,8 +116,12 @@ class MaintenanceConfig:
             this run.
         cluster_column: Explicit vector column to cluster on; ``None`` auto-selects the single
             vector-role column from the dataset's stored column roles.
-        cluster_serve_tag: Advance the HEAD serving tag blue-green after the vector index rebuild
-            commits.
+        cluster_serve_tag: REMOVED behavior, rejected at construction when set. Flipping ``HEAD``
+            right after the clustered rewrite's vector-index rebuild exposed a generation whose
+            scalar and FTS indexes were not rebuilt yet (they are left to the next indexing run),
+            so a text query could see a clustered-but-unindexed generation as the served one.
+            Promotion happens exclusively through the pipeline stamp phase, which runs after the
+            index phase (ADR 0041).
     """
 
     telemetry: TelemetryConfig
@@ -125,7 +132,7 @@ class MaintenanceConfig:
     defer_index_remap: bool = False
     max_source_fragments: int | None = 256
     num_threads: int | None = None
-    cleanup_older_than_seconds: int | None = 172_800
+    cleanup_older_than_seconds: int | None = 216_000
     retain_versions: int | None = None
     commit_retries: int = DEFAULT_COMMIT_RETRIES
     commit_backoff_seconds: float = 0.5
@@ -135,6 +142,21 @@ class MaintenanceConfig:
     cluster_rewrite: bool = False
     cluster_column: str | None = None
     cluster_serve_tag: bool = False
+
+    def __post_init__(self) -> None:
+        """Reject configurations that request the removed post-rebuild HEAD flip.
+
+        Raises:
+            ValueError: If ``cluster_serve_tag`` is set. The clustered rewrite never advances any
+                serving tag itself, so a stale ``True`` here would silently serve a
+                text-unindexed generation if honored, or silently not promote if ignored. Failing
+                loudly directs the operator to the pipeline stamp phase, the only promotion path.
+        """
+        if self.cluster_serve_tag:
+            raise ValueError(
+                "cluster_serve_tag was removed: a HEAD flip right after the vector rebuild exposes a generation "
+                "without scalar/FTS indexes. Promote through the pipeline stamp phase instead (ADR 0041)."
+            )
 
     def ttl_active(self) -> bool:
         """Report whether the TTL step runs for this configuration.
@@ -930,7 +952,7 @@ class MaintenanceJob:
 
             if config.cluster_rewrite:
                 cluster_results, pending_uris = maintenance_cluster.run_cluster_rewrites(
-                    spark, uris, config, cutoff, driver_telemetry
+                    spark, uris, config, cutoff, driver_telemetry, cleanup_slot
                 )
                 results_by_uri.update(cluster_results)
 

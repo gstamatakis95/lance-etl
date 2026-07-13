@@ -594,3 +594,57 @@ def test_non_empty_big_dataset_skips_bulk(
     assert len(set(vector_ids)) == 200
     title_by_id: dict[str, str] = dict(zip(vector_ids, table.column("title").to_pylist(), strict=True))
     assert title_by_id["big-0"] == "new", "the seeded key must resolve last-write-wins to the newer row"
+
+
+def test_delete_only_big_trio_is_not_bootstrapped(
+    spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
+) -> None:
+    """A big NEW trio whose increment is all deletes creates no dataset at all.
+
+    Bootstrapping it would mint a permanently empty dataset that the fleet jobs then discover and
+    maintain forever. :func:`derive_bulk_schemas` excludes delete-only trios, so the fast path
+    never bootstraps them, and the merge path no-ops their deletes against the absent dataset.
+
+    Args:
+        spark: The module-scoped four-core UTC session.
+        tmp_path: Pytest-provided temporary directory.
+        telemetry_config: The test telemetry configuration.
+    """
+    config: ETLConfig = bulk_config(str(tmp_path), telemetry_config, bucket_rows=50)
+    rows: list[tuple] = [("orgDel", "t1", "ns1", f"gone-{i}", "delete", TS, TS, None, {}, {}, {}) for i in range(120)]
+    frame: DataFrame = spark.createDataFrame(rows, schema=SOURCE_DDL)
+    plan: RoutingPlan = compute_routing_plan(frame, config)
+    trios: list[tuple[str, str, str, int]] = plan_bulk_append(plan, config)
+    assert ("orgDel", "t1", "ns1") in {(o, t, n) for o, t, n, _ in trios}, "the trio must be big and bulk-eligible"
+    schemas = derive_bulk_schemas(frame, trios, config)
+    assert schemas == {}, "a delete-only trio must derive no canonical schema"
+
+    failed: int = IcebergToLanceETL(config).run_on_dataframe(frame)
+    assert failed == 0
+    assert not Path(dataset_uri(config, "orgDel", "t1", "ns1")).exists(), (
+        "a delete-only increment must not bootstrap an empty dataset"
+    )
+
+
+def test_derive_rejects_unbounded_map_keys(
+    spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
+) -> None:
+    """Schema derivation fails loudly when a trio's map keys exceed max_keys_per_map.
+
+    Per-row-unique metadata keys are the driver-OOM and runaway-grow-only-schema failure mode, so
+    the bound is enforced at the derivation boundary with an error naming the offending column.
+
+    Args:
+        spark: The module-scoped four-core UTC session.
+        tmp_path: Pytest-provided temporary directory.
+        telemetry_config: The test telemetry configuration.
+    """
+    config: ETLConfig = bulk_config(str(tmp_path), telemetry_config, bucket_rows=50, max_keys_per_map=8)
+    rows: list[tuple] = [
+        ("orgWide", "t1", "ns1", f"w-{i}", "insert", TS, TS, None, {}, {}, {f"unique-key-{i}": "x"}) for i in range(120)
+    ]
+    frame: DataFrame = spark.createDataFrame(rows, schema=SOURCE_DDL)
+    plan: RoutingPlan = compute_routing_plan(frame, config)
+    trios: list[tuple[str, str, str, int]] = plan_bulk_append(plan, config)
+    with pytest.raises(ValueError, match=r"metadata\[orgWide/t1/ns1\].*exceeding max_keys_per_map=8"):
+        derive_bulk_schemas(frame, trios, config)

@@ -14,12 +14,16 @@
 //! - [`intake`]: the [`intake::IntakeGrpc`] transport over the [`crate::domain::RecordSink`] seam,
 //!   serving the `Write` and `WriteStream` RPCs.
 //! - [`intake_convert`]: pure conversions between intake protobuf messages and domain types.
+//! - [`timeout`]: the per-route request-timeout tower layer applied by `main` (and by any test
+//!   that mirrors the production server stack).
 
 pub mod convert;
 pub mod intake;
 pub mod intake_convert;
+pub mod timeout;
 
 pub use intake::IntakeGrpc;
+pub use timeout::RouteTimeoutLayer;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -89,6 +93,7 @@ pub fn status_from_error(err: SearchError) -> Status {
     match err {
         SearchError::InvalidArgument(message) => Status::invalid_argument(message),
         SearchError::NotFound(message) => Status::not_found(message),
+        SearchError::Unavailable(message) => Status::unavailable(message),
         SearchError::Internal(message) => Status::internal(message),
     }
 }

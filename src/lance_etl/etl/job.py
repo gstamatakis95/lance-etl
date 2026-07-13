@@ -107,6 +107,12 @@ def snapshot_id_bounds(
     Gate the empty-window short circuit on ``has_new_snapshots``, not on ``start_id == end_id``:
     equal ids can mean a genuinely empty window or two bounds resolving to the same snapshot.
 
+    The ``committed_at`` timestamps are converted to epoch milliseconds inside Spark via
+    ``unix_millis``, never through collected Python datetimes. A collected ``TimestampType`` value
+    is a naive datetime in the driver's local timezone, and round-tripping it through
+    ``datetime.timestamp()`` is exact only on UTC drivers (and ambiguous during a DST fall-back),
+    so the epoch math must happen before collection.
+
     Args:
         spark: Active Spark session.
         table: Fully qualified Iceberg table name.
@@ -118,8 +124,8 @@ def snapshot_id_bounds(
     """
     snapshots: DataFrame = spark.read.format("iceberg").load(f"{table}.snapshots")
     committed: list[tuple[int, int]] = sorted(
-        (int(row["committed_at"].timestamp() * 1000), int(row["snapshot_id"]))
-        for row in snapshots.select("committed_at", "snapshot_id").collect()
+        (int(row["committed_ms"]), int(row["snapshot_id"]))
+        for row in snapshots.selectExpr("unix_millis(committed_at) AS committed_ms", "snapshot_id").collect()
     )
     start_id: int | None = None
     end_id: int | None = None
@@ -304,7 +310,7 @@ class IcebergToLanceETL:
         """
         return collapse(source, self.config)
 
-    def run(self, spark: SparkSession, table: str, start_ms: int, end_ms: int) -> None:
+    def run(self, spark: SparkSession, table: str, start_ms: int, end_ms: int) -> int:
         """Read one Iceberg window and route it via :meth:`run_on_dataframe`.
 
         Args:
@@ -312,8 +318,11 @@ class IcebergToLanceETL:
             table: Fully qualified Iceberg table name.
             start_ms: Range start in epoch milliseconds.
             end_ms: Range end in epoch milliseconds.
+
+        Returns:
+            The number of datasets that failed in isolation, zero when every dataset succeeded.
         """
-        self.run_on_dataframe(self.apply_window_filter(self.read_increment(spark, table, start_ms, end_ms)))
+        return self.run_on_dataframe(self.apply_window_filter(self.read_increment(spark, table, start_ms, end_ms)))
 
     def drop_null_routing_rows(self, source: DataFrame) -> DataFrame:
         """Drop rows carrying a NULL routing value with a native Spark filter.
@@ -359,14 +368,16 @@ class IcebergToLanceETL:
         Spark runs inside the ``mapInArrow`` closure: the dynamic per-dataset map pivot and the
         Lance ``merge_insert`` commits. Per-dataset stats are pre-aggregated natively before
         collection, so a big dataset flushed as several groups across partitions still returns one
-        summed stats row.
+        summed stats row. Group failures are isolated inside the closure and surface as a non-zero
+        ``failed`` column on the dataset's stats row rather than as a failed Spark job.
 
         Args:
             filtered: The null-routing-filtered increment DataFrame.
             plan: The adaptive routing plan for this increment.
 
         Returns:
-            The collected per-dataset stats rows, one per dataset this increment touched.
+            The collected per-dataset stats rows, one per dataset this increment touched, each
+            carrying ``upserted``, ``deleted``, and ``failed`` sums.
         """
         config: ETLConfig = self.config
         routing: list[str] = list(ROUTING_COLS)
@@ -374,13 +385,18 @@ class IcebergToLanceETL:
         partition_stats_schema: pa.Schema = stats_schema()
 
         def merge_partition(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
-            """Stream and merge all routing-key groups in one Spark partition.
+            """Stream and merge all routing-key groups in one Spark partition, isolating group failures.
+
+            A group whose merge raises is caught here, metered as ``dataset.merge_group_failed``,
+            and reported as a ``failed`` stats row so one poisoned dataset cannot fail the whole
+            run and backlog ingestion for every other org. Failures outside any group (a broken
+            batch stream) still fail the task.
 
             Args:
                 batches: Arrow batches for this task.
 
             Yields:
-                One stats record batch when the partition wrote any dataset.
+                One stats record batch when the partition wrote or failed any dataset.
             """
             first: pa.RecordBatch | None = next(batches, None)
             if first is None:
@@ -392,8 +408,14 @@ class IcebergToLanceETL:
             with executor_telemetry.span("lance.etl.partition"):
                 try:
                     for key, group in stream_routing_groups(chained, routing, config.merge_batch_bytes, counters):
-                        upserted, deleted = apply_merge(config, executor_telemetry, key, group)
-                        results.append((*key, upserted, deleted))
+                        try:
+                            upserted, deleted = apply_merge(config, executor_telemetry, key, group)
+                            results.append((*key, upserted, deleted, 0))
+                        except Exception:
+                            executor_telemetry.incr("dataset.merge_group_failed")
+                            executor_telemetry.error("etl dataset group failed")
+                            logger.exception("merge failed for dataset group %s; continuing with remaining groups", key)
+                            results.append((*key, 0, 0, 1))
                 except Exception:
                     executor_telemetry.error("etl partition failed")
                     raise
@@ -406,11 +428,15 @@ class IcebergToLanceETL:
         stats: DataFrame = routed.mapInArrow(merge_partition, schema=stats_spark_ddl())
         return (
             stats.groupBy(*ROUTING_COLS)
-            .agg(F.sum("upserted").alias("upserted"), F.sum("deleted").alias("deleted"))
+            .agg(
+                F.sum("upserted").alias("upserted"),
+                F.sum("deleted").alias("deleted"),
+                F.sum("failed").alias("failed"),
+            )
             .collect()
         )
 
-    def run_on_dataframe(self, source: DataFrame) -> None:
+    def run_on_dataframe(self, source: DataFrame) -> int:
         """Validate, plan, collapse, salt-shuffle, and merge a pre-read increment into Lance datasets.
 
         Order: validate schema, drop null-routing rows with a native Spark filter, compute the
@@ -426,8 +452,18 @@ class IcebergToLanceETL:
         all writes commit, every written dataset is stamped with the configured interval tag
         (:meth:`stamp_interval_tags`).
 
+        Failure isolation: a dataset group whose merge raises (and a bulk trio whose append or
+        commit raises) is counted and skipped instead of failing the run, so one poisoned org
+        cannot backlog ingestion for every other org. Datasets that failed are never stamped with
+        the interval tag. The returned isolated-failure count maps to the shared partial-failure
+        exit code (``3``) through ``cliutil.resolve_exit_code``. Driver-level failures (schema
+        violations, a failed Spark job) still raise.
+
         Args:
             source: A source DataFrame carrying the operation column.
+
+        Returns:
+            The number of datasets that failed in isolation, zero when every dataset succeeded.
         """
         config: ETLConfig = self.config
         driver_telemetry: Telemetry = Telemetry.create(config.telemetry)
@@ -454,41 +490,53 @@ class IcebergToLanceETL:
                     driver_telemetry.gauge("run.upserted", 0)
                     driver_telemetry.gauge("run.deleted", 0)
                     logger.info("empty increment: no datasets written")
-                    return
+                    return 0
 
                 seen_datasets: set[tuple[str, ...]] = set()
+                failed_datasets: set[tuple[str, ...]] = set()
                 upserted: int = 0
                 deleted: int = 0
                 with driver_telemetry.timed("run.execute_ms"):
-                    bulk_seen, bulk_appended, bulk_trios = self.run_bulk_phase(filtered, plan, driver_telemetry)
+                    bulk_seen, bulk_appended, bulk_trios, bulk_failed = self.run_bulk_phase(
+                        filtered, plan, driver_telemetry
+                    )
                     seen_datasets |= bulk_seen
                     upserted += bulk_appended
                     merge_input: DataFrame = self.exclude_bulk_trios(filtered, bulk_trios)
                     rows: list[Any] = self.merge_dataframe(merge_input, plan)
                 for row in rows:
-                    seen_datasets.add(tuple(row[column] for column in ROUTING_COLS))
+                    key: tuple[str, ...] = tuple(row[column] for column in ROUTING_COLS)
+                    seen_datasets.add(key)
                     upserted += int(row["upserted"] or 0)
                     deleted += int(row["deleted"] or 0)
+                    if int(row["failed"] or 0) > 0:
+                        failed_datasets.add(key)
             except Exception:
                 driver_telemetry.error("etl run failed")
                 raise
 
+            failed_count: int = len(failed_datasets) + bulk_failed
             datasets: int = len(seen_datasets)
             run_span.set_tag("datasets", datasets)
             driver_telemetry.gauge("run.datasets", datasets)
             driver_telemetry.gauge("run.upserted", upserted)
             driver_telemetry.gauge("run.deleted", deleted)
+            driver_telemetry.gauge("run.failed_datasets", failed_count)
             logger.info(
-                "incremental run: %s datasets, %s upserts, %s deletes",
+                "incremental run: %s datasets, %s upserts, %s deletes, %s isolated failures",
                 datasets,
                 upserted,
                 deleted,
+                failed_count,
             )
-            self.stamp_interval_tags(source.sparkSession, seen_datasets, driver_telemetry)
+            if failed_datasets:
+                logger.error("datasets failed in isolation this run: %s", sorted(failed_datasets))
+            self.stamp_interval_tags(source.sparkSession, seen_datasets - failed_datasets, driver_telemetry)
+            return failed_count
 
     def run_bulk_phase(
         self, filtered: DataFrame, plan: RoutingPlan, telemetry: Telemetry
-    ) -> tuple[set[tuple[str, ...]], int, list[tuple[str, str, str, int]]]:
+    ) -> tuple[set[tuple[str, ...]], int, list[tuple[str, str, str, int]], int]:
         """Run the bulk-append fast path for big new or empty datasets, before the merge.
 
         Selects the bulk-eligible big trios, derives one canonical schema per trio, bootstraps each
@@ -498,41 +546,63 @@ class IcebergToLanceETL:
         so no row is written twice. Returns nothing eligible when the fast path is disabled or every
         big trio already carries rows.
 
+        Failure isolation mirrors the merge path: a trio whose append task failed on an executor
+        has ALL its transactions dropped (nothing partial is ever committed, its dataset stays
+        empty), and a trio whose driver-side ``commit_batch`` or post-commit row-count assertion
+        raised is caught and logged. Both are counted into the returned failure count instead of
+        failing the run. Failed trios stay excluded from this run's merge input: their dataset is
+        either still empty (a rerun retries the bulk path) or ambiguously committed (a rerun's
+        emptiness check demotes it to the idempotent merge path), which is the designed recovery.
+
         Args:
             filtered: The null-routing-filtered increment, before collapse.
             plan: The adaptive routing plan carrying the big trios.
             telemetry: The driver telemetry facade.
 
         Returns:
-            ``(seen_datasets, appended_rows, eligible_trios)`` — the trios written by the fast path,
-            the total rows appended, and the eligible trios with sub-bucket counts to exclude from
-            the merge.
+            ``(seen_datasets, appended_rows, eligible_trios, failed_count)`` — the trios the fast
+            path committed, the total rows appended, the eligible trios with sub-bucket counts to
+            exclude from the merge, and the number of trios that failed in isolation.
         """
         config: ETLConfig = self.config
         bulk_trios: list[tuple[str, str, str, int]] = plan_bulk_append(plan, config)
         if not bulk_trios:
-            return set(), 0, []
+            return set(), 0, [], 0
         schemas = derive_bulk_schemas(filtered, bulk_trios, config)
         eligible: list[tuple[str, str, str]] = bootstrap_bulk_datasets(schemas, config, telemetry)
         if not eligible:
-            return set(), 0, []
+            return set(), 0, [], 0
         sub_buckets: dict[tuple[str, str, str], int] = {(o, t, n): k for o, t, n, k in bulk_trios}
         eligible_with_buckets: list[tuple[str, str, str, int]] = [
             (o, t, n, sub_buckets[(o, t, n)]) for o, t, n in eligible
         ]
         collected = run_bulk_append(filtered, eligible_with_buckets, schemas, config, telemetry)
+        failed_trios: set[tuple[str, str, str]] = {
+            (org, tenant, namespace) for org, tenant, namespace, _, _, failed in collected if failed
+        }
         transactions_by_trio: dict[tuple[str, str, str], list[Any]] = {}
-        for org, tenant, namespace, _, transaction in collected:
-            transactions_by_trio.setdefault((org, tenant, namespace), []).append(transaction)
+        for org, tenant, namespace, _, transaction, failed in collected:
+            trio: tuple[str, str, str] = (org, tenant, namespace)
+            if failed or transaction is None or trio in failed_trios:
+                continue
+            transactions_by_trio.setdefault(trio, []).append(transaction)
         appended_total: int = 0
+        committed: set[tuple[str, ...]] = set()
         for trio, transactions in transactions_by_trio.items():
             _, roles, _ = schemas[trio]
-            appended_total += commit_bulk_transactions(
-                config, telemetry, dataset_uri(config, *trio), transactions, roles
-            )
+            try:
+                appended_total += commit_bulk_transactions(
+                    config, telemetry, dataset_uri(config, *trio), transactions, roles
+                )
+                committed.add(trio)
+            except Exception:
+                failed_trios.add(trio)
+                telemetry.incr("dataset.bulk_commit_failed")
+                logger.exception("bulk commit failed for trio %s; leaving the dataset to a rerun", trio)
+        if failed_trios:
+            logger.error("bulk-append trios failed in isolation this run: %s", sorted(failed_trios))
         telemetry.gauge("run.bulk_appended", appended_total)
-        seen: set[tuple[str, ...]] = {trio for trio in eligible}
-        return seen, appended_total, eligible_with_buckets
+        return committed, appended_total, eligible_with_buckets, len(failed_trios)
 
     def exclude_bulk_trios(self, filtered: DataFrame, bulk_trios: list[tuple[str, str, str, int]]) -> DataFrame:
         """Remove every bulk-appended trio's rows from the merge input via a broadcast left-anti join.

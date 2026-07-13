@@ -63,6 +63,12 @@ Mechanics that still govern the code:
 
 - Keys colliding with an existing or reserved column are skipped and metered
   (`dataset.invalid_map_keys`) rather than failing the job.
+- The distinct-key count of every map column is bounded by `ETLConfig.max_keys_per_map`
+  (default 4096), enforced in the pivot and in the bulk schema derivation
+  (`enforce_map_key_bound` in `etl/pivot.py`). This is boundary contract enforcement, not
+  defensive validation. A source emitting near-unique map keys would OOM the driver during schema
+  derivation and mint an irreversible million-column grow-only schema, so the run fails loudly
+  naming the offending column instead of absorbing it.
 - Vector map values arrive as `list<float32>` (contract `ARRAY<FLOAT>`), the fixed-size-list
   dimension is inferred from the first non-null entry, float64 is normalized to float32, and an
   all-null vector column stays a nullable list with no FSL cast.
@@ -155,6 +161,19 @@ full-column `merge_insert.execute()` on disjoint keys rebase at the row level vi
 union and both succeed, and genuine overlaps retry automatically under `conflict_retries`. K
 concurrent disjoint-key writers per dataset are therefore safe.
 
+Task-attempt disjointness is part of the same guarantee. A speculative or zombie duplicate task
+attempt would run the same partition's routing keys concurrently with the original attempt, which
+is exactly the two-writers-same-key scenario the salt exists to prevent. `build_spark` therefore
+pins `spark.speculation=false` on the session builder (`SPARK_CORE_CONF_PINS` in `cliutil.py`).
+This is a correctness invariant, not a tunable default.
+
+The last-write-wins collapse that feeds the shuffle is also fully deterministic. Ties on
+`(routing key, vector_id, ts)` are broken by an `xxhash64` over every column, with each MapType
+column first normalised to `to_json(array_sort(map_entries(col)))` because Spark cannot hash a map
+directly and map iteration order is not deterministic. Two rows tying on the timestamp but
+differing only in their map payloads therefore get a stable winner, so a replayed window converges
+on the same stored payload instead of flipping it per run.
+
 ### Commit contention at scale (the K-does-not-buy-commit-throughput limit)
 
 The salted shuffle fans a big dataset across K concurrent `merge_insert.execute()` writers, and the
@@ -215,7 +234,11 @@ the routing plan) AND its dataset is absent or reports `count_rows() == 0`. `pla
 answers emptiness from the manifest without scanning rows. A non-empty dataset is left to the merge
 path, whose idempotent upsert is required to reconcile existing rows. Small trios stay on the merge
 path unchanged. Every bulk-appended trio is excluded from the merge input by a broadcast left-anti
-join (`exclude_bulk_trios`), so no row is ever written by both paths.
+join (`exclude_bulk_trios`), so no row is ever written by both paths. A big NEW trio whose
+post-collapse increment contains only delete ops is also excluded from the fast path
+(`derive_bulk_schemas` returns no schema for it): it has nothing to append, and bootstrapping it
+would create a permanently empty dataset that the fleet jobs then discover forever. Its rows stay
+in the merge input, where the deletes no-op against the absent dataset.
 
 **Canonical-schema derivation and why it is needed.** Each parallel append task sees only its own
 key-hash slice of the trio, so different tasks observe different subsets of the `vectors`, `texts`,
@@ -233,13 +256,33 @@ transaction for a trio into ONE physical `commit_batch` append (`commit_bulk_tra
 1B-row backfill therefore pays a single commit rather than thousands, sidestepping the per-dataset
 manifest-write ceiling documented in the contention subsection above entirely.
 
+The `commit_batch` deliberately runs with a ZERO outer retry budget. A raw append is not
+idempotent, and re-running it after an ambiguous commit outcome (a CAS whose success the client
+never observed) would silently duplicate every row. Ordinary retryable conflicts are still handled
+by lance's inner rebase loop inside `commit_batch`, so the single outer attempt only converts an
+ambiguous or hard-conflict outcome into a loud failure. The designed recovery is the rerun:
+`plan_bulk_append`'s emptiness check demotes a trio whose commit actually landed to the idempotent
+merge path, and retries the bulk path for a trio whose commit truly failed. After a successful
+commit, the dataset's `count_rows()` is asserted equal to the merged transaction's fragment total
+as a cheap duplicate detector (`dataset.bulk_rowcount_mismatch` on mismatch, then a raised error).
+
+**Concurrency assumption.** The bulk-append path assumes NO concurrent ETL writer touches the same
+trio during the append window. The scheduled Airflow DAG serializes runs via `max_active_runs=1`,
+and manual or backfill runs must not overlap a scheduled window. The bootstrap re-check below
+narrows the planning race, and the post-commit row-count assertion catches a violation after the
+fact, but the assumption itself is the contract: two ETL runs bulk-appending the same trio
+concurrently could each pass the emptiness check and double-write it.
+
 **Tunables.** Two `ETLConfig` fields govern the path.
 
 - `bulk_append` (default `True`): the operational kill switch. Set it to `False` to route every trio
   through the merge path.
 - `max_bulk_tasks_per_dataset` (default `1024`): the cap on parallel append tasks per bulk-eligible
-  dataset. Appends carry no per-key commit contention, so this cap sits far above the merge-writer
-  cap `max_buckets_per_dataset`.
+  dataset. `plan_bulk_append` sizes each trio's append fan-out from the trio's RAW row count in the
+  routing plan (`RoutingPlan.big_trio_rows`) against the same `bucket_rows` grain the merge path
+  uses, capped at this field instead of the merge-writer cap. Appends carry no per-key commit
+  contention, so this cap sits far above `max_buckets_per_dataset` and a 1B-row backfill fans out
+  across hundreds of appenders instead of being throttled to the merge cap of 32.
 
 **Idempotency and crash safety.** A raw append is not idempotent the way `merge_insert` is, so the
 path relies on the emptiness guard rather than per-key matching. A replayed window finds the dataset
@@ -279,6 +322,30 @@ changes OR the buffered bytes reach `merge_batch_bytes`. Executor memory scales 
 group, not the whole partition, which is what removes the hot-trio OOM. The byte-budget flush is
 order-safe because collapse already guarantees at most one row per merge key reaches the merge, so a
 mid-group flush can never split a key across two `merge_insert` calls.
+
+### Per-dataset failure isolation
+
+One poisoned org must not fail the whole ETL run: at fleet scale a single dataset with bad data, a
+corrupt manifest, or a persistent object-store fault would otherwise backlog ingestion for 30k+
+healthy orgs every hour. Both write paths therefore isolate failures at the dataset boundary.
+
+On the merge path, `merge_partition` catches each routing-key group's exception, meters
+`dataset.merge_group_failed`, logs it with the routing key, and reports the group as a `failed`
+stats row (the per-dataset stats schema gained a grow-only `failed` counter next to `upserted` and
+`deleted`). All other groups in the partition continue. On the bulk path, each trio's append task
+is caught the same way (`dataset.bulk_group_failed`), and a failed trio has ALL its transactions
+dropped on the driver so nothing partial is ever committed. Its dataset stays empty for a rerun to
+retry. A driver-side `commit_batch` or row-count-assertion failure is likewise caught per trio
+(`dataset.bulk_commit_failed`) and the trio is left to the rerun recovery described in the
+bulk-append subsection.
+
+The run surfaces the isolated failure count instead of swallowing it. `run_on_dataframe` returns
+the number of datasets that failed in isolation (also gauged as `run.failed_datasets`), which maps
+to the fleet-wide partial-failure exit code `3` through `cliutil.resolve_exit_code`, matching the
+maintenance and indexing jobs' convention. Failed datasets are excluded from interval-tag stamping,
+so a tag never marks an hour whose increment only partially applied to that dataset. Driver-level
+failures — a schema-contract violation, a failed Spark job, a broken batch stream — still raise
+and exit `1`, because they are not attributable to one dataset.
 
 ### spark_batches removal and the new tunables
 

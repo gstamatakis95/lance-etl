@@ -661,3 +661,51 @@ class TestSaltedEquivalence:
         big: dict[tuple[str, str, str], int] = {(o, t, n): k for (o, t, n, k) in plan.big_trios}
         assert big[("o1", "t1", "n1")] == 4
         assert big[("o2", "t1", "n1")] == 2
+
+
+class TestMapKeyBound:
+    """The pivot rejects map columns whose distinct-key count exceeds max_keys_per_map.
+
+    Boundary contract enforcement for the grow-only schema: a source emitting near-unique map keys
+    would mint an unbounded column set and OOM the bulk schema derivation, so the pivot fails
+    loudly naming the offending column instead of absorbing it. Pure PyArrow, no Spark.
+    """
+
+    def make_group(self, metadata_keys_per_row: list[list[str]]) -> pa.Table:
+        """Build one routing group whose metadata map carries the given keys per row.
+
+        Args:
+            metadata_keys_per_row: For each row, the list of metadata keys it carries.
+
+        Returns:
+            A pivot-ready group table with a metadata map column.
+        """
+        count: int = len(metadata_keys_per_row)
+        return pa.table(
+            {
+                "org_id": pa.array(["o1"] * count),
+                "tenant_id": pa.array(["t1"] * count),
+                "namespace": pa.array(["n1"] * count),
+                "vector_id": pa.array([f"v{i}" for i in range(count)]),
+                "metadata": pa.array(
+                    [{key: "x" for key in keys} for keys in metadata_keys_per_row],
+                    pa.map_(pa.string(), pa.string()),
+                ),
+            }
+        )
+
+    def test_pivot_rejects_unbounded_map_keys(self, telemetry_config: TelemetryConfig, tmp_path: Path) -> None:
+        """Per-row-unique metadata keys beyond max_keys_per_map fail loudly naming the column."""
+        config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config, max_keys_per_map=3)
+        group: pa.Table = self.make_group([[f"k{i}"] for i in range(4)])
+        with pytest.raises(ValueError, match="'metadata' has 4 distinct keys, exceeding max_keys_per_map=3"):
+            pivot_module.pivot_map_columns(group, config)
+
+    def test_pivot_accepts_keys_at_the_bound(self, telemetry_config: TelemetryConfig, tmp_path: Path) -> None:
+        """A map with exactly max_keys_per_map distinct keys pivots normally."""
+        config: ETLConfig = ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config, max_keys_per_map=3)
+        group: pa.Table = self.make_group([["k0", "k1", "k2"], ["k0"]])
+        result, counts, roles = pivot_module.pivot_map_columns(group, config)
+        assert {"k0", "k1", "k2"} <= set(result.column_names)
+        assert counts == {}
+        assert set(roles) == {"k0", "k1", "k2"}

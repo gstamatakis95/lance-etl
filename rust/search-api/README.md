@@ -113,6 +113,21 @@ immutable object-store metadata (byte ranges under `_indices/`, `ObjectMeta` sid
 dataset row data is never cached at either tier — only index and metadata bytes cross the
 `EntryStore` seam.
 
+**Never drop-and-recreate a dataset at the same URI.** The persistent caches key on
+`(store prefix, object path)` under the assumption that everything they cache is immutable:
+version manifests, transaction files, index pages. That assumption is exactly what Lance's naming
+guarantees — until a dataset is deleted and a new one is created at the same
+`{org}/{tenant}/{namespace}` path. The new dataset restarts version numbering, so its
+`_versions/1.manifest` collides with the cached manifest of the dead dataset and replicas can
+serve phantom fragments for up to the cache TTL (7 days). The mutable latest-version pointers are
+never cached, but they point into the poisoned immutable namespace. There is no clean read-path
+fix: validating the cached bytes against the live object's etag would cost a conditional request
+per read, which is the cost the cache exists to avoid. The operational rule is therefore: retire
+a dataset by retiring its namespace (create the replacement under a new `namespace` segment), or,
+if the URI truly must be reused, wipe the cache generation first (clear `SEARCH_API_CACHE_DIR` or
+flush the Redis namespace on every replica) before the new dataset serves. The same rule protects
+Lance's own in-session caches and the open-handle LRU, which share the URI-keyed design.
+
 **`LANCE_CACHE_STAMP` versioning contract.** `cache::layout::LANCE_CACHE_STAMP` (currently
 `"8.0.0"`) is baked into the on-disk stamp directory name (`v{CACHE_SCHEMA_VERSION}-lance-{stamp}`)
 because the cache codec format is explicitly unstable across lance releases. Bump it together with
@@ -185,6 +200,11 @@ runtime.
 ---
 
 ## Build, test, lint
+
+Building requires `protoc` (the protobuf compiler) on PATH. `build.rs` compiles the proto through
+`tonic_prost_build`, which shells out to `protoc`. GitHub runners and fresh machines do not
+preinstall it, so add it first (`apt-get install protobuf-compiler`, `brew install protobuf`, or
+equivalent). The CI rust job installs it explicitly for the same reason.
 
 ```bash
 cd rust/search-api

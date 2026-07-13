@@ -78,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run(args: argparse.Namespace) -> None:
+def run(args: argparse.Namespace) -> int:
     """Execute the ETL job from parsed arguments.
 
     Builds a Spark session, constructs the configuration, and dispatches to
@@ -86,11 +86,15 @@ def run(args: argparse.Namespace) -> None:
 
     Args:
         args: Parsed command-line arguments.
+
+    Returns:
+        The number of dataset groups whose merge or bulk append failed in isolation, so
+        :func:`~lance_etl.cliutil.run_cli_main` maps a partially failed run to exit code 3.
     """
     spark = build_spark(APP_NAME)
 
-    def work() -> None:
-        """Build the config and run the ETL job."""
+    def work() -> int:
+        """Build the config and run the ETL job, returning the isolated failure count."""
         config: ETLConfig = ETLConfig(
             base_uri=args.base_uri,
             telemetry=build_telemetry_config(args),
@@ -100,9 +104,9 @@ def run(args: argparse.Namespace) -> None:
             window_end=args.window_end,
             tag_stamp=args.tag_stamp,
         )
-        IcebergToLanceETL(config).run(spark, args.table, parse_epoch_ms(args.start), parse_epoch_ms(args.end))
+        return IcebergToLanceETL(config).run(spark, args.table, parse_epoch_ms(args.start), parse_epoch_ms(args.end))
 
-    run_with_spark(spark, "etl job", logger, work)
+    return run_with_spark(spark, "etl job", logger, work)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

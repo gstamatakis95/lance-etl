@@ -64,6 +64,10 @@ rust/search-api/        Rust gRPC search service (tonic, lance crate)
 
 ## Build, test, lint
 
+`build.rs` compiles the proto via `tonic_prost_build`, which requires `protoc` on PATH. Install the
+protobuf compiler before building (`apt-get install protobuf-compiler` on the CI runner, `brew
+install protobuf` locally). Without it `cargo build`/`clippy`/`test` fail in the build script.
+
 ```bash
 cd rust/search-api
 cargo fmt                    # format
@@ -90,6 +94,20 @@ them together with three coupled things:
 3. The same stamp namespaces every Redis cache key, so after a bump the old generation of keys
    simply ages out through its TTLs rather than being actively purged (ADR 0031,
    `../../docs/adr/caching-and-observability.md`).
+
+---
+
+## Dataset URIs are never reused (operational requirement)
+
+The persistent caches (and Lance's own session caches plus the open-handle LRU) key immutable
+metadata by `(store prefix, object path)` with no etag or generation binding. A dataset that is
+dropped and recreated at the same `{org}/{tenant}/{namespace}` URI restarts version numbering, so
+its new `_versions/1.manifest` collides with the cached manifest of the dead dataset and replicas
+can serve phantom fragments for up to the 7-day cache TTL. Do not build or propose flows that
+delete a dataset and recreate it at the same URI. Replace a dataset by writing the successor under
+a new `namespace` segment and flipping traffic to it. If a URI absolutely must be reused, every
+replica's cache generation has to be wiped first (clear `SEARCH_API_CACHE_DIR`, or flush the Redis
+namespace). See the matching invariant in `README.md`.
 
 ---
 

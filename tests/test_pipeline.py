@@ -615,3 +615,159 @@ class TestPruneTiming:
         assert tags[3] not in remaining
         assert tags[4] not in remaining
         assert tags[5] not in remaining
+
+
+class TestConfigValidation:
+    """PipelineConfig rejects unsafe cross-config combinations at construction time."""
+
+    def test_cleanup_horizon_must_clear_tag_retention_window(self, telemetry_config: TelemetryConfig) -> None:
+        """The old zero-slack shipped combination (48 hourly tags, 48h horizon) is rejected."""
+        maintenance = MaintenanceConfig(telemetry=telemetry_config, cleanup_older_than_seconds=172_800)
+        with pytest.raises(ValueError, match="cleanup_older_than_seconds"):
+            PipelineConfig(telemetry=telemetry_config, maintenance=maintenance, tag_keep_last=48)
+
+    def test_default_horizon_clears_default_retention(self, telemetry_config: TelemetryConfig) -> None:
+        """The shipped defaults (48 hourly tags, 60h horizon, 1h slack) construct cleanly."""
+        config = PipelineConfig(telemetry=telemetry_config)
+        assert config.maintenance.cleanup_older_than_seconds == 216_000
+        assert config.tag_keep_last == 48
+
+    def test_horizon_check_skipped_when_pruning_disabled(self, telemetry_config: TelemetryConfig) -> None:
+        """With tag_keep_last=None no retention window exists, so any valid horizon passes."""
+        maintenance = MaintenanceConfig(telemetry=telemetry_config, cleanup_older_than_seconds=172_800)
+        config = PipelineConfig(telemetry=telemetry_config, maintenance=maintenance, tag_keep_last=None)
+        assert config.maintenance.cleanup_older_than_seconds == 172_800
+
+    def test_horizon_check_skipped_when_horizon_none(self, telemetry_config: TelemetryConfig) -> None:
+        """With cleanup_older_than_seconds=None lance's 14-day default applies, which always clears."""
+        maintenance = MaintenanceConfig(telemetry=telemetry_config, cleanup_older_than_seconds=None)
+        config = PipelineConfig(telemetry=telemetry_config, maintenance=maintenance, tag_keep_last=48)
+        assert config.maintenance.cleanup_older_than_seconds is None
+
+    def test_custom_cadence_and_slack_shift_the_bound(self, telemetry_config: TelemetryConfig) -> None:
+        """The invariant scales with tag_cadence_seconds and cleanup_slack_seconds."""
+        maintenance = MaintenanceConfig(telemetry=telemetry_config, cleanup_older_than_seconds=216_000)
+        with pytest.raises(ValueError, match="retention window"):
+            PipelineConfig(
+                telemetry=telemetry_config,
+                maintenance=maintenance,
+                tag_keep_last=48,
+                tag_cadence_seconds=7200,
+            )
+
+    def test_cluster_rewrite_requires_serve_tag(self, telemetry_config: TelemetryConfig) -> None:
+        """cluster_rewrite without serve_tag would expose the unindexed generation to serve-latest readers."""
+        maintenance = MaintenanceConfig(telemetry=telemetry_config, cluster_rewrite=True)
+        with pytest.raises(ValueError, match="serve_tag"):
+            PipelineConfig(telemetry=telemetry_config, maintenance=maintenance, serve_tag=False)
+
+    def test_cluster_rewrite_with_serve_tag_constructs(self, telemetry_config: TelemetryConfig) -> None:
+        """cluster_rewrite with serve-by-tag promotion is the supported combination."""
+        maintenance = MaintenanceConfig(telemetry=telemetry_config, cluster_rewrite=True)
+        config = PipelineConfig(
+            telemetry=telemetry_config,
+            maintenance=maintenance,
+            tag_stamp="20260611T120000Z",
+            serve_tag=True,
+        )
+        assert config.maintenance.cluster_rewrite is True
+
+    def test_cluster_rewrite_serve_tag_without_tag_stamp_rejected(self, telemetry_config: TelemetryConfig) -> None:
+        """serve_tag=True with tag_stamp=None disables the stamp phase, so HEAD never advances (C1).
+
+        The stamp phase returns early when ``tag_stamp`` is ``None``, so this combination would pass
+        validation yet never promote the clustered generation. It must be rejected at construction.
+        ``tag_keep_last`` is disabled so the cleanup-horizon check does not fire first.
+        """
+        maintenance = MaintenanceConfig(telemetry=telemetry_config, cluster_rewrite=True)
+        with pytest.raises(ValueError, match="tag_stamp set"):
+            PipelineConfig(
+                telemetry=telemetry_config,
+                maintenance=maintenance,
+                tag_keep_last=None,
+                tag_stamp=None,
+                serve_tag=True,
+            )
+
+
+class TestFailedCounts:
+    """counts['failed'] covers every phase, so a stamp or prune failure never exits 0."""
+
+    def test_stamp_failure_counts_as_failed(
+        self,
+        telemetry_config: TelemetryConfig,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A dataset whose HEAD flip errors is counted failed even with maintenance and index clean."""
+        uri: str = write_tiny_dataset(tmp_path)
+
+        def failing_stamp(
+            spark: Any,
+            dataset_uris: Any,
+            telemetry_cfg: Any,
+            storage_options: Any,
+            tags: Any = ("HEAD",),
+            target_version: Any = None,
+            partitions: int = 512,
+        ) -> list[dict[str, Any]]:
+            """Return the isolation error marker the tag fan-out produces on a failed flip."""
+            del spark, telemetry_cfg, storage_options, tags, target_version, partitions
+            return [{"uri": u, "error": "tag flip boom", "phase": "tag"} for u in dataset_uris]
+
+        monkeypatch.setattr(pipeline_job, "prune_interval_tags_fleet", noop_prune_fleet)
+        monkeypatch.setattr(pipeline_job.MaintenanceJob, "run", noop_maintenance_run)
+        monkeypatch.setattr(pipeline_job.LanceIndexer, "run", noop_indexer_run)
+        monkeypatch.setattr(pipeline_job, "update_serving_tags", failing_stamp)
+
+        config = make_config(telemetry_config, tag_keep_last=None, tag_stamp="20260611T120000Z", serve_tag=True)
+        result: dict[str, Any] = PipelineJob(config).run(FakeSpark(), [uri])
+        assert result["counts"]["failed"] == 1
+        assert result["counts"]["stamped"] == 0
+
+    def test_prune_failure_counts_as_failed(
+        self,
+        telemetry_config: TelemetryConfig,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A dataset whose interval-tag prune errors is counted failed."""
+        uri: str = write_tiny_dataset(tmp_path)
+
+        def failing_prune(
+            spark: Any,
+            uris: Any,
+            telemetry_cfg: Any,
+            storage_options: Any,
+            tag_keep_last: Any,
+            partitions: Any = 512,
+        ) -> list[dict[str, Any]]:
+            """Return the isolation error marker the prune fan-out produces on a failed prune."""
+            del spark, telemetry_cfg, storage_options, tag_keep_last, partitions
+            return [{"uri": u, "error": "prune boom", "phase": "prune"} for u in uris]
+
+        monkeypatch.setattr(pipeline_job, "prune_interval_tags_fleet", failing_prune)
+        monkeypatch.setattr(pipeline_job.MaintenanceJob, "run", noop_maintenance_run)
+        monkeypatch.setattr(pipeline_job.LanceIndexer, "run", noop_indexer_run)
+        monkeypatch.setattr(pipeline_job, "update_serving_tags", noop_update_serving_tags)
+
+        config = make_config(telemetry_config, tag_keep_last=10, tag_stamp=None)
+        result: dict[str, Any] = PipelineJob(config).run(FakeSpark(), [uri])
+        assert result["counts"]["failed"] == 1
+
+    def test_clean_run_counts_zero_failed(
+        self,
+        telemetry_config: TelemetryConfig,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A fully clean run still reports zero failures with the widened failure scan."""
+        uri: str = write_tiny_dataset(tmp_path)
+        monkeypatch.setattr(pipeline_job, "prune_interval_tags_fleet", noop_prune_fleet)
+        monkeypatch.setattr(pipeline_job.MaintenanceJob, "run", noop_maintenance_run)
+        monkeypatch.setattr(pipeline_job.LanceIndexer, "run", noop_indexer_run)
+        monkeypatch.setattr(pipeline_job, "update_serving_tags", noop_update_serving_tags)
+
+        config = make_config(telemetry_config, tag_keep_last=None, tag_stamp=None)
+        result: dict[str, Any] = PipelineJob(config).run(FakeSpark(), [uri])
+        assert result["counts"]["failed"] == 0

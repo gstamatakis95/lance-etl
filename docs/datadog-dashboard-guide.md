@@ -463,48 +463,40 @@ names below as they appear in the code.
 
 ### 4.9 TTL Expiry
 
-**Goal.** Confirm the TTL job is deleting expired rows and tracking how many datasets and rows
-are affected each run.
+**Goal.** Confirm the TTL delete step is expiring rows on schedule and that it is not silently
+skipping datasets or piling up commit conflicts.
 
-The TTL job runs from `src/lance_etl/ttl.py`. It is invoked as a separate CLI command (`etl ttl`)
-and may be scheduled inside or alongside the compaction run in the Airflow DAG.
+There is no standalone TTL module or CLI command. Per-row TTL expiration is one phase of the
+unified fleet job: `run_ttl_on_open_dataset` in `src/lance_etl/maintenance/job.py`, driven by
+`MaintenanceJob` and, in production, by `lance-etl-pipeline run --ttl-column <column>` (the
+Airflow `lance_etl_pipeline` DAG's `lance_etl_ttl_column` Variable). Leaving that column unset
+turns TTL off and the job is compaction plus cleanup only. TTL emits under the same
+`lance.pipeline.dataset.*` namespace as compaction (4.8), not a separate `ttl.*` namespace, because
+it is one phase of the same per-dataset task.
 
 **Metrics.**
 
 | Metric | Type | Tags | What it measures |
 |---|---|---|---|
-| `lance.pipeline.ttl.datasets_scanned` | gauge | none | Datasets examined in the TTL run. |
-| `lance.pipeline.ttl.datasets_expired` | gauge | none | Datasets from which rows were deleted. |
-| `lance.pipeline.ttl.total_rows_deleted` | gauge | none | Total rows deleted across the run. |
-| `lance.pipeline.ttl.datasets_compacted` | gauge | none | Datasets compacted after TTL deletion. |
-| `lance.pipeline.ttl.rows_deleted` | distribution | none | Rows deleted per dataset. |
-| `lance.pipeline.ttl.delete_ms` | distribution | `uri` | Per-dataset delete latency. |
-| `lance.pipeline.ttl.compact_ms` | distribution | `uri` | Per-dataset post-delete compaction latency. |
-| `lance.pipeline.ttl.compact_fragments_removed` | distribution | none | Fragments removed by post-delete compaction. |
-| `lance.pipeline.ttl.compact_bytes_removed` | distribution | none | Bytes freed by post-delete compaction. |
-| `lance.pipeline.ttl.commit_conflict` | count | none | TTL delete commit conflicts. |
-| `lance.pipeline.ttl.run_noop` | count | none | Runs where no datasets had expired rows (no-op). |
-| `lance.pipeline.ttl.dataset_open_error` | count | none | Datasets that could not be opened. |
-| `lance.pipeline.ttl.dataset_column_missing` | count | none | Datasets missing the TTL timestamp column. |
-| `lance.pipeline.ttl.dataset_stat_error` | count | none | Datasets where row count could not be read. |
-| `lance.pipeline.ttl.dataset_deferred_to_large_tier` | count | none | Datasets deferred to the large tier. |
-| `lance.pipeline.ttl.dataset_expired` | count | none | Individual dataset expiry completions. |
-| `lance.pipeline.ttl.small_tier_ms` | distribution | none | Small-tier TTL wall time. |
-| `lance.pipeline.ttl.large_tier_ms` | distribution | none | Large-tier TTL wall time. |
+| `lance.pipeline.dataset.ttl_delete_ms` | distribution | none | Per-dataset TTL delete latency, timed around the retrying delete action. |
+| `lance.pipeline.dataset.ttl_rows_deleted` | distribution | none | Rows deleted per dataset by the TTL predicate, including zero when nothing expired. |
+| `lance.pipeline.dataset.ttl_expired` | count | none | Emitted once per dataset where the TTL delete removed at least one row. |
+| `lance.pipeline.dataset.ttl_commit_conflict` | count | none | TTL delete commit conflicts observed by `commit_with_retries` before it succeeded or exhausted its budget. |
+| `lance.pipeline.dataset.ttl_column_missing` | count | none | Datasets skipped because the configured TTL column or timestamp column is absent from the schema. |
 
 **Widgets.**
 
-- **TTL row throughput (timeseries).** `avg:lance.pipeline.ttl.total_rows_deleted`. Rises when more
-  data is aging out. A sudden spike may indicate a misconfigured expiry window.
-- **Datasets affected (timeseries).** `avg:lance.pipeline.ttl.datasets_expired /
-  avg:lance.pipeline.ttl.datasets_scanned`. This ratio shows what fraction of the fleet has active
-  TTL expiry.
-- **No-op runs (timeseries).** `sum:lance.pipeline.ttl.run_noop`. A consistently high no-op rate
-  means the TTL schedule is too frequent for the data velocity, which is harmless but wastes cluster
-  time.
-- **TTL errors (timeseries).** `sum:lance.pipeline.ttl.dataset_open_error`,
-  `sum:lance.pipeline.ttl.dataset_column_missing`, `sum:lance.pipeline.ttl.dataset_stat_error`.
-  A table widget with one row per error type is useful for diagnosis.
+- **TTL row throughput (timeseries).** `avg:lance.pipeline.dataset.ttl_rows_deleted`. Rises when
+  more data is aging out. A sudden spike may indicate a misconfigured expiry window.
+- **Datasets actively expiring (timeseries).** `sum:lance.pipeline.dataset.ttl_expired`. Shows how
+  many datasets in the fleet had at least one row deleted this run.
+- **TTL delete latency (timeseries).** `p95:lance.pipeline.dataset.ttl_delete_ms`. Sudden increases
+  suggest a large expired-row set or write contention on the dataset.
+- **TTL conflicts and skips (timeseries).** `sum:lance.pipeline.dataset.ttl_commit_conflict`
+  overlaid with `sum:lance.pipeline.dataset.ttl_column_missing`. A rising conflict count means the
+  TTL delete is racing with concurrent ingestion on the same dataset. A nonzero
+  `ttl_column_missing` count means `--ttl-column` (or the Datadog-configured timestamp column) does
+  not match the dataset's actual schema and should be corrected.
 
 ### 4.10 Indexing
 

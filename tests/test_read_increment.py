@@ -38,14 +38,19 @@ def epoch_ms(moment: datetime) -> int:
 def spark_with_snapshots(rows: list[dict[str, Any]]) -> MagicMock:
     """Build a mock Spark session whose snapshots metadata read returns the given rows.
 
+    ``snapshot_id_bounds`` converts ``committed_at`` to epoch milliseconds inside Spark via
+    ``unix_millis`` (never through collected driver-local naive datetimes), so the mocked rows
+    carry the already-converted ``committed_ms`` integers its ``selectExpr`` produces.
+
     Args:
-        rows: Mapping-like rows carrying ``committed_at`` datetimes and ``snapshot_id`` integers.
+        rows: Mapping-like rows carrying ``committed_ms`` epoch-millisecond integers and
+            ``snapshot_id`` integers.
 
     Returns:
-        The mock session wired so ``spark.read.format("iceberg").load(...).select(...).collect()`` yields the rows.
+        The mock session wired so ``spark.read.format("iceberg").load(...).selectExpr(...).collect()`` yields the rows.
     """
     spark: MagicMock = MagicMock()
-    spark.read.format.return_value.load.return_value.select.return_value.collect.return_value = rows
+    spark.read.format.return_value.load.return_value.selectExpr.return_value.collect.return_value = rows
     return spark
 
 
@@ -86,10 +91,11 @@ def snapshot_rows() -> list[dict[str, Any]]:
     """Return three snapshot rows committed at :data:`SNAPSHOT_TIMES` with ids 101, 102, 103.
 
     Returns:
-        The mock snapshots metadata rows, deliberately unordered.
+        The mock snapshots metadata rows, deliberately unordered, carrying the ``committed_ms``
+        integers the Spark-side ``unix_millis`` conversion produces.
     """
     rows: list[dict[str, Any]] = [
-        {"committed_at": moment, "snapshot_id": 101 + index} for index, moment in enumerate(SNAPSHOT_TIMES)
+        {"committed_ms": epoch_ms(moment), "snapshot_id": 101 + index} for index, moment in enumerate(SNAPSHOT_TIMES)
     ]
     return [rows[2], rows[0], rows[1]]
 

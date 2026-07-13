@@ -70,6 +70,27 @@ The safety rules that make it correct with version-keyed caches:
 Serving through the tag is opt-in via `SEARCH_API_SERVE_BY_TAG`. The Python tag helper only
 writes the tag and logs the safe sequence — the serving layer is never assumed to auto-refresh.
 
+**Tag retention versus the cleanup horizon.** Interval tags pin the versions they point at, and
+the count-based prune (`tag_keep_last`, hourly by convention) unpins the oldest tag's version
+roughly `tag_keep_last * tag_cadence_seconds` after it was stamped. If the cleanup horizon
+(`cleanup_older_than_seconds`) equals that window exactly, the same run that prunes the oldest tag
+can reclaim the version it just unpinned while a replica pinned to that tag is still mid-scan.
+`PipelineConfig` therefore enforces the invariant at config time:
+`cleanup_older_than_seconds > tag_keep_last * tag_cadence_seconds + cleanup_slack_seconds`
+(`validate_cleanup_horizon`, with `tag_cadence_seconds` defaulting to 3600 and
+`cleanup_slack_seconds` to 3600). The shipped defaults satisfy it with headroom: 48 hourly tags
+plus one hour of slack is a 49-hour window, and the default cleanup horizon is 216,000 seconds
+(60 hours).
+
+**Operational note on permanently failing datasets.** The prune is count-based, not time-based,
+and the stamp phase never tags an error-marked dataset. A dataset that fails every run therefore
+stops receiving new interval tags, so its newest `tag_keep_last` tags are never displaced and the
+versions they pin are retained indefinitely — up to 48 versions of storage under the default
+retention until the dataset is fixed. This is deliberate: those pinned versions are the dataset's
+last good serving states, and reclaiming them while it cannot produce a new good version would
+leave tag-pinned replicas nothing safe to read. The cost is bounded storage per failing dataset,
+surfaced by the pipeline's failed-dataset count and metrics rather than by silent reclamation.
+
 ## ADR 0032 (query half) — Per-query tag and version pinning
 
 Status: Accepted

@@ -22,7 +22,6 @@ from lance_etl.indexing.config import (
     growth_exceeds_retrain_factor,
 )
 from lance_etl.indexing.optimize import (
-    drop_existing_index,
     load_centroids,
     load_vector_config,
     save_centroids,
@@ -575,19 +574,19 @@ def commit_fts_index(
     index_name: str,
     index_uuid: str,
     fragment_ids: list[int],
-    has_existing: bool,
     config: IndexJobConfig,
     telemetry: Telemetry,
 ) -> None:
-    """Publish a rebuilt inverted index on an executor: drop the old one, merge metadata, commit.
+    """Publish a rebuilt inverted index on an executor: merge metadata, then atomically swap.
 
-    An existing same-name index is dropped only now, AFTER the per-fragment executor builds
-    completed, so the old index stayed live and searchable for the whole (potentially
-    hours-long) build phase and is absent only for the short merge-plus-commit window. Each
-    commit attempt validates that every covered fragment still exists at the latest version: a
-    concurrent compaction can rewrite covered fragments between build and commit, and a blind
-    retry at the new head would publish an index whose row addresses point at compacted-away
-    fragments.
+    The old same-name index is never dropped separately. :func:`publish_fts_index` lists its
+    committed segments at commit time and passes them as the ``removed_indices`` of the same
+    ``CreateIndex`` operation that publishes the rebuilt index, so the old index stays live and
+    searchable for the whole (potentially hours-long) build phase and the replacement is one
+    atomic commit with no window where the dataset carries no FTS index. Each commit attempt
+    validates that every covered fragment still exists at the latest version: a concurrent
+    compaction can rewrite covered fragments between build and commit, and a blind retry at the
+    new head would publish an index whose row addresses point at compacted-away fragments.
 
     Args:
         uri: Dataset URI.
@@ -595,7 +594,6 @@ def commit_fts_index(
         index_name: The index name to publish under.
         index_uuid: The shared index id the fragment builds used.
         fragment_ids: The fragments the index covers.
-        has_existing: Whether a same-name index existed before the rebuild.
         config: Indexing configuration.
         telemetry: Telemetry facade for the current process.
 
@@ -603,12 +601,44 @@ def commit_fts_index(
         ValueError: If covered fragments no longer exist because a compaction rewrote them.
         OSError | RuntimeError: If commits keep conflicting past the retry budget.
     """
-    if has_existing:
-        drop_existing_index(uri, index_name, config, telemetry)
     dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
     with telemetry.timed("index.merge_ms", tags=[f"index:{index_name}"]):
         dataset.merge_index_metadata(index_uuid, index_type="INVERTED")
     publish_fts_index(uri, column, index_name, index_uuid, fragment_ids, config, telemetry)
+
+
+def same_name_index_segments(dataset: lance.LanceDataset, index_name: str) -> list[Index]:
+    """Collect the committed segment metadata of every index carrying a name.
+
+    Builds the ``Index`` records the ``CreateIndex`` operation's ``removed_indices`` field
+    expects (removal matches on segment uuid), one per committed segment because an
+    incrementally maintained index carries one segment per delta. This lets a rebuilt inverted
+    index atomically replace its predecessor inside the very commit that publishes it, instead
+    of dropping the old index in a separate earlier commit.
+
+    Args:
+        dataset: The dataset whose committed indexes to inspect.
+        index_name: The index name whose segments to collect.
+
+    Returns:
+        One ``Index`` record per committed segment of the named index, empty when the name is
+        absent.
+    """
+    return [
+        Index(
+            uuid=segment.uuid,
+            name=description.name,
+            fields=list(description.fields),
+            dataset_version=segment.dataset_version_at_last_update,
+            fragment_ids=set(segment.fragment_ids),
+            index_version=segment.index_version,
+            created_at=segment.created_at,
+            base_id=segment.base_id,
+        )
+        for description in dataset.describe_indices()
+        if description.name == index_name
+        for segment in description.segments
+    ]
 
 
 def publish_fts_index(
@@ -623,7 +653,10 @@ def publish_fts_index(
     """Publish an already-merged inverted index, retrying conflicts and refusing stale coverage.
 
     Each attempt validates that every covered fragment still exists at the latest version before
-    committing the ``CreateIndex`` operation.
+    committing the ``CreateIndex`` operation. The commit atomically replaces any existing
+    same-name index: its committed segments are re-listed at the latest version on every attempt
+    (:func:`same_name_index_segments`) and passed as the operation's ``removed_indices``, so the
+    drop and the publish are one commit and a publish failure leaves the old index fully live.
 
     Args:
         uri: Dataset URI.
@@ -645,7 +678,7 @@ def publish_fts_index(
     tags: list[str] = ["index_type:INVERTED"]
 
     def action() -> None:
-        """Publish the merged inverted index at the latest version."""
+        """Atomically swap the merged inverted index in at the latest version."""
         current: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
         live: set[int] = live_fragment_ids(current)
         missing: set[int] = fragments - live
@@ -654,6 +687,7 @@ def publish_fts_index(
                 f"inverted index {index_name} on {uri} covers fragments {sorted(missing)} that no longer exist; "
                 "a compaction rewrote them between build and commit, so this build must be redone"
             )
+        removed: list[Index] = same_name_index_segments(current, index_name)
         index: Index = Index(
             uuid=index_uuid,
             name=index_name,
@@ -662,7 +696,7 @@ def publish_fts_index(
             fragment_ids=fragments,
             index_version=0,
         )
-        operation = lance.LanceOperation.CreateIndex(new_indices=[index], removed_indices=[])
+        operation = lance.LanceOperation.CreateIndex(new_indices=[index], removed_indices=removed)
         lance.LanceDataset.commit(uri, operation, read_version=current.version, storage_options=storage_options)
         telemetry.incr("index.committed", tags=tags)
 

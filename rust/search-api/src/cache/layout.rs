@@ -36,21 +36,42 @@ pub fn stamp_dir_name() -> String {
     format!("v{CACHE_SCHEMA_VERSION}-lance-{LANCE_CACHE_STAMP}")
 }
 
-/// Creates `{cache_dir}/{stamp}` and deletes any sibling directory with a different stamp
+/// Reports whether `name` matches the versioned stamp naming pattern `v{N}-lance-{version}`.
+///
+/// Gates the stale-stamp wipe in [`prepare_cache_root`]: only entries this service itself named
+/// are ever deleted, so a misconfigured `SEARCH_API_CACHE_DIR` pointed at a shared volume never
+/// loses unrelated data.
+fn is_stamp_dir_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('v') else {
+        return false;
+    };
+    let Some((schema_version, lance_version)) = rest.split_once("-lance-") else {
+        return false;
+    };
+    !schema_version.is_empty() && schema_version.bytes().all(|byte| byte.is_ascii_digit()) && !lance_version.is_empty()
+}
+
+/// Creates `{cache_dir}/{stamp}` and deletes any sibling entry carrying a *different* stamp name
 /// (stale layouts from lance upgrades or our own format changes). Returns the stamp path.
+///
+/// Deletion is restricted to entries matching the versioned stamp naming pattern
+/// ([`is_stamp_dir_name`]). Anything else in the cache directory is left untouched, so pointing
+/// `SEARCH_API_CACHE_DIR` at a directory that also holds unrelated data can never destroy it.
 pub fn prepare_cache_root(cache_dir: &Path) -> std::io::Result<PathBuf> {
     let stamp = stamp_dir_name();
     let root = cache_dir.join(&stamp);
     std::fs::create_dir_all(&root)?;
     for entry in std::fs::read_dir(cache_dir)? {
         let entry = entry?;
-        if entry.file_name().to_string_lossy() != stamp.as_str() {
-            let stale = entry.path();
-            if stale.is_dir() {
-                let _ = std::fs::remove_dir_all(&stale);
-            } else {
-                let _ = std::fs::remove_file(&stale);
-            }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == stamp || !is_stamp_dir_name(&name) {
+            continue;
+        }
+        let stale = entry.path();
+        if stale.is_dir() {
+            let _ = std::fs::remove_dir_all(&stale);
+        } else {
+            let _ = std::fs::remove_file(&stale);
         }
     }
     Ok(root)
@@ -284,6 +305,39 @@ mod tests {
         assert!(!stale.exists());
         let root_again = prepare_cache_root(tmp.path()).unwrap();
         assert_eq!(root, root_again);
+    }
+
+    #[test]
+    fn stamp_wipe_never_touches_entries_outside_the_stamp_naming_pattern() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let foreign_dir = tmp.path().join("user-data");
+        std::fs::create_dir_all(&foreign_dir).unwrap();
+        std::fs::write(foreign_dir.join("keep.bin"), b"precious").unwrap();
+        let foreign_file = tmp.path().join("notes.txt");
+        std::fs::write(&foreign_file, b"also precious").unwrap();
+        let near_miss = tmp.path().join("vX-lance-8.0.0");
+        std::fs::create_dir_all(&near_miss).unwrap();
+        let stale = tmp.path().join("v1-lance-7.0.0");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("old.bin"), b"old").unwrap();
+        prepare_cache_root(tmp.path()).unwrap();
+        assert!(foreign_dir.join("keep.bin").exists(), "unrelated dirs must survive");
+        assert!(foreign_file.exists(), "unrelated files must survive");
+        assert!(near_miss.exists(), "names outside the stamp pattern must survive");
+        assert!(!stale.exists(), "an old-stamp sibling must be removed");
+    }
+
+    #[test]
+    fn stamp_name_pattern_accepts_stamps_and_rejects_everything_else() {
+        assert!(is_stamp_dir_name(&stamp_dir_name()));
+        assert!(is_stamp_dir_name("v0-lance-7.0.0"));
+        assert!(is_stamp_dir_name("v12-lance-9.0.0-beta.1"));
+        assert!(!is_stamp_dir_name("user-data"));
+        assert!(!is_stamp_dir_name("v-lance-8.0.0"));
+        assert!(!is_stamp_dir_name("vX-lance-8.0.0"));
+        assert!(!is_stamp_dir_name("v2-lance-"));
+        assert!(!is_stamp_dir_name("prefixes.json"));
+        assert!(!is_stamp_dir_name(""));
     }
 
     #[test]

@@ -12,6 +12,7 @@ import threading
 import time
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import lance
 import numpy as np
@@ -20,7 +21,7 @@ import pytest
 from conftest import compact_dataset_inline
 
 from lance_etl.etl import ETLConfig, apply_merge, dataset_uri
-from lance_etl.etl.sink import table_chunks
+from lance_etl.etl.sink import dataset_absent, open_or_bootstrap, run_delete_chunk, table_chunks
 from lance_etl.maintenance import MaintenanceConfig
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
@@ -621,3 +622,68 @@ def test_stale_cross_window_delete_removes_newer_row(ts_config: ETLConfig, telem
     assert (upserted, deleted) == (0, 1)
     uri: str = dataset_uri(ts_config, *ROUTING_KEY)
     assert lance.dataset(uri).count_rows() == 0
+
+
+def test_dataset_absent_classifies_only_genuine_absence() -> None:
+    """dataset_absent is True only for FileNotFoundError and the lance not-found ValueError rendering.
+
+    pylance maps every dataset-load failure to ValueError, so the sink must distinguish a genuinely
+    missing dataset (safe delete no-op) from a transient or fatal open error (must re-raise) by the
+    lance not-found message marker.
+    """
+    assert dataset_absent(FileNotFoundError("no such file"))
+    assert dataset_absent(ValueError("Dataset at path /tmp/x.lance was not found: Not found: /tmp/x.lance/_versions"))
+    assert not dataset_absent(ValueError("Generic S3 error: 503 Slow Down"))
+    assert not dataset_absent(ValueError("Invalid user input: credentials expired"))
+    assert not dataset_absent(OSError("connection reset"))
+
+
+def test_delete_chunk_absent_dataset_is_noop(etl_config: ETLConfig) -> None:
+    """A delete against a dataset that never existed returns empty stats without raising."""
+    uri: str = dataset_uri(etl_config, *ROUTING_KEY)
+    chunk: pa.Table = pa.table({"vector_id": pa.array(["a"], pa.string())})
+    stats = run_delete_chunk(etl_config, MagicMock(), uri, chunk, 0, 1)
+    assert stats == {}
+
+
+def test_delete_chunk_transient_open_error_reraises(
+    etl_config: ETLConfig, telemetry: Telemetry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient dataset-open ValueError re-raises from the delete path instead of no-opping.
+
+    pylance renders S3 throttling, credential failures, and corrupt manifests as ValueError too, so
+    swallowing every ValueError would silently skip compliance-sensitive deletes. Only the genuine
+    not-found rendering is a no-op. The failure is metered as ``dataset.delete_open_failed``.
+    """
+    apply_merge(etl_config, telemetry, ROUTING_KEY, make_group(["a", "b"]))
+    uri: str = dataset_uri(etl_config, *ROUTING_KEY)
+
+    def raise_transient(*args: object, **kwargs: object) -> lance.LanceDataset:
+        """Simulate a transient object-store failure during dataset open."""
+        del args, kwargs
+        raise ValueError("Generic S3 error: 503 Slow Down")
+
+    monkeypatch.setattr(lance, "dataset", raise_transient)
+    chunk: pa.Table = pa.table({"vector_id": pa.array(["a"], pa.string())})
+    telemetry_mock: MagicMock = MagicMock()
+    with pytest.raises(ValueError, match="503 Slow Down"):
+        run_delete_chunk(etl_config, telemetry_mock, uri, chunk, 0, 1)
+    telemetry_mock.incr.assert_called_once_with("dataset.delete_open_failed")
+
+
+def test_open_or_bootstrap_transient_error_reraises(
+    etl_config: ETLConfig, telemetry: Telemetry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient open error re-raises from open_or_bootstrap instead of bootstrapping a spurious empty dataset."""
+    apply_merge(etl_config, telemetry, ROUTING_KEY, make_group(["a"]))
+    uri: str = dataset_uri(etl_config, *ROUTING_KEY)
+
+    def raise_transient(*args: object, **kwargs: object) -> lance.LanceDataset:
+        """Simulate a transient object-store failure during dataset open."""
+        del args, kwargs
+        raise ValueError("Generic S3 error: 503 Slow Down")
+
+    monkeypatch.setattr(lance, "dataset", raise_transient)
+    schema: pa.Schema = pa.schema([("vector_id", pa.string())])
+    with pytest.raises(ValueError, match="503 Slow Down"):
+        open_or_bootstrap(uri, schema, etl_config)

@@ -112,6 +112,17 @@ from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 pytestmark = pytest.mark.integration
 
+BTREE_DELTA_MERGE_INSERT_REGRESSION_SIGNATURE: str = "RowAddrTreeMap::from_sorted_iter"
+"""Substring identifying the known pylance 8.0.0 wheel regression.
+
+Concurrent ``merge_insert`` against a dataset carrying BTREE index deltas can raise the internal
+error ``RowAddrTreeMap::from_sorted_iter called with non-sorted input`` (lance-index
+scalar/btree/flat.rs via merge_insert.rs). The failure is loud (the merge errors and the actor
+thread records it, no silent corruption). The fix is expected in pylance 9: upstream PRs #7429,
+#7480, and #7484 rework the indexed-scan merge path. Only failures matching this substring are
+treated as the known issue. Everything else fails the test.
+"""
+
 DIM: int = 16
 HEAD_ROUNDS: int = 16
 HEAD_INSERTS_PER_ROUND: int = 12_500
@@ -656,19 +667,17 @@ def assert_full_index_coverage(uri: str, required_names: set[str]) -> None:
         assert remaining == 0, f"{uri} index {name} leaves {remaining} fragments unindexed"
 
 
-@pytest.mark.xfail(
-    reason=(
-        "pylance 8.0.0 wheel regression: concurrent merge_insert against a dataset carrying BTREE "
-        "index deltas raises the internal error 'RowAddrTreeMap::from_sorted_iter called with "
-        "non-sorted input' (lance-index scalar/btree/flat.rs via merge_insert.rs). The failure is "
-        "loud (the merge errors, no silent corruption). The fix is expected in pylance 9: upstream "
-        "PRs #7429, #7480, and #7484 rework the indexed-scan merge path. Remove this marker once "
-        "that upstream fix ships."
-    ),
-    strict=False,
-)
 def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Three concurrent actors converge with zero data loss, full index coverage, and a bounded fragment count.
+
+    This test does not carry a blanket ``xfail``. The scenario is a real concurrency race (three
+    threads with unsynchronized sleeps against the same datasets), so a whole-test
+    ``xfail(strict=False)`` would silently absorb any new regression the race happens to surface,
+    not just the one known pylance bug it was written for. Instead, actor failures are partitioned
+    below: anything matching :data:`BTREE_DELTA_MERGE_INSERT_REGRESSION_SIGNATURE` is treated as the
+    documented known issue and reported via a dynamic ``pytest.xfail`` (non-strict regardless of the
+    global config, since no ``xfail_strict`` ini option is set), while every other failure and every
+    convergence assertion below still asserts strictly.
 
     Args:
         tmp_path: Pytest-provided temporary directory hosting the datasets.
@@ -835,7 +844,18 @@ def test_concurrent_ingest_compact_index_coexistence(tmp_path: Path, monkeypatch
     for thread in service_threads:
         thread.join(JOIN_TIMEOUT_SECONDS)
     assert not any(thread.is_alive() for thread in service_threads), "a service actor did not stop in time"
-    assert not failures, f"actors died: {failures}"
+    known_regression_failures: list[str] = [
+        failure for failure in failures if BTREE_DELTA_MERGE_INSERT_REGRESSION_SIGNATURE in failure
+    ]
+    other_failures: list[str] = [
+        failure for failure in failures if BTREE_DELTA_MERGE_INSERT_REGRESSION_SIGNATURE not in failure
+    ]
+    assert not other_failures, f"actors died: {other_failures}"
+    if known_regression_failures:
+        pytest.xfail(
+            "hit the known pylance 8.0.0 BTREE-delta merge_insert regression during this run: "
+            f"{known_regression_failures}. See BTREE_DELTA_MERGE_INSERT_REGRESSION_SIGNATURE."
+        )
 
     head_required: set[str] = {
         vector_index_name("vector"),

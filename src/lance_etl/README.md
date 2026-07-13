@@ -403,7 +403,7 @@ re-reads the dataset before each attempt. See `./AGENTS.md` for the retry-budget
 ```bash
 uv venv
 source .venv/bin/activate
-uv pip install -e ".[dev]"
+uv pip install -e . --group dev
 uv pip install --group bench
 
 # Lint and format (must pass before any commit)
@@ -411,7 +411,11 @@ uvx ruff format src/ tests/ airflow/ bench/
 uvx ruff check src/ tests/ airflow/ bench/
 
 # Run tests
-.venv/bin/pytest
+.venv/bin/pytest -m "not integration"
 ```
 
-`pylance>=8.0.0` installs from PyPI, so the plain `uv pip install -e ".[dev]"` suffices.
+`dev`, `bench`, and `airflow` are PEP 735 dependency groups, not extras, so install them with
+`--group`, not `.[dev]`. `pylance>=8.0.0,<9` installs from PyPI, so `uv pip install -e . --group dev`
+suffices for the core suite. The `airflow` group (`uv pip install --group airflow`) is needed only
+to run the DAG-parse smoke test `tests/test_airflow_dags.py`, which otherwise self-skips. CI runs
+that test in a dedicated job with the group installed.

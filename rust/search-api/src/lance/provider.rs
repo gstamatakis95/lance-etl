@@ -151,6 +151,17 @@ pub struct CachingDatasetProvider {
     session: Arc<Session>,
     /// Open-handle LRU keyed by `(uri, resolved version)` and bounded by total [`handle_weight`].
     datasets: Cache<(String, Option<u64>), Arc<Dataset>>,
+    /// Short-TTL negative cache of dataset opens that failed with NotFound, keyed by
+    /// `(uri, selector)` where the selector encodes the resolved reference intent (`latest`,
+    /// `version:{n}`, or `tag:{name}`). Keying on the reference — rather than a resolved version
+    /// that a failed tag resolution never produces — lets the cache cover tag-addressed misses
+    /// (`DatasetRef::Tag` and every serve-by-tag request) as well as `Latest`/`Version`, so a hot
+    /// loop of requests for a nonexistent dataset or tag is answered from here instead of hammering
+    /// the object store. Only NotFound outcomes are cached — a missing dataset OR a missing tag,
+    /// never a transient failure — and the TTL
+    /// ([`crate::config::DEFAULT_NEGATIVE_OPEN_TTL_SECS`]) bounds how long a freshly created
+    /// dataset can still be reported missing.
+    negative_opens: Cache<(String, String), SearchError>,
     tag_versions: Cache<(String, String), u64>,
     last_tag_version: Cache<(String, String), u64>,
     last_prewarmed: Cache<String, u64>,
@@ -240,6 +251,10 @@ impl CachingDatasetProvider {
                     ttl: Duration::from_secs(config.serve_tag_ttl_secs),
                 })
                 .build(),
+            negative_opens: Cache::builder()
+                .max_capacity(config.dataset_cache_capacity)
+                .time_to_live(Duration::from_secs(crate::config::DEFAULT_NEGATIVE_OPEN_TTL_SECS))
+                .build(),
             tag_versions: Cache::builder()
                 .max_capacity(config.dataset_cache_capacity)
                 .time_to_live(Duration::from_secs(config.serve_tag_ttl_secs))
@@ -298,6 +313,24 @@ impl CachingDatasetProvider {
         let base = &self.base_uri;
         let (org, tenant, namespace) = (&target.org_id, &target.tenant_id, &target.namespace);
         format!("{base}/{org}/{tenant}/{namespace}.lance")
+    }
+
+    /// Builds the `negative_opens` key for a `(uri, reference)` pair.
+    ///
+    /// The selector mirrors what [`Self::resolve_reference`] will consult, so a NotFound recorded
+    /// under this key short-circuits every subsequent identical request within the TTL — including
+    /// the tag paths, whose resolution failure happens before any version is known. `Serve`
+    /// collapses onto `latest` or `tag:{serve_tag}` exactly as the serve policy resolves it, and a
+    /// `Tag` request naming the serve tag shares that key because both open the same thing.
+    fn negative_open_key(&self, uri: &str, reference: &DatasetRef) -> (String, String) {
+        let selector = match reference {
+            DatasetRef::Latest => "latest".to_string(),
+            DatasetRef::Serve if !self.serve_by_tag => "latest".to_string(),
+            DatasetRef::Serve => format!("tag:{}", self.serve_tag),
+            DatasetRef::Version(version) => format!("version:{version}"),
+            DatasetRef::Tag(tag) => format!("tag:{tag}"),
+        };
+        (uri.to_string(), selector)
     }
 
     /// Resolves a [`DatasetRef`] to the concrete version to open.
@@ -470,6 +503,10 @@ impl CachingDatasetProvider {
     /// the warmed version) or from serving (compared against the warmed version for the
     /// `serve.cold_open` metric) — it is passed explicitly by the two trait entry points
     /// because serving requests can pin the same tag/version references prewarm uses.
+    ///
+    /// A NotFound open is negatively cached for a short TTL (`negative_opens`), so a hot loop of
+    /// requests for a nonexistent dataset does not hammer the object store. Transient failures
+    /// are never negatively cached.
     #[tracing::instrument(
         name = "provider.dataset",
         skip_all,
@@ -490,7 +527,19 @@ impl CachingDatasetProvider {
         target.validate()?;
         let started = std::time::Instant::now();
         let uri = self.dataset_uri(target);
-        let version = self.resolve_reference(&uri, reference).await?;
+        let negative_key = self.negative_open_key(&uri, &reference);
+        if let Some(cached) = self.negative_opens.get(&negative_key).await {
+            return Err(cached);
+        }
+        let version = match self.resolve_reference(&uri, reference).await {
+            Ok(version) => version,
+            Err(err) => {
+                if matches!(err, SearchError::NotFound(_)) {
+                    self.negative_opens.insert(negative_key, err.clone()).await;
+                }
+                return Err(err);
+            }
+        };
         let key = (uri.clone(), version);
         let session = self.session.clone();
         let open_uri = uri.clone();
@@ -512,6 +561,11 @@ impl CachingDatasetProvider {
             })
             .await
             .map_err(|err: Arc<lance::Error>| classify_lance_error(err.as_ref()));
+        if let Err(err) = &result
+            && matches!(err, SearchError::NotFound(_))
+        {
+            self.negative_opens.insert(negative_key, err.clone()).await;
+        }
         let cold = opened.load(std::sync::atomic::Ordering::Relaxed);
         tracing::Span::current().record("cache.dataset_handle_hit", !cold);
         self.metrics.cache_lookup(CacheName::Handles, Tier::Memory, !cold);

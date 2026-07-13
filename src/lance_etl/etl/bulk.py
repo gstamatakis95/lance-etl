@@ -60,13 +60,14 @@ from lance_etl.etl.pivot import (
     align_to_schema,
     apply_ttl_cast,
     build_stats_batch,
+    enforce_map_key_bound,
     pivot_map_columns,
     routing_stats_ddl,
     routing_stats_schema,
     stream_routing_groups,
 )
-from lance_etl.etl.plan import RoutingPlan, apply_salted_shuffle, collapse
-from lance_etl.etl.sink import DATA_STORAGE_VERSION, dataset_uri, open_or_bootstrap
+from lance_etl.etl.plan import RoutingPlan, apply_salted_shuffle, bucket_count, collapse
+from lance_etl.etl.sink import DATA_STORAGE_VERSION, dataset_absent, dataset_uri, open_or_bootstrap
 from lance_etl.telemetry import Telemetry, commit_with_retries
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -79,19 +80,21 @@ def bulk_stats_schema() -> pa.Schema:
     """Build the per-task bulk-append stats schema.
 
     Returns:
-        A schema of one string column per routing column plus ``appended`` (int64) and ``txn``
-        (binary) carrying the pickled append transaction back to the driver.
+        A schema of one string column per routing column plus ``appended`` (int64), ``txn``
+        (binary, null for a failed trio) carrying the pickled append transaction back to the
+        driver, and ``failed`` (int64) marking a trio whose append task failed in isolation.
     """
-    return routing_stats_schema([("appended", pa.int64()), ("txn", pa.binary())])
+    return routing_stats_schema([("appended", pa.int64()), ("txn", pa.binary()), ("failed", pa.int64())])
 
 
 def bulk_stats_spark_ddl() -> str:
     """Return the Spark DDL matching :func:`bulk_stats_schema` for the ``mapInArrow`` output schema.
 
     Returns:
-        A DDL string with routing columns as string, ``appended`` as bigint, and ``txn`` as binary.
+        A DDL string with routing columns as string, ``appended`` as bigint, ``txn`` as binary,
+        and ``failed`` as bigint.
     """
-    return routing_stats_ddl([("appended", "bigint"), ("txn", "binary")])
+    return routing_stats_ddl([("appended", "bigint"), ("txn", "binary"), ("failed", "bigint")])
 
 
 def plan_bulk_append(plan: RoutingPlan, config: ETLConfig) -> list[tuple[str, str, str, int]]:
@@ -103,14 +106,17 @@ def plan_bulk_append(plan: RoutingPlan, config: ETLConfig) -> list[tuple[str, st
     non-empty dataset is left to the merge path, whose idempotent upsert is required to reconcile
     existing rows.
 
-    The returned sub-bucket count reuses the plan's per-trio bucket count ``K`` (already ``> 1``
-    for a big trio) unchanged: the driver does not have the raw per-trio row count here, so the
-    plan's ``K`` is the parallelism used rather than a freshly recomputed one. Appends carry no
-    per-key commit contention, so this parallelism is safe to run unthrottled.
+    The returned sub-bucket count is sized for the append fan-out, NOT reused from the plan's merge
+    ``K``. The merge ``K`` in ``plan.big_trios`` is capped at ``max_buckets_per_dataset`` (default
+    32) to bound per-key commit contention, but an append carries no such contention, so a big
+    backfill can fan out far wider. This recomputes ``K_bulk`` from the trio's raw row count in
+    ``plan.big_trio_rows`` against the same rows-per-bucket grain, capped at
+    ``max_bulk_tasks_per_dataset`` (default 1024). A 1B-row backfill therefore parallelises across
+    hundreds of appenders instead of being throttled to the merge cap.
 
     Args:
-        plan: The routing plan carrying the big trios and their sub-bucket counts.
-        config: ETL configuration carrying the kill switch.
+        plan: The routing plan carrying the big trios, their raw row counts, and sub-bucket counts.
+        config: ETL configuration carrying the kill switch and the bulk task cap.
 
     Returns:
         One ``(org_id, tenant_id, namespace, K_bulk)`` per bulk-eligible trio, empty when the
@@ -124,10 +130,14 @@ def plan_bulk_append(plan: RoutingPlan, config: ETLConfig) -> list[tuple[str, st
         try:
             dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
             empty: bool = dataset.count_rows() == 0
-        except (FileNotFoundError, ValueError):
+        except (FileNotFoundError, ValueError) as error:
+            if not dataset_absent(error):
+                raise
             empty = True
         if empty:
-            eligible.append((org, tenant, namespace, sub_buckets))
+            rows: int = plan.big_trio_rows.get((org, tenant, namespace), sub_buckets)
+            bulk_buckets: int = bucket_count(rows, config.bucket_rows, config.max_bulk_tasks_per_dataset)
+            eligible.append((org, tenant, namespace, bulk_buckets))
     return eligible
 
 
@@ -157,13 +167,27 @@ def derive_bulk_schemas(
     would materialise as a raw-list all-null column, which is the one shape this fast path does not
     reproduce.
 
+    A trio whose post-collapse increment contains only delete ops is excluded from the returned
+    map entirely: it has nothing to append, and bootstrapping it would create a permanently empty
+    dataset that the fleet jobs then discover forever. Its rows stay in the merge input, where the
+    deletes no-op against the absent dataset.
+
+    Each trio's per-map distinct-key count is checked against ``config.max_keys_per_map`` via
+    :func:`~lance_etl.etl.pivot.enforce_map_key_bound` before any schema is assembled, so a source
+    emitting near-unique map keys fails loudly on the driver instead of OOMing it or minting a
+    runaway grow-only schema.
+
     Args:
         filtered: The null-routing-filtered increment, before collapse, carrying the op column.
         trios: The bulk-eligible trios from :func:`plan_bulk_append`.
-        config: ETL configuration providing the timestamp and window column names.
+        config: ETL configuration providing the timestamp and window column names and the map-key cap.
 
     Returns:
-        A map from each ``(org_id, tenant_id, namespace)`` trio to ``(schema, roles, vector_dims)``.
+        A map from each ``(org_id, tenant_id, namespace)`` trio to ``(schema, roles, vector_dims)``,
+        omitting delete-only trios.
+
+    Raises:
+        ValueError: When any trio's map column exceeds ``config.max_keys_per_map`` distinct keys.
     """
     if not trios:
         return {}
@@ -178,6 +202,9 @@ def derive_bulk_schemas(
     is_delete: Any = F.col(OP_COL).isin(DELETE_OP_VALUES)
     upserts: DataFrame = collapsed.where(~is_delete)
 
+    appendable: set[tuple[str, str, str]] = {
+        (row["org_id"], row["tenant_id"], row["namespace"]) for row in upserts.select(*routing).distinct().collect()
+    }
     columns: set[str] = set(filtered.columns)
     vector_dims_rows: list[Any] = []
     if "vectors" in columns:
@@ -211,6 +238,15 @@ def derive_bulk_schemas(
     schemas: dict[tuple[str, str, str], tuple[pa.Schema, dict[str, str], dict[str, int]]] = {}
     for org, tenant, namespace, _ in trios:
         trio = (org, tenant, namespace)
+        if trio not in appendable:
+            logger.info("bulk-append trio %s has only delete ops after collapse; leaving it to the merge path", trio)
+            continue
+        label: str = f"{org}/{tenant}/{namespace}"
+        enforce_map_key_bound(f"vectors[{label}]", len(vector_dims_by_trio.get(trio, {})), config.max_keys_per_map)
+        enforce_map_key_bound(f"texts[{label}]", len(text_keys_by_trio.get(trio, set())), config.max_keys_per_map)
+        enforce_map_key_bound(
+            f"metadata[{label}]", len(metadata_keys_by_trio.get(trio, set())), config.max_keys_per_map
+        )
         schema, roles, vector_dims = assemble_canonical_schema(
             base_fields,
             vector_dims_by_trio.get(trio, {}),
@@ -390,7 +426,7 @@ def run_bulk_append(
     schemas: dict[tuple[str, str, str], tuple[pa.Schema, dict[str, str], dict[str, int]]],
     config: ETLConfig,
     telemetry: Telemetry,
-) -> list[tuple[str, str, str, int, lance.Transaction]]:
+) -> list[tuple[str, str, str, int, lance.Transaction | None, int]]:
     """Fan parallel ``write_fragments`` appends across the eligible trios' key-hash sub-buckets.
 
     Collapses and salt-shuffles the eligible-trio slice exactly as the merge path does, then runs
@@ -405,6 +441,14 @@ def run_bulk_append(
     transaction, which is collected to the driver and unpickled for the single per-trio
     :meth:`lance.LanceDataset.commit_batch`.
 
+    Failure isolation: a trio whose append raises on its own already-materialised groups is caught
+    per trio, metered as ``dataset.bulk_group_failed``, and reported back as a ``failed`` marker row
+    instead of failing the whole run. The caller must drop every transaction of a failed trio, so
+    nothing partial is ever committed and the still-empty dataset is retried by a rerun. A failure
+    that originates in advancing the shared batch stream (not in one trio's processing) fails the
+    whole task instead, so the partition's remaining trios are never silently dropped
+    (:func:`append_partition_trios`).
+
     Args:
         filtered: The null-routing-filtered increment, before collapse, carrying the op column.
         eligible_trios: The trios (with sub-bucket counts) that stayed empty after bootstrap.
@@ -414,8 +458,9 @@ def run_bulk_append(
             builds its own facade for the per-partition spans and distributions.
 
     Returns:
-        One ``(org_id, tenant_id, namespace, appended, transaction)`` per appending task, empty
-        when nothing was eligible or appended.
+        One ``(org_id, tenant_id, namespace, appended, transaction, failed)`` per appending or
+        failing task, where ``transaction`` is None for a failed trio. Empty when nothing was
+        eligible or appended.
     """
     if not eligible_trios:
         return []
@@ -463,10 +508,7 @@ def run_bulk_append(
                 groups: Iterator[tuple[tuple[Any, ...], pa.Table]] = stream_routing_groups(
                     chained, routing, config.merge_batch_bytes, counters
                 )
-                for trio_key, trio_groups in itertools.groupby(groups, key=lambda item: item[0]):
-                    appended: int = append_one_trio(trio_key, trio_groups, broadcast_schemas, config, results)
-                    if appended:
-                        executor_telemetry.distribution("dataset.bulk_appended", appended)
+                append_partition_trios(groups, broadcast_schemas, config, executor_telemetry, results)
             except Exception:
                 executor_telemetry.error("etl bulk partition failed")
                 raise
@@ -475,9 +517,90 @@ def run_bulk_append(
 
     collected: list[Any] = routed.mapInArrow(append_partition, schema=output_ddl).collect()
     return [
-        (row["org_id"], row["tenant_id"], row["namespace"], int(row["appended"]), pickle.loads(bytes(row["txn"])))
+        (
+            row["org_id"],
+            row["tenant_id"],
+            row["namespace"],
+            int(row["appended"]),
+            pickle.loads(bytes(row["txn"])) if row["txn"] is not None else None,
+            int(row["failed"] or 0),
+        )
         for row in collected
     ]
+
+
+def append_partition_trios(
+    groups: Iterator[tuple[tuple[Any, ...], pa.Table]],
+    schemas: dict[tuple[str, str, str], tuple[pa.Schema, dict[str, str], dict[str, int]]],
+    config: ETLConfig,
+    telemetry: Telemetry,
+    results: list[tuple[Any, ...]],
+) -> None:
+    """Append each contiguous trio run from one partition's shared routing-group stream.
+
+    Groups the shared stream into contiguous per-trio runs and appends each through
+    :func:`append_one_trio`, isolating a failure that is confined to processing one trio's
+    already-materialised groups as a ``failed`` marker row while letting a failure that originates in
+    advancing the shared stream itself fail the whole task.
+
+    This mirrors the merge path's group-outside-the-try contract (see
+    :meth:`lance_etl.etl.job.IcebergToLanceETL.merge_dataframe`). The merge path materialises each
+    group fully in the ``for`` header, outside the per-group ``try``, so a shared-stream failure
+    escapes the per-group handler. This path cannot, because :func:`append_one_trio` streams the
+    trio's groups lazily into ``write_fragments`` inside the ``try``. Instead the shared stream is
+    wrapped in a guarded generator that records the exception it raises while advancing before
+    re-raising it. The per-trio handler then re-raises a recorded shared-stream failure (failing the
+    task, so the partition's remaining trios are never silently dropped and nothing partial commits)
+    and marks only the current trio failed for a genuine per-trio processing failure. A post-return
+    check re-raises a recorded shared-stream failure even in the unlikely event ``write_fragments``
+    consumed the raising reader without surfacing the exception.
+
+    Args:
+        groups: The shared ``(key, table)`` routing-group stream for this partition.
+        schemas: The per-trio canonical schemas, roles, and vector dimensions.
+        config: ETL configuration.
+        telemetry: The executor telemetry facade.
+        results: Mutable accumulator receiving one stats row per appending or failing trio.
+    """
+    stream_error: list[BaseException | None] = [None]
+
+    def guarded(source: Iterator[tuple[tuple[Any, ...], pa.Table]]) -> Iterator[tuple[tuple[Any, ...], pa.Table]]:
+        """Yield the shared stream's groups, recording an advancement failure before re-raising it.
+
+        Args:
+            source: The shared routing-group generator.
+
+        Yields:
+            Each ``(key, table)`` group from the shared stream.
+
+        Raises:
+            Exception: Whatever the shared stream raised while advancing, after recording it in
+                ``stream_error`` so the per-trio handler can tell it apart from a per-trio failure.
+        """
+        while True:
+            try:
+                item: tuple[tuple[Any, ...], pa.Table] = next(source)
+            except StopIteration:
+                return
+            except Exception as error:
+                stream_error[0] = error
+                raise
+            yield item
+
+    for trio_key, trio_groups in itertools.groupby(guarded(groups), key=lambda item: item[0]):
+        try:
+            appended: int = append_one_trio(trio_key, trio_groups, schemas, config, results)
+            if stream_error[0] is not None:
+                raise stream_error[0]
+            if appended:
+                telemetry.distribution("dataset.bulk_appended", appended)
+        except Exception:
+            if stream_error[0] is not None:
+                raise
+            telemetry.incr("dataset.bulk_group_failed")
+            telemetry.error("etl bulk trio failed")
+            logger.exception("bulk append failed for trio %s; continuing with remaining trios", trio_key)
+            results.append((trio_key[0], trio_key[1], trio_key[2], 0, None, 1))
 
 
 def append_one_trio(
@@ -499,7 +622,7 @@ def append_one_trio(
         trio_groups: The ``(key, table)`` groups belonging to this trio.
         schemas: The per-trio canonical schemas, roles, and vector dimensions.
         config: ETL configuration.
-        results: Mutable accumulator that receives one ``(org, tenant, namespace, appended, txn)``
+        results: Mutable accumulator that receives one ``(org, tenant, namespace, appended, txn, 0)``
             row when the trio appended any row.
 
     Returns:
@@ -543,7 +666,7 @@ def append_one_trio(
     )
     if appended[0] == 0:
         return 0
-    results.append((*trio, appended[0], pickle.dumps(transaction)))
+    results.append((*trio, appended[0], pickle.dumps(transaction), 0))
     return appended[0]
 
 
@@ -557,15 +680,24 @@ def commit_bulk_transactions(
     """Commit one trio's append transactions as a single ``commit_batch`` and persist its roles.
 
     Merges every task's append transaction for the trio into ONE physical append commit through
-    :func:`lance_etl.telemetry.commit_with_retries`, then merges the trio's pivoted column roles
-    into its ``lance-etl.columns`` config so the indexer sees the backfilled columns. Returns the
-    total rows the merged commit added, read back from the merged transaction's fragments.
+    :func:`lance_etl.telemetry.commit_with_retries` with a ZERO retry budget, then merges the
+    trio's pivoted column roles into its ``lance-etl.columns`` config so the indexer sees the
+    backfilled columns. Returns the total rows the merged commit added, read back from the merged
+    transaction's fragments.
 
-    A raw append is not idempotent the way ``merge_insert`` is: if the outer retry ever re-ran the
-    action after a hard commit conflict it would re-commit the same fragments and duplicate rows.
-    The target is a brand-new empty dataset with no concurrent ETL writer and ``commit_batch`` runs
-    its own inner rebase retry, so an ordinary append rebases inside the inner loop and the outer
-    wrapper covers only the non-retryable-conflict variant the repo mandates wrapping.
+    Why zero retries: a raw append is not idempotent the way ``merge_insert`` is. If the outer
+    wrapper re-ran the action after an ambiguous commit outcome (a CAS whose success the client
+    never observed), it would re-commit the same fragments and silently duplicate every row.
+    ``commit_batch`` already runs lance's inner rebase retry for ordinary retryable conflicts, so
+    the single outer attempt only converts an ambiguous or hard-conflict outcome into a LOUD
+    failure. The designed recovery is the rerun: ``plan_bulk_append``'s emptiness check demotes a
+    trio whose commit actually landed to the idempotent merge path, and retries the bulk path for
+    a trio whose commit truly failed (ADR 0034).
+
+    After the commit, the dataset's ``count_rows`` is asserted equal to the merged transaction's
+    fragment row total. The target was bootstrapped empty and no concurrent ETL writer is assumed
+    during the append window (ADR 0034), so any excess row is a duplicate append. A mismatch
+    increments ``dataset.bulk_rowcount_mismatch`` and raises.
 
     Args:
         config: ETL configuration supplying storage options and retry knobs.
@@ -576,6 +708,9 @@ def commit_bulk_transactions(
 
     Returns:
         The total rows appended by the merged commit, or zero when there is nothing to commit.
+
+    Raises:
+        ValueError: When the post-commit row count differs from the committed fragment total.
     """
     if not transactions:
         return 0
@@ -587,9 +722,18 @@ def commit_bulk_transactions(
     with telemetry.timed("dataset.bulk_commit_ms"):
         result: dict[str, Any] = commit_with_retries(
             action,
-            config.conflict_retries,
+            0,
             config.retry_backoff_seconds,
             on_conflict=lambda: telemetry.incr("dataset.bulk_commit_conflict_retries"),
+        )
+    merged: lance.Transaction = result["merged"]
+    expected: int = sum(fragment.num_rows for fragment in merged.operation.fragments)
+    actual: int = lance.dataset(uri, storage_options=config.storage_options).count_rows()
+    if actual != expected:
+        telemetry.incr("dataset.bulk_rowcount_mismatch")
+        raise ValueError(
+            f"bulk append to {uri} committed {expected} rows but the dataset holds {actual}: "
+            "a duplicate or concurrent append reached this freshly bootstrapped dataset"
         )
     merge_column_roles(
         uri,
@@ -599,5 +743,4 @@ def commit_bulk_transactions(
         config.retry_backoff_seconds,
         on_conflict=lambda: telemetry.incr("dataset.bulk_commit_conflict_retries"),
     )
-    merged: lance.Transaction = result["merged"]
-    return sum(fragment.num_rows for fragment in merged.operation.fragments)
+    return expected

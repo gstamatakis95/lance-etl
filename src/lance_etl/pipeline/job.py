@@ -59,6 +59,10 @@ class PipelineConfig:
             disables the stamp phase.
         serve_tag: When ``True`` and ``tag_stamp`` is set, advance the ``HEAD`` tag to the
             dataset's latest version after stamping the interval tag.
+        tag_cadence_seconds: The scheduling cadence at which interval tags are stamped (hourly by
+            convention), used to size the tag-retention window for the cleanup-horizon check.
+        cleanup_slack_seconds: Extra safety margin the cleanup horizon must clear beyond the
+            tag-retention window, protecting a replica mid-scan on a just-unpinned version.
     """
 
     telemetry: TelemetryConfig
@@ -68,19 +72,82 @@ class PipelineConfig:
     tag_keep_last: int | None = 48
     tag_stamp: str | None = None
     serve_tag: bool = False
+    tag_cadence_seconds: int = 3600
+    cleanup_slack_seconds: int = 3600
+
+    def validate_cleanup_horizon(self) -> None:
+        """Require the cleanup horizon to clear the tag-retention window plus slack.
+
+        Interval tags pin the versions they point at, so the oldest still-tagged version is about
+        ``tag_keep_last * tag_cadence_seconds`` old. The same run that prunes the oldest interval
+        tag unpins its version, and version cleanup must not be able to reclaim that version in the
+        same breath while a replica pinned to the tag is mid-scan. The horizon therefore has to
+        exceed the retention window by at least ``cleanup_slack_seconds`` (ADR 0013).
+
+        Raises:
+            ValueError: If ``cleanup_older_than_seconds`` does not exceed
+                ``tag_keep_last * tag_cadence_seconds + cleanup_slack_seconds``.
+        """
+        horizon: int | None = self.maintenance.cleanup_older_than_seconds
+        if self.tag_keep_last is None or horizon is None:
+            return
+        window: int = self.tag_keep_last * self.tag_cadence_seconds + self.cleanup_slack_seconds
+        if horizon <= window:
+            raise ValueError(
+                f"cleanup_older_than_seconds={horizon} must exceed the interval-tag retention window plus slack "
+                f"({self.tag_keep_last} tags * {self.tag_cadence_seconds}s + {self.cleanup_slack_seconds}s = "
+                f"{window}s); otherwise the run that prunes the oldest tag can reclaim the version it just "
+                "unpinned while a replica mid-scan still holds it (ADR 0013)"
+            )
+
+    def validate_cluster_serving(self) -> None:
+        """Require working serve-by-tag promotion when the clustered rewrite is enabled.
+
+        A clustered rewrite's Overwrite commits a generation whose indexes are rebuilt later
+        (vector in the same maintenance phase, scalar and FTS only in the following index phase),
+        so a serve-LATEST reader would see the unindexed generation in between. A fleet running
+        clustered rewrites must therefore serve by tag, and within this pipeline promotion goes
+        through the stamp phase, which advances ``HEAD`` only after the index phase and only for
+        datasets with no error marker (ADR 0041). Promotion only actually happens when BOTH
+        ``serve_tag`` is set AND ``tag_stamp`` names an interval tag: :meth:`PipelineJob.stamp_phase`
+        returns early when ``tag_stamp`` is ``None``, so ``serve_tag=True`` with ``tag_stamp=None``
+        never advances ``HEAD`` and the clustered generation is never served. Both are therefore
+        required together.
+
+        Raises:
+            ValueError: If ``maintenance.cluster_rewrite`` is set without ``serve_tag`` or without
+                ``tag_stamp``, either of which leaves the clustered generation unpromotable.
+        """
+        if self.maintenance.cluster_rewrite and (not self.serve_tag or self.tag_stamp is None):
+            raise ValueError(
+                "cluster_rewrite requires serve_tag=True and tag_stamp set: the Overwrite exposes an unindexed "
+                "generation to serve-LATEST readers until the index phase rebuilds every index, and the stamp "
+                "phase only advances HEAD when it also writes an interval tag, so clustered-rewrite fleets must "
+                "serve by tag and promote through the stamp phase (ADR 0041)"
+            )
 
     def __post_init__(self) -> None:
-        """Push cross-cutting settings into the composed sub-configurations.
+        """Push cross-cutting settings into the composed sub-configurations, then validate.
 
         Copies ``telemetry`` and ``storage_options`` from this config into both
         ``maintenance`` and ``indexing`` so every phase shares the same identity and
         object-store credentials without requiring callers to set them on each sub-config
-        individually.
+        individually. Then applies the cross-config safety checks
+        (:meth:`validate_cleanup_horizon`, :meth:`validate_cluster_serving`), which need both this
+        config's tag settings and the composed maintenance config, so they live here rather than on
+        either sub-config.
+
+        Raises:
+            ValueError: If the cleanup horizon does not clear the tag-retention window plus slack,
+                or if the clustered rewrite is enabled without a working serve-by-tag promotion
+                (both ``serve_tag`` and ``tag_stamp``).
         """
         self.maintenance.telemetry = self.telemetry
         self.maintenance.storage_options = self.storage_options
         self.indexing.telemetry = self.telemetry
         self.indexing.storage_options = self.storage_options
+        self.validate_cleanup_horizon()
+        self.validate_cluster_serving()
 
 
 def stamp_eligible(index_stats: dict[str, Any]) -> bool:
@@ -248,7 +315,10 @@ class PipelineJob:
             - ``tag_stamp``: the interval tag name that was written, or ``None``.
             - ``counts``: summary counts with keys ``total``, ``pruned_tags``,
               ``maintenance_skipped``, ``index_skipped``, ``stamped``, and ``failed`` (datasets
-              that failed compaction or indexing in isolation this run).
+              that failed any phase in isolation this run — prune, compaction, indexing, or
+              stamping). Prune and stamp failures count too because a dataset whose tag prune or
+              HEAD flip failed serves stale until retried, so the run must exit non-zero for the
+              operator alert rather than reporting success.
         """
         config: PipelineConfig = self.config
         driver_telemetry: Telemetry = Telemetry.create(config.telemetry)
@@ -284,10 +354,17 @@ class PipelineJob:
 
             maintenance_skipped: int = sum(1 for r in maintenance_results if r.get("skipped"))
             index_skipped: int = sum(1 for r in index_results if r.get("skipped"))
+            prune_by_uri: dict[str, dict[str, Any]] = {r["uri"]: r for r in prune_results}
+            stamp_by_uri: dict[str, dict[str, Any]] = {r["uri"]: r for r in stamp_results}
+            prune_failed: int = sum(1 for r in prune_results if dataset_result_failed(r))
+            stamp_failed: int = sum(1 for r in stamp_results if dataset_result_failed(r))
             failed: int = sum(
                 1
                 for u in uris
-                if dataset_result_failed(maint_by_uri.get(u, {})) or dataset_result_failed(idx_by_uri.get(u, {}))
+                if dataset_result_failed(maint_by_uri.get(u, {}))
+                or dataset_result_failed(idx_by_uri.get(u, {}))
+                or dataset_result_failed(prune_by_uri.get(u, {}))
+                or dataset_result_failed(stamp_by_uri.get(u, {}))
             )
 
             counts: dict[str, int] = {
@@ -303,6 +380,8 @@ class PipelineJob:
             run_span.set_tag("failed_datasets", failed)
             driver_telemetry.gauge("run.total_datasets", len(uris))
             driver_telemetry.gauge("run.datasets_failed", failed)
+            driver_telemetry.gauge("run.prune_failed_datasets", prune_failed)
+            driver_telemetry.gauge("run.stamp_failed_datasets", stamp_failed)
             logger.info(
                 "pipeline run complete: %d datasets, %d pruned tags, %d maintenance-skipped, %d index-skipped, "
                 "%d stamped, %d failed",

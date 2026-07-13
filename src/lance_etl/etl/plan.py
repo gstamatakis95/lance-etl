@@ -18,7 +18,7 @@ Imports only from :mod:`lance_etl.etl.pivot` (``KEY_COL``, ``ROUTING_COLS``, and
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from pyspark import StorageLevel
@@ -62,11 +62,16 @@ def routing_null_predicate() -> Column:
 def collapse(source: DataFrame, config: ETLConfig) -> DataFrame:
     """Reduce to the last-write-wins terminal event per (routing key, vector id).
 
-    Orders by ``config.ts_col`` descending NULLS LAST; ties broken by ``xxhash64`` over all
-    non-MapType columns ascending (MapType columns cannot be hashed by Spark). Shared by the
-    merge path (:meth:`lance_etl.etl.job.IcebergToLanceETL.collapse`) and the bulk-append path
-    (:func:`lance_etl.etl.bulk.run_bulk_append`) so the two can never disagree on which row
-    survives per key, which is the invariant that keeps bulk output identical to merge output.
+    Orders by ``config.ts_col`` descending NULLS LAST; ties broken by ``xxhash64`` ascending over
+    all non-MapType columns AND a deterministic JSON projection of every MapType column. Spark
+    cannot hash a map directly, so each map is first normalised to ``to_json(array_sort(map_entries))``
+    — a canonical string that is invariant to the non-deterministic map iteration order. Folding the
+    map payloads into the tie-break means two rows tying on ``(vector_id, ts)`` but differing only in
+    their map payloads get a stable winner instead of an arbitrary per-run one, so a replayed window
+    converges on the same stored payload rather than flipping it. Shared by the merge path
+    (:meth:`lance_etl.etl.job.IcebergToLanceETL.collapse`) and the bulk-append path
+    (:func:`lance_etl.etl.bulk.run_bulk_append`) so the two can never disagree on which row survives
+    per key, which is the invariant that keeps bulk output identical to merge output.
 
     Args:
         source: The source DataFrame with map columns still intact.
@@ -77,10 +82,15 @@ def collapse(source: DataFrame, config: ETLConfig) -> DataFrame:
     """
     partition_by: list[Column] = [F.col(c) for c in ROUTING_COLS]
     partition_by.append(F.col(KEY_COL))
-    non_map_cols: list[str] = [f.name for f in source.schema.fields if not isinstance(f.dataType, MapType)]
+    tie_break: list[Column] = []
+    for schema_field in source.schema.fields:
+        if isinstance(schema_field.dataType, MapType):
+            tie_break.append(F.to_json(F.array_sort(F.map_entries(F.col(schema_field.name)))))
+        else:
+            tie_break.append(F.col(schema_field.name))
     window: WindowSpec = Window.partitionBy(*partition_by).orderBy(
         F.col(config.ts_col).desc_nulls_last(),
-        F.xxhash64(*[F.col(c) for c in non_map_cols]).asc(),
+        F.xxhash64(*tie_break).asc(),
     )
     return source.withColumn("row_num", F.row_number().over(window)).where(F.col("row_num") == 1).drop("row_num")
 
@@ -139,6 +149,10 @@ class RoutingPlan:
         null_routing_rows: Rows dropped because a routing column was NULL, counted in the same
             single ``groupBy`` scan that sizes the plan (carried here to avoid a second scan or a
             fragile ``Observation``).
+        big_trio_rows: Raw per-trio row count for every big trio, keyed by
+            ``(org_id, tenant_id, namespace)``. The merge sub-bucket count ``K`` in ``big_trios`` is
+            capped at ``max_buckets_per_dataset``, so it cannot recover the raw count; the bulk-append
+            path reads this instead to size its far larger ``max_bulk_tasks_per_dataset`` fan-out.
     """
 
     total_rows: int
@@ -146,6 +160,7 @@ class RoutingPlan:
     big_trios: list[tuple[str, str, str, int]]
     num_partitions: int
     null_routing_rows: int
+    big_trio_rows: dict[tuple[str, str, str], int] = field(default_factory=dict)
 
     @property
     def total_buckets(self) -> int:
@@ -202,6 +217,12 @@ def compute_routing_plan(source: DataFrame, config: ETLConfig) -> RoutingPlan:
             for row in big_rows
         ]
         big_trios = [entry for entry in big_trios if entry[3] > 1]
+        kept: set[tuple[str, str, str]] = {(o, t, n) for o, t, n, _ in big_trios}
+        big_trio_rows: dict[tuple[str, str, str], int] = {
+            (row["org_id"], row["tenant_id"], row["namespace"]): int(row["count"])
+            for row in big_rows
+            if (row["org_id"], row["tenant_id"], row["namespace"]) in kept
+        }
     finally:
         counts.unpersist()
     return RoutingPlan(
@@ -210,6 +231,7 @@ def compute_routing_plan(source: DataFrame, config: ETLConfig) -> RoutingPlan:
         big_trios=big_trios,
         num_partitions=shuffle_partition_count(total_rows, trio_count, config),
         null_routing_rows=null_routing_rows,
+        big_trio_rows=big_trio_rows,
     )
 
 

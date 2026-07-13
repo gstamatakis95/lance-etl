@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import Iterator
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -20,13 +21,14 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StringType, StructField, StructType
 
-from lance_etl.etl import ETLConfig
+from lance_etl.etl import ETLConfig, plan_bulk_append
 from lance_etl.etl.plan import (
     MAX_SHUFFLE_PARTITIONS,
     SALT_BUCKETS_COL,
     RoutingPlan,
     apply_salted_shuffle,
     bucket_count,
+    collapse,
     compute_routing_plan,
     shuffle_partition_count,
 )
@@ -116,6 +118,51 @@ class TestRoutingPlanTotalBuckets:
             null_routing_rows=0,
         )
         assert plan.total_buckets == 15
+
+
+class TestPlanBulkAppendSizing:
+    """plan_bulk_append sizes the append fan-out from raw row counts, not the merge K.
+
+    The merge sub-bucket count is capped at ``max_buckets_per_dataset`` (default 32) to bound
+    commit contention, but appends carry none, so the bulk fan-out recomputes from the trio's raw
+    row count in ``RoutingPlan.big_trio_rows`` against the same ``bucket_rows`` grain, capped at
+    ``max_bulk_tasks_per_dataset`` (default 1024). Datasets under ``tmp_path`` are absent, so every
+    big trio is bulk-eligible.
+    """
+
+    def make_plan(self, rows: int, merge_k: int = 32) -> RoutingPlan:
+        """Build a single-big-trio plan carrying the given raw row count.
+
+        Args:
+            rows: The trio's raw row count for ``big_trio_rows``.
+            merge_k: The capped merge sub-bucket count carried in ``big_trios``.
+
+        Returns:
+            The routing plan for one big trio.
+        """
+        return RoutingPlan(
+            total_rows=rows,
+            trio_count=1,
+            big_trios=[("o1", "t1", "n1", merge_k)],
+            num_partitions=512,
+            null_routing_rows=0,
+            big_trio_rows={("o1", "t1", "n1"): rows},
+        )
+
+    def test_large_trio_exceeds_the_merge_writer_cap(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
+        """A 1B-row backfill fans out across ceil(1e9/2e6)=500 append tasks, far above the merge cap of 32."""
+        config: ETLConfig = plan_config(tmp_path, telemetry_config)
+        eligible: list[tuple[str, str, str, int]] = plan_bulk_append(self.make_plan(1_000_000_000), config)
+        assert eligible == [("o1", "t1", "n1", 500)]
+        assert eligible[0][3] > config.max_buckets_per_dataset
+
+    def test_bulk_tasks_cap_at_max_bulk_tasks_per_dataset(
+        self, tmp_path: Path, telemetry_config: TelemetryConfig
+    ) -> None:
+        """A trio needing more tasks than the cap is clamped to max_bulk_tasks_per_dataset."""
+        config: ETLConfig = plan_config(tmp_path, telemetry_config)
+        eligible: list[tuple[str, str, str, int]] = plan_bulk_append(self.make_plan(3_000_000_000), config)
+        assert eligible == [("o1", "t1", "n1", config.max_bulk_tasks_per_dataset)]
 
 
 @pytest.fixture(scope="module")
@@ -232,6 +279,50 @@ class TestComputeRoutingPlan:
         assert plan.trio_count == 0
         assert plan.null_routing_rows == 0
         assert plan.num_partitions >= 1
+
+
+@pytest.mark.integration
+class TestCollapseDeterminism:
+    """collapse breaks (key, ts) ties deterministically, including over map payloads.
+
+    Two rows tying on ``(vector_id, event_timestamp)`` but differing only in a map column must get
+    a stable winner: the tie-break hashes a canonical JSON projection of every map column
+    (``to_json(array_sort(map_entries))``), so a replayed window converges on the same stored
+    payload instead of flipping it per run.
+    """
+
+    COLLAPSE_DDL: str = (
+        "org_id string, tenant_id string, namespace string, vector_id string, op string, "
+        "event_timestamp timestamp, metadata map<string, string>"
+    )
+
+    def test_map_payload_tie_break_is_replay_stable(
+        self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
+    ) -> None:
+        """Replaying the tied rows in any order always yields the same surviving map payload."""
+        tied_ts: datetime = datetime(2026, 7, 5, 12, 0, 0)
+        row_a: tuple = ("o1", "t1", "n1", "k1", "insert", tied_ts, {"m": "payload-a"})
+        row_b: tuple = ("o1", "t1", "n1", "k1", "insert", tied_ts, {"m": "payload-b"})
+        config: ETLConfig = plan_config(tmp_path, telemetry_config)
+        winners: set[str] = set()
+        for ordering in ([row_a, row_b], [row_b, row_a], [row_a, row_b]):
+            frame: DataFrame = spark.createDataFrame(ordering, schema=self.COLLAPSE_DDL)
+            survivors: list = collapse(frame, config).collect()
+            assert len(survivors) == 1
+            winners.add(survivors[0]["metadata"]["m"])
+        assert len(winners) == 1, f"tie-break winner flipped across replays: {winners}"
+
+    def test_distinct_timestamps_still_pick_the_newest(
+        self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
+    ) -> None:
+        """The map-folding tie-break never overrides the primary newest-timestamp ordering."""
+        older: tuple = ("o1", "t1", "n1", "k1", "insert", datetime(2026, 7, 5, 11, 0, 0), {"m": "old"})
+        newer: tuple = ("o1", "t1", "n1", "k1", "insert", datetime(2026, 7, 5, 12, 0, 0), {"m": "new"})
+        config: ETLConfig = plan_config(tmp_path, telemetry_config)
+        frame: DataFrame = spark.createDataFrame([older, newer], schema=self.COLLAPSE_DDL)
+        survivors: list = collapse(frame, config).collect()
+        assert len(survivors) == 1
+        assert survivors[0]["metadata"]["m"] == "new"
 
 
 @pytest.mark.integration

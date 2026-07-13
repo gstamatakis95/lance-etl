@@ -3,7 +3,7 @@ name = "lance-etl"
 version = "0.2.0"
 requires-python = ">=3.12"
 dependencies = [
-    "pylance>=8.0.0",
+    "pylance>=8.0.0,<9",
     "pyarrow>=23",
     "pyspark>=4.1",
     "pandas>=2.2.0",
@@ -29,6 +29,7 @@ packages = ["src/lance_etl"]
 [dependency-groups]
 dev = ["pytest", "ruff"]
 bench = ["matplotlib", "grpcio", "grpcio-tools", "opentelemetry-proto"]
+airflow = ["apache-airflow>=3.3.0", "apache-airflow-providers-apache-spark>=6.2.0"]
 
 [tool.ruff]
 line-length = 120

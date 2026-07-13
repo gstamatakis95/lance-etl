@@ -231,6 +231,13 @@ def build_vector_segment(
     committed ``execute`` path, never here, so existing coverage is preserved and
     :func:`commit_segments` publishes the new segments as a delta.
 
+    Every tunable is spelled as an explicit named keyword below, never splatted from a dict.
+    ``num_bits`` in particular is not a formal parameter of ``create_index_uncommitted`` in
+    pylance 8.0.0 — the binding reads it from ``**kwargs`` by exact name — so a misspelled key
+    would silently no-op inside lance. The keyword names here (``num_partitions``, ``num_bits``,
+    ``ivf_centroids``, ``rabitq_model``, ``fragment_ids``) are verified against the pylance 8.0.0
+    binding.
+
     Args:
         dataset: A dataset handle pinned to the build version.
         fragment_ids: The fragment ids for this shard.

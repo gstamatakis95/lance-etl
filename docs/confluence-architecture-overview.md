@@ -454,7 +454,7 @@ The same idea recurs across the data plane: classify each dataset by fragment co
 ### Vector indexing: IVF_RQ with RaBitQ
 
 - IVF partitions data into clusters. RaBitQ quantizes vectors so the index is compact and fast.
-- The IVF partition count follows a size-aware policy: `clamp(round(sqrt(rows)), 16, 4096)` unless configured.
+- The IVF partition count follows a size-aware policy: `clamp(rows // 8192, 16, 32768)` unless configured.
 - Vector indexing is skipped entirely below a row floor where a flat KNN scan is sufficient.
 - Centroids are retrained (through the full rebuild path) once a dataset grows past `RETRAIN_GROWTH_FACTOR` (4x) its trained row count, so reused centroids cannot go stale forever.
 

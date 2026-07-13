@@ -54,8 +54,7 @@ from lance_etl.indexing.segments import (
     serialize_segment,
     split_evenly,
 )
-from lance_etl.maintenance.tools import update_serving_tag
-from lance_etl.telemetry import Telemetry, commit_with_retries
+from lance_etl.telemetry import DEFAULT_COMMIT_RETRIES, Telemetry, commit_with_retries
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -89,6 +88,141 @@ REWRITE_OK: str = "ok"
 
 REWRITE_ERROR: str = "error"
 """Tag on a collected rewrite-shuffle result carrying a per-dataset failure message."""
+
+CLUSTER_GENERATION_KEY: str = "lance-etl.cluster_generation"
+"""Dataset config KV key recording the fingerprint of the last clustered generation, used to skip
+re-clustering a dataset that has not been written to since it was clustered (ADR 0041). The
+fingerprint is the sorted list of data-fragment ids plus the logical row count: any write that
+replaces or adds fragments (append, merge rewrite, compaction) mints new fragment ids and any
+delete lowers the row count, so either kind of change invalidates the match."""
+
+
+def release_broadcast(handle: Any) -> None:
+    """Release a Spark broadcast's driver and executor copies once its phase has collected.
+
+    The three clustered-rewrite flat jobs (histogram, rewrite, index rebuild) each broadcast the
+    per-dataset centroid bytes, so a fleet-wide run would otherwise pin three generations of the
+    (potentially ~100 MB per dataset) centroid maps on the driver heap at once. Destroying each
+    broadcast right after its job's ``collect`` returns bounds the driver footprint to one live
+    generation. The in-process broadcast double used by the unit tests exposes no ``destroy``
+    method, so the call is skipped when the handle lacks one rather than requiring a test-only
+    shim on the production path.
+
+    Args:
+        handle: The Spark broadcast handle to release, or a test double without ``destroy``.
+    """
+    destroy = getattr(handle, "destroy", None)
+    if destroy is not None:
+        destroy()
+
+
+def fragment_id_signature(dataset: lance.LanceDataset) -> list[int]:
+    """Return a dataset's data-fragment ids as a sorted list, read from the open manifest.
+
+    The sorted id list is the identity half of the clustered-generation fingerprint. Fragment ids
+    are minted monotonically and never reused, so any write that adds, replaces, or compacts
+    fragments changes this list even when the fragment count is preserved (a count-preserving merge
+    rewrite drops one fragment and mints one new id). Reading ``get_fragments`` costs no additional
+    object-store I/O over the already-open manifest.
+
+    Args:
+        dataset: The open dataset to inspect.
+
+    Returns:
+        The dataset's fragment ids in ascending order.
+    """
+    return sorted(fragment.fragment_id for fragment in dataset.get_fragments())
+
+
+def load_cluster_generation(dataset: lance.LanceDataset) -> dict[str, Any] | None:
+    """Read the stored clustered-generation fingerprint from a dataset's config KV.
+
+    The config KV is already in-memory from the open manifest, so this performs no additional
+    object-store I/O. Returns ``None`` when the key is absent or its value cannot be parsed. An
+    older-format value that lacks ``fragment_ids`` parses to an empty signature, which no live
+    dataset matches, so it simply re-enables clustering once rather than raising.
+
+    Args:
+        dataset: The open dataset whose config to read.
+
+    Returns:
+        The parsed ``{"fragment_ids", "num_rows"}`` fingerprint, or ``None`` when absent or
+        malformed.
+    """
+    raw: str | None = dataset.config().get(CLUSTER_GENERATION_KEY)
+    if raw is None:
+        return None
+    try:
+        parsed: dict[str, Any] = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("cluster: malformed cluster generation config on %s; treating as absent", dataset.uri)
+        return None
+    return {
+        "fragment_ids": [int(value) for value in parsed.get("fragment_ids", [])],
+        "num_rows": int(parsed.get("num_rows", -1)),
+    }
+
+
+def cluster_generation_skip_reason(dataset: lance.LanceDataset) -> str | None:
+    """Return a skip reason when a dataset was already clustered and has not been written since.
+
+    The clustered-generation fingerprint (the sorted fragment-id list and the logical row count) is
+    stamped at overwrite-commit time and survives the later index-rebuild and cleanup commits,
+    which add no data fragments and change no logical row count. The two halves catch disjoint
+    kinds of write: a fragment-replacing write (append, merge rewrite, compaction) mints new
+    fragment ids so the id list diverges even when the count is unchanged, while a pure delete
+    lowers the row count without touching the ids. Both reads come from the already-open manifest,
+    so the check costs no object-store I/O. TTL is deliberately not run before this check, so on a
+    clustered fleet with TTL active an idle already-clustered dataset defers time-based expiry
+    until a write re-enables it.
+
+    Args:
+        dataset: The open dataset to inspect.
+
+    Returns:
+        A human-readable skip reason when the dataset is already clustered and unchanged, or
+        ``None`` when it must be (re-)clustered.
+    """
+    stored: dict[str, Any] | None = load_cluster_generation(dataset)
+    if stored is None:
+        return None
+    current_ids: list[int] = fragment_id_signature(dataset)
+    current_rows: int = dataset.count_rows()
+    if stored["fragment_ids"] == current_ids and stored["num_rows"] == current_rows:
+        return f"already clustered at {len(current_ids)} fragments and {current_rows} rows; no writes since"
+    return None
+
+
+def stamp_cluster_generation(uri: str, config: MaintenanceConfig, telemetry: Telemetry) -> None:
+    """Stamp the clustered-generation fingerprint into a dataset's config KV.
+
+    Mirrors :func:`~lance_etl.indexing.optimize.write_vector_config`: the ``update_config`` write
+    surfaces conflicts as ``OSError`` through the pyo3 binding, so it is wrapped in
+    :func:`~lance_etl.telemetry.commit_with_retries`, which re-opens the dataset at the latest
+    version before each attempt. The fingerprint (the freshly clustered generation's sorted
+    fragment-id list and logical row count) is read from the same re-opened handle each attempt, so
+    it always reflects the version it is stamped onto, and it lets the next clustered-rewrite run
+    skip a dataset that has not been written to since it was clustered (ADR 0041).
+
+    Args:
+        uri: Dataset URI.
+        config: Maintenance configuration supplying the retry budget and backoff.
+        telemetry: Telemetry facade for the current process.
+    """
+
+    def action() -> None:
+        """Capture the fingerprint at the latest dataset version and write it into the config KV."""
+        dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+        payload: str = json.dumps({"fragment_ids": fragment_id_signature(dataset), "num_rows": dataset.count_rows()})
+        dataset.update_config({CLUSTER_GENERATION_KEY: payload})
+
+    commit_with_retries(
+        action,
+        config.commit_retries,
+        config.commit_backoff_seconds,
+        lambda: telemetry.incr("cluster.generation_stamp_conflict"),
+    )
+    telemetry.incr("cluster.generation_stamped")
 
 
 def encode_centroids(centroids: pa.Array) -> bytes:
@@ -435,26 +569,46 @@ def cluster_rows_per_task(config: MaintenanceConfig) -> int:
 
 
 def plan_cluster_rewrite(
-    uri: str, config: MaintenanceConfig, cutoff: datetime | None, telemetry: Telemetry
+    uri: str,
+    config: MaintenanceConfig,
+    cutoff: datetime | None,
+    telemetry: Telemetry,
+    cleanup_slot: int | None = None,
 ) -> dict[str, Any]:
     """Plan one dataset's clustered rewrite on an executor (phase ``cluster-plan``).
 
     Resolves the vector column and guards eligibility, runs TTL now so expired rows are never
     rewritten, resolves the reusable centroids sidecar-first, and pins the post-TTL read version
-    with its schema, row count, and fragment shards. An ineligible dataset returns a
-    ``cluster_skipped`` dict so the orchestrator routes it back into normal maintenance.
+    with its schema, row count, and fragment shards. A dataset already clustered and unwritten
+    since (:func:`cluster_generation_skip_reason`) returns a terminal ``cluster_current`` dict so
+    it is neither re-clustered nor routed into normal compaction, which would undo its centroid
+    ordering. It is not fully skipped, though: it first runs the same rotation-gated idle version
+    cleanup the normal compaction-skip path uses (:func:`~lance_etl.maintenance.job.idle_cleanup_bytes`),
+    so the pre-rewrite generation left by the Overwrite is reclaimed on a later run once it ages
+    past the cleanup horizon and its pinning tags are gone. An otherwise-ineligible dataset returns
+    a ``cluster_skipped`` dict so the orchestrator routes it back into normal maintenance.
 
     Args:
         uri: Dataset URI.
         config: Maintenance configuration.
         cutoff: TTL cutoff instant, or ``None`` to skip the TTL step.
         telemetry: Telemetry facade for the current executor process.
+        cleanup_slot: The active fleet-wide rotation slot for this run, threaded into the
+            already-clustered idle cleanup, or ``None`` to always clean (the pre-rotation behavior
+            direct callers rely on).
 
     Returns:
-        A plan dict carrying every artifact the histogram and rewrite phases need, or a
-        ``{"uri", "cluster_skipped"}`` dict when the dataset is ineligible.
+        A plan dict carrying every artifact the histogram and rewrite phases need, a ``{"uri",
+        "cluster_current", "bytes_removed"}`` dict when the dataset is already clustered and
+        unchanged, or a ``{"uri", "cluster_skipped"}`` dict when the dataset is otherwise
+        ineligible.
     """
     dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+    current: str | None = cluster_generation_skip_reason(dataset)
+    if current is not None:
+        telemetry.incr("cluster.skipped_already_clustered")
+        bytes_removed: int = maintenance_job.idle_cleanup_bytes(uri, config, telemetry, dataset, False, cleanup_slot)
+        return {"uri": uri, "cluster_current": current, "bytes_removed": bytes_removed}
     column, skip = resolve_cluster_column(dataset, config)
     if column is None:
         return {"uri": uri, "cluster_skipped": skip}
@@ -748,6 +902,15 @@ def commit_cluster_overwrite(
     index. A concurrent write between the pinned read version and this commit is clobbered, which is
     why a clustered rewrite requires the dataset quiesced.
 
+    Immediately after the overwrite commits, the clustered-generation fingerprint (the sorted
+    fragment-id list and logical row count read back from the committed version) is stamped into
+    the config KV via :func:`stamp_cluster_generation`, so the next scheduled clustered-rewrite run
+    skips this dataset unless it is written to in the meantime. The stamp is written before the
+    later index rebuild deliberately: a rebuild that fails still leaves the data clustered, and the
+    fingerprint keeps the next run from wastefully re-clustering it (the indexing job repairs the
+    missing index instead). The index rebuild adds only index segments, not data fragments, so it
+    leaves the stamped fingerprint matching.
+
     Args:
         uri: Dataset URI.
         fragment_documents: JSON fragment metadata collected from the rewrite shuffle.
@@ -772,6 +935,7 @@ def commit_cluster_overwrite(
         config.commit_backoff_seconds,
         lambda: telemetry.incr("cluster.overwrite_conflict"),
     )
+    stamp_cluster_generation(uri, config, telemetry)
     return len(fragments)
 
 
@@ -781,6 +945,12 @@ def cluster_index_config(config: MaintenanceConfig, num_partitions: int, metric:
     ``cluster.py`` constructs its own :class:`IndexJobConfig` rather than importing one from the
     indexing job, so indexing never imports maintenance and no cycle forms. Only the fields
     :func:`~lance_etl.indexing.segments.commit_segments` and the segment build read are set.
+
+    The index-rebuild commit uses the standard index-path retry budget
+    (:data:`~lance_etl.telemetry.DEFAULT_COMMIT_RETRIES`), NOT the small ``large_commit_retries``
+    budget the Overwrite uses: a segment index commit is an ordinary index commit whose conflicts a
+    retry can resolve, whereas ``large_commit_retries`` is reserved for the genuinely large
+    Overwrite manifest write.
 
     Args:
         config: Maintenance configuration supplying telemetry, storage, and retry budgets.
@@ -795,7 +965,7 @@ def cluster_index_config(config: MaintenanceConfig, num_partitions: int, metric:
         storage_options=config.storage_options,
         num_partitions=num_partitions,
         metric=metric,
-        commit_retries=config.large_commit_retries,
+        commit_retries=DEFAULT_COMMIT_RETRIES,
         commit_backoff_seconds=config.commit_backoff_seconds,
     )
 
@@ -847,15 +1017,19 @@ def run_cluster_rewrites(
     config: MaintenanceConfig,
     cutoff: datetime | None,
     driver_telemetry: Telemetry,
+    cleanup_slot: int | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
     """Cluster-rewrite eligible datasets, returning results and the passthrough set.
 
     The orchestration runs the fleet phases in order: plan fan-out, one flat histogram job, driver
     bucket derivation, one flat rewrite shuffle, per-dataset overwrite commit, per-dataset vector
-    index rebuild, then optional serving-tag flip and cleanup. Per-dataset failure isolation holds
-    at every phase: a failed dataset carries an ``{"error", "phase"}`` marker and drops out of all
-    later cluster phases and out of normal compaction. A cluster-ineligible dataset is returned in
-    the passthrough list so the caller continues it into normal maintenance.
+    index rebuild, then cleanup. No serving tag is ever touched here: promotion happens exclusively
+    through the pipeline stamp phase after the index phase (ADR 0041). Per-dataset failure isolation
+    holds at every phase: a failed dataset carries an ``{"error", "phase"}`` marker and drops out of
+    all later cluster phases and out of normal compaction. A cluster-ineligible dataset is returned
+    in the passthrough list so the caller continues it into normal maintenance, while an
+    already-clustered unchanged dataset (its ``lance-etl.cluster_generation`` fingerprint still
+    matches) is a terminal skip that enters neither.
 
     Args:
         spark: Active Spark session.
@@ -863,6 +1037,8 @@ def run_cluster_rewrites(
         config: Maintenance configuration.
         cutoff: TTL cutoff instant, or ``None`` when TTL is inactive.
         driver_telemetry: The driver's telemetry facade.
+        cleanup_slot: The active fleet-wide rotation slot for this run, threaded into the
+            already-clustered idle cleanup, or ``None`` to always clean.
 
     Returns:
         A ``(results_by_uri, passthrough_uris)`` pair. ``results_by_uri`` holds one result dict per
@@ -870,7 +1046,7 @@ def run_cluster_rewrites(
     """
     results: dict[str, dict[str, Any]] = {}
     passthrough: list[str] = []
-    state = ClusterRunState(spark, config, driver_telemetry, results, passthrough)
+    state = ClusterRunState(spark, config, driver_telemetry, results, passthrough, cleanup_slot)
     with driver_telemetry.span("lance.cluster_rewrite.run") as run_span:
         run_span.set_tag("dataset_count", len(uris))
         eligible: list[dict[str, Any]] = state.plan(uris, cutoff)
@@ -895,6 +1071,7 @@ class ClusterRunState:
         driver_telemetry: Telemetry,
         results: dict[str, dict[str, Any]],
         passthrough: list[str],
+        cleanup_slot: int | None = None,
     ) -> None:
         """Initialize the run state.
 
@@ -904,12 +1081,15 @@ class ClusterRunState:
             driver_telemetry: The driver's telemetry facade.
             results: The per-dataset result accumulator, mutated in place across phases.
             passthrough: The cluster-skipped URI accumulator, mutated in place.
+            cleanup_slot: The active fleet-wide rotation slot for this run, threaded into the
+                already-clustered idle cleanup, or ``None`` to always clean.
         """
         self.spark: SparkSession = spark
         self.config: MaintenanceConfig = config
         self.telemetry: Telemetry = driver_telemetry
         self.results: dict[str, dict[str, Any]] = results
         self.passthrough: list[str] = passthrough
+        self.cleanup_slot: int | None = cleanup_slot
         self.plans_by_uri: dict[str, dict[str, Any]] = {}
 
     def fanout_partitions(self) -> int:
@@ -933,22 +1113,32 @@ class ClusterRunState:
         return max(1, min(resolved, task_count))
 
     def plan(self, uris: list[str], cutoff: datetime | None) -> list[dict[str, Any]]:
-        """Run the plan fan-out and split datasets into eligible, passthrough, and errored.
+        """Run the plan fan-out and split datasets into eligible, passthrough, skipped, and errored.
+
+        A dataset already clustered and unchanged since (``cluster_current``) lands directly in the
+        shared results as a terminal ``skipped`` outcome rather than the passthrough list, so it is
+        never handed to normal compaction, which would re-merge its fragments toward insertion
+        order and undo the centroid ordering. It still carries the ``bytes_removed`` its
+        rotation-gated idle version cleanup reclaimed in the plan phase, so the pre-rewrite
+        generation is retired on a later run rather than pinned forever.
 
         Args:
             uris: Datasets to consider.
             cutoff: TTL cutoff instant, or ``None``.
 
         Returns:
-            The eligible plan dicts. Passthrough and errored datasets are recorded in the shared
-            accumulators.
+            The eligible plan dicts. Passthrough, already-clustered, and errored datasets are
+            recorded in the shared accumulators.
         """
         config: MaintenanceConfig = self.config
+        cleanup_slot: int | None = self.cleanup_slot
         plans: list[dict[str, Any]] = fan_out_per_dataset(
             self.spark,
             uris,
             config.telemetry,
-            lambda uri, telemetry, cutoff_value=cutoff: plan_cluster_rewrite(uri, config, cutoff_value, telemetry),
+            lambda uri, telemetry, cutoff_value=cutoff, slot=cleanup_slot: plan_cluster_rewrite(
+                uri, config, cutoff_value, telemetry, slot
+            ),
             self.fanout_partitions(),
             phase="cluster-plan",
         )
@@ -957,6 +1147,12 @@ class ClusterRunState:
             uri: str = plan["uri"]
             if "error" in plan:
                 self.results[uri] = plan
+            elif "cluster_current" in plan:
+                self.results[uri] = {
+                    "uri": uri,
+                    "skipped": plan["cluster_current"],
+                    "bytes_removed": plan.get("bytes_removed", 0),
+                }
             elif "cluster_skipped" in plan:
                 self.passthrough.append(uri)
             else:
@@ -1000,6 +1196,7 @@ class ClusterRunState:
                 return FLAT_ERROR, uri, str(exc)
 
         grouped, errors = run_flat_tagged_job(self.spark, tasks, run_one, self.flat_partitions(len(tasks)))
+        release_broadcast(centroids)
         return self.reduce_histograms(grouped, errors)
 
     def reduce_histograms(self, grouped: dict[str, list[Any]], errors: dict[str, str]) -> dict[str, list[int]]:
@@ -1078,6 +1275,8 @@ class ClusterRunState:
             total_buckets,
             self.config.storage_options,
         )
+        for handle in (centroids, buckets, owners, meta):
+            release_broadcast(handle)
         return self.validate_rewrite(plans, collected)
 
     def validate_rewrite(self, plans: list[dict[str, Any]], collected: list[tuple[Any, ...]]) -> dict[str, list[str]]:
@@ -1186,6 +1385,7 @@ class ClusterRunState:
             return
         centroids = self.broadcast_centroids(list(plan_by_uri.values()))
         segments_by_uri, build_errors = self.build_rebuild_segments(tasks, centroids, config.storage_options)
+        release_broadcast(centroids)
         for uri, message in build_errors.items():
             self.results[uri] = mark_rebuild_failure(plan_by_uri[uri], message)
             plan_by_uri.pop(uri, None)
@@ -1473,12 +1673,19 @@ def finalise_cluster_dataset(
     config: MaintenanceConfig,
     telemetry: Telemetry,
 ) -> dict[str, Any]:
-    """Commit the rebuilt vector index, optionally flip the serving tag, and clean up.
+    """Commit the rebuilt vector index and clean up, without touching any serving tag.
 
     The vector-index commit is best-effort: a rebuild failure is non-fatal because the data is
     complete, just unindexed, so the result carries an ``{"error", "phase": "cluster_index"}`` marker
-    and the data stays committed. On success the serving tag advances when configured and old
-    versions are pruned.
+    and the data stays committed. On success old versions are pruned.
+
+    Serving promotion is deliberately NOT done here. Flipping ``HEAD`` right after the vector-index
+    commit would expose a generation whose scalar and FTS indexes have not yet been rebuilt (those
+    are left to the next indexing run, ADR 0041), so a text query could see a clustered-but-unindexed
+    generation as the served one. Promotion happens exclusively through the pipeline stamp phase,
+    which runs AFTER the index phase in the ``prune -> maintenance -> index -> stamp`` sequence and
+    excludes error-marked datasets, so a dataset is HEAD-promoted only once every index it needs is
+    rebuilt.
 
     Args:
         uri: Dataset URI.
@@ -1498,8 +1705,6 @@ def finalise_cluster_dataset(
         telemetry.incr("cluster.index_rebuild_failed")
         logger.warning("cluster: vector index rebuild failed for %s, data intact: %s", uri, exc)
         return mark_rebuild_failure(plan, str(exc))
-    if config.cluster_serve_tag:
-        update_serving_tag(uri, None, config.storage_options, telemetry)
     bytes_removed: int = maintenance_job.cleanup_dataset(uri, config, telemetry)
     telemetry.incr("cluster.clustered")
     return {

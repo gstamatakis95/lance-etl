@@ -249,34 +249,6 @@ def merge_index_deltas(uri: str, index_name: str, config: IndexJobConfig, teleme
     return True
 
 
-def drop_existing_index(uri: str, index_name: str, config: IndexJobConfig, telemetry: Telemetry) -> None:
-    """Drop a named index, retrying conflicts.
-
-    Used by :class:`~lance_etl.indexing.handlers.FtsIndexHandler` to remove the old committed
-    inverted index just before the metadata merge and publish commit, minimising the availability
-    gap. Runs in the calling process.
-
-    Args:
-        uri: Dataset URI.
-        index_name: The index to drop.
-        config: Indexing configuration.
-        telemetry: Telemetry facade for the current process.
-
-    Raises:
-        OSError | RuntimeError: If commits keep conflicting past the retry budget.
-    """
-    tags: list[str] = [f"index:{index_name}"]
-
-    def action() -> None:
-        """Drop the index at the latest version when it still exists."""
-        dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-        if index_name in {description.name for description in dataset.describe_indices()}:
-            dataset.drop_index(index_name)
-            telemetry.incr("index.dropped", tags=tags)
-
-    commit_index_with_retries(action, config, telemetry, tags)
-
-
 def maintain_index_locally(uri: str, index_name: str, config: IndexJobConfig, telemetry: Telemetry) -> bool:
     """Maintain one existing index in process, then bound its delta count.
 

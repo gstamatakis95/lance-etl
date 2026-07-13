@@ -1,0 +1,39 @@
+name: Integration
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+jobs:
+  integration:
+    name: Integration tests (Spark local mode)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install package with dev and bench dependency groups
+        run: uv pip install --system -e . --group dev --group bench
+
+      - name: pytest integration (excluding bench e2e)
+        run: >-
+          pytest -m integration
+          --ignore=tests/test_bench_e2e.py
+          --ignore=tests/test_bench_e2e_tagged.py
+
+      - name: pytest bench e2e integration (best effort, may need the search-api binary)
+        continue-on-error: true
+        run: pytest -m integration tests/test_bench_e2e.py tests/test_bench_e2e_tagged.py

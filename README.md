@@ -89,13 +89,14 @@ lance-etl/
 ```bash
 uv venv
 source .venv/bin/activate
-uv pip install -e ".[dev]"
+uv pip install -e . --group dev
 uv pip install --group bench
 ```
 
-The project requires `pylance>=8.0.0`, which installs from PyPI, so a plain
-`uv pip install -e ".[dev]"` suffices. The Rust service sources the lance crates from crates.io at
-the same version.
+The project requires `pylance>=8.0.0,<9`, which installs from PyPI, so `uv pip install -e . --group
+dev` suffices. `dev`, `bench`, and `airflow` are PEP 735 dependency groups (install with `--group`,
+not `.[dev]`). The Rust service sources the lance crates from crates.io at the same version and
+needs `protoc` on PATH to build (see `rust/search-api/README.md`).
 
 ### Running the jobs
 
@@ -130,10 +131,10 @@ flags, and the agent-driveable `experiment` iteration are documented in `bench/R
 ### Running the tests
 
 ```bash
-# Python tests
-.venv/bin/pytest
+# Python tests (the maintained dev venv lives at etl/venv, not .venv)
+etl/venv/bin/pytest -m "not integration"
 
-# Rust tests
+# Rust tests (needs protoc on PATH)
 cd rust/search-api
 cargo test
 ```
