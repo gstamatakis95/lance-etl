@@ -996,7 +996,7 @@ Allowed states are NOT_STARTED, IN_PROGRESS, DONE, and BLOCKED.
 
 | Stage | State | Verification | Notes or blocker |
 |---|---|---|---|
-| Safety removal | NOT_STARTED | | |
+| Safety removal | IN_PROGRESS | | |
 | STATE-01 | NOT_STARTED | | |
 | SOURCE-01 | NOT_STARTED | | |
 | MUTATION-01 | NOT_STARTED | | |

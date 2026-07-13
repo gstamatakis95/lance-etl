@@ -47,7 +47,7 @@ indexing, and operator-tool phases, isolating each dataset's success or failure.
 
 ---
 
-## ETL: adaptive routing and the bulk fast path
+## ETL: adaptive routing and the disabled bulk path
 
 Routing is the fixed trio `org_id/tenant_id/namespace`. Each row lands in the dataset
 `base_uri/{org_id}/{tenant_id}/{namespace}.lance`, and because every key lives in exactly one
@@ -59,12 +59,11 @@ key absent from a row yields NULL. The driver computes a per-trio count aggregat
 partition sort sub-buckets the biggest datasets by key hash (`apply_salted_shuffle`) so no single
 task carries a whole large org.
 
-Before the merge, a bulk-append fast path (`bulk.py`) short-circuits datasets that are absent or
-empty: `plan_bulk_append` tests eligibility, `derive_bulk_schemas` fixes one canonical per-trio
-schema, `bootstrap_bulk_datasets` bootstraps the empty dataset (with a re-check demotion if it
-turns out non-empty), `run_bulk_append` fans out parallel `write_fragments`, and
-`commit_bulk_transactions` lands a single `commit_batch` plus a role merge. Eligible trios are
-excluded from the streaming merge that handles everything else.
+The retained bulk-append qualification path in `bulk.py` can short-circuit absent or empty
+datasets through parallel `write_fragments` and one `commit_batch`. Production configuration
+defaults it off because a raw append cannot distinguish a failed commit from an ambiguously
+successful commit and therefore cannot guarantee duplicate-free retry. Routine ETL sends every
+target through the replay-safe merge path.
 
 ---
 
@@ -105,12 +104,10 @@ job over every dataset's rewrite tasks), and version cleanup. TTL deletes expire
 compaction so the compaction reclaims that storage. `compaction_skip_reason` skips datasets whose
 derived state (fragment count) does not warrant a rewrite.
 
-The clustered-rewrite path (`cluster.py`, ADR 0041) is a separate fleet phase that physically
-reclusters a dataset by IVF centroid. `read_shard_tasks` is shared by the histogram and rewrite
-scans. The rewrite read fan-out is sized by `derive_partitions(REWRITE_PARTITION_FACTOR)`,
-decoupled from the write bucket count, and the global-bucket map is broadcast. After the clustered
-Overwrite drops the IVF_RQ index it is rebuilt from the PRESERVED centroids, so no retraining
-occurs.
+The retained clustered-rewrite qualification path (`cluster.py`, ADR 0041) physically reclusters
+a dataset by IVF centroid. Production maintenance does not expose it on the command line and its
+configuration defaults off. The Overwrite can clobber an overlapping writer and temporarily drops
+indexes, so it cannot become a routine production path until those boundaries are qualified.
 
 ---
 

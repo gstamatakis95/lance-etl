@@ -76,7 +76,8 @@ class ETLConfig:
             under the 100 MB default pool that the sift1m repro exhausted at 97.7 MB. None disables
             chunking.
         bulk_append: Enable the parallel ``write_fragments`` + single ``commit_batch`` fast path
-            for big NEW or empty datasets (operational kill switch).
+            for big NEW or empty datasets. Production defaults this off because a raw append cannot
+            reconcile an ambiguous commit outcome deterministically.
         max_bulk_tasks_per_dataset: Cap on parallel bulk-append tasks per bulk-eligible dataset;
             appends carry no per-key commit contention, so this sits far above the merge-writer cap.
         max_keys_per_map: Upper bound on distinct keys per source map column, enforced at the pivot
@@ -103,7 +104,7 @@ class ETLConfig:
     window_column: str = "processing_timestamp"
     retry_backoff_seconds: float = 0.5
     merge_batch_bytes: int | None = 64 * 1024 * 1024
-    bulk_append: bool = True
+    bulk_append: bool = False
     max_bulk_tasks_per_dataset: int = 1024
     max_keys_per_map: int = 4096
     tag_stamp: str | None = None

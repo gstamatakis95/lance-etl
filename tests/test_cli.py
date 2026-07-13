@@ -116,34 +116,15 @@ def test_maintenance_ttl_column_flag() -> None:
     assert args.ts_column == "event_time"
 
 
-def test_maintenance_cluster_rewrite_defaults_off() -> None:
-    """``--cluster-rewrite`` defaults to False and the other cluster flags default to off/None."""
-    args = maintenance_cli.build_parser().parse_args(REQUIRED_MAINTENANCE_RUN_ARGV)
-    assert args.cluster_rewrite is False
-    assert args.cluster_column is None
-    assert args.cluster_serve_tag is False
-
-
-def test_maintenance_cluster_rewrite_flag() -> None:
-    """``--cluster-rewrite`` turns on the clustered full rewrite."""
-    args = maintenance_cli.build_parser().parse_args([*REQUIRED_MAINTENANCE_RUN_ARGV, "--cluster-rewrite"])
-    assert args.cluster_rewrite is True
-
-
-def test_maintenance_cluster_column_flag() -> None:
-    """``--cluster-column`` overrides the auto-selected vector column."""
-    args = maintenance_cli.build_parser().parse_args(
-        [*REQUIRED_MAINTENANCE_RUN_ARGV, "--cluster-rewrite", "--cluster-column", "embedding"]
-    )
-    assert args.cluster_column == "embedding"
-
-
-def test_maintenance_cluster_serve_tag_flag() -> None:
-    """``--cluster-serve-tag`` turns on the blue-green HEAD flip after a clustered rebuild."""
-    args = maintenance_cli.build_parser().parse_args(
-        [*REQUIRED_MAINTENANCE_RUN_ARGV, "--cluster-rewrite", "--cluster-serve-tag"]
-    )
-    assert args.cluster_serve_tag is True
+@pytest.mark.parametrize("flag", ["--cluster-rewrite", "--cluster-column", "--cluster-serve-tag"])
+def test_maintenance_cluster_rewrite_flags_removed(flag: str) -> None:
+    """Production maintenance rejects every clustered-overwrite command-line surface."""
+    argv: list[str] = [*REQUIRED_MAINTENANCE_RUN_ARGV, flag]
+    if flag == "--cluster-column":
+        argv.append("embedding")
+    with pytest.raises(SystemExit) as exc_info:
+        maintenance_cli.build_parser().parse_args(argv)
+    assert exc_info.value.code != 0
 
 
 def test_ttl_subcommand_removed() -> None:

@@ -98,7 +98,7 @@ pipeline prunes old interval tags. The query-pinning half of ADR 0032 lives in
 
 ## ADR 0034 — Adaptive salted routing, streaming merge, and spark_batches removal
 
-Status: Accepted
+Status: Accepted with the raw bulk path production-disabled
 
 The ETL routes each hourly Iceberg increment into one Lance dataset per `org_id/tenant_id/namespace`
 trio (ADR 0004) via last-write-wins `merge_insert`. At production scale a single run touches more
@@ -220,7 +220,13 @@ of this design. The levers above are the sanctioned response to it. Local-disk t
 the object-store ceiling, because a local manifest CAS is far faster than a remote one, so validating a
 specific K against a specific store is an operational check rather than a unit test.
 
-### Bulk-append fast path for new or empty datasets
+### Bulk-append qualification path for new or empty datasets
+
+The raw append implementation is retained temporarily for deterministic qualification tests, but
+`ETLConfig.bulk_append` defaults to `False` in production. An ambiguous `commit_batch` outcome
+cannot currently be reconciled without risking duplicate rows. Routine ingestion therefore uses
+the replay-safe merge path until MUTATION-01 removes this implementation or a deterministic
+outcome protocol replaces it.
 
 The merge path is the correct engine for incremental change routing, but its per-key, per-commit
 machinery is pure overhead when the target dataset is brand new or empty. There is nothing to match
@@ -275,7 +281,7 @@ concurrently could each pass the emptiness check and double-write it.
 
 **Tunables.** Two `ETLConfig` fields govern the path.
 
-- `bulk_append` (default `True`): the operational kill switch. Set it to `False` to route every trio
+- `bulk_append` (default `False`): an internal qualification opt-in. Routine jobs route every trio
   through the merge path.
 - `max_bulk_tasks_per_dataset` (default `1024`): the cap on parallel append tasks per bulk-eligible
   dataset. `plan_bulk_append` sizes each trio's append fan-out from the trio's RAW row count in the

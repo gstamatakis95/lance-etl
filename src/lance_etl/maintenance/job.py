@@ -116,12 +116,6 @@ class MaintenanceConfig:
             this run.
         cluster_column: Explicit vector column to cluster on; ``None`` auto-selects the single
             vector-role column from the dataset's stored column roles.
-        cluster_serve_tag: REMOVED behavior, rejected at construction when set. Flipping ``HEAD``
-            right after the clustered rewrite's vector-index rebuild exposed a generation whose
-            scalar and FTS indexes were not rebuilt yet (they are left to the next indexing run),
-            so a text query could see a clustered-but-unindexed generation as the served one.
-            Promotion happens exclusively through the pipeline stamp phase, which runs after the
-            index phase (ADR 0041).
     """
 
     telemetry: TelemetryConfig
@@ -141,22 +135,6 @@ class MaintenanceConfig:
     cleanup_rotation_cadence_hours: int = 1
     cluster_rewrite: bool = False
     cluster_column: str | None = None
-    cluster_serve_tag: bool = False
-
-    def __post_init__(self) -> None:
-        """Reject configurations that request the removed post-rebuild HEAD flip.
-
-        Raises:
-            ValueError: If ``cluster_serve_tag`` is set. The clustered rewrite never advances any
-                serving tag itself, so a stale ``True`` here would silently serve a
-                text-unindexed generation if honored, or silently not promote if ignored. Failing
-                loudly directs the operator to the pipeline stamp phase, the only promotion path.
-        """
-        if self.cluster_serve_tag:
-            raise ValueError(
-                "cluster_serve_tag was removed: a HEAD flip right after the vector rebuild exposes a generation "
-                "without scalar/FTS indexes. Promote through the pipeline stamp phase instead (ADR 0041)."
-            )
 
     def ttl_active(self) -> bool:
         """Report whether the TTL step runs for this configuration.

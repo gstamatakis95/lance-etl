@@ -5,10 +5,6 @@ Exposes the ``main()`` entry point consumed by the ``lance-etl-maintenance`` scr
 
 ``run`` applies maintenance to a fleet of datasets: per-row TTL expiration (when ``--ttl-column``
 names a per-row TTL column), unified distributed compaction, and version cleanup in that order.
-``--cluster-rewrite`` opts a run into an occasional, operator-triggered full rewrite that reorders
-same-centroid rows into shared fragments before normal compaction (ADR 0041); it requires the
-targeted datasets quiesced (no concurrent ETL writer) and is not exposed on the pipeline CLI.
-
 ``tag`` flips a serving tag (default ``HEAD``) to a target dataset version for blue-green
 promotion.  With no ``--tag-version`` the tag is moved to each dataset's latest version.
 
@@ -67,32 +63,6 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_arguments(run_parser)
     add_dataset_arguments(run_parser)
     add_ttl_arguments(run_parser)
-    run_parser.add_argument(
-        "--cluster-rewrite",
-        action="store_true",
-        help=(
-            "Opt-in occasional, operator-triggered full rewrite that reorders rows so same-centroid rows share "
-            "fragments (ADR 0041). Subsumes normal compaction for the datasets it rewrites. Non-transactional: "
-            "requires the targeted datasets quiesced, with no concurrent ETL writer, for the duration of the run."
-        ),
-    )
-    run_parser.add_argument(
-        "--cluster-column",
-        default=None,
-        help=(
-            "Explicit vector column to cluster on. Defaults to the single vector-role column stored in the "
-            "dataset's column roles; ambiguous or missing roles skip the dataset back into normal compaction."
-        ),
-    )
-    run_parser.add_argument(
-        "--cluster-serve-tag",
-        action="store_true",
-        help=(
-            "Advance the HEAD serving tag blue-green after a clustered rewrite's vector index rebuild commits. "
-            "Off by default; the pipeline's stamp phase is the normal promotion path."
-        ),
-    )
-
     tag_parser: argparse.ArgumentParser = subparsers.add_parser(
         "tag",
         help=(
@@ -149,9 +119,6 @@ def run_run(args: argparse.Namespace) -> int:
             storage_options=parse_storage_options(args),
             ttl_column=args.ttl_column,
             ts_column=args.ts_column,
-            cluster_rewrite=args.cluster_rewrite,
-            cluster_column=args.cluster_column,
-            cluster_serve_tag=args.cluster_serve_tag,
         )
         failed: int = count_failed(MaintenanceJob(config).run(spark, uris))
         if failed:

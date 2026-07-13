@@ -149,9 +149,14 @@ class TestPlanBulkAppendSizing:
             big_trio_rows={("o1", "t1", "n1"): rows},
         )
 
+    def test_production_default_disables_bulk_append(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
+        """The production configuration never selects the non-idempotent raw append path."""
+        config: ETLConfig = plan_config(tmp_path, telemetry_config)
+        assert plan_bulk_append(self.make_plan(1_000_000_000), config) == []
+
     def test_large_trio_exceeds_the_merge_writer_cap(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
         """A 1B-row backfill fans out across ceil(1e9/2e6)=500 append tasks, far above the merge cap of 32."""
-        config: ETLConfig = plan_config(tmp_path, telemetry_config)
+        config: ETLConfig = plan_config(tmp_path, telemetry_config, bulk_append=True)
         eligible: list[tuple[str, str, str, int]] = plan_bulk_append(self.make_plan(1_000_000_000), config)
         assert eligible == [("o1", "t1", "n1", 500)]
         assert eligible[0][3] > config.max_buckets_per_dataset
@@ -160,7 +165,7 @@ class TestPlanBulkAppendSizing:
         self, tmp_path: Path, telemetry_config: TelemetryConfig
     ) -> None:
         """A trio needing more tasks than the cap is clamped to max_bulk_tasks_per_dataset."""
-        config: ETLConfig = plan_config(tmp_path, telemetry_config)
+        config: ETLConfig = plan_config(tmp_path, telemetry_config, bulk_append=True)
         eligible: list[tuple[str, str, str, int]] = plan_bulk_append(self.make_plan(3_000_000_000), config)
         assert eligible == [("o1", "t1", "n1", config.max_bulk_tasks_per_dataset)]
 

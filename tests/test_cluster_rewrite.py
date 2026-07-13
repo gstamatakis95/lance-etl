@@ -5,7 +5,7 @@ multiset preservation, non-decreasing partition ids across fragment order, survi
 an identically-centroided rebuilt vector index, and true nearest-neighbor correctness against a
 brute-force numpy check), null-vector rows landing in the tail region, the derived-state skip (a
 second run over an unwritten dataset is a cheap no-op and a post-rewrite write re-enables
-eligibility), the removed cluster_serve_tag knob being rejected at construction, and per-dataset
+eligibility), the internal-only production-disabled configuration, and per-dataset
 failure isolation at the rebuild-commit, rewrite-read, and segment-build phases that keeps every
 healthy dataset clustering and every poisoned dataset intact while the run never raises.
 """
@@ -334,12 +334,6 @@ def test_write_after_cluster_reenables_eligibility(tmp_path: Path, telemetry: Te
     post_dataset: lance.LanceDataset = lance.dataset(uri)
     assert post_dataset.count_rows() == ROWS + extra_rows
     assert_pids_non_decreasing_across_fragments(post_dataset, pre_centroids, "l2")
-
-
-def test_cluster_serve_tag_rejected_at_construction() -> None:
-    """The removed cluster_serve_tag knob fails loudly instead of silently mis-promoting."""
-    with pytest.raises(ValueError, match="cluster_serve_tag"):
-        MaintenanceConfig(telemetry=TelemetryConfig(), cluster_rewrite=True, cluster_serve_tag=True)
 
 
 def test_already_clustered_dataset_not_passed_to_normal_compaction(tmp_path: Path, telemetry: Telemetry) -> None:

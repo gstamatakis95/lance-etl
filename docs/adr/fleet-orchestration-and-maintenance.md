@@ -271,8 +271,12 @@ maintenance and indexing jobs driven standalone.
 
 ## ADR 0041 — Clustered rewrite: centroid-locality dataset reorganization
 
-Status: Accepted (opt-in `MaintenanceJob` mode, off by default, depends on ADR 0040's centroid
-sidecar)
+Status: Qualification-only, production-disabled
+
+The implementation remains for direct tests, but production maintenance exposes no clustered
+rewrite command-line flags and `MaintenanceConfig.cluster_rewrite` defaults to `False`. The
+Overwrite can clobber an overlapping writer and temporarily removes required indexes. Re-enabling
+it as a production path requires explicit memory and writer-overlap qualification.
 
 An IVF partition scan only needs the fragments holding rows assigned to the queried centroids,
 but ingestion and ordinary compaction land rows in write order, not centroid order, so partition
@@ -330,13 +334,10 @@ rebuild manually instead of waiting for the retrain.
 Serving-tag promotion happens exclusively through the `PipelineJob` stamp phase, which runs after
 the index phase in the `prune -> maintenance -> index -> stamp` sequence and already excludes
 error-marked datasets from stamping (ADR 0035). The clustered rewrite itself never touches any
-serving tag. An earlier `cluster_serve_tag` opt-in flipped `HEAD` right after the vector-index
-rebuild committed, but that point in time is still before the scalar and FTS rebuilds (deferred to
-the next indexing run, below), so a text query could see a clustered-but-text-unindexed generation
-as the served one. The knob was removed as behavior: `MaintenanceConfig` now rejects
-`cluster_serve_tag=True` at construction with a pointer to the stamp phase. Because the old tags
-keep the pre-rewrite version readable, storage roughly doubles for a rewritten dataset until
-interval-tag pruning and the cleanup horizon retire the pre-rewrite generation.
+serving tag. The obsolete post-vector-rebuild promotion field and every clustered-rewrite CLI flag
+were removed. Because the old tags keep the pre-rewrite version readable, storage roughly doubles
+for an internally qualified rewrite until interval-tag pruning and the cleanup horizon retire the
+pre-rewrite generation.
 
 **Serve-LATEST exposure.** Between the Overwrite commit and the index rebuilds, a default
 serve-latest reader (one not pinned to a tag) sees the freshly clustered generation with NO
@@ -348,9 +349,8 @@ since promotion only happens when the two hold together. The stamp phase returns
 `tag_stamp` is `None`, so `serve_tag=True` with `tag_stamp=None` would pass a promotion-disabled
 config that never advances `HEAD` and never serves the clustered generation. Requiring both is the
 in-config signal that promotion goes through the post-index stamp phase rather than readers
-following latest. A standalone `maintenance run --cluster-rewrite` carries no such signal, so the
-quiescence contract below is what protects it: it is a maintenance-window operation and the window
-must extend until the following indexing run restores the scalar and FTS indexes.
+following latest. This validation remains part of the internal qualification surface. Production
+CLI callers cannot enable the rewrite.
 
 **Derived-state skip.** `commit_cluster_overwrite` stamps a generation fingerprint (the committed
 generation's sorted data-fragment id list and logical row count) into the dataset config KV under
@@ -397,9 +397,8 @@ records what an operator had previously requested by name.
 Clustered rewrite is a non-transactional, quiescence-requiring operation, like the manifest
 migration tools. A concurrent ETL write between the pinned read version and the Overwrite commit
 is clobbered, so it depends on the same ingestion/pipeline non-overlap contract ADR 0038 already
-states, and it is operator-triggered and off by default rather than something the scheduled
-pipeline runs on its own. When it is left enabled on a schedule, the derived-state skip above
-keeps every unwritten dataset a cheap no-op.
+states. Production entry points cannot enable it. Direct qualification callers must provide a
+quiescent test dataset and keep the rewrite disabled outside that bounded environment.
 
 ## Superseded decisions
 
