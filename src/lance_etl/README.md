@@ -113,11 +113,11 @@ indexes, so it cannot become a routine production path until those boundaries ar
 
 ## Serving and interval tags
 
-Serving is tag-based. A `HEAD` tag (or any named tag) points at a concrete dataset version, and the
-Rust service resolves it when `SEARCH_API_SERVE_BY_TAG=true`. Tagged versions are exempt from
-version cleanup. The `update_serving_tag` / `update_serving_tags` helpers take `tags: Sequence[str]`
-(default `("HEAD",)`) and flip every named tag in one dataset open. The pipeline stamp phase uses
-this to stamp the hourly interval tag and advance `HEAD` together in a single fan-out.
+Production serving is pinned to the `HEAD` tag at a concrete dataset version. Tagged versions are
+exempt from version cleanup. The `update_serving_tag` and `update_serving_tags` helpers take
+`tags: Sequence[str]` and flip every named tag in one dataset open. Any call containing `HEAD`
+requires an explicit target version. The temporary pipeline stamps hourly interval tags only and
+never publishes `HEAD`.
 
 Hourly interval tagging (ADR 0032): the ETL run stamps every dataset it wrote with the Lance tag of
 the truncated UTC hour (format `%Y%m%dT%H%M%SZ`, for example `20260611T120000Z`). The stamp is
@@ -219,23 +219,21 @@ Data-shape flags only. Tuning knobs use `IndexJobConfig` defaults.
 | `--fts-language` | none | Stemming and stop-word language |
 | `--rebuild` | off | Reindex every fragment (use after tokenizer or parameter changes) |
 
-### `tag` — blue-green serving-tag flip
+### `tag` — exact HEAD flip
 
-Updates a serving tag (default `HEAD`) to a target dataset version. Tagged versions are exempt from
-version cleanup.
+Updates `HEAD` to an explicit target dataset version. Tagged versions are exempt from version
+cleanup. Omitted versions and caller-selected production tag names are rejected.
 
 ```bash
 lance-etl-maintenance tag \
   --base-uri s3://my-bucket/lance \
-  --tag HEAD \
   --tag-version 42 \
   --dd-service lance-pipeline --dd-env prod
 ```
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--tag` | `HEAD` | Serving tag name to update |
-| `--tag-version` | none | Target version. Omit to point the tag at each dataset's latest. |
+| `--tag-version` | required | Exact target version for `HEAD` |
 
 ### `migrate-manifests` — migrate to V2 manifest paths
 

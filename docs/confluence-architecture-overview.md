@@ -496,7 +496,7 @@ Both planes report to Datadog. Every emitter on the Rust side is infallible by c
 | `maintenance` | Per-dataset maintenance in order: per-row TTL expiration (when `--ttl-column` is set, deleting rows where `ts_column + ttl_column < now`), two-tier distributed compaction, and version cleanup. TTL is off by default. Pass `--ttl-column` to opt in. Pass `--ts-column` to name the event timestamp column (default `timestamp`). |
 | `index` | Build IVF_RQ vector, BTREE scalar, BITMAP, and full-text BM25 indexes over a set of datasets. |
 | `recall` | Replay Datadog-sampled queries as exact brute-force scans and report recall@k, nDCG@k, MRR. |
-| `tag` | Flip a serving tag (default `HEAD`) to a target dataset version for blue-green promotion. |
+| `tag` | Flip `HEAD` to an explicit target dataset version for blue-green promotion. |
 | `migrate-manifests` | Migrate dataset manifest paths to the V2 naming scheme. |
 | `migrate-namespace` | Copy a whole namespace to a new namespace name. One-off operator tool, not scheduled. |
 | `optimize-iceberg` | Optimize the upstream Iceberg source table via Iceberg's own `CALL` maintenance procedures. Distinct from `maintenance`, which optimizes Lance datasets. Steps (all on by default except orphan removal): `rewrite_data_files`, `rewrite_manifests`, `expire_snapshots`, opt-in `remove_orphan_files`. |
@@ -518,11 +518,11 @@ The order matters. **Always build, prewarm, then flip. Never flip, then warm.**
 1. Build the new (green) dataset version offline (for example via `index` or `migrate-namespace`).
 2. Tag green before any cleanup runs, so cleanup cannot delete it (`error_if_tagged_old_versions`).
 3. **Prewarm green by explicit version** on every serving replica (the Prewarm RPC accepts an explicit version or tag and returns the resolved version).
-4. Flip the `HEAD` tag to green with the `tag` subcommand (`update_serving_tags`).
+4. Flip the `HEAD` tag to green with the `tag` subcommand and required `--tag-version`.
 5. Watch telemetry for a flip-without-prewarm signal (served version not equal to the most-recently-prewarmed version).
 6. To roll back, flip the tag back to the prior version.
 
-Note: the serving-side tag resolution and prewarm-before-flip safety are still **Proposed** (ADR 0013). The Python `tag` helper only writes the tag and logs the safe sequence. It never assumes the serving layer auto-refreshes. The default serving tag name is `HEAD`.
+The Python `tag` helper only writes `HEAD` at an explicit version and logs the safe sequence. It never assumes the serving layer auto-refreshes.
 
 ### Running a namespace migration
 

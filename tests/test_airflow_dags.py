@@ -176,7 +176,6 @@ def test_pipeline_application_args_shape(
     """
     overrides, import_dag_module = dag_harness
     overrides["lance_etl_ttl_column"] = "expires_at"
-    overrides["lance_etl_pipeline_serve_tag"] = "true"
     module: ModuleType = import_dag_module("lance_etl_pipeline_dag")
     args: list[str] = module.build_pipeline_application_args(module.pipeline_dag_params)
     assert args[0] == "run"
@@ -184,4 +183,4 @@ def test_pipeline_application_args_shape(
     assert args[args.index("--ttl-column") + 1] == "expires_at"
     assert "--tag-stamp" in args
     assert args[args.index("--tag-keep-last") + 1] == "48"
-    assert "--serve-tag" in args
+    assert "--serve-tag" not in args

@@ -5,8 +5,7 @@ Exposes the ``main()`` entry point consumed by the ``lance-etl-maintenance`` scr
 
 ``run`` applies maintenance to a fleet of datasets: per-row TTL expiration (when ``--ttl-column``
 names a per-row TTL column), unified distributed compaction, and version cleanup in that order.
-``tag`` flips a serving tag (default ``HEAD``) to a target dataset version for blue-green
-promotion.  With no ``--tag-version`` the tag is moved to each dataset's latest version.
+``tag`` flips ``HEAD`` to an explicit target dataset version for blue-green promotion.
 
 ``migrate-manifests`` migrates every selected dataset's manifest paths to the V2 naming scheme
 so subsequent opens cost one object-store request instead of a version-count-proportional LIST.
@@ -66,18 +65,17 @@ def build_parser() -> argparse.ArgumentParser:
     tag_parser: argparse.ArgumentParser = subparsers.add_parser(
         "tag",
         help=(
-            "Flip a serving tag (default 'HEAD') to a target dataset version for blue-green promotion. "
+            "Flip HEAD to an explicit target dataset version for blue-green promotion. "
             "Tagged versions are exempt from version cleanup."
         ),
     )
     add_common_arguments(tag_parser)
     add_dataset_arguments(tag_parser)
-    tag_parser.add_argument("--tag", default="HEAD", help="Serving tag name to update. Default: HEAD.")
     tag_parser.add_argument(
         "--tag-version",
         type=int,
-        default=None,
-        help="Target dataset version for the tag. Omit to point the tag at each dataset's latest version.",
+        required=True,
+        help="Exact target dataset version for HEAD.",
     )
 
     migrate_manifests_parser: argparse.ArgumentParser = subparsers.add_parser(
@@ -150,7 +148,7 @@ def run_tag(args: argparse.Namespace) -> int:
                 load_dataset_uris(args, spark),
                 build_telemetry_config(args),
                 parse_storage_options(args),
-                tags=[args.tag],
+                tags=["HEAD"],
                 target_version=args.tag_version,
             )
         )

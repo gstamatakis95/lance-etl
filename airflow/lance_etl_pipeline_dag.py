@@ -17,8 +17,7 @@ Phase order within each run
 3. **Index**: build or incrementally maintain IVF_RQ vector indices and scalar/FTS indices.
    Column-selection flags come from ``lance_etl_index_flags`` (shell-tokenized).
 4. **Stamp**: write an interval tag named from ``data_interval_end`` in colon-free
-   ``%Y%m%dT%H%M%SZ`` UTC form.  When ``lance_etl_pipeline_serve_tag`` is truthy, the
-   pipeline also advances the ``HEAD`` tag to the same version.
+   ``%Y%m%dT%H%M%SZ`` UTC form. The temporary pipeline never advances ``HEAD``.
 
 Serialization guarantee
 -----------------------
@@ -79,9 +78,6 @@ Airflow Variables consumed by this DAG:
         Number of most-recent interval tags to retain across the fleet (default ``48``,
         equivalent to two days at hourly cadence).  Set to ``0`` to disable tag pruning
         and retention entirely.
-    lance_etl_pipeline_serve_tag
-        When truthy (``true``/``1``/``yes``), the pipeline also advances the ``HEAD``
-        tag after stamping the interval tag.  Default off.
     lance_etl_executor_instances
         ``spark.executor.instances`` override (default ``8``).
     lance_etl_executor_memory
@@ -108,7 +104,6 @@ from lance_etl_common import (
     make_lance_operator,
     pipeline_dag_params,
     resolve_variable,
-    variable_is_truthy,
 )
 
 from airflow import DAG
@@ -124,7 +119,7 @@ def build_pipeline_application_args(params: dict[str, str | int]) -> list[str]:
     by an optional ``--ttl-column`` from the ``lance_etl_ttl_column`` Variable, any
     shell-tokenized index flags from ``lance_etl_index_flags``, the ``--tag-stamp``
     derived from the Airflow ``data_interval_end``, the ``--tag-keep-last`` retention
-    count, and finally ``--serve-tag`` when ``lance_etl_pipeline_serve_tag`` is truthy.
+    count.
 
     Args:
         params: DAG-run ``params`` dict.
@@ -154,8 +149,6 @@ def build_pipeline_application_args(params: dict[str, str | int]) -> list[str]:
         "--tag-keep-last",
         Variable.get("lance_etl_tag_keep_last", default_var="48"),
     ]
-    if variable_is_truthy("lance_etl_pipeline_serve_tag"):
-        args += ["--serve-tag"]
     return args
 
 

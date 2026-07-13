@@ -14,8 +14,8 @@ local Lance fleet, drive the unmocked :class:`PipelineJob` on a real local Spark
 same executor closures production uses), and assert the second run leaves the dataset version and
 the index layout byte-for-byte where the first run left them.
 
-Tag pruning and stamping are intentionally out of scope here (``tag_keep_last=None``,
-``tag_stamp=None``, ``serve_tag=False``) so the no-op assertions focus on data and index state.
+Tag pruning and stamping are intentionally out of scope here (``tag_keep_last=None`` and
+``tag_stamp=None``) so the no-op assertions focus on data and index state.
 """
 
 from __future__ import annotations
@@ -129,7 +129,6 @@ def pipeline_config(telemetry_config: TelemetryConfig) -> PipelineConfig:
         indexing=indexing,
         tag_keep_last=None,
         tag_stamp=None,
-        serve_tag=False,
     )
 
 

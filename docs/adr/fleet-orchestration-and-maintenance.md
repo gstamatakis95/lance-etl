@@ -32,7 +32,7 @@ package, `lance_etl.pipeline`, now runs four phases in series over the fleet ins
 2. **Maintenance**: `MaintenanceJob.run` — TTL expiration, unified compaction, version cleanup.
 3. **Index**: `LanceIndexer.run` with derived-state skip.
 4. **Stamp**: when `tag_stamp` is set, write the `%Y%m%dT%H%M%SZ` interval tag via
-   `update_serving_tags`, optionally advancing `HEAD` when `serve_tag` is on.
+   `update_serving_tags`. The temporary pipeline never advances `HEAD`.
 
 Compact-before-index is structural rather than conventional, one cluster spin-up serves all
 phases, and the standalone maintenance/index CLIs remain as unscheduled operator tools. The ETL
@@ -147,13 +147,11 @@ scheduled interval rather than waiting for it. Idempotency (ADR 0039, verified b
 succeeded, and a dataset that keeps failing past the retry budget is carried to the next scheduled
 run. A clean run returns `0` and is not retried.
 
-A partially built dataset must never look fully served. `stamp_eligible` in `pipeline/job.py`
-excludes a dataset carrying a dataset-level error or any per-index error entry from the pipeline's
-post-index tag stamp, so a dataset whose vector, scalar, or FTS index build failed keeps its serving
-tag on the last fully-indexed version instead of being promoted mid-failure. The maintenance side is
-excluded from stamping the same way on a compaction error. `tests/test_poisoned_dataset.py` covers
-the build-failure case end to end and asserts the poisoned dataset is neither interval-stamped nor
-HEAD-promoted while its healthy siblings are.
+A partially built dataset must never look complete. `stamp_eligible` in `pipeline/job.py` excludes
+a dataset carrying a dataset-level error or any per-index error entry from the pipeline's
+post-index interval stamp. The maintenance side is excluded from stamping the same way on a
+compaction error. `tests/test_poisoned_dataset.py` covers the build-failure case end to end and
+asserts the poisoned dataset is not interval-stamped while its healthy siblings are.
 
 ## ADR 0036 — Idle-dataset cleanup rotation
 
@@ -331,26 +329,20 @@ recovery is automatic: the next indexing run sees no vector index, plans a boots
 the centroid sidecar still holds the old centroids in case an operator wants to re-drive the
 rebuild manually instead of waiting for the retrain.
 
-Serving-tag promotion happens exclusively through the `PipelineJob` stamp phase, which runs after
-the index phase in the `prune -> maintenance -> index -> stamp` sequence and already excludes
-error-marked datasets from stamping (ADR 0035). The clustered rewrite itself never touches any
-serving tag. The obsolete post-vector-rebuild promotion field and every clustered-rewrite CLI flag
-were removed. Because the old tags keep the pre-rewrite version readable, storage roughly doubles
+The temporary `PipelineJob` never publishes `HEAD`. Exact promotion belongs to the durable
+reconciler after the complete index set is validated and prewarmed. The clustered rewrite itself
+never touches any serving tag. The obsolete post-vector-rebuild promotion field and every
+clustered-rewrite CLI flag were removed. Because old tags keep the pre-rewrite version readable,
+storage roughly doubles
 for an internally qualified rewrite until interval-tag pruning and the cleanup horizon retire the
 pre-rewrite generation.
 
-**Serve-LATEST exposure.** Between the Overwrite commit and the index rebuilds, a default
-serve-latest reader (one not pinned to a tag) sees the freshly clustered generation with NO
-indexes at all: the vector gap lasts until the same maintenance phase's rebuild commits, and the
-scalar/FTS gap lasts until the next indexing run. Clustered-rewrite fleets must therefore serve by
-tag. Within the pipeline this is enforced at config time: `PipelineConfig.validate_cluster_serving`
-rejects `maintenance.cluster_rewrite=True` unless BOTH `serve_tag=True` AND `tag_stamp` is set,
-since promotion only happens when the two hold together. The stamp phase returns early when
-`tag_stamp` is `None`, so `serve_tag=True` with `tag_stamp=None` would pass a promotion-disabled
-config that never advances `HEAD` and never serves the clustered generation. Requiring both is the
-in-config signal that promotion goes through the post-index stamp phase rather than readers
-following latest. This validation remains part of the internal qualification surface. Production
-CLI callers cannot enable the rewrite.
+Between the Overwrite commit and the index rebuilds, a serve-latest reader would see the freshly
+clustered generation with no indexes at all. The vector gap lasts until the same maintenance
+phase's rebuild commits, and the scalar and FTS gap lasts until the next indexing run. The
+production pipeline therefore rejects `maintenance.cluster_rewrite=True` at configuration time.
+Production CLI callers cannot enable the rewrite. Direct maintenance construction remains an
+internal qualification surface only.
 
 **Derived-state skip.** `commit_cluster_overwrite` stamps a generation fingerprint (the committed
 generation's sorted data-fragment id list and logical row count) into the dataset config KV under

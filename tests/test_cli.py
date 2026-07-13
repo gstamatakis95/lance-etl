@@ -116,6 +116,22 @@ def test_maintenance_ttl_column_flag() -> None:
     assert args.ts_column == "event_time"
 
 
+def test_maintenance_tag_requires_explicit_version() -> None:
+    """The HEAD publication command rejects an omitted target version."""
+    with pytest.raises(SystemExit) as exc_info:
+        maintenance_cli.build_parser().parse_args(["tag", "--base-uri", "/tmp/lance"])
+    assert exc_info.value.code != 0
+
+
+def test_maintenance_tag_rejects_arbitrary_tag_name() -> None:
+    """Production publication exposes HEAD only, never caller-selected tag names."""
+    with pytest.raises(SystemExit) as exc_info:
+        maintenance_cli.build_parser().parse_args(
+            ["tag", "--base-uri", "/tmp/lance", "--tag-version", "42", "--tag", "prod"]
+        )
+    assert exc_info.value.code != 0
+
+
 @pytest.mark.parametrize("flag", ["--cluster-rewrite", "--cluster-column", "--cluster-serve-tag"])
 def test_maintenance_cluster_rewrite_flags_removed(flag: str) -> None:
     """Production maintenance rejects every clustered-overwrite command-line surface."""
@@ -257,10 +273,9 @@ def test_pipeline_run_parses_required_args() -> None:
 
 
 def test_pipeline_run_defaults() -> None:
-    """``pipeline run`` defaults: tag_keep_last=48, serve_tag=False, tag_stamp=None, rebuild=False."""
+    """``pipeline run`` defaults to interval retention without publication or rebuild."""
     args = pipeline_cli.build_parser().parse_args(REQUIRED_PIPELINE_RUN_ARGV)
     assert args.tag_keep_last == 48
-    assert args.serve_tag is False
     assert args.tag_stamp is None
     assert args.rebuild is False
     assert args.ttl_column is None
@@ -273,10 +288,11 @@ def test_pipeline_tag_keep_last_zero_disables() -> None:
     assert args.tag_keep_last == 0
 
 
-def test_pipeline_serve_tag_flag() -> None:
-    """``--serve-tag`` is accepted and stored as True."""
-    args = pipeline_cli.build_parser().parse_args([*REQUIRED_PIPELINE_RUN_ARGV, "--serve-tag"])
-    assert args.serve_tag is True
+def test_pipeline_serve_tag_flag_removed() -> None:
+    """The temporary pipeline cannot publish an implicit latest version to HEAD."""
+    with pytest.raises(SystemExit) as exc_info:
+        pipeline_cli.build_parser().parse_args([*REQUIRED_PIPELINE_RUN_ARGV, "--serve-tag"])
+    assert exc_info.value.code != 0
 
 
 def test_pipeline_tag_stamp_converts_via_parse_window_tag() -> None:

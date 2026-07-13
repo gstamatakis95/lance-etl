@@ -13,10 +13,9 @@ The suite pins every marker shape the isolation feature produces:
   "phase"}`` entry inside the ``indexes`` list for a build or commit failure (vector-artifact
   resolution now happens inside the build shard, so a resolution failure surfaces as a
   ``"phase": "build"`` entry).
-- :func:`stamp_eligible` must exclude both indexing shapes, which is the correctness fix these
-  tests guard: a dataset whose vector build failed is recorded as a per-index error with no
-  top-level key, so the old one-key ``"error" not in index_stats`` check let it pass and
-  HEAD-promoted the serving layer onto an incomplete index.
+- :func:`stamp_eligible` must exclude both indexing shapes. A dataset whose vector build failed is
+  recorded as a per-index error with no top-level key, so the old one-key
+  ``"error" not in index_stats`` check let it receive a misleading success interval tag.
 - The per-job CLIs surface the isolated failures as the ``EXIT_PARTIAL_FAILURE`` exit code ``3``.
 
 The real business callables are imported under ``real_*`` aliases at module top so a wrapper can
@@ -193,8 +192,8 @@ def test_indexing_build_error_isolated_and_not_stamped(tmp_path: Path, monkeypat
     per-index ``{"error", "phase": "build"}`` entry inside ``indexes`` with no top-level ``"error"``
     key, while the healthy dataset builds its vector index. This is the discriminating case for the
     :func:`stamp_eligible` fix: the poisoned result has no top-level error, so the old one-key
-    ``"error" not in index_stats`` check returned ``True`` and would HEAD-promote a dataset whose
-    index is incomplete. The corrected check also scans the per-index entries, so ``stamp_eligible``
+    ``"error" not in index_stats`` check returned ``True`` and would stamp a dataset whose index
+    is incomplete. The corrected check also scans the per-index entries, so ``stamp_eligible``
     is ``False`` for the poisoned dataset and ``True`` for the healthy one.
 
     Args:
@@ -269,17 +268,14 @@ def test_indexing_plan_error_sets_top_level_error(tmp_path: Path, monkeypatch: p
     assert stamp_eligible(skip_result) is True
 
 
-def test_pipeline_build_failed_dataset_not_head_promoted(
+def test_pipeline_build_failed_dataset_not_interval_stamped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, telemetry_config: TelemetryConfig
 ) -> None:
-    """A build-failed dataset is neither interval-stamped nor HEAD-promoted by the pipeline.
+    """A build-failed dataset receives no successful interval stamp.
 
-    The pipeline runs with an interval tag and ``serve_tag`` on so eligible datasets get both the
-    interval tag and a HEAD flip. ``build_one_shard`` is patched to fail the poisoned dataset's
-    vector build, which records a per-index error. With the :func:`stamp_eligible` fix the poisoned
-    dataset is excluded from stamping, so its HEAD tag never advances onto the incomplete index,
-    while the healthy dataset receives both tags. Without the fix the poisoned dataset would pass
-    the one-key eligibility check and be HEAD-promoted here.
+    ``build_one_shard`` is patched to fail the poisoned dataset's vector build, which records a
+    per-index error. The poisoned dataset is excluded from stamping while the healthy dataset
+    receives the interval tag. The temporary pipeline never publishes HEAD for either dataset.
 
     Args:
         tmp_path: Pytest-provided temporary directory.
@@ -303,16 +299,15 @@ def test_pipeline_build_failed_dataset_not_head_promoted(
         indexing=indexing_config(),
         tag_keep_last=None,
         tag_stamp=INTERVAL_TAG,
-        serve_tag=True,
     )
     result: dict[str, Any] = PipelineJob(config).run(FakeSpark(), [healthy, poison])
 
     assert result["counts"]["failed"] >= 1
     healthy_tags: set[str] = set(lance.dataset(healthy).tags.list())
     poison_tags: set[str] = set(lance.dataset(poison).tags.list())
-    assert "HEAD" in healthy_tags
     assert INTERVAL_TAG in healthy_tags
     assert "HEAD" not in poison_tags
+    assert "HEAD" not in healthy_tags
     assert INTERVAL_TAG not in poison_tags
 
     stamped_uris: set[str] = {entry["uri"] for entry in result["stamp_results"]}

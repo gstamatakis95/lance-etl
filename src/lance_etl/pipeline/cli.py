@@ -5,7 +5,7 @@ Exposes the ``main()`` entry point consumed by the ``lance-etl-pipeline`` script
 
 ``run`` executes the full four-phase pipeline over a fleet of datasets: prune old interval
 tags, TTL expiration and unified compaction, unified index builds, and finally write an
-interval tag (and optionally advance ``HEAD``) on every dataset that completed successfully.
+interval tag on every dataset that completed successfully.
 """
 
 from __future__ import annotations
@@ -87,15 +87,6 @@ def build_parser() -> argparse.ArgumentParser:
             "Pass 0 to disable pruning entirely."
         ),
     )
-    run_parser.add_argument(
-        "--serve-tag",
-        action="store_true",
-        help=(
-            "After stamping the interval tag, also advance the HEAD tag to each dataset's latest version for "
-            "blue-green promotion. Only takes effect when --tag-stamp is set."
-        ),
-    )
-
     return parser
 
 
@@ -135,7 +126,6 @@ def run_run(args: argparse.Namespace) -> int:
             indexing=indexing_config,
             tag_keep_last=tag_keep_last,
             tag_stamp=args.tag_stamp,
-            serve_tag=args.serve_tag,
         )
         result: dict[str, Any] = PipelineJob(config).run(spark, uris)
         failed: int = int(result["counts"]["failed"])

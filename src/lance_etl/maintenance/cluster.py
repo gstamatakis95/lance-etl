@@ -1679,13 +1679,11 @@ def finalise_cluster_dataset(
     complete, just unindexed, so the result carries an ``{"error", "phase": "cluster_index"}`` marker
     and the data stays committed. On success old versions are pruned.
 
-    Serving promotion is deliberately NOT done here. Flipping ``HEAD`` right after the vector-index
+    Serving promotion is deliberately not done here. Flipping ``HEAD`` right after the vector-index
     commit would expose a generation whose scalar and FTS indexes have not yet been rebuilt (those
     are left to the next indexing run, ADR 0041), so a text query could see a clustered-but-unindexed
-    generation as the served one. Promotion happens exclusively through the pipeline stamp phase,
-    which runs AFTER the index phase in the ``prune -> maintenance -> index -> stamp`` sequence and
-    excludes error-marked datasets, so a dataset is HEAD-promoted only once every index it needs is
-    rebuilt.
+    generation as the served one. Exact promotion belongs to the durable reconciler after every
+    required index is rebuilt, validated, and prewarmed.
 
     Args:
         uri: Dataset URI.

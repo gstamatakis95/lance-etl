@@ -115,7 +115,6 @@ def run_e2e_pipeline_batch(config: BenchConfig, batch_index: int, tag: str) -> d
         indexing=union_index_config(config),
         tag_stamp=tag,
         tag_keep_last=None,
-        serve_tag=False,
     )
     uris: list[str] = config.dataset_uris()
     spark = build_spark(config, f"bench-e2e-pipeline-{batch_index}")

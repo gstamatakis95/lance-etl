@@ -204,10 +204,9 @@ class TestPhaseOrdering:
             telemetry_config,
             tag_keep_last=10,
             tag_stamp="20260611T120000Z",
-            serve_tag=True,
         )
         PipelineJob(config).run(FakeSpark(), [uri])
-        assert order == ["prune", "maintenance", "index", "stamp:20260611T120000Z,HEAD"]
+        assert order == ["prune", "maintenance", "index", "stamp:20260611T120000Z"]
 
     def test_prune_skipped_when_tag_keep_last_none(
         self,
@@ -405,17 +404,13 @@ class TestStampGating:
         assert uri_ok in stamped_uris
         assert uri_err not in stamped_uris
 
-    def test_serve_tag_stamps_interval_and_head_in_one_fan_out(
+    def test_stamp_phase_never_publishes_head(
         self,
         telemetry_config: TelemetryConfig,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        """One update_serving_tags fan-out flips both the interval tag and HEAD.
-
-        With ``serve_tag`` set, the stamp phase must make exactly one call carrying both tags
-        instead of one call per tag.
-        """
+        """The temporary pipeline stamps an interval without implicitly publishing HEAD."""
         uri: str = write_tiny_dataset(tmp_path)
         calls: list[list[str]] = []
 
@@ -444,12 +439,11 @@ class TestStampGating:
             telemetry_config,
             tag_keep_last=None,
             tag_stamp="20260611T120000Z",
-            serve_tag=True,
         )
         result: dict[str, Any] = PipelineJob(config).run(FakeSpark(), [uri])
 
         assert len(calls) == 1
-        assert calls[0] == ["20260611T120000Z", "HEAD"]
+        assert calls[0] == ["20260611T120000Z"]
         assert result["counts"]["stamped"] == 1
 
     def test_no_tag_stamp_skips_update_serving_tags(
@@ -655,39 +649,11 @@ class TestConfigValidation:
                 tag_cadence_seconds=7200,
             )
 
-    def test_cluster_rewrite_requires_serve_tag(self, telemetry_config: TelemetryConfig) -> None:
-        """cluster_rewrite without serve_tag would expose the unindexed generation to serve-latest readers."""
+    def test_cluster_rewrite_rejected_from_pipeline(self, telemetry_config: TelemetryConfig) -> None:
+        """The production pipeline cannot reach clustered overwrite before exact promotion exists."""
         maintenance = MaintenanceConfig(telemetry=telemetry_config, cluster_rewrite=True)
-        with pytest.raises(ValueError, match="serve_tag"):
-            PipelineConfig(telemetry=telemetry_config, maintenance=maintenance, serve_tag=False)
-
-    def test_cluster_rewrite_with_serve_tag_constructs(self, telemetry_config: TelemetryConfig) -> None:
-        """cluster_rewrite with serve-by-tag promotion is the supported combination."""
-        maintenance = MaintenanceConfig(telemetry=telemetry_config, cluster_rewrite=True)
-        config = PipelineConfig(
-            telemetry=telemetry_config,
-            maintenance=maintenance,
-            tag_stamp="20260611T120000Z",
-            serve_tag=True,
-        )
-        assert config.maintenance.cluster_rewrite is True
-
-    def test_cluster_rewrite_serve_tag_without_tag_stamp_rejected(self, telemetry_config: TelemetryConfig) -> None:
-        """serve_tag=True with tag_stamp=None disables the stamp phase, so HEAD never advances (C1).
-
-        The stamp phase returns early when ``tag_stamp`` is ``None``, so this combination would pass
-        validation yet never promote the clustered generation. It must be rejected at construction.
-        ``tag_keep_last`` is disabled so the cleanup-horizon check does not fire first.
-        """
-        maintenance = MaintenanceConfig(telemetry=telemetry_config, cluster_rewrite=True)
-        with pytest.raises(ValueError, match="tag_stamp set"):
-            PipelineConfig(
-                telemetry=telemetry_config,
-                maintenance=maintenance,
-                tag_keep_last=None,
-                tag_stamp=None,
-                serve_tag=True,
-            )
+        with pytest.raises(ValueError, match="cluster_rewrite is disabled"):
+            PipelineConfig(telemetry=telemetry_config, maintenance=maintenance, tag_keep_last=None)
 
 
 class TestFailedCounts:
@@ -720,7 +686,7 @@ class TestFailedCounts:
         monkeypatch.setattr(pipeline_job.LanceIndexer, "run", noop_indexer_run)
         monkeypatch.setattr(pipeline_job, "update_serving_tags", failing_stamp)
 
-        config = make_config(telemetry_config, tag_keep_last=None, tag_stamp="20260611T120000Z", serve_tag=True)
+        config = make_config(telemetry_config, tag_keep_last=None, tag_stamp="20260611T120000Z")
         result: dict[str, Any] = PipelineJob(config).run(FakeSpark(), [uri])
         assert result["counts"]["failed"] == 1
         assert result["counts"]["stamped"] == 0

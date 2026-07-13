@@ -49,7 +49,7 @@ src/lance_etl/          Python package (production sources)
     __init__.py         Re-exports: PipelineJob, PipelineConfig, prune_interval_tags, prune_interval_tags_fleet, stamp_eligible
     cli.py              Entry point for lance-etl-pipeline script and python -m lance_etl.pipeline
     __main__.py         Calls cli.main()
-    job.py              PipelineJob, PipelineConfig: prune -> maintenance -> index -> stamp serialized fleet phases. The stamp phase runs ONE update_serving_tags fan-out that stamps the interval tag and HEAD together.
+    job.py              PipelineJob, PipelineConfig: prune -> maintenance -> index -> stamp serialized fleet phases. The temporary stamp phase writes interval tags only and never publishes HEAD.
   tools/                Operator tools package (python -m lance_etl.tools)
     __init__.py         Package marker
     cli.py              Entry point for lance-etl-tools script and python -m lance_etl.tools

@@ -250,8 +250,8 @@ def update_serving_tag(
     """Point one or more serving tags at a target dataset version for blue-green promotion.
 
     Opens the dataset exactly once and flips every tag in ``tags`` against that single open
-    handle, so promoting an interval tag alongside ``HEAD`` (the pipeline stamp phase's common
-    case) costs one dataset open instead of one per tag. Each tag is created when it does not
+    handle, so an internal caller moving several tags costs one dataset open instead of one per
+    tag. Each tag is created when it does not
     exist yet, otherwise updated in place, through the Lance tags API. A tagged version is exempt
     from version cleanup: :func:`~lance_etl.maintenance.job.cleanup_dataset` passes
     ``error_if_tagged_old_versions=False`` and Lance never prunes a tagged version regardless of
@@ -276,7 +276,7 @@ def update_serving_tag(
     Args:
         uri: Dataset URI.
         target_version: The dataset version to point every tag at. ``None`` selects the
-            dataset's latest version.
+            dataset's latest version only when the tag set does not contain ``HEAD``.
         storage_options: Object-store options forwarded to pylance.
         telemetry: Telemetry facade for the current process.
         tags: Serving-tag names to create or move, all against the same resolved version.
@@ -286,10 +286,15 @@ def update_serving_tag(
         A statistics dictionary with keys ``uri``, ``tags`` (the deduplicated list of tag names
         flipped), ``version``, and ``created`` (a dict mapping each flipped tag name to whether a
         create or an update actually landed for it).
+
+    Raises:
+        ValueError: If ``HEAD`` is requested without an explicit target version.
     """
+    unique_tags: list[str] = list(dict.fromkeys(tags))
+    if "HEAD" in unique_tags and target_version is None:
+        raise ValueError("target_version is required when publishing HEAD")
     dataset: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
     version: int = dataset.version if target_version is None else target_version
-    unique_tags: list[str] = list(dict.fromkeys(tags))
     logger.info(
         "blue-green tag flip for %s: 1) build green version %d, 2) prewarm the serving layer against version %d, "
         "3) flip tag(s) %r to version %d. A tag move does not refresh a running serving process: prewarm and "
@@ -317,12 +322,11 @@ def update_serving_tags(
 
     Each dataset's tag flip is an independent cheap metadata commit, so the work fans
     out across executors exactly like the manifest migration. Every tag in ``tags`` is flipped
-    against the same single dataset open (see :func:`update_serving_tag`), so a caller that needs
-    to advance both an interval tag and ``HEAD`` on the same run does so in one fan-out instead of
-    two. With ``target_version`` set, every dataset is pointed at that same version number, which
-    only makes sense for a single dataset. With ``target_version=None`` (the common fleet case)
-    each dataset's tags are moved to its own latest version, promoting the freshly built green
-    version of each.
+    against the same single dataset open (see :func:`update_serving_tag`). With
+    ``target_version`` set, every dataset is pointed at that same version number, which
+    only makes sense when every selected dataset has the intended version number. With
+    ``target_version=None`` each dataset's non-HEAD interval tags are moved to its own latest
+    version. Publishing ``HEAD`` without an exact version is rejected.
 
     Args:
         spark: Active Spark session.
@@ -330,8 +334,8 @@ def update_serving_tags(
         telemetry_config: Telemetry configuration created per executor process.
         storage_options: Object-store options forwarded to pylance.
         tags: Serving-tag names to create or move. Defaults to ``("HEAD",)``.
-        target_version: Target version for every dataset, or ``None`` to use each
-            dataset's latest version.
+        target_version: Target version for every dataset, or ``None`` to use each dataset's latest
+            version for non-HEAD interval tags only.
         partitions: Maximum Spark partitions for the tag-flip job.
 
     Returns:

@@ -53,7 +53,7 @@ every path unchanged.
 
 Status: Accepted (originally Proposed, since implemented and extended by ADR 0032)
 
-A serving tag (default `HEAD`, configurable) updated via `tags.update` provides O(1) cutover.
+A fixed production tag named `HEAD` updated via `tags.update` provides O(1) cutover.
 The safety rules that make it correct with version-keyed caches:
 
 - Prewarm accepts an explicit version or tag and returns the resolved version, so green is
@@ -67,8 +67,9 @@ The safety rules that make it correct with version-keyed caches:
 - Telemetry makes a flip-without-prewarm observable (`serve.cold_open` tagged `warmed`).
 - Version cleanup never deletes a tagged version, and green is tagged before cleanup runs.
 
-Serving through the tag is opt-in via `SEARCH_API_SERVE_BY_TAG`. The Python tag helper only
-writes the tag and logs the safe sequence — the serving layer is never assumed to auto-refresh.
+Production serving always resolves `HEAD`. There is no environment switch to fall back to latest
+or select another production tag. The Python tag helper requires an explicit target version for
+`HEAD` and logs the safe sequence. The serving layer is never assumed to auto-refresh.
 
 **Tag retention versus the cleanup horizon.** Interval tags pin the versions they point at, and
 the count-based prune (`tag_keep_last`, hourly by convention) unpins the oldest tag's version

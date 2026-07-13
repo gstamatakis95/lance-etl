@@ -9,12 +9,11 @@ The phase sequence is:
 1. **Prune**: delete old interval tags (skipped when ``tag_keep_last`` is ``None``).
 2. **Maintenance**: per-row TTL expiration, unified task-based compaction, and version cleanup.
 3. **Index**: unified task-based index builds with derived-state skip.
-4. **Stamp**: write an interval tag and optionally advance the HEAD tag (skipped when
-   ``tag_stamp`` is ``None``).
+4. **Stamp**: write an interval tag (skipped when ``tag_stamp`` is ``None``).
 
 Each fleet phase isolates per-dataset failures rather than aborting the whole run: a dataset that
-fails compaction or indexing is recorded with an error marker and excluded from stamping (a failed
-dataset is never HEAD-promoted), while every other dataset completes and is stamped. Failed
+fails compaction or indexing is recorded with an error marker and excluded from stamping, while
+every other dataset completes and is stamped. Failed
 datasets carry no cursor and are simply re-processed by the next scheduled run.
 """
 
@@ -57,8 +56,6 @@ class PipelineConfig:
             disables pruning entirely.
         tag_stamp: The interval tag name to write after a successful run.  ``None``
             disables the stamp phase.
-        serve_tag: When ``True`` and ``tag_stamp`` is set, advance the ``HEAD`` tag to the
-            dataset's latest version after stamping the interval tag.
         tag_cadence_seconds: The scheduling cadence at which interval tags are stamped (hourly by
             convention), used to size the tag-retention window for the cleanup-horizon check.
         cleanup_slack_seconds: Extra safety margin the cleanup horizon must clear beyond the
@@ -71,7 +68,6 @@ class PipelineConfig:
     indexing: IndexJobConfig = field(default_factory=lambda: IndexJobConfig(telemetry=TelemetryConfig()))
     tag_keep_last: int | None = 48
     tag_stamp: str | None = None
-    serve_tag: bool = False
     tag_cadence_seconds: int = 3600
     cleanup_slack_seconds: int = 3600
 
@@ -100,31 +96,18 @@ class PipelineConfig:
                 "unpinned while a replica mid-scan still holds it (ADR 0013)"
             )
 
-    def validate_cluster_serving(self) -> None:
-        """Require working serve-by-tag promotion when the clustered rewrite is enabled.
+    def validate_cluster_rewrite_disabled(self) -> None:
+        """Reject clustered overwrite from the production pipeline.
 
-        A clustered rewrite's Overwrite commits a generation whose indexes are rebuilt later
-        (vector in the same maintenance phase, scalar and FTS only in the following index phase),
-        so a serve-LATEST reader would see the unindexed generation in between. A fleet running
-        clustered rewrites must therefore serve by tag, and within this pipeline promotion goes
-        through the stamp phase, which advances ``HEAD`` only after the index phase and only for
-        datasets with no error marker (ADR 0041). Promotion only actually happens when BOTH
-        ``serve_tag`` is set AND ``tag_stamp`` names an interval tag: :meth:`PipelineJob.stamp_phase`
-        returns early when ``tag_stamp`` is ``None``, so ``serve_tag=True`` with ``tag_stamp=None``
-        never advances ``HEAD`` and the clustered generation is never served. Both are therefore
-        required together.
+        The temporary pipeline cannot prove, prewarm, and publish one exact fully indexed
+        version. Clustered overwrite remains an internal qualification surface until the
+        reconciler and exact-version promotion protocol replace this pipeline.
 
         Raises:
-            ValueError: If ``maintenance.cluster_rewrite`` is set without ``serve_tag`` or without
-                ``tag_stamp``, either of which leaves the clustered generation unpromotable.
+            ValueError: If clustered overwrite is enabled in the production pipeline.
         """
-        if self.maintenance.cluster_rewrite and (not self.serve_tag or self.tag_stamp is None):
-            raise ValueError(
-                "cluster_rewrite requires serve_tag=True and tag_stamp set: the Overwrite exposes an unindexed "
-                "generation to serve-LATEST readers until the index phase rebuilds every index, and the stamp "
-                "phase only advances HEAD when it also writes an interval tag, so clustered-rewrite fleets must "
-                "serve by tag and promote through the stamp phase (ADR 0041)"
-            )
+        if self.maintenance.cluster_rewrite:
+            raise ValueError("cluster_rewrite is disabled in the production pipeline until exact promotion exists")
 
     def __post_init__(self) -> None:
         """Push cross-cutting settings into the composed sub-configurations, then validate.
@@ -133,21 +116,20 @@ class PipelineConfig:
         ``maintenance`` and ``indexing`` so every phase shares the same identity and
         object-store credentials without requiring callers to set them on each sub-config
         individually. Then applies the cross-config safety checks
-        (:meth:`validate_cleanup_horizon`, :meth:`validate_cluster_serving`), which need both this
+        (:meth:`validate_cleanup_horizon`, :meth:`validate_cluster_rewrite_disabled`), which need both this
         config's tag settings and the composed maintenance config, so they live here rather than on
         either sub-config.
 
         Raises:
             ValueError: If the cleanup horizon does not clear the tag-retention window plus slack,
-                or if the clustered rewrite is enabled without a working serve-by-tag promotion
-                (both ``serve_tag`` and ``tag_stamp``).
+                or if clustered overwrite is enabled.
         """
         self.maintenance.telemetry = self.telemetry
         self.maintenance.storage_options = self.storage_options
         self.indexing.telemetry = self.telemetry
         self.indexing.storage_options = self.storage_options
         self.validate_cleanup_horizon()
-        self.validate_cluster_serving()
+        self.validate_cluster_rewrite_disabled()
 
 
 def stamp_eligible(index_stats: dict[str, Any]) -> bool:
@@ -158,14 +140,13 @@ def stamp_eligible(index_stats: dict[str, Any]) -> bool:
     implements.  A plan failure sets a dataset-level ``"error"`` key, while a build or
     commit failure is recorded as a per-index ``{"error", "phase"}``
     entry inside the ``"indexes"`` list with no top-level key set (see :meth:`LanceIndexer.run`),
-    so both failure shapes must be excluded here.  Checking only the top-level key would let a
-    dataset whose vector index build failed still pass, HEAD-promoting the serving layer onto an
-    incomplete index and degrading recall for that org while the same dataset is reported failed
-    and will be retried.  A dataset that was skipped because all its indices were already current
+    so both failure shapes must be excluded here. Checking only the top-level key would let a
+    dataset whose vector index build failed still receive a misleading success interval tag while
+    the same dataset is reported failed and will be retried. A dataset that was skipped because
+    all its indices were already current
     (``"skipped"`` key present, no error entries) is still eligible because the indices are valid
-    and current.  An ineligible dataset is neither interval-stamped nor HEAD-promoted, so a
-    partially-indexed dataset is never HEAD-promoted and its serving version stays at its last good
-    state.
+    and current. An ineligible dataset is not interval-stamped, so a partially indexed generation
+    is never labeled as a successful completed interval.
 
     Args:
         index_stats: One entry from the list returned by :meth:`LanceIndexer.run`.
@@ -232,14 +213,10 @@ class PipelineJob:
         """Run the interval-tag stamp phase, or skip it when ``tag_stamp`` is ``None``.
 
         Stamps the configured interval tag on every dataset whose index stats pass
-        :func:`stamp_eligible` and whose maintenance result carries no error, and, when
-        ``serve_tag`` is set, advances the ``HEAD`` tag on the same datasets in the SAME
-        fan-out: :func:`~lance_etl.maintenance.tools.update_serving_tags` opens each dataset
-        exactly once and flips both tags against that one open handle
-        (:func:`~lance_etl.maintenance.tools.update_serving_tag`), instead of re-opening every
-        eligible dataset a second time for the HEAD flip. A dataset whose compaction failed is
-        never HEAD-promoted, so a failed dataset's serving version never advances past its last
-        good state.
+        :func:`stamp_eligible` and whose maintenance result carries no error. The temporary
+        pipeline never advances ``HEAD``. Exact publication belongs to the durable reconciler,
+        which validates and prewarms one explicit indexed version before moving the production
+        tag.
 
         Args:
             spark: Active Spark session.
@@ -251,8 +228,7 @@ class PipelineJob:
             driver_telemetry: The driver's telemetry facade.
 
         Returns:
-            The raw per-dataset tag-update results (interval stamp plus any HEAD flip, both from
-            the single fan-out call), empty when stamping is disabled.
+            The raw per-dataset interval-tag update results, empty when stamping is disabled.
         """
         config: PipelineConfig = self.config
         if config.tag_stamp is None:
@@ -264,7 +240,7 @@ class PipelineJob:
             for u in uris
             if stamp_eligible(index_by_uri.get(u, {})) and not dataset_result_failed(maint_by_uri.get(u, {}))
         ]
-        tags: list[str] = [config.tag_stamp, "HEAD"] if config.serve_tag else [config.tag_stamp]
+        tags: list[str] = [config.tag_stamp]
         logger.info(
             "pipeline: stamping tag(s) %r on %d/%d eligible datasets",
             tags,
@@ -284,9 +260,6 @@ class PipelineJob:
         run_span.set_tag("stamped", stamped)
         driver_telemetry.gauge("run.stamped_datasets", stamped)
 
-        if config.serve_tag:
-            head_flipped: int = sum(1 for r in stamp_results if "HEAD" in r.get("tags", []))
-            driver_telemetry.gauge("run.head_tags_flipped", head_flipped)
         return stamp_results
 
     def run(self, spark: SparkSession, uris: list[str]) -> dict[str, Any]:
@@ -309,16 +282,15 @@ class PipelineJob:
             - ``index_results``: raw list from :meth:`LanceIndexer.run`.
             - ``prune_results``: raw list from :meth:`prune_interval_tags_fleet` (empty list
               when pruning is skipped).
-            - ``stamp_results``: raw list from the single :func:`~lance_etl.maintenance.tools.update_serving_tags`
-              fan-out (interval tag plus, when ``serve_tag`` is set, ``HEAD``, flipped together
-              per dataset), empty when stamping is skipped.
+            - ``stamp_results``: raw list from the single
+              :func:`~lance_etl.maintenance.tools.update_serving_tags` interval-tag fan-out,
+              empty when stamping is skipped.
             - ``tag_stamp``: the interval tag name that was written, or ``None``.
             - ``counts``: summary counts with keys ``total``, ``pruned_tags``,
               ``maintenance_skipped``, ``index_skipped``, ``stamped``, and ``failed`` (datasets
               that failed any phase in isolation this run — prune, compaction, indexing, or
-              stamping). Prune and stamp failures count too because a dataset whose tag prune or
-              HEAD flip failed serves stale until retried, so the run must exit non-zero for the
-              operator alert rather than reporting success.
+              stamping). Prune and stamp failures count too, so the run must exit non-zero for
+              the operator alert rather than reporting success.
         """
         config: PipelineConfig = self.config
         driver_telemetry: Telemetry = Telemetry.create(config.telemetry)

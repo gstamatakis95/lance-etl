@@ -41,8 +41,8 @@ MaintenanceJob.run()                      rounds of plan -> execute -> commit
 The unified pipeline job serializes the fleet phases `prune -> maintenance -> index -> stamp`.
 Move-stable row IDs are rejected (`docs/adr/rejected-and-operator-tools.md`, ADR 0010). V2 manifest
 paths are on by default, making each of the 30k dataset opens a single object-store request.
-Serving is tag-based: a `HEAD` (or named) tag points at a concrete version, and the ETL stamps
-hourly interval tags that a query can pin. The full job-by-job guide is in
+Production serving is pinned to the `HEAD` tag at a concrete version. The ETL stamps hourly
+interval tags for internal qualification and replay. The full job-by-job guide is in
 `src/lance_etl/README.md`.
 
 ### Rust gRPC search service (`rust/search-api`)

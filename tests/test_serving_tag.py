@@ -28,11 +28,30 @@ def write_versions(uri: str, count: int) -> None:
         lance.write_dataset(pa.table({"a": pa.array([index], pa.int64())}), uri, mode="append")
 
 
-def test_update_serving_tag_creates_at_latest(tmp_path: Path, telemetry: Telemetry) -> None:
-    """With no target version the tag is created at the dataset's latest version."""
+def test_update_serving_tag_rejects_implicit_head(tmp_path: Path, telemetry: Telemetry) -> None:
+    """HEAD publication fails before opening a dataset when no exact version is supplied."""
     uri: str = str(tmp_path / "ds.lance")
     write_versions(uri, 2)
-    result: dict[str, object] = update_serving_tag(uri, None, None, telemetry)
+    with pytest.raises(ValueError, match="target_version is required"):
+        update_serving_tag(uri, None, None, telemetry)
+
+
+def test_update_interval_tag_allows_latest(tmp_path: Path, telemetry: Telemetry) -> None:
+    """A non-serving interval tag may still resolve the dataset's latest version."""
+    uri: str = str(tmp_path / "ds.lance")
+    write_versions(uri, 2)
+    result: dict[str, object] = update_serving_tag(uri, None, None, telemetry, tags=["20260710T000000Z"])
+    assert result["created"] == {"20260710T000000Z": True}
+    assert result["tags"] == ["20260710T000000Z"]
+    assert result["version"] == 2
+    assert lance.dataset(uri).tags.get_version("20260710T000000Z") == 2
+
+
+def test_update_serving_tag_creates_at_explicit_version(tmp_path: Path, telemetry: Telemetry) -> None:
+    """HEAD is created only at the caller's explicit target version."""
+    uri: str = str(tmp_path / "ds.lance")
+    write_versions(uri, 2)
+    result: dict[str, object] = update_serving_tag(uri, 2, None, telemetry)
     assert result["created"] == {"HEAD": True}
     assert result["tags"] == ["HEAD"]
     assert result["version"] == 2
@@ -43,7 +62,7 @@ def test_update_serving_tag_moves_existing(tmp_path: Path, telemetry: Telemetry)
     """An existing tag is updated in place to an explicit target version."""
     uri: str = str(tmp_path / "ds.lance")
     write_versions(uri, 3)
-    update_serving_tag(uri, None, None, telemetry)
+    update_serving_tag(uri, 3, None, telemetry)
     moved: dict[str, object] = update_serving_tag(uri, 1, None, telemetry)
     assert moved["created"] == {"HEAD": False}
     assert moved["version"] == 1
@@ -54,7 +73,7 @@ def test_update_serving_tag_flips_multiple_tags_at_the_same_version(tmp_path: Pa
     """One call flips several tags against the same resolved version, one dataset open."""
     uri: str = str(tmp_path / "ds.lance")
     write_versions(uri, 2)
-    result: dict[str, object] = update_serving_tag(uri, None, None, telemetry, tags=["20260710T000000Z", "HEAD"])
+    result: dict[str, object] = update_serving_tag(uri, 2, None, telemetry, tags=["20260710T000000Z", "HEAD"])
     assert result["tags"] == ["20260710T000000Z", "HEAD"]
     assert result["created"] == {"20260710T000000Z": True, "HEAD": True}
     dataset: lance.LanceDataset = lance.dataset(uri)
@@ -66,7 +85,7 @@ def test_update_serving_tag_deduplicates_repeated_tag_names(tmp_path: Path, tele
     """A tag name repeated in the input is flipped once, not twice."""
     uri: str = str(tmp_path / "ds.lance")
     write_versions(uri, 1)
-    result: dict[str, object] = update_serving_tag(uri, None, None, telemetry, tags=["HEAD", "HEAD"])
+    result: dict[str, object] = update_serving_tag(uri, 1, None, telemetry, tags=["HEAD", "HEAD"])
     assert result["tags"] == ["HEAD"]
     assert result["created"] == {"HEAD": True}
 
