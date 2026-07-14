@@ -573,11 +573,13 @@ Every stored row carries:
 - lance_etl_event_digest as fixed 32-byte binary SHA-256
 - is_deleted
 
-Compare the incoming digest first. The same digest is an exact duplicate and becomes a no-op even
-when it was appended again in a later snapshot. With a different digest, a greater source_sequence
-updates the row, a lower source_sequence is a stale retry and becomes a metered no-op, and an equal
-source_sequence is an unordered same-snapshot conflict that blocks the target work. A stale zombie
-cannot overwrite or delete state committed from a newer Iceberg snapshot.
+Compare equal source sequences by digest first. The same digest is an exact logical duplicate, but
+a later duplicate still advances the stored source_sequence watermark without changing the logical
+payload. This prevents an expired worker from an intermediate snapshot from overwriting the row.
+With a different digest, a greater source_sequence updates the row, a lower source_sequence is a
+stale retry and becomes a metered no-op, and an equal source_sequence is an unordered same-snapshot
+conflict that blocks the target work. A stale zombie cannot overwrite or delete state committed
+from a newer Iceberg snapshot.
 
 Detect conflicting reuse both inside the append snapshot and against existing target rows before
 the first Lance write for that target. A conflict visible in preflight writes nothing. A conflict
@@ -611,10 +613,10 @@ Implement the write with Lance v8's conditional merge update using this conditio
 
 ~~~text
 target.lance_etl_source_sequence < source.lance_etl_source_sequence
-AND target.lance_etl_event_digest != source.lance_etl_event_digest
 ~~~
 
-Also use insert-if-absent. Do not depend only on a pre-read. After every merge group, join the
+This metadata-only update for a later exact duplicate is required to advance the ordering
+watermark. Also use insert-if-absent. Do not depend only on a pre-read. After every merge group, join the
 affected keys back to the reopened dataset. For each incoming terminal row, the stored digest must
 match, or the stored source sequence must be greater. Equal source sequence with a different digest
 blocks before the dataset completion marker. This post-write check closes the race where an expired

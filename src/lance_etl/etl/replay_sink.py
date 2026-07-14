@@ -43,11 +43,16 @@ class ReplayMergeResult:
 
 
 def replay_update_condition() -> str:
-    """Return the pinned Lance v8 conditional update expression."""
-    return (
-        f"target.{SOURCE_SEQUENCE_COLUMN} < source.{SOURCE_SEQUENCE_COLUMN} "
-        f"AND target.{EVENT_DIGEST_COLUMN} != source.{EVENT_DIGEST_COLUMN}"
-    )
+    """Return the Lance v8 source-watermark conditional update expression.
+
+    A later exact duplicate must still advance the stored source sequence. Otherwise an expired
+    worker carrying a distinct mutation from an intermediate snapshot could overwrite the logical
+    state after the duplicate window completed.
+
+    Returns:
+        Source-sequence ordering predicate.
+    """
+    return f"target.{SOURCE_SEQUENCE_COLUMN} < source.{SOURCE_SEQUENCE_COLUMN}"
 
 
 def validate_replay_table(table: pa.Table, key_column: str) -> list[str]:
@@ -199,11 +204,12 @@ def verify_reconciled_states(
         if current is None:
             raise ReplayConflict(f"terminal mutation is absent after merge for key {key!r}")
         stored_sequence, stored_digest = current
-        if stored_digest == incoming_digest or stored_sequence > incoming_sequence:
+        if stored_sequence > incoming_sequence:
             continue
-        if stored_sequence == incoming_sequence:
+        if stored_sequence < incoming_sequence:
+            raise ReplayConflict(f"stored source sequence regressed after merge for key {key!r}")
+        if stored_digest != incoming_digest:
             raise ReplayConflict(f"same source sequence carries a different digest after merge for key {key!r}")
-        raise ReplayConflict(f"stored source sequence regressed after merge for key {key!r}")
 
 
 def open_or_create_replay_dataset(

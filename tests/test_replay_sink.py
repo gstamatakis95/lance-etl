@@ -64,10 +64,10 @@ def live_rows(uri: str) -> list[dict[str, object]]:
 
 
 def test_update_condition_matches_frozen_contract() -> None:
-    """The sink uses source sequence and digest rather than event time."""
+    """The sink advances its source watermark without using event time."""
     condition = replay_update_condition()
     assert f"target.{SOURCE_SEQUENCE_COLUMN} < source.{SOURCE_SEQUENCE_COLUMN}" in condition
-    assert f"target.{EVENT_DIGEST_COLUMN} != source.{EVENT_DIGEST_COLUMN}" in condition
+    assert EVENT_DIGEST_COLUMN not in condition
     assert "event_timestamp" not in condition
 
 
@@ -90,6 +90,19 @@ def test_older_source_work_cannot_overwrite_newer_state(tmp_path: Path, telemetr
     row = lance.dataset(uri).to_table().to_pylist()[0]
     assert row["text"] == "new"
     assert row[SOURCE_SEQUENCE_COLUMN] == 2
+
+
+def test_later_exact_duplicate_advances_watermark_against_intermediate_zombie(
+    tmp_path: Path, telemetry: Telemetry
+) -> None:
+    """A later redelivery prevents an expired intermediate worker from changing state."""
+    uri = str(tmp_path / "duplicate-watermark.lance")
+    replay_safe_merge(uri, terminal_table("id", 10, b"a", "stable"), telemetry)
+    replay_safe_merge(uri, terminal_table("id", 12, b"a", "stable"), telemetry)
+    replay_safe_merge(uri, terminal_table("id", 11, b"b", "zombie"), telemetry)
+    row = lance.dataset(uri).to_table().to_pylist()[0]
+    assert row["text"] == "stable"
+    assert row[SOURCE_SEQUENCE_COLUMN] == 12
 
 
 def test_same_sequence_different_digest_blocks_before_write(tmp_path: Path, telemetry: Telemetry) -> None:
