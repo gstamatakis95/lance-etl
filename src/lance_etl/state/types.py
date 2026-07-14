@@ -224,6 +224,29 @@ class WorkClaim:
 
 
 @dataclass(frozen=True)
+class WorkExecutionContext:
+    """Immutable source and target context resolved for one fenced claim.
+
+    Attributes:
+        claim: Fenced durable work identity.
+        identity: Validated logical target identity.
+        profile_id: Release-owned target profile.
+        snapshot_id: Exact Iceberg source snapshot for INGEST.
+        parent_snapshot_id: Exact incremental scan parent for INGEST.
+        iceberg_sequence_number: Arrival-order watermark for INGEST rows.
+        source_window_kind: Accepted source classification for INGEST.
+    """
+
+    claim: WorkClaim
+    identity: RoutingIdentity
+    profile_id: str
+    snapshot_id: int | None
+    parent_snapshot_id: int | None
+    iceberg_sequence_number: int | None
+    source_window_kind: SourceWindowKind | None
+
+
+@dataclass(frozen=True)
 class ControlPlaneStatus:
     """Bounded operational snapshot used by reconciliation and SLO reporting."""
 

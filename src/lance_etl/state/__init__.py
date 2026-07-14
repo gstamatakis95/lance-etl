@@ -33,6 +33,9 @@ from lance_etl.state.types import (
     WorkClaim as WorkClaim,
 )
 from lance_etl.state.types import (
+    WorkExecutionContext as WorkExecutionContext,
+)
+from lance_etl.state.types import (
     WorkKind as WorkKind,
 )
 from lance_etl.state.types import (

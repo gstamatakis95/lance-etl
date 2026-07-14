@@ -17,10 +17,12 @@ from lance_etl.state.types import (
     ControlPlaneStatus,
     RoutingIdentity,
     ServingTarget,
+    SourceWindowKind,
     SourceWindowPlan,
     SourceWindowState,
     TargetPlan,
     WorkClaim,
+    WorkExecutionContext,
     WorkKind,
     WorkPhase,
     WorkState,
@@ -241,6 +243,74 @@ class ControlPlaneRepository:
                     .values(state=SourceWindowState.COMPLETE.value, updated_at=utc_now())
                 )
             return window_seq
+
+    def work_execution_context(
+        self,
+        claim: WorkClaim,
+        now: datetime | None = None,
+    ) -> WorkExecutionContext | None:
+        """Resolve immutable target and exact source metadata for a live fenced claim.
+
+        Args:
+            claim: Current worker claim.
+            now: Deterministic clock override for tests.
+
+        Returns:
+            Execution context while the claim lease and target fence remain current, otherwise null.
+        """
+        current = now or utc_now()
+        joined = target_work.join(targets, target_work.c.target_id == targets.c.target_id).outerjoin(
+            source_windows,
+            target_work.c.source_window_seq == source_windows.c.window_seq,
+        )
+        context_query = sa.select(
+            target_work.c.state,
+            target_work.c.lease_token,
+            target_work.c.lease_expires_at,
+            targets.c.fence_epoch,
+            targets.c.tenant_id,
+            targets.c.namespace,
+            targets.c.org_id,
+            targets.c.profile_id,
+            source_windows.c.snapshot_id,
+            source_windows.c.parent_snapshot_id,
+            source_windows.c.iceberg_sequence_number,
+            source_windows.c.kind.label("source_window_kind"),
+        ).select_from(joined)
+        with self.engine.connect() as connection:
+            row = (
+                connection.execute(context_query.where(target_work.c.work_id == claim.work_id)).mappings().one_or_none()
+            )
+        if row is None:
+            return None
+        live = (
+            row["state"] == WorkState.RUNNING.value
+            and row["lease_token"] == claim.lease_token
+            and int(row["fence_epoch"]) == claim.fence_epoch
+            and row["lease_expires_at"] is not None
+            and row["lease_expires_at"] > current
+        )
+        if not live:
+            return None
+        identity = RoutingIdentity(
+            tenant_id=str(row["tenant_id"]),
+            namespace=str(row["namespace"]),
+            org_id=str(row["org_id"]),
+        ).validate()
+        snapshot_id = int(row["snapshot_id"]) if row["snapshot_id"] is not None else None
+        parent_snapshot_id = int(row["parent_snapshot_id"]) if row["parent_snapshot_id"] is not None else None
+        sequence = int(row["iceberg_sequence_number"]) if row["iceberg_sequence_number"] is not None else None
+        source_kind = row["source_window_kind"]
+        kind = SourceWindowKind(source_kind) if source_kind is not None else None
+        return WorkExecutionContext(
+            claim=claim,
+            identity=identity,
+            profile_id=str(row["profile_id"]),
+            snapshot_id=snapshot_id,
+            parent_snapshot_id=parent_snapshot_id,
+            iceberg_sequence_number=sequence,
+            source_window_kind=kind,
+        )
 
     def insert_or_validate_window(self, connection: Connection, plan: SourceWindowPlan) -> tuple[int, bool]:
         """Insert one source window or validate an idempotent replay.
