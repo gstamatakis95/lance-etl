@@ -17,6 +17,7 @@ from typing import Any
 
 import grpc
 
+from bench.capacity import capacity_artifact
 from bench.compaction import run_compact
 from bench.config import BenchConfig, build_parser
 from bench.download import run_download
@@ -26,7 +27,7 @@ from bench.indexes import run_index
 from bench.ingest import run_ingest
 from bench.prepare import run_prepare
 from bench.report import run_report
-from bench.results import save_phase
+from bench.results import save_phase, write_json
 from bench.search import run_search
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -121,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.getLevelName(args.log_level.upper()), format="%(asctime)s %(levelname)s %(message)s"
     )
     config: BenchConfig = BenchConfig.from_args(args)
+    write_json(config.run_dir() / "capacity.json", capacity_artifact(config))
     try:
         if config.command == "all":
             outcome: dict[str, Any] = run_all(config)
