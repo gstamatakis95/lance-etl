@@ -235,6 +235,10 @@ class WorkExecutionContext:
         parent_snapshot_id: Exact incremental scan parent for INGEST.
         iceberg_sequence_number: Arrival-order watermark for INGEST rows.
         source_window_kind: Accepted source classification for INGEST.
+        candidate_lance_uri: Frozen SERVE, REBUILD, or rollback candidate URI.
+        indexed_lance_version: Exact candidate version when already known.
+        artifact_manifest_uri: Retained immutable validation manifest when already known.
+        artifact_digest: Retained manifest digest when already known.
     """
 
     claim: WorkClaim
@@ -244,6 +248,10 @@ class WorkExecutionContext:
     parent_snapshot_id: int | None
     iceberg_sequence_number: int | None
     source_window_kind: SourceWindowKind | None
+    candidate_lance_uri: str | None
+    indexed_lance_version: int | None
+    artifact_manifest_uri: str | None
+    artifact_digest: bytes | None
 
 
 @dataclass(frozen=True)

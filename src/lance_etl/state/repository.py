@@ -267,6 +267,10 @@ class ControlPlaneRepository:
             target_work.c.state,
             target_work.c.lease_token,
             target_work.c.lease_expires_at,
+            target_work.c.candidate_lance_uri,
+            target_work.c.indexed_lance_version,
+            target_work.c.artifact_manifest_uri,
+            target_work.c.artifact_digest,
             targets.c.fence_epoch,
             targets.c.tenant_id,
             targets.c.namespace,
@@ -310,6 +314,12 @@ class ControlPlaneRepository:
             parent_snapshot_id=parent_snapshot_id,
             iceberg_sequence_number=sequence,
             source_window_kind=kind,
+            candidate_lance_uri=row["candidate_lance_uri"],
+            indexed_lance_version=(
+                int(row["indexed_lance_version"]) if row["indexed_lance_version"] is not None else None
+            ),
+            artifact_manifest_uri=row["artifact_manifest_uri"],
+            artifact_digest=bytes(row["artifact_digest"]) if row["artifact_digest"] is not None else None,
         )
 
     def insert_or_validate_window(self, connection: Connection, plan: SourceWindowPlan) -> tuple[int, bool]:
@@ -1087,6 +1097,89 @@ class ControlPlaneRepository:
             lance_version=int(row["served_lance_version"]),
             profile_id=str(row["profile_id"]),
         )
+
+    def enqueue_rollback(self, identity: RoutingIdentity, successful_work_id: uuid.UUID) -> uuid.UUID:
+        """Enqueue a fenced rollback to one retained validated publication.
+
+        Args:
+            identity: Validated logical target selected by an operator.
+            successful_work_id: Retained successful SERVE or REBUILD publication.
+
+        Returns:
+            New rollback work identity requiring exact prewarm before catalog publication.
+
+        Raises:
+            StateTransitionError: If the target, retained result, or target lane is unsuitable.
+        """
+        identity.validate()
+        current = utc_now()
+        with self.engine.begin() as connection:
+            target_row = (
+                connection.execute(
+                    targets.select()
+                    .where(targets.c.tenant_id == identity.tenant_id)
+                    .where(targets.c.namespace == identity.namespace)
+                    .where(targets.c.org_id == identity.org_id)
+                    .with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if target_row is None:
+                raise StateTransitionError("rollback target does not exist")
+            retained = (
+                connection.execute(
+                    target_work.select()
+                    .where(target_work.c.work_id == successful_work_id)
+                    .where(target_work.c.target_id == target_row["target_id"])
+                    .where(target_work.c.kind.in_((WorkKind.SERVE.value, WorkKind.REBUILD.value)))
+                    .where(target_work.c.state == WorkState.SUCCEEDED.value)
+                )
+                .mappings()
+                .one_or_none()
+            )
+            required = (
+                retained is not None
+                and retained["candidate_lance_uri"] is not None
+                and retained["indexed_lance_version"] is not None
+                and retained["artifact_manifest_uri"] is not None
+                and retained["artifact_digest"] is not None
+            )
+            if not required or retained is None:
+                raise StateTransitionError("rollback result lacks retained validated publication evidence")
+            open_lane = connection.scalar(
+                sa.select(sa.literal(True))
+                .select_from(target_work)
+                .where(target_work.c.target_id == target_row["target_id"])
+                .where(
+                    target_work.c.state.in_(
+                        (WorkState.PENDING.value, WorkState.RUNNING.value, WorkState.RETRY_WAIT.value)
+                    )
+                )
+                .limit(1)
+            )
+            if open_lane:
+                raise StateTransitionError("rollback requires an idle target lane")
+            rollback_work_id = uuid.uuid4()
+            connection.execute(
+                target_work.insert().values(
+                    work_id=rollback_work_id,
+                    target_id=target_row["target_id"],
+                    kind=WorkKind.SERVE.value,
+                    state=WorkState.PENDING.value,
+                    phase=WorkPhase.PREWARM.value,
+                    data_lance_version=target_row["last_applied_lance_version"],
+                    indexed_lance_version=retained["indexed_lance_version"],
+                    candidate_lance_uri=retained["candidate_lance_uri"],
+                    expected_ingest_lance_uri=target_row["ingest_lance_uri"],
+                    expected_served_lance_uri=target_row["served_lance_uri"],
+                    expected_served_lance_version=target_row["served_lance_version"],
+                    artifact_manifest_uri=retained["artifact_manifest_uri"],
+                    artifact_digest=retained["artifact_digest"],
+                    next_attempt_at=current,
+                )
+            )
+            return rollback_work_id
 
     def publish_serve(
         self,
