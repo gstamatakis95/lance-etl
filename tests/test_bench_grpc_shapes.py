@@ -8,7 +8,7 @@ absent. Results carry typed logical identifiers and projections.
 from __future__ import annotations
 
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -19,9 +19,12 @@ from bench.grpc_client import (
     authorization_metadata,
     dataset_target,
     generate_stubs,
+    load_expected_versions,
     load_stubs,
     result_vector_ids,
     text_query,
+    timed_call,
+    validate_served_version,
     vector_query,
 )
 from bench.search import ghz_payload
@@ -115,6 +118,7 @@ class TestAuthentication:
             endpoint="search.example:443",
             search_ca_path=ca_path,
             search_token_dir=token_dir,
+            search_expected_versions_path=tmp_path / "expected.json",
         )
 
         assert authorization_metadata(config, "org3") == (("authorization", "Bearer first.jwt.value"),)
@@ -131,9 +135,53 @@ class TestAuthentication:
             endpoint="search.example:443",
             search_ca_path=tmp_path / "ca.pem",
             search_token_dir=token_dir,
+            search_expected_versions_path=tmp_path / "expected.json",
         )
         with pytest.raises(RuntimeError, match="org1"):
             authorization_metadata(config, "org1")
+
+    def test_expected_publication_is_exact_and_version_mismatch_fails(self, tmp_path: Path) -> None:
+        """Evidence must cover exactly every target and every response must match it."""
+        expected_path: Path = tmp_path / "expected.json"
+        expected_path.write_text('{"tenant0/ns/org0": 17}', encoding="utf-8")
+        config = BenchConfig(
+            command="search",
+            endpoint="search.example:443",
+            search_ca_path=tmp_path / "ca.pem",
+            search_token_dir=tmp_path / "tokens",
+            search_expected_versions_path=expected_path,
+        )
+        assert load_expected_versions(config) == {"org0": 17}
+        assert validate_served_version(SimpleNamespace(served_version=17), "org0", 17) == 17
+        with pytest.raises(RuntimeError, match="expected published version 17"):
+            validate_served_version(SimpleNamespace(served_version=16), "org0", 17)
+
+    def test_every_rpc_has_a_client_deadline(self) -> None:
+        """The shared call helper passes authentication metadata and a bounded timeout."""
+        captured: dict[str, Any] = {}
+
+        def callable_rpc(request: Any, metadata: Any, timeout: float) -> str:
+            """Capture invocation arguments.
+
+            Args:
+                request: Request object.
+                metadata: Authentication metadata.
+                timeout: Client deadline.
+
+            Returns:
+                Fixed response marker.
+            """
+            captured.update(request=request, metadata=metadata, timeout=timeout)
+            return "ok"
+
+        response, unused_latency = timed_call(callable_rpc, "request", (("authorization", "Bearer token"),))
+        assert response == "ok"
+        assert unused_latency >= 0
+        assert captured == {
+            "request": "request",
+            "metadata": (("authorization", "Bearer token"),),
+            "timeout": 5.0,
+        }
 
 
 class TestSearchRequests:

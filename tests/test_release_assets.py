@@ -70,6 +70,10 @@ def test_ci_uses_immutable_actions_and_locked_commands() -> None:
     assert "provenance: mode=max" in workflows
     assert "sbom: true" in workflows
     assert "severity: HIGH,CRITICAL" in workflows
+    release: str = read_repository_file(".github/workflows/release.yml")
+    assert "needs:\n      - quality\n      - integration" in release
+    assert release.index("image-ref: ${{ matrix.image }}:release-candidate") < release.index("docker push")
+    assert "push: false" in release
     for command in re.findall(r"cargo (?:clippy|test|build)[^\n]*", workflows):
         assert "--locked" in command
 
@@ -94,6 +98,8 @@ def test_container_is_immutable_and_unprivileged() -> None:
     assert "uv python install 3.14.0" in reconciler
     assert 'io.lance-etl.pylance.version="8.0.0"' in reconciler
     assert 'io.lance-etl.spark.version="4.0.1"' in reconciler
+    assert "assert pyspark.__version__ == '4.0.1'" in reconciler
+    assert "assert metadata.version('pylance') == '8.0.0'" in reconciler
     assert "iceberg-spark-runtime-4.0_2.13-1.10.0.jar" in reconciler
     assert "0480f1248e0a8b50ae2a730d7ad3e1a727351c362ca63f4a0c35182087a49323" in reconciler
     assert ".venv/bin/spark-submit --version" in reconciler
@@ -147,8 +153,10 @@ def test_deployment_fails_closed_and_exposes_runtime_health() -> None:
     assert "SEARCH_API_REPLICA_ID" in canary
     assert "fieldPath: metadata.name" in canary
     assert "grpcurl -plaintext" not in canary_runbook
-    assert '-H "authorization: Bearer' in canary_runbook
-    assert "-cacert" in canary_runbook
+    assert '-H "authorization: Bearer' not in canary_runbook
+    assert "python -m bench.smoke_client" in canary_runbook
+    assert '--token-path "$SEARCH_CANARY_JWT_PATH"' in canary_runbook
+    assert '--expected-version "$SEARCH_CANARY_EXPECTED_VERSION"' in canary_runbook
     assert "sslmode=verify-full" in canary_runbook
 
 
@@ -195,6 +203,8 @@ def test_reconciler_prewarm_contract_targets_every_stable_ordinal() -> None:
     runbook: str = read_repository_file("docs/production-release.md")
     assert "/lance_etl.internal.v1.AdminService/PrewarmExact" in runbook
     assert "reads that file afresh" in runbook
+    assert "`admin`\nrole and `lance-etl:prewarm` scope" in runbook
+    assert "intentionally carries no exact logical-target claims" in runbook
     assert "spark.kubernetes.driver.podTemplateFile" in runbook
     assert "spark.kubernetes.executor.podTemplateFile" in runbook
 

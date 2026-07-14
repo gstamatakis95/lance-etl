@@ -31,21 +31,8 @@ jobs:
           version: "0.9.8"
           enable-cache: true
 
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
-        with:
-          toolchain: "1.91.0"
-
-      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b
-        with:
-          version: "33.2"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Synchronize locked Python environment
         run: uv sync --locked --group dev --group bench --no-group airflow --python 3.14.0
-
-      - name: Build locked release search server
-        working-directory: rust/search-api
-        run: cargo build --release --locked
 
       - name: Run Spark integration suites
         run: >-
@@ -57,7 +44,7 @@ jobs:
       - name: Run Iceberg optimization in a fresh Spark process
         run: uv run --locked --no-sync pytest -m integration tests/test_iceberg_optimize.py -x -q
 
-      - name: Run mandatory built-server benchmark gates
+      - name: Run mandatory offline data-path benchmark qualification
         run: >-
           uv run --locked --no-sync pytest -m integration
           tests/test_bench_e2e.py tests/test_bench_e2e_tagged.py -x -q

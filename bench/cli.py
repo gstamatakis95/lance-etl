@@ -81,7 +81,7 @@ def run_all(config: BenchConfig) -> dict[str, Any]:
     if config.search_credentials_configured():
         outcomes["search"] = run_phase(config, "search")
     else:
-        reason: str = "external search requires --endpoint, --search-ca-path, and --search-token-dir"
+        reason: str = "run the standalone search command with TLS, token, and expected-version evidence"
         logger.warning(reason)
         outcomes["search"] = save_phase(config, "search", {"status": "NOT_RUN", "reason": reason})
     outcomes["report"] = run_phase(config, "report")

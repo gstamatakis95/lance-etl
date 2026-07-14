@@ -262,6 +262,11 @@ def test_offline_experiment_full_loop(tmp_path: Path) -> None:
     assert lines[-1]["knobs"]["batches"] == 2
 
     assert metrics["sweep"]["status"] == "NOT_RUN"
-    assert metrics["search_service"] == {"mode": "not_configured", "endpoint": None, "status": "NOT_RUN"}
+    assert metrics["search_service"] == {
+        "mode": "offline_build_only",
+        "endpoint": None,
+        "status": "NOT_RUN",
+        "reason": "run the standalone search command after publishing the qualified build",
+    }
     assert metrics["headline"]["recall_measured"] is False
     assert not (run_dir / "server.log").exists()

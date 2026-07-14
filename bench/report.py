@@ -179,6 +179,14 @@ def summary_sections(config: BenchConfig, phases: dict[str, dict[str, Any] | Non
         sections.append(markdown_table(["dataset", "fragments before", "fragments after"], rows))
         sections.append(f"Total wall: {compact['total_seconds']}s")
     search: dict[str, Any] | None = phases.get("search")
+    sections.append("## Search qualification")
+    if search:
+        sections.append(f"Status: `{search.get('status', 'UNKNOWN')}`")
+        if search.get("reason"):
+            sections.append(f"Reason: {search['reason']}")
+    else:
+        sections.append("Status: `NOT_RUN`")
+        sections.append("Reason: no search phase artifact exists")
     if search and "sweep" in search:
         sections.append("## Recall / latency sweep")
         sections.append(
@@ -198,8 +206,8 @@ def summary_sections(config: BenchConfig, phases: dict[str, dict[str, Any] | Non
                 markdown_table(load_headers, [[level.get(h) for h in load_headers] for level in load["levels"]])
             )
         else:
-            sections.append(load.get("skipped", "not run"))
-        sections.append("## First-query latency (cold vs warm)")
+            sections.append(load.get("reason", load.get("skipped", "not run")))
+        sections.append("## First and repeated query latency")
         sections.append(
             markdown_table(
                 ["org", "cold_ms", "warm_ms"],

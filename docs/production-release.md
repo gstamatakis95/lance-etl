@@ -142,8 +142,10 @@ template fixes the ordered `LANCE_ETL_SEARCH_REPLICA_ENDPOINTS` list to those th
 and mounts the admin JWT at the path named by `LANCE_ETL_SEARCH_ADMIN_TOKEN_PATH`. The reconciler
 reads that file afresh for every replica attempt, so projected Secret rotation does not require a
 process restart. `LANCE_ETL_SEARCH_CA_PATH` names the separately projected PEM trust root. Hostname
-verification remains enabled for every ordinal. The token requires the `admin` role and exact
-logical-target claims. It must not be mounted into search pods or Spark executors. Each ordinal handles
+verification remains enabled for every ordinal. The deployment-scoped token requires the `admin`
+role and `lance-etl:prewarm` scope. It intentionally carries no exact logical-target claims because
+one rotating fleet credential prewarms every fenced candidate. It must not be mounted into search
+pods or Spark executors. Each ordinal handles
 `/lance_etl.internal.v1.AdminService/PrewarmExact` locally and returns its stable replica identity
 plus resolved exact version. Publication fails until all three unique identities confirm the
 candidate URI and version.
@@ -207,14 +209,17 @@ release-controlled valid search request for that same target. Verify that the re
 expected exact `served_version`.
 
 ```bash
-grpcurl \
-  -cacert "$SEARCH_SERVER_CA_PATH" \
-  -authority "$SEARCH_TLS_SERVER_NAME" \
-  -H "authorization: Bearer $(<"$SEARCH_CANARY_JWT_PATH")" \
-  -d @ \
-  127.0.0.1:18080 lance_etl.v1.SearchService/VectorSearch \
-  < "$SEARCH_CANARY_REQUEST_PATH"
+python -m bench.smoke_client \
+  --endpoint 127.0.0.1:18080 \
+  --server-name "$SEARCH_TLS_SERVER_NAME" \
+  --ca-path "$SEARCH_SERVER_CA_PATH" \
+  --token-path "$SEARCH_CANARY_JWT_PATH" \
+  --request-path "$SEARCH_CANARY_REQUEST_PATH" \
+  --expected-version "$SEARCH_CANARY_EXPECTED_VERSION"
 ```
+
+The smoke client reads the token file inside the process immediately before the RPC. The secret is
+never expanded into a command-line argument or printed in evidence.
 
 Hold the canary for the observation window. Compare request errors, deadlines, saturation, object
 store requests, cold latency, and recall against stable replicas. Delete the canary immediately on

@@ -49,9 +49,17 @@ class TestOrgRecallAlignment:
         ground_truth: np.ndarray = np.array([[0, 1, 2], [10, 11, 12], [20, 21, 22], [30, 31, 32]], dtype=np.int64)
         queries: np.ndarray = np.zeros((4, 8), dtype=np.float32)
 
-        def fake_search(stub: Any, pb2: Any, org: str, query: np.ndarray, k: int) -> tuple[Any, float]:
+        def fake_search(
+            stub: Any,
+            pb2: Any,
+            config: BenchConfig,
+            org: str,
+            query: np.ndarray,
+            k: int,
+            expected_version: int,
+        ) -> tuple[Any, float]:
             """Return each query's own truth, failing on query index 1."""
-            del stub, pb2, org, query, k
+            del stub, pb2, config, org, query, k, expected_version
             index: int = fake_search.calls
             fake_search.calls += 1
             if index == 1:
@@ -63,7 +71,7 @@ class TestOrgRecallAlignment:
         monkeypatch.setattr(bench_e2e, "result_vector_ids", lambda results: np.asarray(results, dtype=np.int64))
 
         point = bench_e2e.org_catalog_recall(
-            object(), object(), alignment_config(str(tmp_path)), "org0", queries, ground_truth
+            object(), object(), alignment_config(str(tmp_path)), "org0", queries, ground_truth, 1
         )
         assert point is not None
         assert point["queries"] == 3
@@ -86,6 +94,7 @@ class TestOrgRecallAlignment:
             "org0",
             np.zeros((2, 8), dtype=np.float32),
             np.zeros((2, 3), dtype=np.int64),
+            1,
         )
         assert point is None
 

@@ -15,6 +15,7 @@ versions, tags, index execution knobs, or administrative cache operations.
 from __future__ import annotations
 
 import importlib
+import json
 import shutil
 import sys
 import time
@@ -28,6 +29,8 @@ import numpy as np
 from grpc_tools import protoc
 
 from bench.config import NAMESPACE, PROTO_PATH, TENANT_ID, BenchConfig
+
+RPC_DEADLINE_SECONDS: float = 5.0
 
 
 def generate_stubs(gen_dir: Path) -> Path:
@@ -134,6 +137,77 @@ def authorization_metadata(config: BenchConfig, org_id: str) -> tuple[tuple[str,
     return (("authorization", f"Bearer {token}"),)
 
 
+def target_key(org_id: str) -> str:
+    """Return the exact logical target key used by publication evidence.
+
+    Args:
+        org_id: Benchmark organization identity.
+
+    Returns:
+        The stable ``tenant/namespace/org`` key.
+    """
+    return f"{TENANT_ID}/{NAMESPACE}/{org_id}"
+
+
+def load_expected_versions(config: BenchConfig) -> dict[str, int]:
+    """Load and validate the expected catalog publication for every benchmark target.
+
+    Args:
+        config: External search configuration.
+
+    Returns:
+        Expected positive Lance version keyed by organization.
+
+    Raises:
+        RuntimeError: If the evidence file is missing, malformed, incomplete, or contains extra targets.
+    """
+    path: Path | None = config.search_expected_versions_path
+    if path is None:
+        raise RuntimeError("external search expected-version evidence is not configured")
+    try:
+        raw: object = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"cannot read expected search publication at {path}") from error
+    if not isinstance(raw, dict):
+        raise RuntimeError("expected search publication must be a JSON object")
+    expected_keys: set[str] = {target_key(org) for org in config.org_ids()}
+    if set(raw) != expected_keys:
+        raise RuntimeError(
+            f"expected search publication keys must equal {sorted(expected_keys)}, "
+            f"got {sorted(str(key) for key in raw)}"
+        )
+    versions: dict[str, int] = {}
+    for org in config.org_ids():
+        value: object = raw[target_key(org)]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise RuntimeError(f"expected served version for {target_key(org)} must be a positive integer")
+        versions[org] = value
+    return versions
+
+
+def validate_served_version(response: Any, org_id: str, expected_version: int) -> int:
+    """Reject a response that did not use the operator-approved exact publication.
+
+    Args:
+        response: Typed public search response.
+        org_id: Organization being measured.
+        expected_version: Approved exact Lance version for that target.
+
+    Returns:
+        The validated served version.
+
+    Raises:
+        RuntimeError: If the response version differs from publication evidence.
+    """
+    served_version: int = int(response.served_version)
+    if served_version != expected_version:
+        raise RuntimeError(
+            f"target {target_key(org_id)} served version {served_version}, "
+            f"expected published version {expected_version}"
+        )
+    return served_version
+
+
 def dataset_target(pb2: ModuleType, org_id: str, tenant_id: str = TENANT_ID, namespace: str = NAMESPACE) -> Any:
     """Build the ``DatasetTarget`` addressing one per-tenant benchmark dataset.
 
@@ -220,6 +294,7 @@ def timed_call(
     callable_rpc: Any,
     request: Any,
     metadata: tuple[tuple[str, str], ...] = (),
+    timeout_seconds: float = RPC_DEADLINE_SECONDS,
 ) -> tuple[Any, float]:
     """Invoke one RPC and measure its latency.
 
@@ -227,12 +302,13 @@ def timed_call(
         callable_rpc: The stub method.
         request: The request message.
         metadata: Authentication metadata attached to the request.
+        timeout_seconds: Per-RPC client deadline.
 
     Returns:
         The response and the latency in milliseconds.
     """
     started: float = time.perf_counter()
-    response: Any = callable_rpc(request, metadata=metadata)
+    response: Any = callable_rpc(request, metadata=metadata, timeout=timeout_seconds)
     return response, (time.perf_counter() - started) * 1000.0
 
 
@@ -243,6 +319,7 @@ def vector_search(
     org_id: str,
     query: np.ndarray,
     k: int,
+    expected_version: int,
 ) -> tuple[Any, float]:
     """Run vector search through the current catalog publication.
 
@@ -253,6 +330,7 @@ def vector_search(
         org_id: Organization to query.
         query: Query vector.
         k: Bounded result count.
+        expected_version: Operator-approved exact Lance publication.
 
     Returns:
         Response and client-side latency in milliseconds.
@@ -262,7 +340,9 @@ def vector_search(
         query=vector_query(pb2, query),
         k=k,
     )
-    return timed_call(stub.VectorSearch, request, authorization_metadata(config, org_id))
+    response, elapsed_ms = timed_call(stub.VectorSearch, request, authorization_metadata(config, org_id))
+    validate_served_version(response, org_id, expected_version)
+    return response, elapsed_ms
 
 
 def text_search(
@@ -272,6 +352,7 @@ def text_search(
     org_id: str,
     terms: str,
     k: int,
+    expected_version: int,
 ) -> tuple[Any, float]:
     """Run text search through the current catalog publication.
 
@@ -282,6 +363,7 @@ def text_search(
         org_id: Organization to query.
         terms: Simple product query terms.
         k: Bounded result count.
+        expected_version: Operator-approved exact Lance publication.
 
     Returns:
         Response and client-side latency in milliseconds.
@@ -291,7 +373,9 @@ def text_search(
         query=text_query(pb2, terms),
         k=k,
     )
-    return timed_call(stub.TextSearch, request, authorization_metadata(config, org_id))
+    response, elapsed_ms = timed_call(stub.TextSearch, request, authorization_metadata(config, org_id))
+    validate_served_version(response, org_id, expected_version)
+    return response, elapsed_ms
 
 
 def hybrid_search(
@@ -302,6 +386,7 @@ def hybrid_search(
     query: np.ndarray,
     terms: str,
     k: int,
+    expected_version: int,
 ) -> tuple[Any, float]:
     """Run hybrid search through the current catalog publication.
 
@@ -313,6 +398,7 @@ def hybrid_search(
         query: The query vector for the vector leg.
         terms: The space-separated query terms for the text leg.
         k: Fused hits to return.
+        expected_version: Operator-approved exact Lance publication.
 
     Returns:
         Response and client-side latency in milliseconds.
@@ -323,4 +409,6 @@ def hybrid_search(
         text=text_query(pb2, terms),
         k=k,
     )
-    return timed_call(stub.HybridSearch, request, authorization_metadata(config, org_id))
+    response, elapsed_ms = timed_call(stub.HybridSearch, request, authorization_metadata(config, org_id))
+    validate_served_version(response, org_id, expected_version)
+    return response, elapsed_ms

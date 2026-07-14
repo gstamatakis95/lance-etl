@@ -33,7 +33,7 @@ RUN test -n "${GIT_REVISION}" \
     && uv python install 3.14.0 \
     && uv sync --locked --no-dev --no-group bench --no-group airflow --python 3.14.0 \
     && cp /opt/iceberg/iceberg-spark-runtime-4.0_2.13-1.10.0.jar .venv/lib/python3.14/site-packages/pyspark/jars/ \
-    && .venv/bin/python -c "import importlib.metadata as metadata, pyspark, sys; import lance_etl; print(sys.version.split()[0], pyspark.__version__, metadata.version('pylance'))" \
+    && .venv/bin/python -c "import importlib.metadata as metadata, pyspark, sys; import lance_etl; assert sys.version.split()[0] == '3.14.0'; assert pyspark.__version__ == '4.0.1'; assert metadata.version('pylance') == '8.0.0'" \
     && .venv/bin/spark-submit --version
 RUN mkdir -p /tmp/spark \
     && chown -R 185:185 /tmp/spark

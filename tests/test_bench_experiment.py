@@ -95,34 +95,34 @@ def experiment_config(tmp_path: Path, run_id: str, extra: list[str] | None = Non
 
 
 def test_experiment_flags_parse(tmp_path: Path) -> None:
-    """The experiment exposes only external TLS search credentials and baseline flags."""
-    config: BenchConfig = experiment_config(
-        tmp_path,
-        "r1",
-        [
-            "--endpoint",
-            "search.example:443",
-            "--search-ca-path",
-            str(tmp_path / "ca.pem"),
-            "--search-token-dir",
-            str(tmp_path / "tokens"),
-            "--baseline",
-            "r0",
-        ],
-    )
+    """The experiment remains offline-only and accepts baseline comparison."""
+    config: BenchConfig = experiment_config(tmp_path, "r1", ["--baseline", "r0"])
     assert config.command == "experiment"
-    assert config.endpoint == "search.example:443"
-    assert config.search_ca_path == (tmp_path / "ca.pem").resolve()
-    assert config.search_token_path("org7") == (tmp_path / "tokens" / "tenant0--ns--org7.jwt").resolve()
+    assert config.endpoint == ""
     assert config.baseline == "r0"
 
 
 def test_external_search_configuration_fails_closed(tmp_path: Path) -> None:
     """Partial credentials and obsolete local-server flags are rejected."""
-    with pytest.raises(ValueError, match="both --search-ca-path and --search-token-dir"):
+    with pytest.raises(ValueError, match="external search requires"):
         experiment_config(tmp_path, "partial", ["--search-ca-path", str(tmp_path / "ca.pem")])
     with pytest.raises(ValueError, match="--endpoint requires"):
         experiment_config(tmp_path, "endpoint-only", ["--endpoint", "search.example:443"])
+    with pytest.raises(ValueError, match="standalone search command"):
+        experiment_config(
+            tmp_path,
+            "external",
+            [
+                "--endpoint",
+                "search.example:443",
+                "--search-ca-path",
+                str(tmp_path / "ca.pem"),
+                "--search-token-dir",
+                str(tmp_path / "tokens"),
+                "--search-expected-versions-path",
+                str(tmp_path / "expected.json"),
+            ],
+        )
     with pytest.raises(SystemExit):
         build_parser().parse_args(["experiment", "--build-server"])
     with pytest.raises(SystemExit):

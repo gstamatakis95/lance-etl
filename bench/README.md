@@ -114,21 +114,7 @@ Official ground truth ships for exactly ten prefix sizes:
 
 Any other `--limit` falls back to exact brute-force ground truth computed during the prepare phase (only sensible at small limits).
 
-### Step 2 — Prepare the production search gate
-
-Deploy the release image through the production manifests and publish the exact benchmark targets
-through the reconciler. Obtain the fleet CA and one short-lived JWT for every exact target. The
-token directory uses this fixed naming convention:
-
-```text
-tokens/tenant0--ns--org0.jwt
-tokens/tenant0--ns--org1.jwt
-```
-
-Each JWT must authorize exactly the tenant, namespace, and organization named by its file. Token
-files are read again for every RPC so an operator can rotate them during a long run.
-
-### Step 3 — Run the e2e benchmark
+### Step 2 — Run offline build qualification
 
 ```bash
 python -m bench e2e \
@@ -142,17 +128,56 @@ python -m bench e2e \
   --num-shards 16 \
   --vector-row-floor 1024 \
   --seed 42 \
-  --endpoint search.production.example:443 \
-  --search-ca-path /run/secrets/search/ca.pem \
-  --search-token-dir /run/secrets/search/tokens \
   --workspace bench/workspace \
   --results-root bench/results
 ```
 
-This runs ETL and then a unified ``PipelineJob`` for each of the four batches. It verifies historical
-Lance tags directly and measures the final serving-catalog publication through gRPC. Public search
-requests cannot select a tag or version. Per-stage index timings are not emitted by the e2e path
-because all index types run inside a single ``LanceIndexer.run`` call within the pipeline job.
+This run verifies the local Iceberg, ETL, Lance index, compaction, and historical-version path. It
+does not combine those measurements with an unrelated external catalog route.
+
+### Step 3 — Prepare the production search gate
+
+Deploy the release image through the production manifests and publish the exact benchmark targets
+through the reconciler. Obtain the fleet CA and one short-lived JWT for every exact target. The
+token directory uses this fixed naming convention:
+
+```text
+tokens/tenant0--ns--org0.jwt
+tokens/tenant0--ns--org1.jwt
+```
+
+Each JWT must authorize exactly the tenant, namespace, and organization named by its file. Token
+files are read again for every RPC so an operator can rotate them during a long run.
+
+Record the exact catalog publication expected for every target. Extra or missing targets and
+non-positive versions are rejected.
+
+```json
+{
+  "tenant0/ns/org0": 1042,
+  "tenant0/ns/org1": 998
+}
+```
+
+### Step 4 — Run the bound service benchmark
+
+```bash
+python -m bench search \
+  --dataset bigann \
+  --limit 100000000 \
+  --no-text \
+  --seed 42 \
+  --endpoint search.production.example:443 \
+  --search-ca-path /run/secrets/search/ca.pem \
+  --search-token-dir /run/secrets/search/tokens \
+  --search-expected-versions-path /run/release/bigann-expected-versions.json \
+  --workspace bench/workspace \
+  --results-root bench/results
+```
+
+The search request cannot select a tag or version. The benchmark instead validates every response's
+`served_version` against the operator-owned publication file and fails on any mismatch. Build and
+service artifacts remain separate, so an external result cannot be attributed to local index knobs.
 
 ---
 
@@ -172,9 +197,6 @@ python -m bench e2e \
   --num-shards 32 \
   --vector-row-floor 1024 \
   --seed 42 \
-  --endpoint search.production.example:443 \
-  --search-ca-path /run/secrets/search/ca.pem \
-  --search-token-dir /run/secrets/search/tokens \
   --workspace /mnt/nvme/bench/workspace \
   --results-root /mnt/nvme/bench/results
 ```
@@ -288,8 +310,7 @@ internal publication gate and is not exposed to benchmark users through the sear
 One command runs a complete, measurable offline build iteration: knobs in, `metrics.json` out. It chains
 download and prepare when the corpus shape is missing (cached afterwards), wipes the Lance root
 so every iteration is a clean build of the configured knobs, runs the batch-major e2e body, measures
-the on-disk footprint, optionally measures an authenticated external catalog-selected release, and
-appends a one-line summary to
+the on-disk footprint and appends a one-line summary to
 `{results_root}/experiments.jsonl`.
 
 ```bash
@@ -298,10 +319,11 @@ python -m bench experiment \
   --num-partitions 256 --target-rows-per-fragment 1048576
 ```
 
-Add `--endpoint`, `--search-ca-path`, and `--search-token-dir` together to measure an external
-production fleet. Without those three inputs, build qualification remains mandatory and search is
-explicitly `NOT_RUN`. A locally built binary is never discovered or started, so CI cannot present
-an insecure process smoke test as production search evidence.
+The experiment command is deliberately offline-only. Run the standalone `search` command with
+`--endpoint`, `--search-ca-path`, `--search-token-dir`, and
+`--search-expected-versions-path` after publishing the qualified candidate. A locally built binary
+is never discovered or started, so CI cannot present an insecure process smoke test as production
+search evidence.
 
 `metrics.json` schema (stable keys, everything an agent needs to compare iterations):
 

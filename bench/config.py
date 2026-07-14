@@ -101,6 +101,7 @@ class BenchConfig:
         endpoint: gRPC endpoint of the external production search service.
         search_ca_path: PEM certificate authority used to verify the external service.
         search_token_dir: Directory holding one bearer-token file per benchmark organization.
+        search_expected_versions_path: JSON mapping every exact benchmark target to its expected published version.
         search_k: Neighbors requested per query. Must cover the deepest recall cut-off.
         max_queries: Cap on query vectors per sweep point. ``None`` sends all 10k.
         fts_query_count: Deterministic full-text queries drawn from cluster vocabularies in the FTS leg.
@@ -152,6 +153,7 @@ class BenchConfig:
     endpoint: str = ""
     search_ca_path: Path | None = None
     search_token_dir: Path | None = None
+    search_expected_versions_path: Path | None = None
     search_k: int = SIFT_GT_DEPTH
     max_queries: int | None = None
     fts_query_count: int = 100
@@ -186,15 +188,25 @@ class BenchConfig:
                 f"(RECALL_CUTOFFS={RECALL_CUTOFFS}); recall_at_{deepest_cutoff} would be silently "
                 f"deflated by the shorter retrieved-id array. Pass --search-k >= {deepest_cutoff}."
             )
-        credential_fields: tuple[Path | None, Path | None] = (self.search_ca_path, self.search_token_dir)
+        credential_fields: tuple[Path | None, Path | None, Path | None] = (
+            self.search_ca_path,
+            self.search_token_dir,
+            self.search_expected_versions_path,
+        )
         if any(value is not None for value in credential_fields) and not all(
             value is not None for value in credential_fields
         ):
-            raise ValueError("external search requires both --search-ca-path and --search-token-dir")
+            raise ValueError(
+                "external search requires --search-ca-path, --search-token-dir, and --search-expected-versions-path"
+            )
         if self.endpoint and not self.search_credentials_configured():
-            raise ValueError("--endpoint requires --search-ca-path and --search-token-dir")
+            raise ValueError(
+                "--endpoint requires --search-ca-path, --search-token-dir, and --search-expected-versions-path"
+            )
         if self.search_credentials_configured() and not self.endpoint:
             raise ValueError("external search requires --endpoint")
+        if self.search_credentials_configured() and self.command != "search":
+            raise ValueError("external search evidence must use the standalone search command")
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> BenchConfig:
@@ -217,6 +229,7 @@ class BenchConfig:
                 "otlp_port",
                 "search_ca_path",
                 "search_token_dir",
+                "search_expected_versions_path",
             }
         )
         for item in fields(cls):
@@ -227,7 +240,7 @@ class BenchConfig:
         values["workspace"] = Path(args.workspace).resolve()
         values["corpus_root"] = Path(args.corpus_root).resolve()
         values["results_root"] = Path(args.results_root).resolve()
-        for path_field in ("search_ca_path", "search_token_dir"):
+        for path_field in ("search_ca_path", "search_token_dir", "search_expected_versions_path"):
             if values.get(path_field) is not None:
                 values[path_field] = Path(values[path_field]).resolve()
         return cls(**values)
@@ -320,7 +333,11 @@ class BenchConfig:
         Returns:
             True only when both the trusted CA and token directory are configured.
         """
-        return self.search_ca_path is not None and self.search_token_dir is not None
+        return (
+            self.search_ca_path is not None
+            and self.search_token_dir is not None
+            and self.search_expected_versions_path is not None
+        )
 
     def search_token_path(self, org_id: str) -> Path:
         """Return the bearer-token file for one exact logical benchmark target.
@@ -392,6 +409,12 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
         type=Path,
         default=None,
         help="Directory of tenant0--ns--ORG.jwt bearer-token files with exact target claims",
+    )
+    parser.add_argument(
+        "--search-expected-versions-path",
+        type=Path,
+        default=None,
+        help="JSON mapping tenant0/ns/ORG target keys to expected positive served versions",
     )
     parser.add_argument(
         "--search-k",
@@ -470,7 +493,7 @@ def build_parser() -> argparse.ArgumentParser:
         "report": "Aggregate run artifacts into summary.md, results.csv, and pareto.png",
         "all": "Run the full chain: download, prepare, ingest, index, compact, search, report",
         "e2e": "Batch-major e2e: per-batch ETL+index+compact+tag, historical-tag verification, optional gRPC legs",
-        "experiment": "One agent iteration: prepare if needed, spawn the server, e2e, sizes, sweep, metrics.json",
+        "experiment": "One offline build iteration: prepare if needed, e2e, sizes, and metrics.json",
         "qualify": "Measure deterministic mutation collapse, skew, shuffle width, capacity, and external scale gates",
     }
     for name in SUBCOMMANDS:

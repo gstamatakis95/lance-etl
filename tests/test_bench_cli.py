@@ -128,6 +128,8 @@ class TestSubcommandFlags:
                 str(tmp_path / "ca.pem"),
                 "--search-token-dir",
                 str(tmp_path / "tokens"),
+                "--search-expected-versions-path",
+                str(tmp_path / "expected.json"),
                 "--max-queries",
                 "100",
                 "--concurrency",
@@ -139,6 +141,7 @@ class TestSubcommandFlags:
         assert config.endpoint == "localhost:9999"
         assert config.search_ca_path == (tmp_path / "ca.pem").resolve()
         assert config.search_token_dir == (tmp_path / "tokens").resolve()
+        assert config.search_expected_versions_path == (tmp_path / "expected.json").resolve()
         assert config.max_queries == 100
         assert config.concurrency == [2, 4]
         assert config.load_duration == "5s"

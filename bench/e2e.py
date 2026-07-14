@@ -33,7 +33,14 @@ import numpy as np
 
 from bench.config import RECALL_CUTOFFS, BenchConfig
 from bench.groundtruth import recall_at
-from bench.grpc_client import generate_stubs, load_stubs, open_stub, result_vector_ids, vector_search
+from bench.grpc_client import (
+    generate_stubs,
+    load_expected_versions,
+    load_stubs,
+    open_stub,
+    result_vector_ids,
+    vector_search,
+)
 from bench.indexes import union_index_config
 from bench.ingest import batch_windows, run_etl_window
 from bench.results import ensure_dir, save_phase
@@ -186,6 +193,7 @@ def org_catalog_recall(
     org: str,
     queries: np.ndarray,
     org_gt: np.ndarray,
+    expected_version: int,
 ) -> dict[str, Any] | None:
     """Measure vector recall for one org through its current catalog publication.
 
@@ -196,6 +204,7 @@ def org_catalog_recall(
         org: The org to sweep.
         queries: The query matrix.
         org_gt: The org's ground-truth global ids.
+        expected_version: Operator-approved exact Lance publication.
 
     Returns:
         The org's recall point with per-cutoff recall and mean latency, or ``None`` when every
@@ -208,7 +217,7 @@ def org_catalog_recall(
     kept_indices: list[int] = []
     for index, query in enumerate(queries):
         try:
-            response, elapsed_ms = vector_search(stub, pb2, config, org, query, config.search_k)
+            response, elapsed_ms = vector_search(stub, pb2, config, org, query, config.search_k, expected_version)
         except Exception as exc:
             logger.warning("gRPC error during tag recall sweep for org %s: %s", org, exc)
             continue
@@ -255,9 +264,10 @@ def run_catalog_grpc_legs(
     if not config.search_credentials_configured():
         return {
             "status": "NOT_RUN",
-            "reason": "external search requires --endpoint, --search-ca-path, and --search-token-dir",
+            "reason": "run the standalone search command with TLS, token, and expected-version evidence",
         }
     try:
+        expected_versions: dict[str, int] = load_expected_versions(config)
         pb2, pb2_grpc = load_stubs(generate_stubs(grpc_gen_dir))
         stub = open_stub(config, pb2_grpc, timeout_seconds=3.0)
     except Exception as exc:
@@ -266,9 +276,9 @@ def run_catalog_grpc_legs(
     first_latencies: dict[str, Any] = {}
     for org in config.org_ids():
         try:
-            resp, cold_ms = vector_search(stub, pb2, config, org, queries[0], 10)
+            resp, cold_ms = vector_search(stub, pb2, config, org, queries[0], 10, expected_versions[org])
             del resp
-            _, warm_ms = vector_search(stub, pb2, config, org, queries[0], 10)
+            _, warm_ms = vector_search(stub, pb2, config, org, queries[0], 10, expected_versions[org])
             first_latencies[org] = {"cold_ms": round(cold_ms, 3), "warm_ms": round(warm_ms, 3)}
         except Exception as exc:
             first_latencies[org] = {"error": str(exc)[:500]}
@@ -278,7 +288,9 @@ def run_catalog_grpc_legs(
     for org in config.org_ids():
         if org not in ground_truth:
             continue
-        point: dict[str, Any] | None = org_catalog_recall(stub, pb2, config, org, queries, ground_truth[org])
+        point: dict[str, Any] | None = org_catalog_recall(
+            stub, pb2, config, org, queries, ground_truth[org], expected_versions[org]
+        )
         if point is not None:
             sweep_recalls.append(point)
             if point["failed_queries"]:
@@ -291,6 +303,7 @@ def run_catalog_grpc_legs(
     return {
         "status": "FAILED" if failed_targets else "MEASURED",
         "failed_targets": failed_targets,
+        "expected_versions": expected_versions,
         "first_latencies": first_latencies,
         "recall": sweep_recalls,
     }
@@ -420,7 +433,7 @@ def run_e2e_body(config: BenchConfig) -> dict[str, Any]:
     catalog_grpc: dict[str, Any] = run_catalog_grpc_legs(config, queries, ground_truth, grpc_gen_dir)
     final_recall: dict[str, Any] = catalog_grpc if catalog_grpc.get("status") == "MEASURED" else {}
 
-    return save_phase(
+    result: dict[str, Any] = save_phase(
         config,
         "e2e",
         {
@@ -431,3 +444,8 @@ def run_e2e_body(config: BenchConfig) -> dict[str, Any]:
             "final_catalog_recall": final_recall,
         },
     )
+    if not all_ok:
+        raise RuntimeError("historical tag verification failed")
+    if config.search_credentials_configured() and catalog_grpc.get("status") != "MEASURED":
+        raise RuntimeError(f"configured external search failed: {catalog_grpc.get('reason', catalog_grpc)}")
+    return result

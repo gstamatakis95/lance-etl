@@ -21,11 +21,9 @@ from typing import Any
 
 from bench.config import BenchConfig
 from bench.download import run_download
-from bench.e2e import load_queries_and_gt, run_e2e
-from bench.grpc_client import generate_stubs, load_stubs, open_stub
+from bench.e2e import run_e2e
 from bench.prepare import run_prepare
 from bench.results import ensure_dir, read_json, save_phase, utc_now
-from bench.search import measure_first_queries, sweep_point
 from bench.sizes import measure_dataset_sizes
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -96,37 +94,6 @@ def ensure_prepared(config: BenchConfig) -> dict[str, Any]:
     run_download(config)
     run_prepare(config)
     return {"reused": False, "prepared_dir": str(config.prepared_dir())}
-
-
-def run_sweep_and_first_queries(config: BenchConfig) -> dict[str, Any]:
-    """Run first queries plus one release-profile recall point against an external service.
-
-    Args:
-        config: Benchmark configuration (endpoint already pointing at the live server).
-
-    Returns:
-        First-query timings and one catalog-profile point, an explicit not-run record when
-        credentials are absent, or a failed record when verified connectivity fails.
-    """
-    if not config.search_credentials_configured():
-        return {
-            "status": "NOT_RUN",
-            "reason": "external search requires --endpoint, --search-ca-path, and --search-token-dir",
-        }
-    grpc_gen_dir: Path = config.workspace / "grpc_gen"
-    pb2, pb2_grpc = load_stubs(generate_stubs(grpc_gen_dir))
-    try:
-        stub = open_stub(config, pb2_grpc)
-    except RuntimeError as exc:
-        return {"status": "FAILED", "reason": str(exc)}
-    queries, ground_truth = load_queries_and_gt(config)
-    try:
-        first_query: dict[str, Any] = measure_first_queries(stub, pb2, config, queries)
-        point: dict[str, Any] = sweep_point(stub, pb2, config, queries, ground_truth)
-    except Exception as error:
-        return {"status": "FAILED", "reason": str(error)[:500]}
-    logger.info("catalog profile recall@10=%.4f p95=%.2fms", point["recall_at_10"], point["p95_ms"])
-    return {"status": "MEASURED", "first_query": first_query, "points": [point]}
 
 
 def headline_numbers(sweep: dict[str, Any], sizes: dict[str, Any], build_seconds: float) -> dict[str, Any]:
@@ -240,14 +207,15 @@ def run_experiment(config: BenchConfig) -> dict[str, Any]:
         shutil.rmtree(lance_root)
 
     service_record: dict[str, Any] = {
-        "mode": "external_authenticated" if config.search_credentials_configured() else "not_configured",
-        "endpoint": config.endpoint or None,
+        "mode": "offline_build_only",
+        "endpoint": None,
+        "status": "NOT_RUN",
+        "reason": "run the standalone search command after publishing the qualified build",
     }
     e2e_doc: dict[str, Any] = run_e2e(config)
     build_seconds: float = sum(batch["etl_seconds"] + batch["pipeline"]["seconds"] for batch in e2e_doc["batches"])
     sizes: dict[str, Any] = measure_dataset_sizes(lance_root)
-    sweep: dict[str, Any] = run_sweep_and_first_queries(config)
-    service_record["status"] = sweep["status"]
+    sweep: dict[str, Any] = {"status": "NOT_RUN", "reason": service_record["reason"]}
 
     headline: dict[str, Any] = headline_numbers(sweep, sizes, build_seconds)
     delta: dict[str, Any] | None = baseline_delta(config, headline)
