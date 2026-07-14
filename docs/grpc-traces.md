@@ -126,7 +126,7 @@ same `backend.hybrid_search` span and so appear as siblings in the trace, each c
 
 ```
 [server span: rpc.method=Clusters]       (OtelGrpcLayer)
-  └─ (no child instrument span; Lance read runs inside the server span)
+  └─ (no child instrument span because the Lance read runs inside the server span)
 ```
 
 ---
