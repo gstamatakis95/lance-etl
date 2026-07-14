@@ -8,7 +8,10 @@ use lance::index::DatasetIndexExt;
 use lance_index::{FtsPrewarmOptions, PrewarmOptions, is_system_index};
 use tracing::Instrument;
 
-use crate::domain::{DatasetRef, DatasetTarget, PrewarmReport, PrewarmSpec, PrewarmedIndex, Prewarmer, SearchError};
+use crate::domain::{
+    DatasetRef, DatasetTarget, ExactPrewarmer, PrewarmReport, PrewarmSpec, PrewarmedIndex, Prewarmer, SearchError,
+    ServingRoute,
+};
 use crate::lance::backend::LanceSearchBackend;
 use crate::lance::error::classify_lance_error;
 use crate::lance::provider::DatasetProvider;
@@ -61,6 +64,37 @@ impl<P: DatasetProvider> Prewarmer for LanceSearchBackend<P> {
                 return Err(error);
             }
         };
+        self.finish_prewarm(dataset, spec, total_start).await
+    }
+}
+
+impl<P: DatasetProvider> ExactPrewarmer for LanceSearchBackend<P> {
+    #[tracing::instrument(
+        name = "backend.prewarm_exact",
+        skip_all,
+        fields(prewarm.resolved_version = tracing::field::Empty)
+    )]
+    async fn prewarm_exact(&self, target: &DatasetTarget, route: ServingRoute) -> Result<PrewarmReport, SearchError> {
+        let total_start = Instant::now();
+        let dataset = self.provider.dataset_for_exact_prewarm(target, route).await?;
+        let spec = PrewarmSpec {
+            metadata: true,
+            all_indexes: true,
+            index_names: Vec::new(),
+            fts_with_position: true,
+        };
+        self.finish_prewarm(dataset, spec, total_start).await
+    }
+}
+
+impl<P: DatasetProvider> LanceSearchBackend<P> {
+    /// Completes bounded metadata and index warming after an exact dataset handle is open.
+    async fn finish_prewarm(
+        &self,
+        dataset: Arc<Dataset>,
+        spec: PrewarmSpec,
+        total_start: Instant,
+    ) -> Result<PrewarmReport, SearchError> {
         let resolved_version = dataset.version_id();
         tracing::Span::current().record("prewarm.resolved_version", resolved_version);
         self.metrics.prewarm_last_version(resolved_version);

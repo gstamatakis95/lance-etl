@@ -17,7 +17,7 @@ use crate::cache::janitor::CacheJanitor;
 use crate::cache::layout::prepare_cache_root;
 use crate::cache::redis_store::RedisEntryStore;
 use crate::cache::store_cache::MetadataByteCache;
-use crate::config::{CacheBackendKind, Config, PRODUCTION_SERVE_TAG};
+use crate::config::{CacheBackendKind, Config, PRODUCTION_PROFILE_ID, PRODUCTION_SERVE_TAG};
 use crate::domain::target::validate_path_segment;
 use crate::domain::{DatasetRef, DatasetTarget, SearchError, ServingCatalog, ServingRoute};
 use crate::lance::error::{classify_lance_error, is_definitive_open_absence};
@@ -103,6 +103,18 @@ pub trait DatasetProvider: Send + Sync + 'static {
         reference: DatasetRef,
     ) -> impl Future<Output = Result<Arc<Dataset>, SearchError>> + Send {
         self.dataset(target, reference)
+    }
+
+    /// Opens one caller-supplied exact route for authenticated replica-local prewarm.
+    fn dataset_for_exact_prewarm(
+        &self,
+        target: &DatasetTarget,
+        route: ServingRoute,
+    ) -> impl Future<Output = Result<Arc<Dataset>, SearchError>> + Send {
+        async move {
+            let _ = (target, route);
+            Err(SearchError::internal("exact prewarm is not supported by this provider"))
+        }
     }
 
     /// Approximate bytes resident in the shared index cache. Providers without one report 0.
@@ -352,6 +364,11 @@ impl CachingDatasetProvider {
             .await
             .map_err(|error| error.as_ref().clone())?;
         validate_serving_route(&self.base_uri, &route)?;
+        if route.profile_id != PRODUCTION_PROFILE_ID {
+            return Err(SearchError::internal(
+                "serving catalog profile is incompatible with this release",
+            ));
+        }
         Ok(route)
     }
 
@@ -590,10 +607,16 @@ impl CachingDatasetProvider {
         target: &DatasetTarget,
         reference: DatasetRef,
         warm_intent: bool,
+        route_override: Option<ServingRoute>,
     ) -> Result<Arc<Dataset>, SearchError> {
         target.validate()?;
         let started = std::time::Instant::now();
-        let catalog_route = if reference == DatasetRef::Serve && self.catalog.is_some() {
+        if let Some(route) = &route_override {
+            validate_serving_route(&self.base_uri, route)?;
+        }
+        let catalog_route = if route_override.is_some() {
+            route_override
+        } else if reference == DatasetRef::Serve && self.catalog.is_some() {
             Some(self.serving_route(target).await?)
         } else {
             None
@@ -661,7 +684,7 @@ impl CachingDatasetProvider {
 impl DatasetProvider for CachingDatasetProvider {
     /// Returns an open dataset handle for a serving open, counting cold-open telemetry.
     async fn dataset(&self, target: &DatasetTarget, reference: DatasetRef) -> Result<Arc<Dataset>, SearchError> {
-        self.open(target, reference, false).await
+        self.open(target, reference, false, None).await
     }
 
     /// Returns an open dataset handle for a prewarm open, recording the warmed version.
@@ -670,7 +693,17 @@ impl DatasetProvider for CachingDatasetProvider {
         target: &DatasetTarget,
         reference: DatasetRef,
     ) -> Result<Arc<Dataset>, SearchError> {
-        self.open(target, reference, true).await
+        self.open(target, reference, true, None).await
+    }
+
+    /// Opens and records one authenticated exact candidate route without consulting mutable state.
+    async fn dataset_for_exact_prewarm(
+        &self,
+        target: &DatasetTarget,
+        route: ServingRoute,
+    ) -> Result<Arc<Dataset>, SearchError> {
+        self.open(target, DatasetRef::Version(route.lance_version), true, Some(route))
+            .await
     }
 
     /// Approximate bytes resident in the shared index cache (memory tier plus persistent tier).

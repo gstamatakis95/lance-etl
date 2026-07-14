@@ -97,7 +97,7 @@ pub const DEFAULT_STORE_CACHE_MAX_RANGE_BYTES: u64 = 4 * 1024 * 1024;
 /// Hardcoded: the 300 s sweep cadence is an internal maintenance constant, no longer an env knob.
 pub const DEFAULT_DISK_CACHE_SWEEP_SECS: u64 = 300;
 
-/// Fixed number of indexes prewarmed concurrently per Prewarm RPC.
+/// Fixed number of indexes prewarmed concurrently by replica-local administration.
 ///
 /// Hardcoded: no deployment has ever retuned this, so it is no longer an env knob.
 pub const DEFAULT_PREWARM_CONCURRENCY: usize = 4;
@@ -111,6 +111,9 @@ pub const DEFAULT_ID_COLUMN: &str = "vector_id";
 ///
 /// Hardcoded: matches the standardized ETL event clock, so it is no longer an env knob.
 pub const DEFAULT_EVENT_TIMESTAMP_COLUMN: &str = "event_timestamp";
+
+/// Exact release-owned profile accepted by public production serving.
+pub const PRODUCTION_PROFILE_ID: &str = "production-v1";
 
 /// Default DogStatsD address when neither `SEARCH_API_STATSD_ADDR` nor `DD_AGENT_HOST` is set.
 pub const DEFAULT_STATSD_ADDR: &str = "127.0.0.1:8125";
@@ -223,16 +226,12 @@ pub const DEFAULT_GRACEFUL_DRAIN_SECS: u64 = 30;
 /// varies it, so it is no longer an env knob.
 pub const DEFAULT_IO_BLOCK_SIZE_BYTES: usize = 256 * 1024;
 
-/// Fixed tag resolved by production serving requests.
+/// Legacy fixed tag used only by non-catalog provider seams and compatibility tests.
 ///
-/// This is deliberately not configurable. Publishers move `HEAD` only after the target version
-/// has been prewarmed and verified on every required replica.
+/// Production serving resolves exact URI and version through the PostgreSQL catalog.
 pub const PRODUCTION_SERVE_TAG: &str = "HEAD";
 
-/// Fixed TTL in seconds for trusting the resolved `HEAD` version before re-reading the tag.
-///
-/// Bounds how long a tag flip can go unobserved by a replica. Hardcoded: no deployment has ever
-/// retuned this, so it is no longer an env knob.
+/// Fixed freshness TTL for legacy unpinned provider handles.
 pub const DEFAULT_SERVE_TAG_TTL_SECS: u64 = 10;
 
 /// Fixed object-store retry-window timeout in seconds — 120 s.
@@ -275,6 +274,9 @@ pub struct Config {
     /// HTTPS JWKS location used for signing-key rotation.
     /// Env: `SEARCH_API_JWKS_URI`.
     pub jwks_uri: String,
+    /// Stable non-secret identity returned by replica-local administration.
+    /// Env: `SEARCH_API_REPLICA_ID`.
+    pub replica_id: String,
     /// Weighted capacity of the open-`Dataset` handle LRU (default [`DEFAULT_DATASET_CACHE_CAPACITY`]).
     /// Fixed: no longer env-configurable.
     pub dataset_cache_capacity: u64,
@@ -310,8 +312,7 @@ pub struct Config {
     /// Disables trace export and DogStatsD entirely (tests / local runs keep JSON logs only).
     /// Env: `SEARCH_API_TELEMETRY_DISABLED`.
     pub telemetry_disabled: bool,
-    /// Seconds the resolved `HEAD` version is trusted before the tag JSON is re-read (default
-    /// [`DEFAULT_SERVE_TAG_TTL_SECS`]). Fixed: no longer env-configurable.
+    /// Freshness TTL for legacy unpinned provider handles. Fixed: no longer env-configurable.
     pub serve_tag_ttl_secs: u64,
 }
 
@@ -323,8 +324,8 @@ impl Config {
     /// `SEARCH_API_CACHE_DIR`, `SEARCH_API_CACHE_BACKEND` (`disk`, `redis`, or `memory`),
     /// `SEARCH_API_REDIS_URL` (required for the `redis` backend), `SEARCH_API_REDIS_NAMESPACE`
     /// (default `search-api`), `SEARCH_API_STATSD_ADDR` (default honors `DD_AGENT_HOST`),
-    /// and `SEARCH_API_TELEMETRY_DISABLED`. Production serving always resolves the fixed
-    /// [`PRODUCTION_SERVE_TAG`].
+    /// and `SEARCH_API_TELEMETRY_DISABLED`. Production serving always resolves an exact catalog
+    /// URI and version under [`PRODUCTION_PROFILE_ID`].
     ///
     /// Every other knob — dataset-handle cache sizing, index/metadata/disk cache budgets,
     /// serve-tag TTL, IO concurrency, ANN probe/refine/fast-search defaults, gRPC timeout and
@@ -353,6 +354,14 @@ impl Config {
         if !jwks_uri.starts_with("https://") {
             return Err("SEARCH_API_JWKS_URI must use https".to_owned());
         }
+        let replica_id = required_string("SEARCH_API_REPLICA_ID")?;
+        if replica_id.len() > 128
+            || !replica_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err("SEARCH_API_REPLICA_ID must match [A-Za-z0-9_.-]{1,128}".to_owned());
+        }
         let cache_backend = env_cache_backend()?;
         let redis_url = std::env::var("SEARCH_API_REDIS_URL").ok().filter(|url| !url.is_empty());
         if cache_backend == CacheBackendKind::Redis && redis_url.is_none() {
@@ -367,6 +376,7 @@ impl Config {
             jwt_issuer,
             jwt_audience,
             jwks_uri,
+            replica_id,
             dataset_cache_capacity: DEFAULT_DATASET_CACHE_CAPACITY,
             index_cache_bytes: DEFAULT_INDEX_CACHE_BYTES,
             metadata_cache_bytes: DEFAULT_METADATA_CACHE_BYTES,
@@ -474,6 +484,7 @@ mod tests {
             ("SEARCH_API_JWT_ISSUER", "https://issuer.test"),
             ("SEARCH_API_JWT_AUDIENCE", "search-api"),
             ("SEARCH_API_JWKS_URI", "https://issuer.test/.well-known/jwks.json"),
+            ("SEARCH_API_REPLICA_ID", "search-api-0"),
         ] {
             if !effective.iter().any(|(candidate, _)| *candidate == name) {
                 effective.push((name, Some(value)));
@@ -529,6 +540,7 @@ mod tests {
             assert_eq!(config.jwt_issuer, "https://issuer.test");
             assert_eq!(config.jwt_audience, "search-api");
             assert_eq!(config.jwks_uri, "https://issuer.test/.well-known/jwks.json");
+            assert_eq!(config.replica_id, "search-api-0");
             assert_eq!(config.dataset_cache_capacity, DEFAULT_DATASET_CACHE_CAPACITY);
             assert_eq!(config.index_cache_bytes, DEFAULT_INDEX_CACHE_BYTES);
             assert_eq!(config.metadata_cache_bytes, DEFAULT_METADATA_CACHE_BYTES);
@@ -560,7 +572,7 @@ mod tests {
                 assert_eq!(config.cache_backend, CacheBackendKind::Disk);
                 assert_eq!(
                     config.serve_tag_ttl_secs, DEFAULT_SERVE_TAG_TTL_SECS,
-                    "HEAD resolution TTL remains fixed"
+                    "legacy unpinned-handle TTL remains fixed"
                 );
             },
         );

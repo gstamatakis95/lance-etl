@@ -11,6 +11,12 @@ use crate::domain::{DatasetTarget, SearchError, ServingCatalog, ServingRoute};
 /// Fixed maximum number of PostgreSQL connections used by one search process.
 const CATALOG_POOL_SIZE: u32 = 16;
 
+/// Client-safe message for a transient catalog dependency failure.
+const CATALOG_UNAVAILABLE_MESSAGE: &str = "serving catalog unavailable";
+
+/// Client-safe message for malformed state returned by the catalog.
+const CATALOG_INVALID_MESSAGE: &str = "serving catalog returned invalid state";
+
 /// PostgreSQL-backed serving catalog over the three-table control plane.
 pub struct PostgresServingCatalog {
     pool: Pool<PostgresConnectionManager<MakeTlsConnector>>,
@@ -80,40 +86,46 @@ fn catalog_config(database_url: &str) -> Result<Config, String> {
 impl ServingCatalog for PostgresServingCatalog {
     async fn resolve(&self, target: &DatasetTarget) -> Result<ServingRoute, SearchError> {
         target.validate()?;
-        let connection = self
-            .pool
-            .get()
-            .await
-            .map_err(|error| SearchError::unavailable(format!("serving catalog unavailable: {error}")))?;
+        let connection = self.pool.get().await.map_err(|_| catalog_unavailable("pool"))?;
         let row = connection
             .query_opt(
                 "SELECT served_lance_uri, served_lance_version, profile_id FROM targets WHERE tenant_id = $1 AND namespace = $2 AND org_id = $3",
                 &[&target.tenant_id, &target.namespace, &target.org_id],
             )
             .await
-            .map_err(|error| SearchError::unavailable(format!("serving catalog query failed: {error}")))?
+            .map_err(|_| catalog_unavailable("query"))?
             .ok_or_else(|| SearchError::not_found("target is not published"))?;
         let lance_uri = row
             .try_get::<_, Option<String>>(0)
-            .map_err(|error| SearchError::internal(format!("invalid serving catalog URI: {error}")))?
+            .map_err(|_| catalog_invalid("uri"))?
             .ok_or_else(|| SearchError::not_found("target is not published"))?;
         let raw_version = row
             .try_get::<_, Option<i64>>(1)
-            .map_err(|error| SearchError::internal(format!("invalid serving catalog version: {error}")))?
+            .map_err(|_| catalog_invalid("version"))?
             .ok_or_else(|| SearchError::not_found("target is not published"))?;
         let lance_version = u64::try_from(raw_version)
             .ok()
             .filter(|version| *version > 0)
             .ok_or_else(|| SearchError::internal("serving catalog contains an invalid Lance version"))?;
-        let profile_id = row
-            .try_get::<_, String>(2)
-            .map_err(|error| SearchError::internal(format!("invalid serving catalog profile: {error}")))?;
+        let profile_id = row.try_get::<_, String>(2).map_err(|_| catalog_invalid("profile"))?;
         Ok(ServingRoute {
             lance_uri,
             lance_version,
             profile_id,
         })
     }
+}
+
+/// Emits only a closed failure category and returns a bounded retriable error.
+fn catalog_unavailable(category: &'static str) -> SearchError {
+    tracing::warn!(failure_category = category, "serving catalog request failed");
+    SearchError::unavailable(CATALOG_UNAVAILABLE_MESSAGE)
+}
+
+/// Emits only a closed decode category and returns a bounded internal error.
+fn catalog_invalid(category: &'static str) -> SearchError {
+    tracing::error!(failure_category = category, "serving catalog state is invalid");
+    SearchError::internal(CATALOG_INVALID_MESSAGE)
 }
 
 #[cfg(test)]

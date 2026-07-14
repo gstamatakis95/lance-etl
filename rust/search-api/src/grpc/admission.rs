@@ -15,7 +15,14 @@ const MAX_INACTIVE_TENANT_ENTRIES: usize = 4096;
 pub struct AdmissionController {
     global: Arc<Semaphore>,
     per_tenant_limit: usize,
-    tenants: Mutex<HashMap<DatasetTarget, Weak<Semaphore>>>,
+    tenants: Mutex<HashMap<TenantKey, Weak<Semaphore>>>,
+}
+
+/// Internal fairness key for an org-local tenant across all namespaces.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TenantKey {
+    org_id: String,
+    tenant_id: String,
 }
 
 /// Owned permits held for the complete lifetime of one admitted request.
@@ -65,11 +72,15 @@ impl AdmissionController {
         if tenants.len() >= MAX_INACTIVE_TENANT_ENTRIES {
             tenants.retain(|_, semaphore| semaphore.strong_count() > 0);
         }
-        if let Some(semaphore) = tenants.get(target).and_then(Weak::upgrade) {
-            return semaphore;
+        let key = TenantKey {
+            org_id: target.org_id.clone(),
+            tenant_id: target.tenant_id.clone(),
+        };
+        if let Some(existing) = tenants.get(&key).and_then(Weak::upgrade) {
+            return existing;
         }
         let semaphore = Arc::new(Semaphore::new(self.per_tenant_limit));
-        tenants.insert(target.clone(), Arc::downgrade(&semaphore));
+        tenants.insert(key, Arc::downgrade(&semaphore));
         semaphore
     }
 }

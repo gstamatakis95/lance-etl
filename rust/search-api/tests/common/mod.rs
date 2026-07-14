@@ -52,7 +52,7 @@ impl FakeServingCatalog {
             route: ServingRoute {
                 lance_uri: lance_uri.into(),
                 lance_version,
-                profile_id: "default".to_string(),
+                profile_id: search_api::config::PRODUCTION_PROFILE_ID.to_string(),
             },
             calls: AtomicU64::new(0),
         }
@@ -300,6 +300,7 @@ pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) 
         jwt_issuer: "https://issuer.test".to_owned(),
         jwt_audience: "search-api".to_owned(),
         jwks_uri: "https://issuer.test/.well-known/jwks.json".to_owned(),
+        replica_id: "search-api-test-0".to_owned(),
         dataset_cache_capacity: 16,
         index_cache_bytes: 64 * 1024 * 1024,
         metadata_cache_bytes: 64 * 1024 * 1024,

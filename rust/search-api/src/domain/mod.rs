@@ -29,7 +29,7 @@ pub use clusters::{ClusterReader, ClusterReport, ClusterSpec};
 pub use error::SearchError;
 pub use filter::{CompareOp, Filter, Literal};
 pub use fusion::FusionSpec;
-pub use prewarm::{PrewarmReport, PrewarmSpec, PrewarmedIndex, Prewarmer};
+pub use prewarm::{ExactPrewarmer, PrewarmReport, PrewarmSpec, PrewarmedIndex, Prewarmer};
 pub use query::{
     DistanceKind, FilterMode, FusedHit, Fuzziness, Hit, HybridQuery, HybridSearchOutcome, MatchSpec, PhraseSpec,
     SearchWarning, TextOperator, TextQuery, TextQueryNode, TextSearchOutcome, TimeRange, VectorQuery,

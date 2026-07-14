@@ -14,6 +14,7 @@
 //! - [`timeout`]: the per-route request-timeout tower layer applied by `main` (and by any test
 //!   that mirrors the production server stack).
 
+pub mod admin;
 pub mod admission;
 pub mod auth;
 pub mod convert;

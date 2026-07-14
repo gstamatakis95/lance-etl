@@ -15,8 +15,8 @@ use tower::{Layer, Service};
 use crate::config::{DEFAULT_LONG_REQUEST_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS};
 use crate::telemetry::{Metrics, Rpc};
 
-/// No public route receives the internal long-operation timeout budget.
-pub const LONG_TIMEOUT_ROUTES: [&str; 0] = [];
+/// Internal replica-local operations receiving the long-operation timeout budget.
+pub const LONG_TIMEOUT_ROUTES: [&str; 1] = ["/lance_etl.internal.v1.AdminService/PrewarmExact"];
 
 /// Tower layer applying a per-route server-side timeout to every request.
 ///
@@ -142,6 +142,7 @@ fn rpc_for_path(path: &str) -> Option<Rpc> {
         "/lance_etl.v1.SearchService/VectorSearch" => Some(Rpc::VectorSearch),
         "/lance_etl.v1.SearchService/TextSearch" => Some(Rpc::TextSearch),
         "/lance_etl.v1.SearchService/HybridSearch" => Some(Rpc::HybridSearch),
+        "/lance_etl.internal.v1.AdminService/PrewarmExact" => Some(Rpc::Prewarm),
         _ => None,
     }
 }
@@ -199,6 +200,10 @@ mod tests {
         assert_eq!(layer.budget_for("/lance_etl.v1.SearchService/TextSearch"), default);
         assert_eq!(layer.budget_for("/lance_etl.v1.SearchService/HybridSearch"), default);
         assert_eq!(layer.budget_for("/grpc.health.v1.Health/Check"), default);
+        assert_eq!(
+            layer.budget_for("/lance_etl.internal.v1.AdminService/PrewarmExact"),
+            long
+        );
     }
 
     #[tokio::test(start_paused = true)]

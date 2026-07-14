@@ -7,9 +7,11 @@ use std::time::Duration;
 
 use search_api::catalog::PostgresServingCatalog;
 use search_api::config::Config;
+use search_api::grpc::admin::AdminGrpc;
 use search_api::grpc::admission::AdmissionController;
 use search_api::grpc::auth::JwtAuthorizer;
 use search_api::grpc::{RouteTimeoutLayer, SearchGrpc};
+use search_api::internal_pb::admin_service_server::AdminServiceServer;
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
 use search_api::pb::search_service_server::SearchServiceServer;
 use search_api::telemetry::{self, Metrics, RecallCapture};
@@ -125,7 +127,9 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let backend = Arc::new(LanceSearchBackend::new(provider).with_metrics(metrics.clone()));
 
     let recall = RecallCapture::new(search_api::config::DEFAULT_RECALL_SAMPLE_RATE, metrics.clone());
-    let service = SearchGrpc::with_metrics(backend, metrics.clone(), authorizer.clone(), admission).with_recall(recall);
+    let service =
+        SearchGrpc::with_metrics(backend.clone(), metrics.clone(), authorizer.clone(), admission).with_recall(recall);
+    let admin_service = AdminGrpc::new(backend, authorizer.clone(), config.replica_id.clone());
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter.set_service_status("", ServingStatus::Serving).await;
     let search_listener = tokio::net::TcpListener::bind(addr).await?;
@@ -142,6 +146,11 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             .layer(RouteTimeoutLayer::from_defaults(metrics.clone()))
             .add_service(
                 SearchServiceServer::new(service)
+                    .max_decoding_message_size(search_api::config::DEFAULT_MAX_REQUEST_BYTES)
+                    .max_encoding_message_size(search_api::config::DEFAULT_MAX_RESPONSE_BYTES),
+            )
+            .add_service(
+                AdminServiceServer::new(admin_service)
                     .max_decoding_message_size(search_api::config::DEFAULT_MAX_REQUEST_BYTES)
                     .max_encoding_message_size(search_api::config::DEFAULT_MAX_RESPONSE_BYTES),
             )

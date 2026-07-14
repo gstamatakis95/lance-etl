@@ -60,3 +60,8 @@ pub mod telemetry;
 pub mod pb {
     tonic::include_proto!("lance_etl.v1");
 }
+
+/// Generated protobuf and gRPC types for the internal replica-local administration service.
+pub mod internal_pb {
+    include!(concat!(env!("OUT_DIR"), "/internal/lance_etl.internal.v1.rs"));
+}

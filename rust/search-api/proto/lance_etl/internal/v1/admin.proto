@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package lance_etl.internal.v1;
+
+import "lance_etl/v1/lance_etl.proto";
+
+// Replica-local administrative operations unavailable on the public SearchService.
+service AdminService {
+  // Warms one exact candidate snapshot into only the addressed replica.
+  rpc PrewarmExact(PrewarmExactRequest) returns (PrewarmExactResponse);
+}
+
+// Exact candidate selected by the fenced control-plane worker.
+message PrewarmExactRequest {
+  // Validated logical target used for authorization and audit fencing.
+  lance_etl.v1.DatasetTarget target = 1;
+  // Candidate URI that must remain under the configured serving prefix.
+  string candidate_lance_uri = 2;
+  // Exact immutable Lance version to warm.
+  uint64 candidate_lance_version = 3;
+}
+
+// Proof returned by one local replica after every committed index is warm.
+message PrewarmExactResponse {
+  // Stable deployment-provided replica identity.
+  string replica_id = 1;
+  // Exact candidate URI that was opened.
+  string candidate_lance_uri = 2;
+  // Exact Lance version that was opened and warmed.
+  uint64 resolved_version = 3;
+  // Number of committed user indexes warmed successfully.
+  uint32 indexes_warmed = 4;
+}
