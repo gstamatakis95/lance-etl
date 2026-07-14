@@ -31,7 +31,19 @@ from lance_etl.source import (
     SourcePlan,
     SourcePlanner,
     TableMetadata,
+    WindowKind,
 )
+from lance_etl.source.contract import validate_table_contract
+from lance_etl.source.errors import (
+    SourceBaselineError,
+    SourceContractError,
+    SourceLineageError,
+    SourceSnapshotBlockedError,
+)
+from lance_etl.source.lineage import index_snapshots, validate_snapshot_identity
+from lance_etl.source.manifests import discover_baseline_targets
+from lance_etl.source.planner import build_window
+from lance_etl.state import SourceWindowKind, SourceWindowPlan, SourceWindowState
 
 TABLE_IDENTIFIER_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*){1,2}$")
 """Allowlisted catalog-qualified Iceberg identifier contract."""
@@ -54,7 +66,7 @@ MANIFEST_CONTENT_BY_CODE: dict[int, ManifestContent] = {
 class SourceCheckpointRepository(Protocol):
     """Structural interface for reading the durable audit tip."""
 
-    def latest_source_window(self, table_uuid: uuid.UUID) -> Any:
+    def latest_source_window(self, table_uuid: uuid.UUID | None = None) -> Any:
         """Return the newest durable source row.
 
         Args:
@@ -62,6 +74,30 @@ class SourceCheckpointRepository(Protocol):
 
         Returns:
             Mapping-like row or ``None``.
+        """
+        ...
+
+    def enqueue_blocked_source_window(self, plan: SourceWindowPlan, error_code: str) -> int:
+        """Persist a rejected exact next snapshot without child work.
+
+        Args:
+            plan: Rejected snapshot identity.
+            error_code: Bounded deterministic classification.
+
+        Returns:
+            Durable rejected window sequence.
+        """
+        ...
+
+    def block_source_window(self, window_seq: int, error_code: str) -> bool:
+        """Gate the latest exact safe audit tip when no next identity is trustworthy.
+
+        Args:
+            window_seq: Latest safe durable audit sequence.
+            error_code: Bounded deterministic classification.
+
+        Returns:
+            Whether the durable fail-closed gate exists.
         """
         ...
 
@@ -337,12 +373,44 @@ class SparkIcebergCatalog:
             row = snapshots.where(col("snapshot_id") == cursor).limit(1).first()
             if row is None:
                 break
-            record = snapshot_from_row(metadata.table_uuid, metadata.active_partition_spec.spec_id, row)
+            spec_id = self.snapshot_partition_spec_id(validated, cursor, row, metadata.active_partition_spec.spec_id)
+            record = snapshot_from_row(metadata.table_uuid, spec_id, row)
             records.append(record)
             if cursor == stop_snapshot_id or record.parent_snapshot_id is None:
                 break
             cursor = record.parent_snapshot_id
         return tuple(records)
+
+    def snapshot_partition_spec_id(self, table: str, snapshot_id: int, row: Row, fallback_spec_id: int) -> int:
+        """Resolve a snapshot's own partition spec from summary or added manifests.
+
+        Args:
+            table: Validated Iceberg table identifier.
+            snapshot_id: Exact historical snapshot.
+            row: Spark snapshots metadata row.
+            fallback_spec_id: Current active spec used only for snapshots with no added manifests.
+
+        Returns:
+            Exact added-manifest spec ID or the safe active fallback.
+
+        Raises:
+            SourceContractError: If one snapshot adds manifests under multiple specs.
+        """
+        summary = row.asDict(recursive=True).get("summary") or {}
+        for key in ("partition-spec-id", "partition_spec_id"):
+            if key in summary:
+                return int(summary[key])
+        manifests = self.spark.read.format("iceberg").load(f"{table}.all_manifests")
+        specs = (
+            manifests.where(col("added_snapshot_id") == snapshot_id)
+            .select(col("partition_spec_id").cast("int").alias("partition_spec_id"))
+            .distinct()
+            .limit(2)
+            .collect()
+        )
+        if len(specs) > 1:
+            raise SourceContractError("one source snapshot adds manifests under multiple partition specifications")
+        return int(specs[0]["partition_spec_id"]) if specs else fallback_spec_id
 
     def manifest_entries(self, table: str, snapshot_id: int) -> tuple[ManifestEntry, ...]:
         """Aggregate changed files to distinct target-hour manifest facts.
@@ -419,7 +487,7 @@ class DurableSourcePlanProvider:
     baseline_qualifier: BaselineQualifier
 
     def plan(self) -> SourcePlan:
-        """Build a deterministic incremental plan or the explicitly pinned initial baseline.
+        """Build only the next accepted window or durably record the next rejection.
 
         Returns:
             Pinned side-effect-free source plan.
@@ -428,22 +496,217 @@ class DurableSourcePlanProvider:
             RuntimeError: If first startup lacks an explicit canonical baseline.
         """
         metadata = self.catalog.table_metadata(self.table)
-        table_uuid = uuid.UUID(metadata.table_uuid)
-        row = self.repository.latest_source_window(table_uuid)
-        checkpoint: SourceCheckpoint | None = None
-        baseline: BaselineProof | None = None
+        uuid.UUID(metadata.table_uuid)
+        row = self.repository.latest_source_window()
         if row is None:
-            if self.baseline_snapshot_id is None:
-                raise RuntimeError("initial planning requires LANCE_ETL_CANONICAL_BASELINE_SNAPSHOT_ID")
-            baseline = self.baseline_qualifier.qualify(self.table, metadata, self.baseline_snapshot_id)
-        else:
-            checkpoint = SourceCheckpoint(
+            validate_table_contract(metadata, None)
+            return self.plan_initial_baseline(metadata)
+        if row["state"] == SourceWindowState.BLOCKED.value:
+            return self.empty_plan(metadata)
+        checkpoint = SourceCheckpoint(
+            str(row["table_uuid"]),
+            int(row["snapshot_id"]),
+            int(row["iceberg_sequence_number"]),
+            int(row["partition_spec_id"]),
+        )
+        try:
+            validate_table_contract(metadata, checkpoint)
+        except SourceContractError:
+            self.repository.block_source_window(int(row["window_seq"]), "SOURCE_TABLE_CONTRACT")
+            return self.empty_plan(metadata)
+        return self.plan_next_increment(metadata, checkpoint, int(row["window_seq"]))
+
+    def plan_initial_baseline(self, metadata: TableMetadata) -> SourcePlan:
+        """Qualify and plan only the explicit first baseline snapshot.
+
+        Args:
+            metadata: Current pinned Iceberg table metadata.
+
+        Returns:
+            A single baseline window or an empty plan after durable rejection.
+        """
+        if self.baseline_snapshot_id is None:
+            raise RuntimeError("initial planning requires LANCE_ETL_CANONICAL_BASELINE_SNAPSHOT_ID")
+        if metadata.current_snapshot_id is None:
+            return SourcePlan(metadata.table_uuid, None, metadata.active_partition_spec.spec_id, ())
+        snapshots = self.catalog.snapshots_through(
+            self.table,
+            metadata.current_snapshot_id,
+            self.baseline_snapshot_id,
+        )
+        baseline_snapshot = index_snapshots(snapshots).get(self.baseline_snapshot_id)
+        if baseline_snapshot is None:
+            raise SourceLineageError("pinned baseline is not retained in the requested ancestry")
+        try:
+            validate_snapshot_identity(
+                baseline_snapshot,
                 metadata.table_uuid,
-                int(row["snapshot_id"]),
-                int(row["iceberg_sequence_number"]),
                 metadata.active_partition_spec.spec_id,
             )
-        return SourcePlanner(self.catalog).plan(self.table, checkpoint, baseline)
+            proof = self.baseline_qualifier.qualify(self.table, metadata, self.baseline_snapshot_id)
+            accepted = (
+                proof.table_uuid == metadata.table_uuid
+                and proof.snapshot_id == self.baseline_snapshot_id
+                and proof.partition_spec_id == baseline_snapshot.partition_spec_id
+                and proof.canonical
+                and proof.distinct_mutation_conflicts == 0
+            )
+            if not accepted:
+                raise SourceBaselineError("baseline qualification found distinct mutations or mismatched identity")
+            entries = self.catalog.manifest_entries(self.table, self.baseline_snapshot_id)
+            touched = discover_baseline_targets(baseline_snapshot, entries)
+            window = build_window(self.table, baseline_snapshot, WindowKind.BASELINE, touched)
+        except (SourceBaselineError, SourceLineageError, SourceSnapshotBlockedError) as exc:
+            if isinstance(exc, SourceSnapshotBlockedError):
+                error_code = exc.error_code
+            elif isinstance(exc, SourceLineageError):
+                error_code = "BASELINE_IDENTITY_MISMATCH"
+            else:
+                error_code = "BASELINE_NOT_CANONICAL"
+            self.persist_rejected(baseline_snapshot, error_code, baseline=True)
+            return SourcePlan(
+                metadata.table_uuid,
+                metadata.current_snapshot_id,
+                metadata.active_partition_spec.spec_id,
+                (),
+            )
+        return SourcePlan(
+            metadata.table_uuid,
+            metadata.current_snapshot_id,
+            metadata.active_partition_spec.spec_id,
+            (window,),
+        )
+
+    def plan_next_increment(
+        self,
+        metadata: TableMetadata,
+        checkpoint: SourceCheckpoint,
+        checkpoint_window_seq: int,
+    ) -> SourcePlan:
+        """Inspect only the direct next descendant and stop at its first rejection.
+
+        Args:
+            metadata: Current pinned table metadata.
+            checkpoint: Exact durable audit tip.
+            checkpoint_window_seq: Durable row identity used for an atomic safe-tip gate.
+
+        Returns:
+            One accepted next window or an empty plan after durable rejection.
+        """
+        if metadata.current_snapshot_id is None:
+            return SourcePlan(metadata.table_uuid, None, metadata.active_partition_spec.spec_id, ())
+        try:
+            snapshots = self.catalog.snapshots_through(
+                self.table,
+                metadata.current_snapshot_id,
+                checkpoint.snapshot_id,
+            )
+            snapshot = direct_next_snapshot(
+                snapshots,
+                metadata.current_snapshot_id,
+                checkpoint.snapshot_id,
+            )
+        except (SourceContractError, SourceLineageError):
+            self.repository.block_source_window(checkpoint_window_seq, "SOURCE_LINEAGE_UNTRUSTED")
+            return self.empty_plan(metadata)
+        if snapshot is None:
+            return self.empty_plan(metadata)
+        try:
+            validate_snapshot_identity(snapshot, metadata.table_uuid, metadata.active_partition_spec.spec_id)
+        except SourceLineageError:
+            self.persist_rejected(snapshot, "SOURCE_SNAPSHOT_IDENTITY")
+            return self.empty_plan(metadata)
+        if snapshot.sequence_number <= checkpoint.sequence_number:
+            self.persist_rejected(snapshot, "SOURCE_SEQUENCE_ORDER")
+            return self.empty_plan(metadata)
+        try:
+            window = SourcePlanner(self.catalog).plan_snapshot(self.table, snapshot)
+        except SourceSnapshotBlockedError as exc:
+            self.persist_rejected(snapshot, exc.error_code)
+            return self.empty_plan(metadata)
+        return SourcePlan(
+            metadata.table_uuid,
+            metadata.current_snapshot_id,
+            metadata.active_partition_spec.spec_id,
+            (window,),
+        )
+
+    def empty_plan(self, metadata: TableMetadata) -> SourcePlan:
+        """Return an empty result pinned to the metadata read for this planner pass.
+
+        Args:
+            metadata: Pinned table metadata.
+
+        Returns:
+            Empty source plan retaining exact head and active-spec evidence.
+        """
+        return SourcePlan(
+            metadata.table_uuid,
+            metadata.current_snapshot_id,
+            metadata.active_partition_spec.spec_id,
+            (),
+        )
+
+    def persist_rejected(self, snapshot: SnapshotRecord, error_code: str, baseline: bool = False) -> int:
+        """Persist one exact rejected source snapshot without target children.
+
+        Args:
+            snapshot: First unsupported direct descendant.
+            error_code: Bounded planning classification.
+            baseline: Whether this is the explicitly qualified initial baseline.
+
+        Returns:
+            Durable rejected audit sequence.
+        """
+        return self.repository.enqueue_blocked_source_window(
+            SourceWindowPlan(
+                table_uuid=uuid.UUID(snapshot.table_uuid),
+                snapshot_id=snapshot.snapshot_id,
+                parent_snapshot_id=snapshot.parent_snapshot_id,
+                iceberg_sequence_number=snapshot.sequence_number,
+                partition_spec_id=snapshot.partition_spec_id,
+                kind=SourceWindowKind.BASELINE if baseline else SourceWindowKind.REJECTED,
+            ),
+            error_code,
+        )
+
+
+def direct_next_snapshot(
+    snapshots: tuple[SnapshotRecord, ...],
+    head_snapshot_id: int,
+    checkpoint_snapshot_id: int,
+) -> SnapshotRecord | None:
+    """Return only the direct child of a retained checkpoint in a pinned ancestry.
+
+    Args:
+        snapshots: Bounded ancestry from head through checkpoint.
+        head_snapshot_id: Pinned current head.
+        checkpoint_snapshot_id: Durable audit tip.
+
+    Returns:
+        Direct child snapshot, or ``None`` when checkpoint is already head.
+
+    Raises:
+        SourceLineageError: If ancestry is missing, cyclic, or does not reach the checkpoint.
+    """
+    if head_snapshot_id == checkpoint_snapshot_id:
+        return None
+    indexed = index_snapshots(snapshots)
+    cursor = head_snapshot_id
+    visited: set[int] = set()
+    child: SnapshotRecord | None = None
+    while cursor != checkpoint_snapshot_id:
+        if cursor in visited:
+            raise SourceLineageError("cycle detected in pinned Iceberg snapshot ancestry")
+        visited.add(cursor)
+        record = indexed.get(cursor)
+        if record is None:
+            raise SourceLineageError("pinned Iceberg ancestry is missing a required snapshot")
+        child = record
+        if record.parent_snapshot_id is None:
+            raise SourceLineageError("pinned Iceberg head does not descend from the durable audit tip")
+        cursor = record.parent_snapshot_id
+    return child
 
 
 def snapshot_from_row(table_uuid: str, spec_id: int, row: Row) -> SnapshotRecord:

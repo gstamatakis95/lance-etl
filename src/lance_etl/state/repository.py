@@ -209,6 +209,8 @@ class ControlPlaneRepository:
             StateTransitionError: If an existing idempotency key carries different metadata.
         """
         plan.validate()
+        if plan.kind == SourceWindowKind.REJECTED:
+            raise ValueError("rejected source snapshots require enqueue_blocked_source_window")
         validated_targets: list[TargetPlan] = [target_plan.validate() for target_plan in target_plans]
         with self.engine.begin() as connection:
             window_seq, inserted = self.insert_or_validate_window(connection, plan)
@@ -242,6 +244,49 @@ class ControlPlaneRepository:
                     .where(source_windows.c.state == SourceWindowState.SEALED.value)
                     .values(state=SourceWindowState.COMPLETE.value, updated_at=utc_now())
                 )
+            return window_seq
+
+    def enqueue_blocked_source_window(self, plan: SourceWindowPlan, error_code: str) -> int:
+        """Persist one rejected baseline or next snapshot as the durable retention tip.
+
+        Args:
+            plan: Exact rejected snapshot identity and partition specification.
+            error_code: Bounded deterministic planning classification.
+
+        Returns:
+            Existing or newly allocated source-window sequence.
+
+        Raises:
+            ValueError: If the plan is neither an initial baseline nor an incremental rejection.
+            StateTransitionError: If an idempotent replay changes its error classification.
+        """
+        plan.validate()
+        if plan.kind not in (SourceWindowKind.BASELINE, SourceWindowKind.REJECTED):
+            raise ValueError("blocked source enqueue requires a BASELINE or REJECTED kind")
+        current = utc_now()
+        bounded = bounded_error(error_code, ERROR_CODE_LIMIT)
+        with self.engine.begin() as connection:
+            window_seq, inserted = self.insert_or_validate_window(connection, plan)
+            row = (
+                connection.execute(
+                    source_windows.select().where(source_windows.c.window_seq == window_seq).with_for_update()
+                )
+                .mappings()
+                .one()
+            )
+            if not inserted and row["state"] == SourceWindowState.BLOCKED.value:
+                if row["error_code"] != bounded:
+                    raise StateTransitionError("rejected source window carries a different error classification")
+                return window_seq
+            connection.execute(
+                source_windows.update()
+                .where(source_windows.c.window_seq == window_seq)
+                .values(
+                    state=SourceWindowState.BLOCKED.value,
+                    error_code=bounded,
+                    updated_at=current,
+                )
+            )
             return window_seq
 
     def work_execution_context(
@@ -279,6 +324,7 @@ class ControlPlaneRepository:
             source_windows.c.snapshot_id,
             source_windows.c.parent_snapshot_id,
             source_windows.c.iceberg_sequence_number,
+            source_windows.c.partition_spec_id,
             source_windows.c.kind.label("source_window_kind"),
         ).select_from(joined)
         with self.engine.connect() as connection:
@@ -304,6 +350,7 @@ class ControlPlaneRepository:
         snapshot_id = int(row["snapshot_id"]) if row["snapshot_id"] is not None else None
         parent_snapshot_id = int(row["parent_snapshot_id"]) if row["parent_snapshot_id"] is not None else None
         sequence = int(row["iceberg_sequence_number"]) if row["iceberg_sequence_number"] is not None else None
+        partition_spec_id = int(row["partition_spec_id"]) if row["partition_spec_id"] is not None else None
         source_kind = row["source_window_kind"]
         kind = SourceWindowKind(source_kind) if source_kind is not None else None
         return WorkExecutionContext(
@@ -313,6 +360,7 @@ class ControlPlaneRepository:
             snapshot_id=snapshot_id,
             parent_snapshot_id=parent_snapshot_id,
             iceberg_sequence_number=sequence,
+            partition_spec_id=partition_spec_id,
             source_window_kind=kind,
             candidate_lance_uri=row["candidate_lance_uri"],
             indexed_lance_version=(
@@ -339,6 +387,7 @@ class ControlPlaneRepository:
                 snapshot_id=plan.snapshot_id,
                 parent_snapshot_id=plan.parent_snapshot_id,
                 iceberg_sequence_number=plan.iceberg_sequence_number,
+                partition_spec_id=plan.partition_spec_id,
                 kind=plan.kind.value,
                 state=SourceWindowState.SEALED.value,
             )
@@ -361,11 +410,13 @@ class ControlPlaneRepository:
         expected: tuple[Any, ...] = (
             plan.parent_snapshot_id,
             plan.iceberg_sequence_number,
+            plan.partition_spec_id,
             plan.kind.value,
         )
         actual: tuple[Any, ...] = (
             row["parent_snapshot_id"],
             row["iceberg_sequence_number"],
+            row["partition_spec_id"],
             row["kind"],
         )
         if actual != expected:
@@ -775,29 +826,44 @@ class ControlPlaneRepository:
         error_code: str,
         now: datetime | None = None,
     ) -> bool:
-        """Block a source-level lineage or snapshot-contract failure.
+        """Atomically gate the latest safe source audit tip.
 
         Args:
-            window_seq: Sealed source window to block.
+            window_seq: Exact latest safe source window to block.
             error_code: Stable bounded source-contract code.
             now: Deterministic clock override for tests.
 
         Returns:
-            True when the sealed window transitioned, false otherwise.
+            True when the desired durable gate exists.
+
+        Raises:
+            StateTransitionError: If the row is absent, no longer latest, or carries another gate reason.
         """
         current: datetime = now or utc_now()
+        bounded = bounded_error(error_code, ERROR_CODE_LIMIT)
         with self.engine.begin() as connection:
-            result = connection.execute(
+            row = (
+                connection.execute(
+                    source_windows.select().where(source_windows.c.window_seq == window_seq).with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if row is None:
+                raise StateTransitionError("source audit tip does not exist")
+            latest = connection.scalar(sa.select(sa.func.max(source_windows.c.window_seq)))
+            if latest is None or int(latest) != window_seq:
+                raise StateTransitionError("source audit tip changed before its fail-closed gate committed")
+            if row["state"] == SourceWindowState.BLOCKED.value:
+                if row["error_code"] != bounded:
+                    raise StateTransitionError("source audit tip carries a different fail-closed classification")
+                return True
+            connection.execute(
                 source_windows.update()
                 .where(source_windows.c.window_seq == window_seq)
-                .where(source_windows.c.state == SourceWindowState.SEALED.value)
-                .values(
-                    state=SourceWindowState.BLOCKED.value,
-                    error_code=bounded_error(error_code, ERROR_CODE_LIMIT),
-                    updated_at=current,
-                )
+                .values(state=SourceWindowState.BLOCKED.value, error_code=bounded, updated_at=current)
             )
-            return result.rowcount == 1
+            return True
 
     def retry_blocked_work(self, work_id: uuid.UUID, now: datetime | None = None) -> bool:
         """Return blocked target work to its same durable identity for operator retry.
@@ -952,6 +1018,7 @@ class ControlPlaneRepository:
         connection.execute(
             source_windows.update()
             .where(source_windows.c.window_seq == window_seq)
+            .where(source_windows.c.state == SourceWindowState.SEALED.value)
             .where(~unfinished)
             .values(state=SourceWindowState.COMPLETE.value, error_code=None, updated_at=now)
         )
@@ -1295,25 +1362,21 @@ class ControlPlaneRepository:
                 .one_or_none()
             )
 
-    def latest_source_window(self, table_uuid: uuid.UUID) -> RowMapping | None:
-        """Return the newest durable audit-tip row for one Iceberg table.
+    def latest_source_window(self, table_uuid: uuid.UUID | None = None) -> RowMapping | None:
+        """Return the newest durable audit tip for the deployment-owned source table.
 
         Args:
-            table_uuid: Stable Iceberg table identity.
+            table_uuid: Optional identity filter for diagnostic callers.
 
         Returns:
             Newest source-window row or ``None`` before initial planning.
         """
+        query = source_windows.select()
+        if table_uuid is not None:
+            query = query.where(source_windows.c.table_uuid == table_uuid)
         with self.engine.connect() as connection:
             return (
-                connection.execute(
-                    source_windows.select()
-                    .where(source_windows.c.table_uuid == table_uuid)
-                    .order_by(source_windows.c.window_seq.desc())
-                    .limit(1)
-                )
-                .mappings()
-                .one_or_none()
+                connection.execute(query.order_by(source_windows.c.window_seq.desc()).limit(1)).mappings().one_or_none()
             )
 
     def control_plane_status(self, now: datetime | None = None) -> ControlPlaneStatus:

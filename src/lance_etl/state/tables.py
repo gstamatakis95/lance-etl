@@ -7,7 +7,7 @@ import sqlalchemy as sa
 metadata: sa.MetaData = sa.MetaData()
 """Control-plane metadata containing exactly three application tables."""
 
-SOURCE_KINDS: tuple[str, ...] = ("BASELINE", "APPEND", "TRUSTED_MAINTENANCE")
+SOURCE_KINDS: tuple[str, ...] = ("BASELINE", "APPEND", "TRUSTED_MAINTENANCE", "REJECTED")
 SOURCE_STATES: tuple[str, ...] = ("SEALED", "COMPLETE", "BLOCKED")
 WORK_KINDS: tuple[str, ...] = ("INGEST", "SERVE", "REBUILD")
 WORK_STATES: tuple[str, ...] = ("PENDING", "RUNNING", "RETRY_WAIT", "SUCCEEDED", "BLOCKED")
@@ -34,6 +34,7 @@ source_windows: sa.Table = sa.Table(
     sa.Column("snapshot_id", sa.BigInteger(), nullable=False),
     sa.Column("parent_snapshot_id", sa.BigInteger(), nullable=True),
     sa.Column("iceberg_sequence_number", sa.BigInteger(), nullable=False),
+    sa.Column("partition_spec_id", sa.Integer(), nullable=False),
     sa.Column("kind", sa.String(32), nullable=False),
     sa.Column("state", sa.String(16), nullable=False, server_default="SEALED"),
     sa.Column("error_code", sa.String(128), nullable=True),
@@ -45,6 +46,7 @@ source_windows: sa.Table = sa.Table(
     sa.CheckConstraint(f"state IN ({quoted_values(SOURCE_STATES)})", name="ck_source_windows_state"),
     sa.CheckConstraint("snapshot_id >= 0", name="ck_source_windows_snapshot_nonnegative"),
     sa.CheckConstraint("iceberg_sequence_number >= 0", name="ck_source_windows_sequence_nonnegative"),
+    sa.CheckConstraint("partition_spec_id >= 0", name="ck_source_windows_spec_nonnegative"),
     sa.CheckConstraint(
         "kind = 'BASELINE' OR parent_snapshot_id IS NOT NULL",
         name="ck_source_windows_parent_required",

@@ -15,7 +15,8 @@ import lance
 import pyarrow as pa
 import pyarrow.compute as pc
 from pyspark import StorageLevel
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.errors import AnalysisException
+from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql.functions import array, array_except, col, countDistinct, element_at, lit, lower, map_keys, size, trim
 from pyspark.sql.types import (
     ArrayType,
@@ -23,6 +24,7 @@ from pyspark.sql.types import (
     BooleanType,
     FloatType,
     LongType,
+    MapType,
     StringType,
     StructField,
     StructType,
@@ -33,7 +35,7 @@ from lance_etl.cloud_storage import resolve_filesystem
 from lance_etl.etl.completion import CompletionMarker, finalize_completion_marker
 from lance_etl.etl.digest import SOURCE_DIGEST_HEADER, canonical_event_digest, encode_bytes
 from lance_etl.etl.mutation import DELETE_OPERATIONS, UPSERT_OPERATIONS, normalize_operation
-from lance_etl.etl.pivot import apply_fsl_cast
+from lance_etl.etl.pivot import apply_fsl_cast, apply_ttl_cast
 from lance_etl.etl.replay_sink import (
     DELETED_COLUMN,
     EVENT_DIGEST_COLUMN,
@@ -139,8 +141,8 @@ class DistributedIngestRunner:
             WindowKind(context.source_window_kind.value),
             TargetKey(context.identity.tenant_id, context.identity.namespace, context.identity.org_id),
         )
-        source = execute_spark_scan(self.spark, scan)
         try:
+            source = execute_spark_scan(self.spark, scan)
             self.validate_source_profile(source)
             selected = self.select_profile_fields(source)
             terminal = self.normalize_terminal(selected, context).persist(StorageLevel.MEMORY_AND_DISK)
@@ -175,7 +177,7 @@ class DistributedIngestRunner:
                 )
             finally:
                 terminal.unpersist()
-        except ValueError as exc:
+        except (AnalysisException, ValueError) as exc:
             return blocked_result(context.claim, "SOURCE_PROFILE_VIOLATION", str(exc))
 
     def validate_source_profile(self, source: DataFrame) -> None:
@@ -187,33 +189,99 @@ class DistributedIngestRunner:
         Raises:
             ValueError: If source fields violate the release-owned target profile.
         """
-        map_contracts = (
-            ("vectors", tuple(name for name, dimension in self.profile.vector_fields)),
-            ("texts", self.profile.text_fields),
-            ("metadata", self.profile.metadata_fields),
-        )
-        required_columns = {"vector_id", "op", "event_timestamp"}
-        missing_columns = sorted(required_columns - set(source.columns))
-        if missing_columns:
-            raise ValueError(f"source is missing required columns {missing_columns}")
+        self.validate_source_schema(source)
         if source.where(col("event_timestamp").isNull()).limit(1).count():
             raise ValueError("source contains a null event_timestamp")
         normalized_operation = lower(trim(col("op")))
         supported = tuple(sorted(UPSERT_OPERATIONS | DELETE_OPERATIONS))
         if source.where(col("op").isNull() | ~normalized_operation.isin(*supported)).limit(1).count():
             raise ValueError("source contains an unsupported mutation operation")
-        delete_operation = normalized_operation.isin(*tuple(sorted(DELETE_OPERATIONS)))
+        self.validate_map_keys(source)
+        self.validate_vector_dimensions(source, normalized_operation)
+
+    def validate_source_schema(self, source: DataFrame) -> None:
+        """Validate the fixed physical source types before distributed checks.
+
+        Args:
+            source: Exact target snapshot scan.
+
+        Raises:
+            ValueError: If a required column is absent or carries the wrong Spark type.
+        """
+        required_columns = {
+            "tenant_id",
+            "namespace",
+            "org_id",
+            "vector_id",
+            "op",
+            "event_timestamp",
+            "vectors",
+            "texts",
+            "metadata",
+        }
+        if self.profile.include_ttl:
+            required_columns.add("ttl")
+        missing_columns = sorted(required_columns - set(source.columns))
+        if missing_columns:
+            raise ValueError(f"source is missing required columns {missing_columns}")
+        string_columns = ("tenant_id", "namespace", "org_id", "vector_id", "op")
+        if any(not isinstance(source.schema[name].dataType, StringType) for name in string_columns):
+            raise ValueError("source routing, vector_id, and op columns must be strings")
+        if not isinstance(source.schema["event_timestamp"].dataType, TimestampType):
+            raise ValueError("source event_timestamp must be a timestamp")
+        vectors_type = source.schema["vectors"].dataType
+        texts_type = source.schema["texts"].dataType
+        metadata_type = source.schema["metadata"].dataType
+        vectors_valid = (
+            isinstance(vectors_type, MapType)
+            and isinstance(vectors_type.keyType, StringType)
+            and isinstance(vectors_type.valueType, ArrayType)
+            and isinstance(vectors_type.valueType.elementType, FloatType)
+        )
+        strings_valid = all(
+            isinstance(map_type, MapType)
+            and isinstance(map_type.keyType, StringType)
+            and isinstance(map_type.valueType, StringType)
+            for map_type in (texts_type, metadata_type)
+        )
+        if not vectors_valid or not strings_valid:
+            raise ValueError("source maps must match vectors<string,array<float>> and text metadata string maps")
+        if self.profile.include_ttl and not isinstance(source.schema["ttl"].dataType, LongType):
+            raise ValueError("source ttl must be bigint seconds")
+
+    def validate_map_keys(self, source: DataFrame) -> None:
+        """Reject dynamic map keys outside the release-owned profile.
+
+        Args:
+            source: Exact target snapshot scan.
+
+        Raises:
+            ValueError: If a map contains a field outside the target schema profile.
+        """
+        map_contracts = (
+            ("vectors", tuple(name for name, dimension in self.profile.vector_fields)),
+            ("texts", self.profile.text_fields),
+            ("metadata", self.profile.metadata_fields),
+        )
         for map_column, allowed in map_contracts:
-            if map_column not in source.columns:
-                if allowed:
-                    raise ValueError(f"source is missing required map column {map_column!r}")
-                continue
             keys = map_keys(col(map_column))
             unknown_count = (
                 size(keys) if not allowed else size(array_except(keys, array(*(lit(name) for name in allowed))))
             )
             if source.where(unknown_count > 0).limit(1).count():
                 raise ValueError(f"source map {map_column!r} contains fields outside profile {self.profile.profile_id}")
+
+    def validate_vector_dimensions(self, source: DataFrame, normalized_operation: Column) -> None:
+        """Validate required vector presence and fixed dimensions.
+
+        Args:
+            source: Exact target snapshot scan.
+            normalized_operation: Normalized Spark operation expression.
+
+        Raises:
+            ValueError: If an upsert omits a vector or any vector has the wrong dimension.
+        """
+        delete_operation = normalized_operation.isin(*tuple(sorted(DELETE_OPERATIONS)))
         for name, dimension in self.profile.vector_fields:
             vector = element_at(col("vectors"), lit(name))
             if source.where(~delete_operation & vector.isNull()).limit(1).count():
@@ -372,6 +440,8 @@ class DistributedIngestRunner:
                     pa.field(EVENT_DIGEST_COLUMN, pa.binary(32)),
                     pc.cast(table[EVENT_DIGEST_COLUMN], pa.binary(32)),
                 )
+                if profile.include_ttl:
+                    table = apply_ttl_cast(table, "ttl")
                 for name, dimension in profile.vector_fields:
                     table = apply_fsl_cast(table, name, {}, dimension)
                     invalid = pc.and_(pc.invert(table[DELETED_COLUMN]), pc.is_null(table[name]))

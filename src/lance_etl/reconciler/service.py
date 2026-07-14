@@ -286,7 +286,7 @@ class ResultReconciler:
         if result.kind is ResultKind.RETRY:
             return self.repository.retry_work(
                 result.claim,
-                self.profile.retry_delay(result.claim.attempt_count),
+                self.profile.retry_delay(result.claim.attempt_count, result.claim.work_id),
                 required_str(result.error_code),
                 result.error_message or "",
                 now,
@@ -494,12 +494,29 @@ class ReconcilerApplication:
     profile: DeploymentProfile
 
     def plan_and_enqueue_window(self) -> EnqueueSummary:
-        """Plan a pinned source prefix and enqueue each window atomically.
+        """Classify and enqueue a bounded source backlog one snapshot at a time.
 
         Returns:
             Durable enqueue summary.
         """
-        return self.plan_enqueuer.enqueue(self.plan_provider.plan())
+        pinned_head: int | None = None
+        planned = 0
+        enqueued = 0
+        sequences: list[int] = []
+        truncated = False
+        for planner_pass in range(self.profile.max_windows_per_plan):
+            del planner_pass
+            summary = self.plan_enqueuer.enqueue(self.plan_provider.plan())
+            pinned_head = summary.pinned_head_snapshot_id
+            planned += summary.planned_windows
+            enqueued += summary.enqueued_windows
+            sequences.extend(summary.window_sequences)
+            truncated = truncated or summary.truncated
+            if summary.enqueued_windows == 0 or summary.truncated:
+                break
+        else:
+            truncated = True
+        return EnqueueSummary(pinned_head, planned, enqueued, tuple(sequences), truncated)
 
     def run_due_target_work(self) -> DispatchSummary:
         """Drain a bounded amount of due work.

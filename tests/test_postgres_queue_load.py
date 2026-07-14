@@ -144,6 +144,7 @@ def test_skip_locked_queue_load_is_complete_disjoint_and_bounded(
             snapshot_id=1,
             parent_snapshot_id=None,
             iceberg_sequence_number=1,
+            partition_spec_id=7,
             kind=SourceWindowKind.BASELINE,
         ),
         plans,

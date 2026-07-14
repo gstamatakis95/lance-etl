@@ -68,5 +68,15 @@ def test_source_and_target_plans_validate_contracts() -> None:
             snapshot_id=2,
             parent_snapshot_id=None,
             iceberg_sequence_number=2,
+            partition_spec_id=7,
             kind=SourceWindowKind.APPEND,
+        ).validate()
+    with pytest.raises(ValueError, match="only a BASELINE"):
+        SourceWindowPlan(
+            table_uuid=uuid.uuid4(),
+            snapshot_id=3,
+            parent_snapshot_id=None,
+            iceberg_sequence_number=3,
+            partition_spec_id=7,
+            kind=SourceWindowKind.REJECTED,
         ).validate()

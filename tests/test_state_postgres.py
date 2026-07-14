@@ -133,6 +133,7 @@ def source_plan(
         snapshot_id=snapshot_id,
         parent_snapshot_id=parent_snapshot_id,
         iceberg_sequence_number=sequence_number,
+        partition_spec_id=7,
         kind=kind,
     )
 
@@ -166,6 +167,68 @@ def test_migration_creates_exactly_three_application_tables(
     del repository
     names: set[str] = set(sa.inspect(engine).get_table_names())
     assert names == {"alembic_version", "source_windows", "targets", "target_work"}
+
+
+def test_rejected_source_snapshots_are_idempotent_retention_tips_without_child_work(
+    postgres_repository: tuple[ControlPlaneRepository, Engine],
+) -> None:
+    """Exact rejected snapshots replay safely and never create target work.
+
+    Args:
+        postgres_repository: Fresh repository and engine fixture.
+    """
+    repository, engine = postgres_repository
+    table_uuid = uuid.uuid4()
+    baseline = source_plan(table_uuid, 90, 9, None, SourceWindowKind.BASELINE)
+    baseline_seq = repository.enqueue_source_window(baseline, [])
+    rejected = source_plan(table_uuid, 91, 10, 90, SourceWindowKind.REJECTED)
+    rejected_seq = repository.enqueue_blocked_source_window(rejected, "UNTRUSTED_REWRITE")
+    assert repository.enqueue_blocked_source_window(rejected, "UNTRUSTED_REWRITE") == rejected_seq
+    assert rejected_seq > baseline_seq
+    with pytest.raises(StateTransitionError, match="classification"):
+        repository.enqueue_blocked_source_window(rejected, "PHYSICAL_DELETE")
+    with engine.connect() as connection:
+        rejected_row = (
+            connection.execute(source_windows.select().where(source_windows.c.window_seq == rejected_seq))
+            .mappings()
+            .one()
+        )
+        child_count = int(connection.scalar(sa.select(sa.func.count()).select_from(target_work)) or 0)
+    assert rejected_row["state"] == SourceWindowState.BLOCKED.value
+    assert rejected_row["partition_spec_id"] == 7
+    assert child_count == 0
+    assert repository.retention_floor()["window_seq"] == rejected_seq
+
+
+def test_source_contract_gate_reopens_only_the_latest_exact_safe_tip(
+    postgres_repository: tuple[ControlPlaneRepository, Engine],
+) -> None:
+    """A no-next-identity failure durably gates the latest completed audit row.
+
+    Args:
+        postgres_repository: Fresh repository and engine fixture.
+    """
+    repository, engine = postgres_repository
+    table_uuid = uuid.uuid4()
+    first_seq = repository.enqueue_source_window(
+        source_plan(table_uuid, 95, 9, None, SourceWindowKind.BASELINE),
+        [],
+    )
+    second_seq = repository.enqueue_source_window(source_plan(table_uuid, 96, 10, 95), [])
+    with pytest.raises(StateTransitionError, match="changed"):
+        repository.block_source_window(first_seq, "SOURCE_LINEAGE_UNTRUSTED")
+    assert repository.block_source_window(second_seq, "SOURCE_LINEAGE_UNTRUSTED")
+    assert repository.block_source_window(second_seq, "SOURCE_LINEAGE_UNTRUSTED")
+    with pytest.raises(StateTransitionError, match="different"):
+        repository.block_source_window(second_seq, "SOURCE_TABLE_CONTRACT")
+    with engine.connect() as connection:
+        row = (
+            connection.execute(source_windows.select().where(source_windows.c.window_seq == second_seq))
+            .mappings()
+            .one()
+        )
+    assert row["state"] == SourceWindowState.BLOCKED.value
+    assert row["error_code"] == "SOURCE_LINEAGE_UNTRUSTED"
 
 
 def test_duplicate_plan_ordered_ingest_and_serve_coalescing(

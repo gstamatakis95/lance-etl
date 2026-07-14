@@ -89,6 +89,7 @@ def map_window(table_uuid: uuid.UUID, window: WindowPlan) -> SourceWindowPlan:
         snapshot_id=window.snapshot.snapshot_id,
         parent_snapshot_id=window.snapshot.parent_snapshot_id,
         iceberg_sequence_number=window.snapshot.sequence_number,
+        partition_spec_id=window.snapshot.partition_spec_id,
         kind=kind,
     )
 

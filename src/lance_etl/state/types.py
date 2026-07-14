@@ -19,11 +19,12 @@ WORK_ID_NAMESPACE: uuid.UUID = uuid.UUID("c73b9521-68b9-479f-aa19-7f646f129091")
 
 
 class SourceWindowKind(StrEnum):
-    """Kinds of accepted Iceberg source windows."""
+    """Kinds of accepted or durably rejected Iceberg source windows."""
 
     BASELINE = "BASELINE"
     APPEND = "APPEND"
     TRUSTED_MAINTENANCE = "TRUSTED_MAINTENANCE"
+    REJECTED = "REJECTED"
 
 
 class SourceWindowState(StrEnum):
@@ -187,6 +188,7 @@ class SourceWindowPlan:
     snapshot_id: int
     parent_snapshot_id: int | None
     iceberg_sequence_number: int
+    partition_spec_id: int
     kind: SourceWindowKind
 
     def validate(self) -> SourceWindowPlan:
@@ -202,6 +204,8 @@ class SourceWindowPlan:
             raise ValueError("snapshot_id must be non-negative")
         if self.iceberg_sequence_number < 0:
             raise ValueError("iceberg_sequence_number must be non-negative")
+        if self.partition_spec_id < 0:
+            raise ValueError("partition_spec_id must be non-negative")
         if self.kind != SourceWindowKind.BASELINE and self.parent_snapshot_id is None:
             raise ValueError("only a BASELINE source window may omit parent_snapshot_id")
         return self
@@ -234,6 +238,7 @@ class WorkExecutionContext:
         snapshot_id: Exact Iceberg source snapshot for INGEST.
         parent_snapshot_id: Exact incremental scan parent for INGEST.
         iceberg_sequence_number: Arrival-order watermark for INGEST rows.
+        partition_spec_id: Exact source partition specification for the snapshot.
         source_window_kind: Accepted source classification for INGEST.
         candidate_lance_uri: Frozen SERVE, REBUILD, or rollback candidate URI.
         indexed_lance_version: Exact candidate version when already known.
@@ -247,6 +252,7 @@ class WorkExecutionContext:
     snapshot_id: int | None
     parent_snapshot_id: int | None
     iceberg_sequence_number: int | None
+    partition_spec_id: int | None
     source_window_kind: SourceWindowKind | None
     candidate_lance_uri: str | None
     indexed_lance_version: int | None

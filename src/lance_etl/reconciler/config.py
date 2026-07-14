@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -43,18 +45,24 @@ class DeploymentProfile:
         ("spark.speculation", "false"),
     )
 
-    def retry_delay(self, attempt_count: int) -> timedelta:
+    def retry_delay(self, attempt_count: int, work_id: uuid.UUID | None = None) -> timedelta:
         """Return bounded exponential target-work retry delay.
 
         Args:
             attempt_count: Durable claim attempt count, starting at one.
+            work_id: Stable work identity used to derive reproducible full jitter.
 
         Returns:
             Code-owned delay capped by ``retry_max_delay``.
         """
         exponent = max(0, min(attempt_count - 1, 10))
-        seconds = self.retry_base_delay.total_seconds() * (2**exponent)
-        return min(timedelta(seconds=seconds), self.retry_max_delay)
+        cap_seconds = min(
+            self.retry_base_delay.total_seconds() * (2**exponent),
+            self.retry_max_delay.total_seconds(),
+        )
+        seed = f"{work_id or self.profile_id}:{attempt_count}".encode()
+        sample = int.from_bytes(hashlib.sha256(seed).digest()[:8], "big") / float(2**64 - 1)
+        return timedelta(seconds=cap_seconds * sample)
 
     def spark_configuration(self) -> dict[str, str]:
         """Return a mutable Spark-submit configuration copy.

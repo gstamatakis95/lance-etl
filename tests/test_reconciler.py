@@ -17,6 +17,7 @@ import pytest
 from lance_etl.reconciler import (
     BoundedDispatcher,
     DeploymentProfile,
+    EnqueueSummary,
     ReconcilerApplication,
     ResultKind,
     ResultReconciler,
@@ -32,6 +33,7 @@ from lance_etl.reconciler.results import ReconcileSummary
 from lance_etl.reconciler.workers import FencedWorkExecutor, ProfiledServeRunner, required_indexes
 from lance_etl.source import (
     BaselineProof,
+    PartitionField,
     PartitionSpec,
     SnapshotRecord,
     SourcePlan,
@@ -159,6 +161,26 @@ def source_plan(window_count: int = 2) -> SourcePlan:
     return SourcePlan(table_uuid, window_count + 1, 7, tuple(windows))
 
 
+def valid_partition_spec(spec_id: int = 7) -> PartitionSpec:
+    """Return the exact accepted Iceberg routing and hour partition layout.
+
+    Args:
+        spec_id: Iceberg partition specification identity.
+
+    Returns:
+        Accepted partition specification.
+    """
+    return PartitionSpec(
+        spec_id,
+        (
+            PartitionField("tenant_id", "tenant_id", "identity"),
+            PartitionField("namespace", "namespace", "identity"),
+            PartitionField("org_id", "org_id", "identity"),
+            PartitionField("processing_timestamp_hour", "processing_timestamp", "hour"),
+        ),
+    )
+
+
 def test_source_plan_enqueuer_maps_windows_and_release_profile() -> None:
     """Source windows and manifest targets reach one atomic repository call per snapshot."""
     repository = MagicMock()
@@ -187,29 +209,181 @@ def test_source_plan_enqueuer_has_code_owned_window_bound() -> None:
     assert repository.enqueue_source_window.call_count == 2
 
 
-def test_initial_source_plan_uses_executor_qualified_baseline_proof(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An environment snapshot ID is never treated as canonical without a qualifier scan.
-
-    Args:
-        monkeypatch: Scoped planner-constructor replacement.
-    """
+def test_initial_source_plan_uses_executor_qualified_baseline_proof() -> None:
+    """An environment snapshot ID is never treated as canonical without a qualifier scan."""
     table_uuid = str(uuid.uuid4())
-    metadata = TableMetadata(table_uuid, 9, PartitionSpec(7, ()))
+    metadata = TableMetadata(table_uuid, 9, valid_partition_spec())
     proof = BaselineProof(table_uuid, 9, 7, True, 0)
     catalog = MagicMock()
     catalog.table_metadata.return_value = metadata
+    catalog.snapshots_through.return_value = (SnapshotRecord(table_uuid, 9, None, 9, 1000, "append", 7),)
+    catalog.manifest_entries.return_value = ()
     repository = MagicMock()
     repository.latest_source_window.return_value = None
     qualifier = MagicMock()
     qualifier.qualify.return_value = proof
-    planner = MagicMock()
-    expected = SourcePlan(table_uuid, 9, 7, ())
-    planner.plan.return_value = expected
-    monkeypatch.setattr("lance_etl.reconciler.iceberg.SourcePlanner", MagicMock(return_value=planner))
     provider = DurableSourcePlanProvider("prod.vectors.events", catalog, repository, 9, qualifier)
-    assert provider.plan() == expected
+    plan = provider.plan()
+    assert len(plan.windows) == 1
+    assert plan.windows[0].kind is WindowKind.BASELINE
+    assert plan.windows[0].snapshot.snapshot_id == 9
     qualifier.qualify.assert_called_once_with("prod.vectors.events", metadata, 9)
-    planner.plan.assert_called_once_with("prod.vectors.events", None, proof)
+
+
+def test_invalid_root_baseline_is_durably_blocked_without_parentless_rejected_kind() -> None:
+    """A rejected root baseline remains BASELINE while its durable state records the rejection."""
+    table_uuid = str(uuid.uuid4())
+    metadata = TableMetadata(table_uuid, 9, valid_partition_spec())
+    baseline = SnapshotRecord(table_uuid, 9, None, 9, 1000, "append", 7)
+    catalog = MagicMock()
+    catalog.table_metadata.return_value = metadata
+    catalog.snapshots_through.return_value = (baseline,)
+    repository = MagicMock()
+    repository.latest_source_window.return_value = None
+    qualifier = MagicMock()
+    qualifier.qualify.return_value = BaselineProof(table_uuid, 9, 7, False, 1)
+    provider = DurableSourcePlanProvider("prod.vectors.events", catalog, repository, 9, qualifier)
+    assert provider.plan().windows == ()
+    blocked_plan, error_code = repository.enqueue_blocked_source_window.call_args.args
+    assert blocked_plan.kind is SourceWindowKind.BASELINE
+    assert blocked_plan.parent_snapshot_id is None
+    assert error_code == "BASELINE_NOT_CANONICAL"
+
+
+def test_source_audit_tip_detects_partition_spec_change_before_next_scan() -> None:
+    """A changed numeric spec identity blocks even when its named fields are semantically identical."""
+    table_uuid = uuid.uuid4()
+    catalog = MagicMock()
+    catalog.table_metadata.return_value = TableMetadata(str(table_uuid), 2, valid_partition_spec(8))
+    repository = MagicMock()
+    repository.latest_source_window.return_value = {
+        "window_seq": 11,
+        "table_uuid": table_uuid,
+        "snapshot_id": 1,
+        "iceberg_sequence_number": 1,
+        "partition_spec_id": 7,
+        "state": SourceWindowState.COMPLETE.value,
+    }
+    provider = DurableSourcePlanProvider("prod.vectors.events", catalog, repository, None, MagicMock())
+    assert provider.plan().windows == ()
+    repository.block_source_window.assert_called_once_with(11, "SOURCE_TABLE_CONTRACT")
+    catalog.snapshots_through.assert_not_called()
+
+
+def test_source_audit_tip_detects_replaced_table_uuid_before_baseline_logic() -> None:
+    """A deployment table replacement cannot silently start a second baseline lineage."""
+    current_uuid = uuid.uuid4()
+    previous_uuid = uuid.uuid4()
+    catalog = MagicMock()
+    catalog.table_metadata.return_value = TableMetadata(str(current_uuid), 2, valid_partition_spec())
+    repository = MagicMock()
+    repository.latest_source_window.return_value = {
+        "window_seq": 12,
+        "table_uuid": previous_uuid,
+        "snapshot_id": 1,
+        "iceberg_sequence_number": 1,
+        "partition_spec_id": 7,
+        "state": SourceWindowState.COMPLETE.value,
+    }
+    qualifier = MagicMock()
+    provider = DurableSourcePlanProvider("prod.vectors.events", catalog, repository, 2, qualifier)
+    assert provider.plan().windows == ()
+    repository.block_source_window.assert_called_once_with(12, "SOURCE_TABLE_CONTRACT")
+    qualifier.qualify.assert_not_called()
+
+
+def test_missing_pinned_ancestry_gates_latest_safe_audit_tip() -> None:
+    """A missing or forked ancestry cannot repeatedly fail without a durable retention gate."""
+    table_uuid = uuid.uuid4()
+    catalog = MagicMock()
+    catalog.table_metadata.return_value = TableMetadata(str(table_uuid), 3, valid_partition_spec())
+    catalog.snapshots_through.return_value = (SnapshotRecord(str(table_uuid), 3, 2, 3, 3000, "append", 7),)
+    repository = MagicMock()
+    repository.latest_source_window.return_value = {
+        "window_seq": 13,
+        "table_uuid": table_uuid,
+        "snapshot_id": 1,
+        "iceberg_sequence_number": 1,
+        "partition_spec_id": 7,
+        "state": SourceWindowState.COMPLETE.value,
+    }
+    provider = DurableSourcePlanProvider("prod.vectors.events", catalog, repository, None, MagicMock())
+    assert provider.plan().windows == ()
+    repository.block_source_window.assert_called_once_with(13, "SOURCE_LINEAGE_UNTRUSTED")
+    repository.enqueue_blocked_source_window.assert_not_called()
+
+
+def test_known_next_snapshot_spec_change_is_persisted_as_exact_rejection() -> None:
+    """A known next snapshot with changed identity becomes an exact rejected audit tip."""
+    table_uuid = uuid.uuid4()
+    catalog = MagicMock()
+    catalog.table_metadata.return_value = TableMetadata(str(table_uuid), 2, valid_partition_spec())
+    catalog.snapshots_through.return_value = (
+        SnapshotRecord(str(table_uuid), 2, 1, 2, 2000, "append", 8),
+        SnapshotRecord(str(table_uuid), 1, None, 1, 1000, "append", 7),
+    )
+    repository = MagicMock()
+    repository.latest_source_window.return_value = {
+        "window_seq": 14,
+        "table_uuid": table_uuid,
+        "snapshot_id": 1,
+        "iceberg_sequence_number": 1,
+        "partition_spec_id": 7,
+        "state": SourceWindowState.COMPLETE.value,
+    }
+    provider = DurableSourcePlanProvider("prod.vectors.events", catalog, repository, None, MagicMock())
+    assert provider.plan().windows == ()
+    rejected, error_code = repository.enqueue_blocked_source_window.call_args.args
+    assert rejected.snapshot_id == 2
+    assert rejected.partition_spec_id == 8
+    assert error_code == "SOURCE_SNAPSHOT_IDENTITY"
+    repository.block_source_window.assert_not_called()
+
+
+def test_invalid_next_snapshot_is_durably_blocked_without_descendant_discovery() -> None:
+    """The first unsupported direct descendant becomes the retention tip and stops later planning."""
+    table_uuid = uuid.uuid4()
+    catalog = MagicMock()
+    catalog.table_metadata.return_value = TableMetadata(str(table_uuid), 3, valid_partition_spec())
+    checkpoint = SnapshotRecord(str(table_uuid), 1, None, 1, 1000, "append", 7)
+    rejected = SnapshotRecord(str(table_uuid), 2, 1, 2, 2000, "overwrite", 7)
+    descendant = SnapshotRecord(str(table_uuid), 3, 2, 3, 3000, "append", 7)
+    catalog.snapshots_through.return_value = (descendant, rejected, checkpoint)
+    catalog.manifest_entries.return_value = ()
+    catalog.maintenance_trust.return_value = None
+    repository = MagicMock()
+    repository.latest_source_window.return_value = {
+        "window_seq": 15,
+        "table_uuid": table_uuid,
+        "snapshot_id": 1,
+        "iceberg_sequence_number": 1,
+        "partition_spec_id": 7,
+        "state": SourceWindowState.COMPLETE.value,
+    }
+    provider = DurableSourcePlanProvider("prod.vectors.events", catalog, repository, None, MagicMock())
+    plan = provider.plan()
+    assert plan.windows == ()
+    blocked_plan, error_code = repository.enqueue_blocked_source_window.call_args.args
+    assert blocked_plan.snapshot_id == 2
+    assert blocked_plan.partition_spec_id == 7
+    assert blocked_plan.kind == SourceWindowKind.REJECTED
+    assert error_code == "UNTRUSTED_REWRITE"
+    catalog.manifest_entries.assert_called_once_with("prod.vectors.events", 2)
+
+    repository.reset_mock()
+    catalog.reset_mock()
+    catalog.table_metadata.return_value = TableMetadata(str(table_uuid), 3, valid_partition_spec())
+    repository.latest_source_window.return_value = {
+        "window_seq": 16,
+        "table_uuid": table_uuid,
+        "snapshot_id": 2,
+        "iceberg_sequence_number": 2,
+        "partition_spec_id": 7,
+        "state": SourceWindowState.BLOCKED.value,
+    }
+    assert provider.plan().windows == ()
+    catalog.snapshots_through.assert_not_called()
+    catalog.manifest_entries.assert_not_called()
 
 
 def test_ingest_success_reconciles_exact_completion_evidence() -> None:
@@ -411,9 +585,10 @@ def test_transient_retry_delay_is_code_owned_and_unbounded_by_attempt_count() ->
     result = WorkResult(claim, ResultKind.RETRY, error_code="OBJECT_STORE_TIMEOUT", error_message="timeout")
     reconciler = ResultReconciler(repository, DeploymentProfile())
     assert reconciler.reconcile(result)
+    expected_delay = DeploymentProfile().retry_delay(claim.attempt_count, claim.work_id)
     repository.retry_work.assert_called_once_with(
         claim,
-        DeploymentProfile().retry_max_delay,
+        expected_delay,
         "OBJECT_STORE_TIMEOUT",
         "timeout",
         None,
@@ -499,6 +674,7 @@ def test_fenced_executor_discards_result_when_heartbeat_loses_lease() -> None:
         10,
         None,
         10,
+        7,
         SourceWindowKind.BASELINE,
         None,
         None,
@@ -648,7 +824,7 @@ def test_application_dispatches_five_actions_and_restricted_repair() -> None:
     plan_provider = MagicMock()
     plan_provider.plan.return_value = source_plan(0)
     plan_enqueuer = MagicMock()
-    plan_enqueuer.enqueue.return_value = "enqueued"
+    plan_enqueuer.enqueue.return_value = EnqueueSummary(None, 0, 0, (), False)
     dispatcher = MagicMock()
     dispatcher.run.return_value = "dispatched"
     sweep = MagicMock()
@@ -666,7 +842,7 @@ def test_application_dispatches_five_actions_and_restricted_repair() -> None:
         emitter,
         DeploymentProfile(),
     )
-    assert application.plan_and_enqueue_window() == "enqueued"
+    assert application.plan_and_enqueue_window() == EnqueueSummary(None, 0, 0, (), False)
     assert application.run_due_target_work() == "dispatched"
     assert application.reconcile_results() == ReconcileSummary(0, 0, 0)
     assert not application.gate_source_retention().retention_held
@@ -684,6 +860,29 @@ def test_application_dispatches_five_actions_and_restricted_repair() -> None:
     repository.enqueue_rollback.assert_not_called()
     assert application.repair_rollback(identity, retained_work_id, False) == rollback_work_id
     repository.enqueue_rollback.assert_called_once_with(identity, retained_work_id)
+
+
+def test_application_catches_up_source_backlog_within_one_bounded_task() -> None:
+    """One scheduler task advances multiple snapshots while preserving one-at-a-time classification."""
+    profile = replace(DeploymentProfile(), max_windows_per_plan=4)
+    plan_provider = MagicMock()
+    plan_provider.plan.side_effect = (source_plan(1), source_plan(1), source_plan(1), source_plan(0))
+    repository = MagicMock()
+    repository.enqueue_source_window.side_effect = (21, 22, 23)
+    application = ReconcilerApplication(
+        plan_provider,
+        SourcePlanEnqueuer(repository, profile),
+        MagicMock(),
+        MagicMock(),
+        MagicMock(),
+        MagicMock(),
+        profile,
+    )
+    summary = application.plan_and_enqueue_window()
+    assert summary.enqueued_windows == 3
+    assert summary.window_sequences == (21, 22, 23)
+    assert not summary.truncated
+    assert plan_provider.plan.call_count == 4
 
 
 def test_execute_command_never_dispatches_arbitrary_action() -> None:
