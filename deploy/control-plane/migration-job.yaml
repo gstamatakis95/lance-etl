@@ -1,0 +1,79 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: lance-etl-control-plane-migrate-
+  labels:
+    app.kubernetes.io/name: lance-etl-reconciler
+    app.kubernetes.io/component: migration
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lance-etl-reconciler
+        app.kubernetes.io/component: migration
+    spec:
+      restartPolicy: Never
+      serviceAccountName: lance-etl-reconciler
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsGroup: 185
+        runAsUser: 185
+        fsGroup: 185
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: ghcr.io/gstamatakis95/lance-etl-reconciler@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          command:
+            - /opt/lance-etl/.venv/bin/python
+            - -c
+          args:
+            - |
+              import os
+              from alembic import command
+              from alembic.config import Config
+              config = Config("/opt/lance-etl/alembic.ini")
+              config.set_main_option("sqlalchemy.url", os.environ["LANCE_ETL_DATABASE_URL"].replace("%", "%%"))
+              command.upgrade(config, "head")
+          env:
+            - name: LANCE_ETL_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: lance-etl-migrator
+                  key: database-url
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: database-credentials
+              mountPath: /var/run/secrets/lance-etl-migrator
+              readOnly: true
+            - name: temporary
+              mountPath: /tmp
+      volumes:
+        - name: database-credentials
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: lance-etl-migrator
+                  items:
+                    - key: database-ca.pem
+                      path: database-ca.pem
+        - name: temporary
+          emptyDir:
+            sizeLimit: 1Gi

@@ -12,14 +12,23 @@ permissions:
   id-token: write
   attestations: write
 
-env:
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/lance-etl-search
-
 jobs:
   image:
     name: Build, scan, attest, and publish
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: search-api
+            dockerfile: containers/search-api.Dockerfile
+            image: lance-etl-search
+          - component: reconciler
+            dockerfile: containers/reconciler.Dockerfile
+            image: lance-etl-reconciler
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -35,7 +44,7 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: .
-          file: containers/search-api.Dockerfile
+          file: ${{ matrix.dockerfile }}
           build-args: GIT_REVISION=${{ github.sha }}
           push: true
           provenance: mode=max
@@ -46,7 +55,7 @@ jobs:
         with:
           image: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
           format: spdx-json
-          output-file: search-api.spdx.json
+          output-file: ${{ matrix.component }}.spdx.json
 
       - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         with:
@@ -64,15 +73,15 @@ jobs:
 
       - name: Record immutable release identity
         run: >-
-          printf '{"git_revision":"%s","lance_version":"8.0.0","image":"%s@%s"}\n'
-          "$GITHUB_SHA" "$IMAGE_NAME" "${{ steps.build.outputs.digest }}"
-          > release-identity.json
+          printf '{"component":"%s","git_revision":"%s","pylance_version":"8.0.0","python_version":"3.14.0","spark_version":"4.0.1","iceberg_version":"1.10.0","image":"%s@%s"}\n'
+          "${{ matrix.component }}" "$GITHUB_SHA" "$IMAGE_NAME" "${{ steps.build.outputs.digest }}"
+          > ${{ matrix.component }}-release-identity.json
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: search-api-release-${{ github.sha }}
+          name: ${{ matrix.component }}-release-${{ github.sha }}
           path: |
-            release-identity.json
-            search-api.spdx.json
+            ${{ matrix.component }}-release-identity.json
+            ${{ matrix.component }}.spdx.json
           if-no-files-found: error
           retention-days: 90

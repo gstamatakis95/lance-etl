@@ -90,6 +90,18 @@ jobs:
     name: Rust search API
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    services:
+      redis:
+        image: redis:8.2.1-bookworm@sha256:5fa2edb1e408fa8235e6db8fab01d1afaaae96c9403ba67b70feceb8661e8621
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+        ports:
+          - 6379:6379
+    env:
+      SEARCH_API_TEST_REDIS_URL: redis://127.0.0.1:6379
     defaults:
       run:
         working-directory: rust/search-api
@@ -130,6 +142,16 @@ jobs:
     name: Container build and vulnerability gate
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: search-api
+            dockerfile: containers/search-api.Dockerfile
+            image: lance-etl-search:ci
+          - component: reconciler
+            dockerfile: containers/reconciler.Dockerfile
+            image: lance-etl-reconciler:ci
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -138,16 +160,43 @@ jobs:
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: .
-          file: containers/search-api.Dockerfile
+          file: ${{ matrix.dockerfile }}
           build-args: GIT_REVISION=${{ github.sha }}
           load: true
           push: false
-          tags: lance-etl-search:ci
+          tags: ${{ matrix.image }}
 
       - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         with:
-          image-ref: lance-etl-search:ci
+          image-ref: ${{ matrix.image }}
           format: table
           ignore-unfixed: true
           severity: HIGH,CRITICAL
           exit-code: "1"
+
+      - name: Validate Kubernetes release manifests
+        if: matrix.component == 'search-api'
+        run: >-
+          docker run --rm
+          --volume "$PWD:/work:ro"
+          ghcr.io/yannh/kubeconform:v0.7.0-alpine@sha256:8f0eeaaa96ba27ba1500b0e4b1c215acc358d159c62a7ecae58d7a03403287b0
+          -strict -summary -kubernetes-version 1.32.0
+          /work/deploy/search-api/statefulset.yaml
+          /work/deploy/search-api/headless-service.yaml
+          /work/deploy/search-api/service.yaml
+          /work/deploy/search-api/service-account.yaml
+          /work/deploy/search-api/pod-disruption-budget.yaml
+          /work/deploy/search-api/network-policy.yaml
+          /work/deploy/search-api/canary.yaml
+          /work/deploy/reconciler/driver-pod-template.yaml
+          /work/deploy/reconciler/executor-pod-template.yaml
+          /work/deploy/reconciler/rbac.yaml
+          /work/deploy/control-plane/migration-job.yaml
+
+      - name: Validate GitHub Actions workflows
+        if: matrix.component == 'search-api'
+        run: >-
+          docker run --rm
+          --volume "$PWD:/repo:ro"
+          --workdir /repo
+          rhysd/actionlint:1.7.7@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9
