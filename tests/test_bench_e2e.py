@@ -220,10 +220,6 @@ def experiment_argv(tmp_path: Path) -> list[str]:
         "2",
         "--vector-row-floor",
         "100",
-        "--nprobes",
-        "1,4",
-        "--refine-factors",
-        "none",
         "--max-queries",
         "20",
         "--spark-master",
@@ -273,7 +269,7 @@ def test_offline_experiment_full_loop(tmp_path: Path) -> None:
     else:
         assert metrics["server"]["endpoint"].startswith("localhost:")
         points: list[dict[str, Any]] = metrics["sweep"]["points"]
-        assert len(points) == 2, "the nprobes x refine grid must produce one point per combination"
+        assert len(points) == 1, "the catalog release profile produces one qualified operating point"
         for point in points:
             assert 0.0 <= point["recall_at_10"] <= 1.0
             assert point["p95_ms"] > 0

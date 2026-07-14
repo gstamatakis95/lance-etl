@@ -144,12 +144,14 @@ python -m bench e2e \
   --vector-row-floor 1024 \
   --seed 42 \
   --endpoint localhost:50051 \
-  --prewarm \
   --workspace bench/workspace \
   --results-root bench/results
 ```
 
-This runs ETL and then a unified ``PipelineJob`` (compaction, index build, and interval-tag stamping in one serialized fleet run) for each of the 4 batches in sequence, then verifies all historical tags and runs tag-pinned recall measurements via gRPC. Per-stage index timings are not emitted by the e2e path because all index types run inside a single ``LanceIndexer.run`` call within the pipeline job.
+This runs ETL and then a unified ``PipelineJob`` for each of the four batches. It verifies historical
+Lance tags directly and measures the final serving-catalog publication through gRPC. Public search
+requests cannot select a tag or version. Per-stage index timings are not emitted by the e2e path
+because all index types run inside a single ``LanceIndexer.run`` call within the pipeline job.
 
 ---
 
@@ -170,7 +172,6 @@ python -m bench e2e \
   --vector-row-floor 1024 \
   --seed 42 \
   --endpoint <remote-host>:50051 \
-  --prewarm \
   --workspace /mnt/nvme/bench/workspace \
   --results-root /mnt/nvme/bench/results
 ```
@@ -261,19 +262,20 @@ To pin a checksum and detect corruption on future runs, pass `--sha256 <hex>` wh
 
 ## Cold-vs-warm measurement recipe
 
-The e2e flow records `cold_ms` and `warm_ms` for the first query pair at each tag via the gRPC legs. These are client-measured single-stream latencies:
+The e2e flow records `cold_ms` and `warm_ms` for the first query pair against the final catalog
+publication. These are client-measured single-stream latencies:
 
-- `cold_ms`: the first query this client sends to the server for a given org at the given tag, after prewarming (when `--prewarm` is set) or without it.
+- `cold_ms`: the first query this client sends to the server for a given org.
 - `warm_ms`: the immediately following identical query, benefiting from OS page cache and the server's in-process index cache.
 
 To measure a true cold start (empty page cache and empty server cache):
 
 1. Start a fresh server with an empty `SEARCH_API_CACHE_DIR`.
-2. Run the e2e benchmark without `--prewarm`. Record `cold_ms` from the e2e artifact.
-3. Stop and restart the server with the same empty cache directory.
-4. Run the e2e benchmark with `--prewarm`. Record `cold_ms` again. This measures first-query latency after the Prewarm RPC has loaded metadata and index segments into the in-process cache.
+2. Run the e2e benchmark and record `cold_ms` from the e2e artifact.
+3. Stop the server and clear the cache directory before another cold cohort.
 
-The difference between the two `cold_ms` values quantifies the benefit of prewarming. The `warm_ms` in both runs measures the steady-state in-process cache hit latency.
+The `warm_ms` value measures the immediately repeated in-process cache latency. Prewarming is an
+internal publication gate and is not exposed to benchmark users through the search API.
 
 ---
 
@@ -283,15 +285,14 @@ One command runs a complete, measurable iteration: knobs in, `metrics.json` out.
 download and prepare when the corpus shape is missing (cached afterwards), wipes the Lance root
 so every iteration is a clean build of the configured knobs, spawns and owns the `search-api`
 server, runs the batch-major e2e body (real ETL, pipeline compaction, indexing, hour tags),
-measures the on-disk footprint, restarts the server for a true cold first query, runs the full
-`nprobes x refine_factors` recall sweep, and appends a one-line summary to
+measures the on-disk footprint, restarts the server for a true cold first query, measures the
+catalog-selected release profile, and appends a one-line summary to
 `{results_root}/experiments.jsonl`.
 
 ```bash
 python -m bench experiment \
   --dataset sift1m --run-id iter-001 \
   --num-partitions 256 --target-rows-per-fragment 1048576 \
-  --nprobes 1,10,25,50 --refine-factors none,5 \
   --server-env SEARCH_API_CACHE_BACKEND=disk
 ```
 
@@ -335,7 +336,9 @@ Each batch's serve tag is named after the batch window's end time in UTC, format
 
 A tagged version is exempt from Lance version cleanup: `cleanup_dataset` never prunes a version that has a tag pointing at it. Serve tags therefore act as explicit retention pins, keeping historical snapshots readable across maintenance operations until the tag is explicitly moved or deleted.
 
-The gRPC server's `version_ref` oneof on `VectorSearchRequest`, `TextSearchRequest`, `HybridSearchRequest`, and `PrewarmRequest` accepts either an exact `version` (uint64 committed-version id) or a `tag` (string) that the server resolves at request time. Pinning a search to a tag makes the result set reproducible across compaction and index rebuilds as long as the tag remains.
+The public gRPC API accepts only the logical tenant, namespace, and organization identity. The
+server resolves the exact URI, Lance version, and release profile from PostgreSQL. Every response
+returns `served_version` so benchmark evidence names the version that actually served the query.
 
 ---
 

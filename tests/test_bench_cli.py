@@ -15,7 +15,6 @@ from bench.config import (
     BenchConfig,
     build_parser,
     parse_int_list,
-    parse_refine_list,
 )
 
 
@@ -38,14 +37,6 @@ class TestListParsing:
         """Comma-separated integers parse with whitespace tolerated."""
         assert parse_int_list("1, 10,25") == [1, 10, 25]
 
-    def test_parse_refine_list_none(self) -> None:
-        """'none' parses to None alongside integers."""
-        assert parse_refine_list("none,5, 10") == [None, 5, 10]
-
-    def test_parse_refine_list_empty_items_skipped(self) -> None:
-        """Empty items are skipped."""
-        assert parse_refine_list("5,,10,") == [5, 10]
-
 
 class TestEverySubcommandParses:
     """Each subcommand parses with defaults and reports its own command."""
@@ -61,13 +52,10 @@ class TestEverySubcommandParses:
         assert config.seed == 42
         assert config.batches == 1
         assert config.endpoint == "localhost:50051"
-        assert config.nprobes == [1, 10, 25, 50, 100]
-        assert config.refine_factors == [None, 5, 10]
         assert config.concurrency == [1, 8, 32]
         assert config.ivf_partitions is None
         assert config.max_queries is None
         assert config.iceberg_package == DEFAULT_ICEBERG_PACKAGE
-        assert config.prewarm is False
         assert config.force is False
 
 
@@ -136,29 +124,18 @@ class TestSubcommandFlags:
                 "search",
                 "--endpoint",
                 "localhost:9999",
-                "--nprobes",
-                "1,5",
-                "--refine-factors",
-                "none,20",
                 "--max-queries",
                 "100",
                 "--concurrency",
                 "2,4",
                 "--load-duration",
                 "5s",
-                "--load-nprobes",
-                "25",
-                "--prewarm",
             ]
         )
         assert config.endpoint == "localhost:9999"
-        assert config.nprobes == [1, 5]
-        assert config.refine_factors == [None, 20]
         assert config.max_queries == 100
         assert config.concurrency == [2, 4]
         assert config.load_duration == "5s"
-        assert config.load_nprobes == 25
-        assert config.prewarm is True
 
     def test_report_and_run_id(self) -> None:
         """Report accepts an explicit run id and results root."""

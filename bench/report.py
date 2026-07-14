@@ -2,7 +2,7 @@
 
 Reads every ``<phase>.json`` present in the run directory and writes ``summary.md`` (markdown tables), ``recall.csv``
 (the recall/latency sweep), ``results.csv`` (a long-format combination of every phase's headline metrics), and
-``pareto.png`` (recall@10 versus QPS per sweep point, one line per refine factor). :func:`plot_pareto` forces the Agg
+``pareto.png`` (recall@10 versus QPS for the release profile). :func:`plot_pareto` forces the Agg
 backend right before drawing so importing this module never touches a GUI toolkit.
 """
 
@@ -19,8 +19,7 @@ from bench.config import PHASE_NAMES, BenchConfig
 from bench.results import ensure_dir, load_phase, save_phase, utc_now
 
 SWEEP_COLUMNS: tuple[str, ...] = (
-    "nprobes",
-    "refine_factor",
+    "execution_policy",
     "queries",
     "recall_at_1",
     "recall_at_10",
@@ -108,7 +107,7 @@ def write_results_csv(path: Path, phases: dict[str, dict[str, Any] | None]) -> i
 
 
 def plot_pareto(path: Path, sweep: list[dict[str, Any]], title: str) -> bool:
-    """Plot recall@10 versus single-stream QPS, one line per refine factor.
+    """Plot recall@10 versus single-stream QPS for catalog profiles.
 
     Args:
         path: Destination PNG.
@@ -122,19 +121,13 @@ def plot_pareto(path: Path, sweep: list[dict[str, Any]], title: str) -> bool:
         return False
     matplotlib.use("Agg", force=True)
     figure, axes = plt.subplots(figsize=(8, 6))
-    refine_values: list[int | None] = sorted({point["refine_factor"] for point in sweep}, key=lambda v: (v is None, v))
-    for refine in refine_values:
-        points: list[dict[str, Any]] = sorted(
-            [p for p in sweep if p["refine_factor"] == refine], key=lambda p: p["qps_single_stream"]
-        )
-        axes.plot(
-            [p["qps_single_stream"] for p in points],
-            [p["recall_at_10"] for p in points],
-            marker="o",
-            label=f"refine={refine if refine is not None else 'none'}",
-        )
-        for point in points:
-            axes.annotate(f"np={point['nprobes']}", (point["qps_single_stream"], point["recall_at_10"]), fontsize=7)
+    points: list[dict[str, Any]] = sorted(sweep, key=lambda point: point["qps_single_stream"])
+    axes.plot(
+        [point["qps_single_stream"] for point in points],
+        [point["recall_at_10"] for point in points],
+        marker="o",
+        label="catalog profile",
+    )
     axes.set_xlabel("QPS (single stream)")
     axes.set_ylabel("recall@10")
     axes.set_title(title)
@@ -197,15 +190,6 @@ def summary_sections(config: BenchConfig, phases: dict[str, dict[str, Any] | Non
         sections.append(markdown_table(list(search["fts"].keys()), [list(search["fts"].values())]))
         sections.append("## Hybrid leg (RRF)")
         sections.append(markdown_table(list(search["hybrid"].keys()), [list(search["hybrid"].values())]))
-        clusters: dict[str, Any] = search.get("clusters", {})
-        if "orgs" in clusters:
-            sections.append("## Clusters probe")
-            headers: list[str] = ["org", "ok", "index_name", "num_partitions", "clusters", "dimension", "duration_ms"]
-            sections.append(
-                markdown_table(
-                    headers, [[org, *[probe.get(h) for h in headers[1:]]] for org, probe in clusters["orgs"].items()]
-                )
-            )
         load: dict[str, Any] = search.get("load", {})
         sections.append("## Load (ghz)")
         if "levels" in load:
@@ -218,17 +202,8 @@ def summary_sections(config: BenchConfig, phases: dict[str, dict[str, Any] | Non
         sections.append("## First-query latency (cold vs warm)")
         sections.append(
             markdown_table(
-                ["org", "cold_ms", "warm_ms", "prewarmed", "prewarm_rpc_ms"],
-                [
-                    [
-                        org,
-                        timing["cold_ms"],
-                        timing["warm_ms"],
-                        timing["prewarmed"],
-                        timing.get("prewarm", {}).get("rpc_ms", "-"),
-                    ]
-                    for org, timing in search["first_queries"].items()
-                ],
+                ["org", "cold_ms", "warm_ms"],
+                [[org, timing["cold_ms"], timing["warm_ms"]] for org, timing in search["first_queries"].items()],
             )
         )
     return sections
@@ -252,7 +227,7 @@ def run_report(config: BenchConfig) -> dict[str, Any]:
     if sweep:
         write_sweep_csv(run_directory / "recall.csv", sweep)
         written.append("recall.csv")
-        title: str = f"{config.dataset.upper()} recall vs QPS (IVF_RQ sweep)"
+        title: str = f"{config.dataset.upper()} recall vs QPS (catalog profile)"
         if plot_pareto(run_directory / "pareto.png", sweep, title):
             written.append("pareto.png")
     metric_rows: int = write_results_csv(run_directory / "results.csv", phases)

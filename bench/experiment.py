@@ -6,7 +6,7 @@ Lance root so every iteration is a clean build of the configured knobs, spawn an
 search-api server (:mod:`bench.server`), run the batch-major e2e body (real ETL, pipeline
 compaction, indexing, and hour tags), measure the on-disk data/index/metadata footprint
 (:mod:`bench.sizes`), restart the server for a true cold first query, run the full
-``nprobes x refine_factors`` recall sweep, and write one machine-readable ``metrics.json``
+release-profile recall measurement, and write one machine-readable ``metrics.json``
 plus a one-line summary appended to ``{results_root}/experiments.jsonl``. With ``--baseline
 RUN_ID`` the headline delta against a previous iteration is computed and logged.
 """
@@ -47,8 +47,6 @@ KNOB_FIELDS: tuple[str, ...] = (
     "compact_target_rows",
     "fts_with_position",
     "no_text",
-    "nprobes",
-    "refine_factors",
     "search_k",
     "server_env",
 )
@@ -104,7 +102,7 @@ def ensure_prepared(config: BenchConfig) -> dict[str, Any]:
 
 
 def run_sweep_and_first_queries(config: BenchConfig, server: ServerHandle | None) -> dict[str, Any]:
-    """Run the cold/warm first queries and the full recall sweep grid.
+    """Run cold and warm first queries plus one release-profile recall point.
 
     When the experiment owns the server it is restarted first, so the recorded ``cold_ms`` is
     a true empty-process cold open rather than a warm-cache re-read.
@@ -114,8 +112,7 @@ def run_sweep_and_first_queries(config: BenchConfig, server: ServerHandle | None
         server: The owned server handle, or ``None`` when measuring an external server.
 
     Returns:
-        First-query timings per org and one sweep record per ``(nprobes, refine_factor)``
-        point, or a skip record when no server is reachable.
+        First-query timings per org and one catalog-profile point, or a skip record when no server is reachable.
     """
     if server is not None:
         server.restart()
@@ -127,28 +124,16 @@ def run_sweep_and_first_queries(config: BenchConfig, server: ServerHandle | None
         return {"skipped": str(exc)}
     queries, ground_truth = load_queries_and_gt(config)
     first_query: dict[str, Any] = measure_first_queries(stub, pb2, config, queries)
-    points: list[dict[str, Any]] = []
-    for nprobes in config.nprobes:
-        for refine_factor in config.refine_factors:
-            point: dict[str, Any] = sweep_point(stub, pb2, config, queries, ground_truth, nprobes, refine_factor)
-            logger.info(
-                "sweep nprobes=%d refine=%s recall@10=%.4f p95=%.2fms",
-                nprobes,
-                refine_factor,
-                point["recall_at_10"],
-                point["p95_ms"],
-            )
-            points.append(point)
-    return {"first_query": first_query, "points": points}
+    point: dict[str, Any] = sweep_point(stub, pb2, config, queries, ground_truth)
+    logger.info("catalog profile recall@10=%.4f p95=%.2fms", point["recall_at_10"], point["p95_ms"])
+    return {"first_query": first_query, "points": [point]}
 
 
 def headline_numbers(sweep: dict[str, Any], sizes: dict[str, Any], build_seconds: float) -> dict[str, Any]:
     """Distill one iteration into the numbers an agent compares across runs.
 
-    Two operating points summarize the sweep: the point with the best recall@10 (ties broken
-    by lower p95), and the fastest point reaching the recall target
-    (:data:`HEADLINE_RECALL_TARGET`), which is the latency/recall knee an agent typically
-    optimizes.
+    The single catalog-selected operating point records recall and latency. Index execution
+    policy is release-owned and therefore cannot be swept by a public request.
 
     Args:
         sweep: The sweep record from :func:`run_sweep_and_first_queries`.
@@ -171,13 +156,13 @@ def headline_numbers(sweep: dict[str, Any], sizes: dict[str, Any], build_seconds
     if points:
         best = max(points, key=lambda point: (point["recall_at_10"], -point["p95_ms"]))
         headline["best_recall_at_10"] = best["recall_at_10"]
-        headline["best_point"] = {"nprobes": best["nprobes"], "refine_factor": best["refine_factor"]}
+        headline["best_point"] = {"execution_policy": best["execution_policy"]}
         headline["best_point_p95_ms"] = best["p95_ms"]
         at_target = [point for point in points if point["recall_at_10"] >= HEADLINE_RECALL_TARGET]
         if at_target:
             knee = min(at_target, key=lambda point: point["p95_ms"])
             headline["knee_p95_ms"] = knee["p95_ms"]
-            headline["knee_point"] = {"nprobes": knee["nprobes"], "refine_factor": knee["refine_factor"]}
+            headline["knee_point"] = {"execution_policy": knee["execution_policy"]}
             headline["knee_recall_at_10"] = knee["recall_at_10"]
     cold_values: list[float] = [
         timing["cold_ms"]

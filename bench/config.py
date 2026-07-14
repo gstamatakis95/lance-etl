@@ -87,24 +87,6 @@ def parse_int_list(text: str) -> list[int]:
     return [int(item.strip()) for item in text.split(",") if item.strip()]
 
 
-def parse_refine_list(text: str) -> list[int | None]:
-    """Parse a comma-separated refine-factor list where ``none`` means no refinement.
-
-    Args:
-        text: The raw flag value, such as ``"none,5,10"``.
-
-    Returns:
-        The parsed refine factors with ``None`` for the unrefined point.
-    """
-    result: list[int | None] = []
-    for item in text.split(","):
-        cleaned: str = item.strip().lower()
-        if not cleaned:
-            continue
-        result.append(None if cleaned in ("none", "null") else int(cleaned))
-    return result
-
-
 @dataclass
 class BenchConfig:
     """Configuration shared by every benchmark phase.
@@ -138,16 +120,12 @@ class BenchConfig:
         catalog: Name of the local Hadoop Iceberg catalog.
         table_name: Bare Iceberg table name under ``<catalog>.db``.
         endpoint: gRPC endpoint of the Rust search service.
-        nprobes: Probed-partition sweep values for the recall mode.
-        refine_factors: Refine-factor sweep values. ``None`` disables re-ranking.
         search_k: Neighbors requested per query. Must cover the deepest recall cut-off.
         max_queries: Cap on query vectors per sweep point. ``None`` sends all 10k.
         fts_query_count: Deterministic full-text queries drawn from cluster vocabularies in the FTS leg.
         hybrid_query_count: Queries in the hybrid (vector + text, RRF) leg.
         concurrency: ghz concurrency levels for the load mode.
         load_duration: ghz test duration per concurrency level.
-        load_nprobes: nprobes used by the load and hybrid legs.
-        prewarm: Call the prewarm hook before timing first queries.
         sha256: Optional pinned checksum for the downloaded sift archive.
         force: Rebuild prepared artifacts even when a manifest already exists.
         warmup_queries: Queries issued at the maximum nprobes before the timed sweep. Set to 0 to skip warmup.
@@ -198,16 +176,12 @@ class BenchConfig:
     catalog: str = "bench"
     table_name: str = "sift"
     endpoint: str = "localhost:50051"
-    nprobes: list[int] = field(default_factory=lambda: [1, 10, 25, 50, 100])
-    refine_factors: list[int | None] = field(default_factory=lambda: [None, 5, 10])
     search_k: int = SIFT_GT_DEPTH
     max_queries: int | None = None
     fts_query_count: int = 100
     hybrid_query_count: int = 100
     concurrency: list[int] = field(default_factory=lambda: [1, 8, 32])
     load_duration: str = "15s"
-    load_nprobes: int = 10
-    prewarm: bool = False
     sha256: str | None = None
     force: bool = False
     warmup_queries: int = 100
@@ -388,10 +362,6 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--catalog", default="bench")
     parser.add_argument("--table-name", default="sift")
     parser.add_argument("--endpoint", default="localhost:50051")
-    parser.add_argument("--nprobes", type=parse_int_list, default=None, help="Comma list, e.g. 1,10,25,50,100")
-    parser.add_argument(
-        "--refine-factors", type=parse_refine_list, default=None, help="Comma list; 'none' disables, e.g. none,5,10"
-    )
     parser.add_argument(
         "--search-k",
         type=int,
@@ -403,8 +373,6 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--hybrid-queries", dest="hybrid_query_count", type=int, default=100)
     parser.add_argument("--concurrency", type=parse_int_list, default=None, help="ghz concurrency levels, e.g. 1,8,32")
     parser.add_argument("--load-duration", default="15s")
-    parser.add_argument("--load-nprobes", type=int, default=10)
-    parser.add_argument("--prewarm", action="store_true")
     parser.add_argument("--sha256", default=None, help="Pinned sha256 of sift.tar.gz")
     parser.add_argument("--force", action="store_true", help="Rebuild prepared artifacts")
     parser.add_argument("--warmup-queries", type=int, default=100, help="Warmup queries before timed sweep; 0 skips")

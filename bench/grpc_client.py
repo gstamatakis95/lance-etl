@@ -7,9 +7,9 @@ collide with the installed ``lance_etl`` Python package. The flattened modules (
 reflection, which would make the benchmark depend on the server having reflection enabled. The proto carries the
 ``SearchService`` contract exercised by the benchmark.
 
-Every request message addresses its dataset through a ``DatasetTarget`` built by :func:`dataset_target`, matching the
-``{base}/{org_id}/{tenant_id}/{namespace}.lance`` layout the benchmark ingest phase writes. :func:`prewarm_dataset`
-drives the real ``Prewarm`` rpc and returns the server-reported warm-up timings.
+Every request addresses a logical ``DatasetTarget`` built by :func:`dataset_target`. The service resolves its exact
+URI, Lance version, and release profile through the serving catalog. The public client cannot select storage paths,
+versions, tags, index execution knobs, or administrative cache operations.
 """
 
 from __future__ import annotations
@@ -128,88 +128,63 @@ def dataset_target(pb2: ModuleType, org_id: str, tenant_id: str = TENANT_ID, nam
 def vector_query(
     pb2: ModuleType,
     vector: np.ndarray,
-    k: int,
-    nprobes: int | None,
-    refine_factor: int | None,
-    column: str = "vector",
-    projection: tuple[str, ...] = ("vector_id",),
 ) -> Any:
     """Build a ``VectorQuery`` message.
 
     Args:
         pb2: The generated proto module.
         vector: The query vector.
-        k: Neighbors to return. 0 inherits the fused k in a hybrid request.
-        nprobes: Probed IVF partitions, or ``None`` to leave unset.
-        refine_factor: Re-ranking factor, or ``None`` to leave unset.
-        column: The vector column name.
-        projection: Columns to return.
 
     Returns:
-        The populated message.
+        Query semantics containing only the vector. Execution policy is catalog-owned.
     """
-    query = pb2.VectorQuery(vector=[float(value) for value in vector], k=k, column=column)
-    query.projection.extend(projection)
-    if nprobes is not None:
-        query.nprobes = nprobes
-    if refine_factor is not None:
-        query.refine_factor = refine_factor
-    return query
+    return pb2.VectorQuery(vector=[float(value) for value in vector])
 
 
-def text_query(pb2: ModuleType, terms: str, k: int, projection: tuple[str, ...] = ("vector_id",)) -> Any:
+def text_query(pb2: ModuleType, terms: str, columns: tuple[str, ...] = ("text",)) -> Any:
     """Build a simple ``TextQuery`` message over the ``text`` column.
 
     Args:
         pb2: The generated proto module.
         terms: The space-separated query terms.
-        k: Hits to return. 0 inherits the fused k in a hybrid request.
-        projection: Columns to return.
+        columns: Allowlisted text columns selected by product semantics.
 
     Returns:
         The populated message.
     """
-    query = pb2.TextQuery(simple=terms, k=k)
-    query.columns.append("text")
-    query.projection.extend(projection)
+    query = pb2.TextQuery(simple=terms)
+    query.columns.extend(columns)
     return query
 
 
 def result_vector_ids(results: Any) -> np.ndarray:
     """Extract the ``vector_id`` column from search results as global int ids.
 
-    Every call site projects ``vector_id`` explicitly (see the default ``projection`` of
-    :func:`vector_query` and :func:`text_query`), so every result row is expected to carry it as
-    the ``string_value`` oneof. A row missing that field, or carrying it under a different oneof,
-    means the server's schema or wire encoding drifted from what the benchmark assumes. Dropping
-    such rows silently would shrink the retrieved-id list and deflate recall, FTS, and hybrid
-    numbers without ever raising, so this helper fails loud instead.
+    The release API carries the stable logical identifier as a required typed string rather than a
+    generic row struct. An empty or non-numeric identifier is contract drift for these integer-id
+    corpora and fails loudly instead of silently deflating recall.
 
     Args:
-        results: The repeated result messages, each carrying a ``row`` struct.
+        results: Repeated typed result messages.
 
     Returns:
         An int64 array of global vector ids in result order, one entry per input result.
 
     Raises:
-        ValueError: If any result is missing ``vector_id`` or carries it as something other than
-            the ``string_value`` oneof.
+        ValueError: If any result has an empty or non-numeric ``vector_id``.
     """
     ids: list[int] = []
     malformed: list[str] = []
     total: int = 0
     for result in results:
-        field = result.row.fields.get("vector_id")
-        kind: str | None = field.WhichOneof("kind") if field is not None else None
-        if kind == "string_value":
-            ids.append(int(field.string_value))
-        else:
-            malformed.append(f"result[{total}] vector_id kind={kind!r}")
+        try:
+            ids.append(int(result.vector_id))
+        except (TypeError, ValueError):
+            malformed.append(f"result[{total}] vector_id={result.vector_id!r}")
         total += 1
     if malformed:
         raise ValueError(
-            f"{len(malformed)} of {total} results carried a missing or mistyped vector_id "
-            f"(expected the string_value oneof); offenders: {malformed[:5]}"
+            f"{len(malformed)} of {total} results carried an empty or non-numeric vector_id. Offenders: {malformed[:5]}"
         )
     return np.asarray(ids, dtype=np.int64)
 
@@ -229,148 +204,69 @@ def timed_call(callable_rpc: Any, request: Any) -> tuple[Any, float]:
     return response, (time.perf_counter() - started) * 1000.0
 
 
-def prewarm_dataset(
-    stub: Any,
-    pb2: ModuleType,
-    org_id: str,
-    fts_with_position: bool = False,
-    tag: str | None = None,
-    version: int | None = None,
-) -> dict[str, Any]:
-    """Prewarm one org's dataset through the real ``Prewarm`` rpc.
-
-    Warms the dataset metadata and every index, and returns the server-reported timings together with the
-    client-measured rpc latency. When ``tag`` is supplied the request pins to that serve tag's resolved version.
-    When ``version`` is supplied the request pins to that exact committed version id. Only one of ``tag`` or
-    ``version`` may be set at a time.
-
-    Args:
-        stub: The connected service stub.
-        pb2: The generated proto module.
-        org_id: The organization whose dataset is prewarmed.
-        fts_with_position: Also pull FTS position data for inverted indexes.
-        tag: Optional serve tag to pin the prewarm to (sets the ``version_ref.tag`` oneof).
-        version: Optional exact committed version to pin to (sets the ``version_ref.version`` oneof).
-
-    Returns:
-        The prewarm outcome: server-side metadata/total durations, per-index durations and errors, the index cache
-        size after the call, the resolved version, and the client-side rpc latency in milliseconds.
-    """
-    kwargs: dict[str, Any] = {
-        "target": dataset_target(pb2, org_id),
-        "metadata": True,
-        "all_indexes": True,
-        "fts_with_position": fts_with_position,
-    }
-    if tag is not None:
-        kwargs["tag"] = tag
-    elif version is not None:
-        kwargs["version"] = version
-    request = pb2.PrewarmRequest(**kwargs)
-    response, rpc_ms = timed_call(stub.Prewarm, request)
-    return {
-        "rpc_ms": round(rpc_ms, 3),
-        "metadata_warmed": response.metadata_warmed,
-        "metadata_duration_ms": int(response.metadata_duration_ms),
-        "total_duration_ms": int(response.total_duration_ms),
-        "index_cache_size_bytes": int(response.index_cache_size_bytes),
-        "resolved_version": int(response.resolved_version),
-        "indexes": [
-            {"name": entry.name, "duration_ms": int(entry.duration_ms), "error": entry.error}
-            for entry in response.indexes
-        ],
-    }
-
-
-def vector_search_at_tag(
+def vector_search(
     stub: Any,
     pb2: ModuleType,
     org_id: str,
     query: np.ndarray,
     k: int,
-    nprobes: int,
-    tag: str | None = None,
-    version: int | None = None,
 ) -> tuple[Any, float]:
-    """Run a vector search pinned to a serve tag or exact version.
-
-    Sets the ``version_ref`` oneof on the ``VectorSearchRequest`` message so the server opens
-    exactly the tagged snapshot. When neither ``tag`` nor ``version`` is supplied the request
-    resolves the fixed production ``HEAD`` tag.
+    """Run vector search through the current catalog publication.
 
     Args:
         stub: The connected service stub.
         pb2: The generated proto module.
-        org_id: The organization to query.
-        query: The query vector.
-        k: Neighbors to return.
-        nprobes: Probed IVF partitions.
-        tag: Optional serve tag string (sets ``version_ref.tag``).
-        version: Optional exact committed version id (sets ``version_ref.version``).
+        org_id: Organization to query.
+        query: Query vector.
+        k: Bounded result count.
 
     Returns:
-        The ``VectorSearchResponse`` and the rpc latency in milliseconds.
+        Response and client-side latency in milliseconds.
     """
-    vq = vector_query(pb2, query, k, nprobes, None)
-    kwargs: dict[str, Any] = {"target": dataset_target(pb2, org_id), "query": vq}
-    if tag is not None:
-        kwargs["tag"] = tag
-    elif version is not None:
-        kwargs["version"] = version
-    request = pb2.VectorSearchRequest(**kwargs)
+    request = pb2.VectorSearchRequest(
+        target=dataset_target(pb2, org_id),
+        query=vector_query(pb2, query),
+        k=k,
+    )
     return timed_call(stub.VectorSearch, request)
 
 
-def text_search_at_tag(
+def text_search(
     stub: Any,
     pb2: ModuleType,
     org_id: str,
     terms: str,
     k: int,
-    tag: str | None = None,
-    version: int | None = None,
 ) -> tuple[Any, float]:
-    """Run a text search pinned to a tag or exact version via the ``version_ref`` oneof.
-
-    When neither ``tag`` nor ``version`` is supplied the request resolves the fixed production
-    ``HEAD`` tag.
+    """Run text search through the current catalog publication.
 
     Args:
         stub: The connected service stub.
         pb2: The generated proto module.
-        org_id: The organization to query.
-        terms: The space-separated query terms.
-        k: Hits to return.
-        tag: Optional tag name (sets ``version_ref.tag``).
-        version: Optional exact committed version id (sets ``version_ref.version``).
+        org_id: Organization to query.
+        terms: Simple product query terms.
+        k: Bounded result count.
 
     Returns:
-        The ``TextSearchResponse`` and the rpc latency in milliseconds.
+        Response and client-side latency in milliseconds.
     """
-    kwargs: dict[str, Any] = {"target": dataset_target(pb2, org_id), "query": text_query(pb2, terms, k)}
-    if tag is not None:
-        kwargs["tag"] = tag
-    elif version is not None:
-        kwargs["version"] = version
-    request = pb2.TextSearchRequest(**kwargs)
+    request = pb2.TextSearchRequest(
+        target=dataset_target(pb2, org_id),
+        query=text_query(pb2, terms),
+        k=k,
+    )
     return timed_call(stub.TextSearch, request)
 
 
-def hybrid_search_at_tag(
+def hybrid_search(
     stub: Any,
     pb2: ModuleType,
     org_id: str,
     query: np.ndarray,
     terms: str,
     k: int,
-    nprobes: int,
-    tag: str | None = None,
-    version: int | None = None,
 ) -> tuple[Any, float]:
-    """Run a hybrid search pinned to a tag or exact version via the ``version_ref`` oneof.
-
-    Both legs open the same pinned snapshot server-side. When neither ``tag`` nor ``version``
-    is supplied the request follows the server's default serve policy.
+    """Run hybrid search through the current catalog publication.
 
     Args:
         stub: The connected service stub.
@@ -379,37 +275,14 @@ def hybrid_search_at_tag(
         query: The query vector for the vector leg.
         terms: The space-separated query terms for the text leg.
         k: Fused hits to return.
-        nprobes: Probed IVF partitions for the vector leg.
-        tag: Optional tag name (sets ``version_ref.tag``).
-        version: Optional exact committed version id (sets ``version_ref.version``).
 
     Returns:
-        The ``HybridSearchResponse`` and the rpc latency in milliseconds.
+        Response and client-side latency in milliseconds.
     """
-    kwargs: dict[str, Any] = {
-        "target": dataset_target(pb2, org_id),
-        "vector": vector_query(pb2, query, 0, nprobes, None),
-        "text": text_query(pb2, terms, 0),
-        "k": k,
-    }
-    if tag is not None:
-        kwargs["tag"] = tag
-    elif version is not None:
-        kwargs["version"] = version
-    request = pb2.HybridSearchRequest(**kwargs)
+    request = pb2.HybridSearchRequest(
+        target=dataset_target(pb2, org_id),
+        vector=vector_query(pb2, query),
+        text=text_query(pb2, terms),
+        k=k,
+    )
     return timed_call(stub.HybridSearch, request)
-
-
-def fetch_clusters(stub: Any, pb2: ModuleType, org_id: str) -> tuple[Any, float]:
-    """Read the IVF cluster centroids of one org's vector index through the ``Clusters`` rpc.
-
-    Args:
-        stub: The connected service stub.
-        pb2: The generated proto module.
-        org_id: The organization whose vector index is read.
-
-    Returns:
-        The ``ClustersResponse`` and the rpc latency in milliseconds.
-    """
-    request = pb2.ClustersRequest(target=dataset_target(pb2, org_id))
-    return timed_call(stub.Clusters, request)

@@ -125,9 +125,7 @@ def test_headline_numbers_picks_best_and_knee() -> None:
     sweep = {
         "first_query": {"org0": {"cold_ms": 10.0, "warm_ms": 2.0}, "org1": {"cold_ms": 20.0, "warm_ms": 3.0}},
         "points": [
-            {"nprobes": 1, "refine_factor": None, "recall_at_10": 0.80, "p95_ms": 2.0},
-            {"nprobes": 10, "refine_factor": None, "recall_at_10": 0.96, "p95_ms": 5.0},
-            {"nprobes": 50, "refine_factor": 5, "recall_at_10": 0.99, "p95_ms": 12.0},
+            {"execution_policy": "catalog_profile", "recall_at_10": 0.99, "p95_ms": 12.0},
         ],
     }
     sizes = {"total_bytes": 1000, "data_bytes": 800, "index_bytes": 150}
@@ -135,9 +133,9 @@ def test_headline_numbers_picks_best_and_knee() -> None:
     headline = headline_numbers(sweep, sizes, build_seconds=42.5)
 
     assert headline["best_recall_at_10"] == 0.99
-    assert headline["best_point"] == {"nprobes": 50, "refine_factor": 5}
-    assert headline["knee_point"] == {"nprobes": 10, "refine_factor": None}
-    assert headline["knee_p95_ms"] == 5.0
+    assert headline["best_point"] == {"execution_policy": "catalog_profile"}
+    assert headline["knee_point"] == {"execution_policy": "catalog_profile"}
+    assert headline["knee_p95_ms"] == 12.0
     assert headline["cold_first_query_ms"] == 15.0
     assert headline["build_seconds"] == 42.5
     assert headline["total_bytes"] == 1000

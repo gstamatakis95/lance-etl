@@ -2,7 +2,7 @@
 
 Drives the full pipeline in batch-major order: for each ETL window the orchestrator runs ETL then
 the production ``lance_etl.pipeline.PipelineJob`` (compaction, index build, and interval-tag stamp
-in one serialized fleet run), then optionally prewarms and queries the gRPC server at the new tag.
+in one serialized fleet run), then queries the final catalog publication through gRPC.
 Tag pruning is disabled in the bench driver (``tag_keep_last=None``) so every batch's interval tag
 is retained for the historical-tag verification pass at the end of the run.  After all batches
 complete the verification pass opens every tagged dataset version and asserts the row count matches
@@ -34,13 +34,7 @@ import numpy as np
 
 from bench.config import RECALL_CUTOFFS, BenchConfig
 from bench.groundtruth import recall_at
-from bench.grpc_client import (
-    generate_stubs,
-    load_stubs,
-    prewarm_dataset,
-    result_vector_ids,
-    vector_search_at_tag,
-)
+from bench.grpc_client import generate_stubs, load_stubs, result_vector_ids, vector_search
 from bench.indexes import union_index_config
 from bench.ingest import batch_windows, run_etl_window
 from bench.results import ensure_dir, save_phase
@@ -50,9 +44,6 @@ from lance_etl.maintenance import MaintenanceConfig
 from lance_etl.pipeline import PipelineConfig, PipelineJob
 
 logger: logging.Logger = logging.getLogger(__name__)
-
-E2E_NPROBES: int = 10
-"""Fallback nprobes for gRPC legs when config.nprobes is empty."""
 
 
 def window_tag_name(window_end: str) -> str:
@@ -189,38 +180,15 @@ def verify_historical_tags(tag_records: list[dict[str, Any]]) -> list[dict[str, 
     return outcomes
 
 
-def prewarm_orgs_at_tag(stub: Any, pb2: Any, config: BenchConfig, tag: str) -> dict[str, Any]:
-    """Prewarm every org's dataset pinned to a serve tag, capturing per-org outcomes.
-
-    Args:
-        stub: The connected ``SearchServiceStub``.
-        pb2: The generated protobuf module.
-        config: Benchmark configuration.
-        tag: The serve tag to prewarm at.
-
-    Returns:
-        Per-org prewarm reports, with failures recorded as ``error`` strings.
-    """
-    outcomes: dict[str, Any] = {}
-    for org in config.org_ids():
-        try:
-            outcomes[org] = prewarm_dataset(stub, pb2, org, fts_with_position=False, tag=tag)
-        except Exception as exc:
-            outcomes[org] = {"error": str(exc)[:500]}
-    return outcomes
-
-
-def org_recall_at_tag(
+def org_catalog_recall(
     stub: Any,
     pb2: Any,
     config: BenchConfig,
     org: str,
     queries: np.ndarray,
     org_gt: np.ndarray,
-    tag: str,
-    nprobes: int,
 ) -> dict[str, Any] | None:
-    """Run the vector recall sweep for one org pinned to a serve tag.
+    """Measure vector recall for one org through its current catalog publication.
 
     Args:
         stub: The connected ``SearchServiceStub``.
@@ -229,8 +197,6 @@ def org_recall_at_tag(
         org: The org to sweep.
         queries: The query matrix.
         org_gt: The org's ground-truth global ids.
-        tag: The serve tag to query at.
-        nprobes: The IVF nprobes to search with.
 
     Returns:
         The org's recall point with per-cutoff recall and mean latency, or ``None`` when every
@@ -243,7 +209,7 @@ def org_recall_at_tag(
     kept_indices: list[int] = []
     for index, query in enumerate(queries):
         try:
-            response, elapsed_ms = vector_search_at_tag(stub, pb2, org, query, config.search_k, nprobes, tag=tag)
+            response, elapsed_ms = vector_search(stub, pb2, org, query, config.search_k)
         except Exception as exc:
             logger.warning("gRPC error during tag recall sweep for org %s: %s", org, exc)
             continue
@@ -255,7 +221,7 @@ def org_recall_at_tag(
     expected: np.ndarray = org_gt[np.asarray(kept_indices, dtype=np.int64)]
     point: dict[str, Any] = {
         "org": org,
-        "tag": tag,
+        "execution_policy": "catalog_profile",
         "queries": len(retrieved),
         "failed_queries": len(queries) - len(retrieved),
     }
@@ -266,14 +232,13 @@ def org_recall_at_tag(
     return point
 
 
-def run_grpc_legs_at_tag(
+def run_catalog_grpc_legs(
     config: BenchConfig,
-    tag: str,
     queries: np.ndarray,
     ground_truth: dict[str, np.ndarray],
     grpc_gen_dir: Path,
 ) -> dict[str, Any]:
-    """Run prewarm-at-tag and a vector recall leg pinned to a serve tag via gRPC.
+    """Run first-query latency and recall through the final catalog publication.
 
     Probes the server before attempting any RPCs. If the server is unreachable the call
     returns a skipped record with a descriptive reason so callers can treat the absence of a
@@ -281,13 +246,12 @@ def run_grpc_legs_at_tag(
 
     Args:
         config: Benchmark configuration.
-        tag: The serve tag to query at.
         queries: The query matrix (capped by ``--max-queries`` if set).
         ground_truth: Per-org ground-truth global ids.
         grpc_gen_dir: Directory holding the compiled gRPC stubs.
 
     Returns:
-        Prewarm outcome (per org), recall results at the tag, and cold/warm first-query latency.
+        Catalog recall and cold plus warm first-query latency.
     """
     try:
         pb2, pb2_grpc = load_stubs(generate_stubs(grpc_gen_dir))
@@ -297,16 +261,12 @@ def run_grpc_legs_at_tag(
     except Exception as exc:
         return {"skipped": f"gRPC server unreachable at {config.endpoint}: {exc}"}
 
-    nprobes: int = config.nprobes[0] if config.nprobes else E2E_NPROBES
-
-    prewarm_outcomes: dict[str, Any] = prewarm_orgs_at_tag(stub, pb2, config, tag)
-
     first_latencies: dict[str, Any] = {}
     for org in config.org_ids():
         try:
-            resp, cold_ms = vector_search_at_tag(stub, pb2, org, queries[0], 10, nprobes, tag=tag)
+            resp, cold_ms = vector_search(stub, pb2, org, queries[0], 10)
             del resp
-            _, warm_ms = vector_search_at_tag(stub, pb2, org, queries[0], 10, nprobes, tag=tag)
+            _, warm_ms = vector_search(stub, pb2, org, queries[0], 10)
             first_latencies[org] = {"cold_ms": round(cold_ms, 3), "warm_ms": round(warm_ms, 3)}
         except Exception as exc:
             first_latencies[org] = {"error": str(exc)[:500]}
@@ -315,13 +275,11 @@ def run_grpc_legs_at_tag(
     for org in config.org_ids():
         if org not in ground_truth:
             continue
-        point: dict[str, Any] | None = org_recall_at_tag(
-            stub, pb2, config, org, queries, ground_truth[org], tag, nprobes
-        )
+        point: dict[str, Any] | None = org_catalog_recall(stub, pb2, config, org, queries, ground_truth[org])
         if point is not None:
             sweep_recalls.append(point)
 
-    return {"prewarm": prewarm_outcomes, "first_latencies": first_latencies, "recall": sweep_recalls}
+    return {"first_latencies": first_latencies, "recall": sweep_recalls}
 
 
 def load_queries_and_gt(config: BenchConfig) -> tuple[np.ndarray, dict[str, np.ndarray]]:
@@ -445,16 +403,8 @@ def run_e2e_body(config: BenchConfig) -> dict[str, Any]:
         logger.warning("historical-tag verification: some row counts did not match (see e2e.json)")
 
     queries, ground_truth = load_queries_and_gt(config)
-    grpc_legs_per_tag: dict[str, Any] = {}
-    for batch_record in batch_records:
-        current_tag: str = batch_record["tag"]
-        grpc_legs_per_tag[current_tag] = run_grpc_legs_at_tag(config, current_tag, queries, ground_truth, grpc_gen_dir)
-
-    last_tag: str = window_tag_name(windows[-1][1])
-    last_grpc: dict[str, Any] = grpc_legs_per_tag.get(last_tag) or run_grpc_legs_at_tag(
-        config, last_tag, queries, ground_truth, grpc_gen_dir
-    )
-    final_recall: dict[str, Any] = {} if "skipped" in last_grpc else last_grpc
+    catalog_grpc: dict[str, Any] = run_catalog_grpc_legs(config, queries, ground_truth, grpc_gen_dir)
+    final_recall: dict[str, Any] = {} if "skipped" in catalog_grpc else catalog_grpc
 
     return save_phase(
         config,
@@ -463,7 +413,7 @@ def run_e2e_body(config: BenchConfig) -> dict[str, Any]:
             "batches": batch_records,
             "tags_created": [r["tag"] for r in all_tag_records if r.get("created")],
             "historical_tag_verification": {"ok": all_ok, "checks": verification},
-            "grpc_legs_per_tag": grpc_legs_per_tag,
-            "final_recall_at_last_tag": final_recall,
+            "final_catalog_grpc": catalog_grpc,
+            "final_catalog_recall": final_recall,
         },
     )
