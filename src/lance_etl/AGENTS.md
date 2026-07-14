@@ -142,14 +142,14 @@ you are unsure whether an API exists or what its signature is, read that checkou
 ## Build and test commands
 
 ```bash
-# Install (editable) with dev dependencies (dev/bench/airflow are PEP 735 groups, not extras)
-uv pip install -e . --group dev
+# Synchronize the exact locked development environment
+uv sync --locked --group dev --python 3.14.0
 
 # Install bench dependencies
-uv pip install --group bench
+uv sync --locked --group dev --group bench --python 3.14.0
 
 # Install airflow dependencies (only needed to run tests/test_airflow_dags.py unskipped)
-uv pip install --group airflow
+uv sync --locked --group dev --group airflow --python 3.14.0
 
 # Lint and format (must pass before any commit)
 uvx ruff format src/ tests/ airflow/ bench/

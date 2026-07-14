@@ -47,6 +47,11 @@ def test_ci_uses_immutable_actions_and_locked_commands() -> None:
     pinned_actions: list[str] = SHA_PATTERN.findall(workflows)
     assert len(pinned_actions) == len(remote_actions)
     assert "continue-on-error" not in workflows
+    assert "ubuntu-latest" not in workflows
+    assert "apt-get" not in workflows
+    assert 'python-version: "3.14.0"' in workflows
+    assert 'java-version: "17.0.19+10"' in workflows
+    assert 'version: "33.2"' in workflows
     assert "uv sync --locked" in workflows
     for command in re.findall(r"cargo (?:clippy|test|build)[^\n]*", workflows):
         assert "--locked" in command

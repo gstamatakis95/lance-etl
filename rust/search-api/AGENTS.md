@@ -67,10 +67,10 @@ install protobuf` locally). Without it `cargo build`/`clippy`/`test` fail in the
 
 ```bash
 cd rust/search-api
-cargo fmt                    # format
-cargo clippy -- -D warnings  # lint (must be clean)
-cargo build                  # compile
-cargo test                   # unit tests
+cargo fmt                         # format
+cargo clippy --locked -- -D warnings  # lint (must be clean)
+cargo build --locked               # compile
+cargo test --locked                # unit tests
 ```
 
 The Redis cache-backend integration tests (`tests/redis_cache.rs`) spawn a throwaway local

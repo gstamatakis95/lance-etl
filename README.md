@@ -110,7 +110,7 @@ tools, and the Airflow deployment variables) is in `src/lance_etl/README.md`.
 
 ```bash
 cd rust/search-api
-cargo build --release
+cargo build --release --locked
 LANCE_ETL_BASE_URI=s3://my-bucket/lance \
   SEARCH_API_PORT=8080 \
   ./target/release/search-api
@@ -122,7 +122,7 @@ RPC surface, and the caching and observability behavior are in `rust/search-api/
 ### Running the benchmark
 
 ```bash
-uv pip install --group bench
+uv sync --locked --group bench --python 3.14.0
 python -m bench e2e --dataset sift1m
 ```
 
@@ -137,7 +137,7 @@ etl/venv/bin/pytest -m "not integration"
 
 # Rust tests (needs protoc on PATH)
 cd rust/search-api
-cargo test
+cargo test --locked
 ```
 
 ---
