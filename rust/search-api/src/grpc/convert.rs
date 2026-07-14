@@ -2,6 +2,7 @@
 
 use serde_json::{Map, Value};
 
+use crate::config::DEFAULT_MAX_PROJECTION_COLUMNS;
 use crate::domain::{
     CompareOp, DatasetTarget, Filter, FilterMode, FusedHit, FusionSpec, Fuzziness, Hit, HybridQuery, Literal,
     MatchSpec, PhraseSpec, SearchError, SearchWarning, TextOperator, TextQuery, TextQueryNode, TimeRange, VectorQuery,
@@ -40,6 +41,7 @@ pub fn vector_query_from_proto(
     time_range: Option<TimeRange>,
 ) -> Result<VectorQuery, SearchError> {
     let query = query.ok_or_else(|| SearchError::invalid_argument("query is required"))?;
+    validate_projection(&projection)?;
     Ok(VectorQuery {
         vector: query.vector,
         k: k as usize,
@@ -68,6 +70,7 @@ pub fn text_query_from_proto(
     time_range: Option<TimeRange>,
 ) -> Result<TextQuery, SearchError> {
     let query = query.ok_or_else(|| SearchError::invalid_argument("query is required"))?;
+    validate_projection(&projection)?;
     let node = match query.input {
         Some(pb::text_query::Input::Simple(terms)) if !terms.is_empty() => TextQueryNode::Match(MatchSpec::new(terms)),
         Some(pb::text_query::Input::Simple(_)) => {
@@ -87,6 +90,16 @@ pub fn text_query_from_proto(
         projection,
         fast_search: None,
     })
+}
+
+/// Enforces the fixed public projection-width bound before opening a dataset.
+fn validate_projection(projection: &[String]) -> Result<(), SearchError> {
+    if projection.len() > DEFAULT_MAX_PROJECTION_COLUMNS {
+        return Err(SearchError::invalid_argument(format!(
+            "projection must not exceed {DEFAULT_MAX_PROJECTION_COLUMNS} fields"
+        )));
+    }
+    Ok(())
 }
 
 /// Converts a hybrid request and applies its filter, projection, and time range to both legs.

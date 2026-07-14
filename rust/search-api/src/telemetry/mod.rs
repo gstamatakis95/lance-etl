@@ -18,9 +18,9 @@
 //! # Metric catalog
 //!
 //! All metrics flow through the typed [`Metrics`] facade (DogStatsD, prefix `search_api.`).
-//! Cardinality policy: metrics carry only the low-cardinality tags listed below. Per-org,
-//! per-tenant, and per-version detail lives on spans and logs, never on metrics. Every emitter is
-//! infallible (an unreachable Agent never panics and never fails a request).
+//! Cardinality and privacy policy: normal metrics, spans, and logs contain no target identity,
+//! storage URI, or raw engine error. Every emitter is infallible (an unreachable Agent never
+//! panics and never fails a request).
 //!
 //! RPC surface ([`metrics::Metrics::rpc`]):
 //! - `rpc.requests` (count), `rpc.duration_ms` (distribution), `rpc.errors` (count, non-ok only),
@@ -70,9 +70,8 @@
 //! - `clusters.read.duration_ms` (distribution: centroid read duration), `clusters.centroids`
 //!   (distribution: centroid count), `recall.samples` (count, tagged `query_type`/`filtered`).
 //!
-//! Spans (via the OpenTelemetry layer) carry the high-cardinality detail: `org_id`, `tenant_id`,
-//! `namespace`, `dataset.version`, `prewarm.resolved_version`, `clusters.index`, and the gRPC
-//! status code.
+//! Normal spans carry bounded execution facts such as `search.k`, `dataset.version`, aggregate
+//! object-store counters, and the gRPC status code. Target identity and storage URI are omitted.
 
 pub mod metrics;
 pub mod recall;

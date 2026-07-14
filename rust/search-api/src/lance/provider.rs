@@ -581,9 +581,6 @@ impl CachingDatasetProvider {
         name = "provider.dataset",
         skip_all,
         fields(
-            org_id = %target.org_id,
-            tenant_id = %target.tenant_id,
-            namespace = %target.namespace,
             dataset.version = tracing::field::Empty,
             cache.dataset_handle_hit = tracing::field::Empty,
         )

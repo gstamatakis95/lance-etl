@@ -4,22 +4,20 @@ use crate::domain::SearchError;
 
 /// Generic client-facing message for an unclassified Lance failure.
 ///
-/// The raw Lance error (which can carry object-store paths, schema detail, or other internal
-/// state) is logged server-side via `tracing::error!` at the call site instead of being forwarded
-/// to the client, so a caller never sees more than "an internal error occurred."
+/// Raw Lance errors can carry object-store paths, schema detail, or other private state, so only
+/// a closed error class is logged and clients receive this bounded message.
 const GENERIC_INTERNAL_MESSAGE: &str = "an internal error occurred while executing the request";
 
 /// Client-facing message for a missing dataset.
 ///
 /// Lance's `DatasetNotFound` display includes the full dataset URI (bucket, org, tenant paths),
-/// which must never reach a client. The full error is logged server-side instead, and the RPC
-/// failure log already carries the dataset target triplet for correlation.
+/// which must never reach either clients or normal telemetry.
 const DATASET_NOT_FOUND_MESSAGE: &str = "Dataset not found";
 
 /// Client-facing message for a missing non-dataset resource.
 ///
 /// Lance's generic `NotFound` display also embeds the object URI, so it gets the same
-/// log-full-return-sanitized treatment as `DatasetNotFound`.
+/// bounded-class logging treatment as `DatasetNotFound`.
 const RESOURCE_NOT_FOUND_MESSAGE: &str = "a required resource was not found";
 
 /// Client-facing message for an engine-internal timeout.
@@ -37,22 +35,22 @@ pub fn is_definitive_open_absence(err: &lance::Error) -> bool {
 /// Classifies a Lance error by reference into the closest domain error.
 ///
 /// Not-found conditions map to [`SearchError::NotFound`]: `DatasetNotFound` and `NotFound` carry
-/// object-store URIs in their display form, so they are logged in full server-side and returned
-/// with a sanitized message, while `RefNotFound` and `VersionNotFound` messages only echo the
+/// object-store URIs in their display form, so only their closed class is logged and they are
+/// returned with a sanitized message, while `RefNotFound` and `VersionNotFound` messages echo the
 /// client-supplied tag or version and are forwarded as-is. `InvalidInput`/`IndexNotFound` carry
 /// client-safe detail and are forwarded as [`SearchError::InvalidArgument`]. `Timeout` becomes a
 /// retriable [`SearchError::Unavailable`] with a generic message. Every other Lance error is
-/// logged in full server-side (`tracing::error!`) and mapped to a generic
+/// logged by closed class and mapped to a generic
 /// [`SearchError::Internal`] message, so internal engine detail never reaches a client through
 /// the gRPC status.
 pub fn classify_lance_error(err: &lance::Error) -> SearchError {
     match err {
         lance::Error::DatasetNotFound { .. } => {
-            tracing::warn!(error = %err, "dataset not found");
+            tracing::warn!(error_class = "dataset_not_found", "lance request failed");
             SearchError::not_found(DATASET_NOT_FOUND_MESSAGE)
         }
         lance::Error::NotFound { .. } => {
-            tracing::warn!(error = %err, "resource not found");
+            tracing::warn!(error_class = "resource_not_found", "lance request failed");
             SearchError::not_found(RESOURCE_NOT_FOUND_MESSAGE)
         }
         lance::Error::RefNotFound { .. } | lance::Error::VersionNotFound { .. } => {
@@ -62,11 +60,11 @@ pub fn classify_lance_error(err: &lance::Error) -> SearchError {
             SearchError::invalid_argument(err.to_string())
         }
         lance::Error::Timeout { .. } => {
-            tracing::warn!(error = %err, "lance operation timed out");
+            tracing::warn!(error_class = "timeout", "lance request failed");
             SearchError::unavailable(ENGINE_TIMEOUT_MESSAGE)
         }
-        other => {
-            tracing::error!(error = %other, "unclassified lance error");
+        _ => {
+            tracing::error!(error_class = "internal", "lance request failed");
             SearchError::internal(GENERIC_INTERNAL_MESSAGE)
         }
     }
@@ -74,7 +72,25 @@ pub fn classify_lance_error(err: &lance::Error) -> SearchError {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+
+    /// Cloneable writer collecting one subscriber's formatted events.
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn unclassified_errors_are_generic_and_do_not_leak_internal_detail() {
@@ -170,5 +186,26 @@ mod tests {
             }
             other => panic!("expected unavailable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn emitted_logs_never_contain_raw_uri_or_engine_detail() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = CaptureWriter(bytes.clone());
+        let subscriber = tracing_subscriber::fmt().with_writer(move || writer.clone()).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            classify_lance_error(&lance::Error::dataset_not_found(
+                "s3://secret-bucket/private-target.lance",
+                "private detail".into(),
+            ));
+            classify_lance_error(&lance::Error::internal(
+                "corrupt s3://secret-bucket/private-target.lance",
+            ));
+        });
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("dataset_not_found"));
+        assert!(output.contains("error_class=\"internal\""));
+        assert!(!output.contains("secret-bucket"));
+        assert!(!output.contains("private detail"));
     }
 }

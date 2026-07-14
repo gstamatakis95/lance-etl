@@ -34,7 +34,7 @@ impl<P: DatasetProvider> Prewarmer for LanceSearchBackend<P> {
     #[tracing::instrument(
         name = "backend.prewarm",
         skip_all,
-        fields(org_id = %target.org_id, prewarm.resolved_version = tracing::field::Empty)
+        fields(prewarm.resolved_version = tracing::field::Empty)
     )]
     async fn prewarm(
         &self,
@@ -93,7 +93,6 @@ impl<P: DatasetProvider> Prewarmer for LanceSearchBackend<P> {
         self.metrics.prewarm_indexes_warmed(warmed);
         self.metrics.prewarm_warmed_bytes(report.index_cache_size_bytes);
         tracing::info!(
-            org_id = %target.org_id,
             status = status.as_tag(),
             indexes_warmed = warmed,
             resolved_version,

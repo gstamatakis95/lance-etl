@@ -3,19 +3,21 @@
 use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use search_api::catalog::PostgresServingCatalog;
 use search_api::config::Config;
+use search_api::grpc::admission::AdmissionController;
+use search_api::grpc::auth::JwtAuthorizer;
 use search_api::grpc::{RouteTimeoutLayer, SearchGrpc};
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
 use search_api::pb::search_service_server::SearchServiceServer;
 use search_api::telemetry::{self, Metrics, RecallCapture};
-use tonic::transport::Server;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic_health::ServingStatus;
 use tonic_tracing_opentelemetry::middleware::filters::reject_healthcheck;
 use tonic_tracing_opentelemetry::middleware::server::OtelGrpcLayer;
-
-/// Backend type served by this binary: Lance over the caching base-URI-template provider.
-type Backend = LanceSearchBackend<CachingDatasetProvider>;
 
 /// Stamps process-global Lance IO tuning knobs into the environment.
 ///
@@ -88,7 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Runs the async service body on the already-built runtime: wires telemetry, provider, backend,
-/// and transport, then serves the gRPC API together with the standard gRPC health service.
+/// and transport, then serves TLS search and plaintext health on separate listeners.
 async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(if config.telemetry_disabled {
         Metrics::disabled()
@@ -97,8 +99,24 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     });
     let telemetry_guard = telemetry::init_tracing(config.telemetry_disabled, metrics.clone());
     let addr: SocketAddr = ([0, 0, 0, 0], config.port).into();
-    let catalog = Arc::new(PostgresServingCatalog::connect(&config.database_url).await?);
-    let provider = CachingDatasetProvider::with_catalog_and_telemetry(&config, catalog, metrics.clone()).await;
+    let health_addr: SocketAddr = ([0, 0, 0, 0], search_api::config::DEFAULT_HEALTH_PORT).into();
+    let catalog = Arc::new(PostgresServingCatalog::connect(&config.database_url, &config.database_ca_path).await?);
+    let authorizer = Arc::new(
+        JwtAuthorizer::connect(
+            config.jwt_issuer.clone(),
+            config.jwt_audience.clone(),
+            config.jwks_uri.clone(),
+        )
+        .await?,
+    );
+    let admission = Arc::new(AdmissionController::new(
+        search_api::config::DEFAULT_GLOBAL_SEARCH_CONCURRENCY,
+        search_api::config::DEFAULT_PER_TENANT_SEARCH_CONCURRENCY,
+    )?);
+    let certificate = tokio::fs::read(&config.tls_cert_path).await?;
+    let private_key = tokio::fs::read(&config.tls_key_path).await?;
+    let tls = ServerTlsConfig::new().identity(Identity::from_pem(certificate, private_key));
+    let provider = CachingDatasetProvider::with_catalog_and_telemetry(&config, catalog.clone(), metrics.clone()).await;
     if let Some(janitor) = provider.janitor(&config) {
         janitor.spawn(std::time::Duration::from_secs(
             search_api::config::DEFAULT_DISK_CACHE_SWEEP_SECS,
@@ -107,25 +125,128 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let backend = Arc::new(LanceSearchBackend::new(provider).with_metrics(metrics.clone()));
 
     let recall = RecallCapture::new(search_api::config::DEFAULT_RECALL_SAMPLE_RATE, metrics.clone());
-    let service = SearchGrpc::with_metrics(backend, metrics.clone()).with_recall(recall);
+    let service = SearchGrpc::with_metrics(backend, metrics.clone(), authorizer.clone(), admission).with_recall(recall);
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
-    health_reporter
-        .set_serving::<SearchServiceServer<SearchGrpc<Backend>>>()
-        .await;
-    tracing::info!(address = %addr, "search-api listening");
+    health_reporter.set_service_status("", ServingStatus::Serving).await;
+    let search_listener = tokio::net::TcpListener::bind(addr).await?;
+    let health_listener = tokio::net::TcpListener::bind(health_addr).await?;
+    tracing::info!(address = %addr, health_address = %health_addr, "search-api listening");
     let server_builder = Server::builder()
+        .tls_config(tls)?
         .concurrency_limit_per_connection(search_api::config::DEFAULT_CONCURRENCY_LIMIT_PER_CONNECTION)
         .max_concurrent_streams(search_api::config::DEFAULT_MAX_CONCURRENT_STREAMS);
-    server_builder
-        .layer(OtelGrpcLayer::default().filter(reject_healthcheck))
-        .layer(RouteTimeoutLayer::from_defaults(metrics.clone()))
-        .add_service(health_service)
-        .add_service(SearchServiceServer::new(service))
-        .serve_with_shutdown(addr, shutdown_signal())
-        .await?;
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
+    let mut search_task = tokio::spawn(
+        server_builder
+            .layer(OtelGrpcLayer::default().filter(reject_healthcheck))
+            .layer(RouteTimeoutLayer::from_defaults(metrics.clone()))
+            .add_service(
+                SearchServiceServer::new(service)
+                    .max_decoding_message_size(search_api::config::DEFAULT_MAX_REQUEST_BYTES)
+                    .max_encoding_message_size(search_api::config::DEFAULT_MAX_RESPONSE_BYTES),
+            )
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(search_listener),
+                wait_for_shutdown(shutdown_receiver.clone()),
+            ),
+    );
+    let mut health_task = tokio::spawn(
+        Server::builder()
+            .add_service(health_service)
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(health_listener),
+                wait_for_shutdown(shutdown_receiver.clone()),
+            ),
+    );
+    let mut readiness_task = tokio::spawn(monitor_readiness(
+        catalog,
+        authorizer,
+        health_reporter.clone(),
+        shutdown_receiver,
+    ));
+    tokio::select! {
+        _ = shutdown_signal() => {}
+        result = &mut search_task => {
+            health_task.abort();
+            readiness_task.abort();
+            result??;
+            return Err(std::io::Error::other("TLS search server stopped before shutdown").into());
+        }
+        result = &mut health_task => {
+            search_task.abort();
+            readiness_task.abort();
+            result??;
+            return Err(std::io::Error::other("health server stopped before shutdown").into());
+        }
+        result = &mut readiness_task => {
+            search_task.abort();
+            health_task.abort();
+            result?;
+            return Err(std::io::Error::other("readiness monitor stopped before shutdown").into());
+        }
+    }
+    health_reporter.set_service_status("", ServingStatus::NotServing).await;
+    let _ = shutdown_sender.send(true);
+    let drain = async {
+        (&mut search_task).await??;
+        (&mut health_task).await??;
+        (&mut readiness_task).await?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
+    if tokio::time::timeout(
+        Duration::from_secs(search_api::config::DEFAULT_GRACEFUL_DRAIN_SECS),
+        drain,
+    )
+    .await
+    .is_err()
+    {
+        search_task.abort();
+        health_task.abort();
+        readiness_task.abort();
+        tracing::warn!(
+            drain_seconds = search_api::config::DEFAULT_GRACEFUL_DRAIN_SECS,
+            "graceful drain deadline exceeded"
+        );
+    }
     tracing::info!("in-flight requests drained, flushing telemetry and exiting");
     drop(telemetry_guard);
     Ok(())
+}
+
+/// Resolves after the shared shutdown flag becomes true.
+async fn wait_for_shutdown(mut receiver: tokio::sync::watch::Receiver<bool>) {
+    while !*receiver.borrow() {
+        if receiver.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Keeps readiness synchronized with catalog and JWKS health until drain begins.
+async fn monitor_readiness(
+    catalog: Arc<PostgresServingCatalog>,
+    authorizer: Arc<JwtAuthorizer>,
+    reporter: tonic_health::server::HealthReporter,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    reporter.set_service_status("", ServingStatus::NotServing).await;
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                let status = if catalog.health().await.is_ok() && authorizer.health().await.is_ok() {
+                    ServingStatus::Serving
+                } else {
+                    ServingStatus::NotServing
+                };
+                reporter.set_service_status("", status).await;
+            }
+        }
+    }
 }
 
 /// Resolves when the process receives SIGTERM or ctrl-c (SIGINT), starting the graceful drain.

@@ -8,9 +8,12 @@ use std::sync::atomic::Ordering;
 use arrow_array::types::Float32Type;
 use arrow_array::{BooleanArray, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use common::{FakeServingCatalog, build_indexed_dataset, test_config, test_target};
+use common::{
+    AllowTestAuthorizer, FakeServingCatalog, build_indexed_dataset, test_admission, test_config, test_target,
+};
 use lance::Dataset;
 use search_api::domain::{DatasetRef, DatasetTarget};
+use search_api::grpc::auth::{RequestAuthorizer, RequiredRole};
 use search_api::grpc::{RouteTimeoutLayer, SearchGrpc};
 use search_api::lance::{CachingDatasetProvider, DatasetProvider, LanceSearchBackend};
 use search_api::pb::search_service_client::SearchServiceClient;
@@ -40,12 +43,23 @@ async fn serve(
     uri: &str,
     version: u64,
 ) -> (Channel, Arc<FakeServingCatalog>) {
+    serve_with_authorizer(data_root, cache_root, uri, version, Arc::new(AllowTestAuthorizer)).await
+}
+
+/// Starts the public service with an explicit authorization seam.
+async fn serve_with_authorizer(
+    data_root: &TempDir,
+    cache_root: &TempDir,
+    uri: &str,
+    version: u64,
+    authorizer: Arc<dyn RequestAuthorizer>,
+) -> (Channel, Arc<FakeServingCatalog>) {
     let config = test_config(data_root.path(), cache_root.path());
     let catalog = Arc::new(FakeServingCatalog::new(test_target(), uri, version));
     let provider = CachingDatasetProvider::with_catalog_and_inner_store_wrapper(&config, catalog.clone(), None).await;
     let metrics = Arc::new(Metrics::disabled());
     let backend = Arc::new(LanceSearchBackend::new(provider).with_metrics(metrics.clone()));
-    let service = SearchGrpc::with_metrics(backend, metrics.clone());
+    let service = SearchGrpc::with_metrics(backend, metrics.clone(), authorizer, test_admission());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = TcpListenerStream::new(listener);
@@ -61,6 +75,21 @@ async fn serve(
         .await
         .unwrap();
     (channel, catalog)
+}
+
+/// Authorizer that rejects every otherwise valid target.
+struct DenyTestAuthorizer;
+
+#[async_trait::async_trait]
+impl RequestAuthorizer for DenyTestAuthorizer {
+    async fn authorize(
+        &self,
+        _metadata: &tonic::metadata::MetadataMap,
+        _target: &DatasetTarget,
+        _required_role: RequiredRole,
+    ) -> Result<(), tonic::Status> {
+        Err(tonic::Status::permission_denied("denied by test policy"))
+    }
 }
 
 /// Writes a dataset containing duplicate logical IDs and one deleted nearest neighbor.
@@ -207,6 +236,29 @@ async fn target_validation_happens_before_catalog_access() {
         .await
         .unwrap_err();
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert_eq!(catalog.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cross_target_authorization_fails_before_catalog_or_object_store_access() {
+    let data = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let uri = format!("file-object-store://{}/org1/tenant1/ns1.lance", data.path().display());
+    build_indexed_dataset(&uri).await;
+    let version = Dataset::open(&uri).await.unwrap().version_id();
+    let (channel, catalog) = serve_with_authorizer(&data, &cache, &uri, version, Arc::new(DenyTestAuthorizer)).await;
+    let status = SearchServiceClient::new(channel)
+        .vector_search(VectorSearchRequest {
+            target: Some(proto_target()),
+            query: Some(VectorQuery { vector: vec![1.0; 4] }),
+            k: 1,
+            filter: None,
+            projection: Vec::new(),
+            time_range: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
     assert_eq!(catalog.calls.load(Ordering::SeqCst), 0);
 }
 

@@ -161,8 +161,9 @@ request remains pinned to the version it resolved.
 
 ## Configuration
 
-All configuration is read once at startup by `Config::from_env` in `src/config.rs`.
-`LANCE_ETL_BASE_URI` and `LANCE_ETL_DATABASE_URL` are required. Every other tuning knob (dataset-handle cache
+All configuration is read once at startup by `Config::from_env` in `src/config.rs`. The serving
+prefix, verified PostgreSQL connection, TLS identity, and JWT trust settings are required. Every
+execution tuning knob (dataset-handle cache
 sizing, index/metadata/disk cache budgets, serve-tag TTL, IO concurrency, ANN probe/refine/
 fast-search defaults, gRPC timeout and concurrency limits, the event-timestamp column, recall
 sampling, and the search `k` ceiling) is a fixed constant in `src/config.rs`, not an env knob.
@@ -170,7 +171,13 @@ sampling, and the search `k` ceiling) is a fixed constant in `src/config.rs`, no
 | Variable | Default | Purpose |
 |---|---|---|
 | `LANCE_ETL_BASE_URI` | (required) | Base URI all dataset paths resolve under: `{base}/{org_id}/{tenant_id}/{namespace}.lance` |
-| `LANCE_ETL_DATABASE_URL` | (required) | PostgreSQL control-plane URL. Must set `sslmode=require`. The `postgresql+psycopg://` scheme is accepted. |
+| `LANCE_ETL_DATABASE_URL` | (required) | PostgreSQL control-plane URL. Must set exactly one `sslmode=verify-full`. The `postgresql+psycopg://` scheme is accepted. |
+| `SEARCH_API_DATABASE_CA_PATH` | (required) | Mounted PEM root CA for PostgreSQL certificate and hostname verification |
+| `SEARCH_API_TLS_CERT_PATH` | (required) | Mounted PEM certificate chain for the TLS search listener |
+| `SEARCH_API_TLS_KEY_PATH` | (required) | Mounted PEM private key for the TLS search listener |
+| `SEARCH_API_JWT_ISSUER` | (required) | Exact trusted bearer-token issuer |
+| `SEARCH_API_JWT_AUDIENCE` | (required) | Exact trusted bearer-token audience |
+| `SEARCH_API_JWKS_URI` | (required) | HTTPS signing-key set fetched at startup and refreshed boundedly |
 | `SEARCH_API_PORT` | `8080` | TCP port |
 | `SEARCH_API_CACHE_BACKEND` | `disk` | Persistent cache backend: `disk`, `redis`, or `memory` |
 | `SEARCH_API_REDIS_URL` | (none) | Redis connection URL (`redis://` or `rediss://`), required when the backend is `redis` |
@@ -203,19 +210,30 @@ cargo build                  # compile
 cargo test                   # unit tests
 ```
 
-The Redis cache-backend integration tests (`tests/redis_cache.rs`) spawn a throwaway local
-`redis-server` per test and self-skip with a message when the binary is not installed, so
-`cargo test` stays green without Redis. Install `redis-server` to run them unskipped.
+The Redis cache-backend integration tests use `SEARCH_API_TEST_REDIS_URL` when CI supplies it.
+Otherwise they spawn a throwaway local `redis-server` per test and self-skip with a message when
+the binary is not installed. The forced-outage test always requires a local disposable server.
 
 ### Running the service
 
 ```bash
 cargo build --release
 LANCE_ETL_BASE_URI=s3://my-bucket/lance \
-  LANCE_ETL_DATABASE_URL='postgresql://search@catalog/control?sslmode=require' \
+  LANCE_ETL_DATABASE_URL='postgresql://search@catalog/control?sslmode=verify-full' \
+  SEARCH_API_DATABASE_CA_PATH=/run/secrets/postgres-ca.pem \
+  SEARCH_API_TLS_CERT_PATH=/run/secrets/tls.crt \
+  SEARCH_API_TLS_KEY_PATH=/run/secrets/tls.key \
+  SEARCH_API_JWT_ISSUER=https://identity.example.com \
+  SEARCH_API_JWT_AUDIENCE=lance-search \
+  SEARCH_API_JWKS_URI=https://identity.example.com/.well-known/jwks.json \
   SEARCH_API_PORT=8080 \
   ./target/release/search-api
 ```
+
+Port 8080 requires TLS and a bearer JWT whose `org_id`, `tenant_id`, and `namespace` claims exactly
+match the request plus a `search` role. Fixed port 8081 exposes only the standard plaintext gRPC
+health service for Kubernetes native probes. It reports serving only after catalog and JWKS
+initialization, tracks those dependencies, and becomes not-serving when bounded drain begins.
 
 ## Observability
 

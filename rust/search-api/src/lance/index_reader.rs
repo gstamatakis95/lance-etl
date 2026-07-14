@@ -123,7 +123,6 @@ impl<P: DatasetProvider> ClusterReader for LanceSearchBackend<P> {
         name = "backend.clusters",
         skip_all,
         fields(
-            org_id = %target.org_id,
             clusters.index = tracing::field::Empty,
             clusters.count = tracing::field::Empty,
         )

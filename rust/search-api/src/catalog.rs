@@ -2,7 +2,7 @@
 
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
-use native_tls::TlsConnector;
+use native_tls::{Certificate, TlsConnector};
 use postgres_native_tls::MakeTlsConnector;
 use tokio_postgres::{Config, config::SslMode};
 
@@ -18,9 +18,15 @@ pub struct PostgresServingCatalog {
 
 impl PostgresServingCatalog {
     /// Connects a bounded pool to the control-plane PostgreSQL database.
-    pub async fn connect(database_url: &str) -> Result<Self, String> {
+    pub async fn connect(database_url: &str, ca_path: &std::path::Path) -> Result<Self, String> {
         let config = catalog_config(database_url)?;
+        let ca_pem = tokio::fs::read(ca_path)
+            .await
+            .map_err(|error| format!("failed to read PostgreSQL CA certificate: {error}"))?;
+        let ca =
+            Certificate::from_pem(&ca_pem).map_err(|error| format!("invalid PostgreSQL CA certificate: {error}"))?;
         let connector = TlsConnector::builder()
+            .add_root_certificate(ca)
             .build()
             .map_err(|error| format!("failed to configure serving catalog TLS: {error}"))?;
         let manager = PostgresConnectionManager::new(config, MakeTlsConnector::new(connector));
@@ -31,16 +37,41 @@ impl PostgresServingCatalog {
             .map_err(|error| format!("failed to connect to the serving catalog: {error}"))?;
         Ok(Self { pool })
     }
+
+    /// Verifies that the catalog pool can execute a trivial query.
+    pub async fn health(&self) -> Result<(), String> {
+        let connection = self
+            .pool
+            .get()
+            .await
+            .map_err(|error| format!("serving catalog unavailable: {error}"))?;
+        connection
+            .simple_query("SELECT 1")
+            .await
+            .map_err(|error| format!("serving catalog health query failed: {error}"))?;
+        Ok(())
+    }
 }
 
 /// Parses a PostgreSQL URL and rejects any configuration that permits plaintext transport.
 fn catalog_config(database_url: &str) -> Result<Config, String> {
     let normalized_url = database_url.replacen("postgresql+psycopg://", "postgresql://", 1);
-    let config = normalized_url
+    let parsed =
+        reqwest::Url::parse(&normalized_url).map_err(|error| format!("invalid LANCE_ETL_DATABASE_URL: {error}"))?;
+    let ssl_modes: Vec<_> = parsed
+        .query_pairs()
+        .filter(|(name, _)| name == "sslmode")
+        .map(|(_, value)| value.into_owned())
+        .collect();
+    if ssl_modes != ["verify-full"] {
+        return Err("LANCE_ETL_DATABASE_URL must set exactly one sslmode=verify-full".to_owned());
+    }
+    let driver_url = normalized_url.replace("sslmode=verify-full", "sslmode=require");
+    let config = driver_url
         .parse::<Config>()
         .map_err(|error| format!("invalid LANCE_ETL_DATABASE_URL: {error}"))?;
     if config.get_ssl_mode() != SslMode::Require {
-        return Err("LANCE_ETL_DATABASE_URL must set sslmode=require".to_owned());
+        return Err("LANCE_ETL_DATABASE_URL did not enable verified TLS".to_owned());
     }
     Ok(config)
 }
@@ -90,10 +121,11 @@ mod tests {
     use super::catalog_config;
 
     #[test]
-    fn catalog_transport_requires_tls() {
+    fn catalog_transport_requires_certificate_and_hostname_verification() {
         let plaintext = catalog_config("postgresql://localhost/control?sslmode=disable").unwrap_err();
-        assert!(plaintext.contains("sslmode=require"));
-        catalog_config("postgresql://localhost/control?sslmode=require").unwrap();
-        catalog_config("postgresql+psycopg://localhost/control?sslmode=require").unwrap();
+        assert!(plaintext.contains("sslmode=verify-full"));
+        assert!(catalog_config("postgresql://localhost/control?sslmode=require").is_err());
+        catalog_config("postgresql://localhost/control?sslmode=verify-full").unwrap();
+        catalog_config("postgresql+psycopg://localhost/control?sslmode=verify-full").unwrap();
     }
 }

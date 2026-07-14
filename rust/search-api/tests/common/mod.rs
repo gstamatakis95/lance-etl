@@ -294,6 +294,12 @@ pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) 
     Config {
         base_uri: format!("file-object-store://{}", dataset_root.display()),
         database_url: "postgresql://unused/test".to_string(),
+        database_ca_path: "/tmp/search-api-test-database-ca.pem".into(),
+        tls_cert_path: "/tmp/search-api-test-cert.pem".into(),
+        tls_key_path: "/tmp/search-api-test-key.pem".into(),
+        jwt_issuer: "https://issuer.test".to_owned(),
+        jwt_audience: "search-api".to_owned(),
+        jwks_uri: "https://issuer.test/.well-known/jwks.json".to_owned(),
         dataset_cache_capacity: 16,
         index_cache_bytes: 64 * 1024 * 1024,
         metadata_cache_bytes: 64 * 1024 * 1024,
@@ -310,6 +316,26 @@ pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) 
     }
 }
 
+/// Test authorizer that permits every already-validated logical target.
+pub struct AllowTestAuthorizer;
+
+#[async_trait::async_trait]
+impl search_api::grpc::auth::RequestAuthorizer for AllowTestAuthorizer {
+    async fn authorize(
+        &self,
+        _metadata: &tonic::metadata::MetadataMap,
+        _target: &DatasetTarget,
+        _required_role: search_api::grpc::auth::RequiredRole,
+    ) -> Result<(), tonic::Status> {
+        Ok(())
+    }
+}
+
+/// Creates the same bounded admission controller used by integration-test servers.
+pub fn test_admission() -> Arc<search_api::grpc::admission::AdmissionController> {
+    Arc::new(search_api::grpc::admission::AdmissionController::new(32, 4).unwrap())
+}
+
 /// Like [`test_config`] but selecting the Redis cache backend at the given URL.
 pub fn redis_test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path, redis_url: &str) -> Config {
     let mut config = test_config(dataset_root, cache_dir);
@@ -320,16 +346,41 @@ pub fn redis_test_config(dataset_root: &std::path::Path, cache_dir: &std::path::
 
 /// A locally spawned `redis-server` child on a free port, killed on drop.
 pub struct RedisServerGuard {
-    child: std::process::Child,
+    child: Option<std::process::Child>,
+    external_lock: Option<tokio::sync::OwnedMutexGuard<()>>,
     /// The connection URL of the spawned server.
     pub url: String,
 }
 
 impl RedisServerGuard {
+    /// Uses the release-provided Redis URL when present, serializing tests over the shared server.
+    pub async fn spawn() -> Option<Self> {
+        if let Ok(url) = std::env::var("SEARCH_API_TEST_REDIS_URL")
+            && !url.is_empty()
+        {
+            static EXTERNAL_REDIS_LOCK: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>> = std::sync::OnceLock::new();
+            let external_lock = EXTERNAL_REDIS_LOCK
+                .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+                .lock_owned()
+                .await;
+            let guard = Self {
+                child: None,
+                external_lock: Some(external_lock),
+                url,
+            };
+            if redis_answers(&guard.url).await {
+                return Some(guard);
+            }
+            panic!("SEARCH_API_TEST_REDIS_URL did not answer PING");
+        }
+        Self::spawn_local().await
+    }
+
     /// Spawns a throwaway `redis-server` on a free localhost port and waits for it to answer
     /// `PING`. Returns `None` (after an explanatory eprintln) when the binary is not installed,
     /// so redis-backed tests skip gracefully on machines without Redis.
-    pub async fn spawn() -> Option<Self> {
+    pub async fn spawn_local() -> Option<Self> {
         let port = {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
             listener.local_addr().ok()?.port()
@@ -352,12 +403,13 @@ impl RedisServerGuard {
             }
         };
         let url = format!("redis://127.0.0.1:{port}");
-        let guard = Self { child, url };
+        let guard = Self {
+            child: Some(child),
+            external_lock: None,
+            url,
+        };
         for _ in 0..50 {
-            if let Ok(client) = redis::Client::open(guard.url.as_str())
-                && let Ok(mut conn) = client.get_multiplexed_async_connection().await
-                && redis::cmd("PING").query_async::<String>(&mut conn).await.is_ok()
-            {
+            if redis_answers(&guard.url).await {
                 return Some(guard);
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -370,16 +422,33 @@ impl RedisServerGuard {
 impl RedisServerGuard {
     /// Kills the server immediately, simulating a mid-run Redis outage.
     pub fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let child = self
+            .child
+            .as_mut()
+            .expect("outage test requires a locally spawned Redis");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
 impl Drop for RedisServerGuard {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = self.external_lock.take();
     }
+}
+
+/// Returns whether one Redis URL answers a `PING` command.
+async fn redis_answers(url: &str) -> bool {
+    if let Ok(client) = redis::Client::open(url)
+        && let Ok(mut connection) = client.get_multiplexed_async_connection().await
+    {
+        return redis::cmd("PING").query_async::<String>(&mut connection).await.is_ok();
+    }
+    false
 }
 
 /// Recursively counts `.bin` entry files under `root`.

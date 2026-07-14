@@ -150,13 +150,16 @@ variable table. These finer-grained normative facts are recorded here so they ar
   event-timestamp column (`event_timestamp`) and is translated to a typed range predicate ANDed
   with any `Filter`, pruned by a BTREE or zone-map on that column. A `TimeRange` absent from the
   request leaves every search path behaving exactly as before.
-- **HybridSearch request-level filter.** `HybridSearch` accepts a request-level `filter` (field 8)
-  and `filter_mode` (field 9) that are ANDed into both the vector leg and the text leg
-  independently. When a leg already carries its own filter the two predicates are combined with a
-  typed `AND` node. Absent means no additional predicate beyond what each leg specifies.
+- **HybridSearch request-level filter.** `HybridSearch` accepts a request-level typed `filter`
+  (field 8) that is ANDed into both legs through server-owned prefilter policy. Absent means only
+  the mandatory live-row predicate applies.
 - **Fusion.** Public `HybridSearch` accepts only the closed product modes `BALANCED`,
   `SEMANTIC_PRIORITY`, and `LEXICAL_PRIORITY`. The service maps them to fixed code-owned fusion
   policy. It never accepts raw weights or reciprocal-rank constants.
 - **Serving resolution.** Public search requests carry only `DatasetTarget`. The server resolves it
   through `ServingCatalog` to an allowlisted URI, exact committed version, and profile. URI,
   version, tag, prewarm, and IVF-cluster inspection are not public search surfaces.
+- **Production transport and auth.** Port 8080 requires TLS and RS256 bearer JWTs validated against
+  the deployment issuer, audience, and bounded JWKS cache. Target claims must exactly match the
+  request before catalog access. Fixed port 8081 exposes only plaintext standard gRPC health for
+  Kubernetes probes. It contains no search or administration methods.

@@ -25,6 +25,9 @@ pub const DEFAULT_DATASET_CACHE_CAPACITY: u64 = 16384;
 /// Default TCP port for the gRPC server.
 pub const DEFAULT_PORT: u16 = 8080;
 
+/// Default plaintext gRPC health port exposed without search methods or credentials.
+pub const DEFAULT_HEALTH_PORT: u16 = 8081;
+
 /// Default root directory for the persistent disk caches.
 pub const DEFAULT_CACHE_DIR: &str = "/tmp/rust-search/cache";
 
@@ -196,6 +199,24 @@ pub const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 256;
 /// Hardcoded: no deployment has ever retuned this, so it is no longer an env knob.
 pub const DEFAULT_CONCURRENCY_LIMIT_PER_CONNECTION: usize = 256;
 
+/// Fixed process-global number of concurrent searches admitted across all connections.
+pub const DEFAULT_GLOBAL_SEARCH_CONCURRENCY: usize = 256;
+
+/// Fixed number of concurrent searches admitted for one exact logical tenant.
+pub const DEFAULT_PER_TENANT_SEARCH_CONCURRENCY: usize = 8;
+
+/// Fixed maximum encoded response size for every public search method.
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Fixed maximum decoded request size for every public search method.
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// Fixed maximum number of projected fields in one public search request.
+pub const DEFAULT_MAX_PROJECTION_COLUMNS: usize = 64;
+
+/// Fixed maximum graceful-drain duration before in-flight work is cancelled.
+pub const DEFAULT_GRACEFUL_DRAIN_SECS: u64 = 30;
+
 /// Fixed minimum object-store request size in bytes (IO buffer / block size) — 256 KiB.
 ///
 /// Passed as `ObjectStoreParams::block_size` when opening every dataset. Hardcoded: no deployment
@@ -236,6 +257,24 @@ pub struct Config {
     /// PostgreSQL control-plane URL used to resolve exact published serving tuples.
     /// Env: `LANCE_ETL_DATABASE_URL`.
     pub database_url: String,
+    /// PEM root certificate used to verify the PostgreSQL server certificate and hostname.
+    /// Env: `SEARCH_API_DATABASE_CA_PATH`.
+    pub database_ca_path: PathBuf,
+    /// PEM certificate chain used by the public gRPC TLS listener.
+    /// Env: `SEARCH_API_TLS_CERT_PATH`.
+    pub tls_cert_path: PathBuf,
+    /// PEM private key used by the public gRPC TLS listener.
+    /// Env: `SEARCH_API_TLS_KEY_PATH`.
+    pub tls_key_path: PathBuf,
+    /// Exact trusted JWT issuer.
+    /// Env: `SEARCH_API_JWT_ISSUER`.
+    pub jwt_issuer: String,
+    /// Exact trusted JWT audience.
+    /// Env: `SEARCH_API_JWT_AUDIENCE`.
+    pub jwt_audience: String,
+    /// HTTPS JWKS location used for signing-key rotation.
+    /// Env: `SEARCH_API_JWKS_URI`.
+    pub jwks_uri: String,
     /// Weighted capacity of the open-`Dataset` handle LRU (default [`DEFAULT_DATASET_CACHE_CAPACITY`]).
     /// Fixed: no longer env-configurable.
     pub dataset_cache_capacity: u64,
@@ -305,6 +344,15 @@ impl Config {
         if database_url.is_empty() {
             return Err("LANCE_ETL_DATABASE_URL must be non-empty".to_string());
         }
+        let database_ca_path = required_path("SEARCH_API_DATABASE_CA_PATH")?;
+        let tls_cert_path = required_path("SEARCH_API_TLS_CERT_PATH")?;
+        let tls_key_path = required_path("SEARCH_API_TLS_KEY_PATH")?;
+        let jwt_issuer = required_string("SEARCH_API_JWT_ISSUER")?;
+        let jwt_audience = required_string("SEARCH_API_JWT_AUDIENCE")?;
+        let jwks_uri = required_string("SEARCH_API_JWKS_URI")?;
+        if !jwks_uri.starts_with("https://") {
+            return Err("SEARCH_API_JWKS_URI must use https".to_owned());
+        }
         let cache_backend = env_cache_backend()?;
         let redis_url = std::env::var("SEARCH_API_REDIS_URL").ok().filter(|url| !url.is_empty());
         if cache_backend == CacheBackendKind::Redis && redis_url.is_none() {
@@ -313,6 +361,12 @@ impl Config {
         Ok(Self {
             base_uri,
             database_url,
+            database_ca_path,
+            tls_cert_path,
+            tls_key_path,
+            jwt_issuer,
+            jwt_audience,
+            jwks_uri,
             dataset_cache_capacity: DEFAULT_DATASET_CACHE_CAPACITY,
             index_cache_bytes: DEFAULT_INDEX_CACHE_BYTES,
             metadata_cache_bytes: DEFAULT_METADATA_CACHE_BYTES,
@@ -328,6 +382,22 @@ impl Config {
             serve_tag_ttl_secs: DEFAULT_SERVE_TAG_TTL_SECS,
         })
     }
+}
+
+/// Reads one required non-empty string environment variable.
+fn required_string(name: &str) -> Result<String, String> {
+    std::env::var(name)
+        .map_err(|_| format!("{name} must be set"))
+        .and_then(|value| {
+            (!value.is_empty())
+                .then_some(value)
+                .ok_or_else(|| format!("{name} must be non-empty"))
+        })
+}
+
+/// Reads one required non-empty filesystem path environment variable.
+fn required_path(name: &str) -> Result<PathBuf, String> {
+    required_string(name).map(PathBuf::from)
 }
 
 /// Resolves the cache backend selection.
@@ -392,7 +462,22 @@ mod tests {
         let guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut effective = vars.to_vec();
         if !effective.iter().any(|(name, _)| *name == "LANCE_ETL_DATABASE_URL") {
-            effective.push(("LANCE_ETL_DATABASE_URL", Some("postgresql://catalog/test")));
+            effective.push((
+                "LANCE_ETL_DATABASE_URL",
+                Some("postgresql://catalog/test?sslmode=verify-full"),
+            ));
+        }
+        for (name, value) in [
+            ("SEARCH_API_DATABASE_CA_PATH", "/tmp/search-api-test-database-ca.pem"),
+            ("SEARCH_API_TLS_CERT_PATH", "/tmp/search-api-test-cert.pem"),
+            ("SEARCH_API_TLS_KEY_PATH", "/tmp/search-api-test-key.pem"),
+            ("SEARCH_API_JWT_ISSUER", "https://issuer.test"),
+            ("SEARCH_API_JWT_AUDIENCE", "search-api"),
+            ("SEARCH_API_JWKS_URI", "https://issuer.test/.well-known/jwks.json"),
+        ] {
+            if !effective.iter().any(|(candidate, _)| *candidate == name) {
+                effective.push((name, Some(value)));
+            }
         }
         let previous: Vec<(String, Option<String>)> = effective
             .iter()
@@ -434,7 +519,16 @@ mod tests {
         with_env(&vars, || {
             let config = Config::from_env().unwrap();
             assert_eq!(config.base_uri, "/data/lance", "trailing slash must be stripped");
-            assert_eq!(config.database_url, "postgresql://catalog/test");
+            assert_eq!(config.database_url, "postgresql://catalog/test?sslmode=verify-full");
+            assert_eq!(
+                config.database_ca_path,
+                PathBuf::from("/tmp/search-api-test-database-ca.pem")
+            );
+            assert_eq!(config.tls_cert_path, PathBuf::from("/tmp/search-api-test-cert.pem"));
+            assert_eq!(config.tls_key_path, PathBuf::from("/tmp/search-api-test-key.pem"));
+            assert_eq!(config.jwt_issuer, "https://issuer.test");
+            assert_eq!(config.jwt_audience, "search-api");
+            assert_eq!(config.jwks_uri, "https://issuer.test/.well-known/jwks.json");
             assert_eq!(config.dataset_cache_capacity, DEFAULT_DATASET_CACHE_CAPACITY);
             assert_eq!(config.index_cache_bytes, DEFAULT_INDEX_CACHE_BYTES);
             assert_eq!(config.metadata_cache_bytes, DEFAULT_METADATA_CACHE_BYTES);

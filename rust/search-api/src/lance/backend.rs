@@ -199,7 +199,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
     #[tracing::instrument(
         name = "backend.vector_search",
         skip_all,
-        fields(org_id = %target.org_id, search.k = query.k)
+        fields(search.k = query.k)
     )]
     async fn vector_search(
         &self,
@@ -230,7 +230,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
     #[tracing::instrument(
         name = "backend.text_search",
         skip_all,
-        fields(org_id = %target.org_id, search.k = query.k)
+        fields(search.k = query.k)
     )]
     async fn text_search(&self, target: &DatasetTarget, query: TextQuery) -> Result<TextSearchOutcome, SearchError> {
         validate_k(query.k, self.max_k)?;
@@ -257,7 +257,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
     #[tracing::instrument(
         name = "backend.hybrid_search",
         skip_all,
-        fields(org_id = %target.org_id, search.k = query.k)
+        fields(search.k = query.k)
     )]
     async fn hybrid_search(
         &self,

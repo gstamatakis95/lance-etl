@@ -3,8 +3,8 @@
 //! This layer never references Lance types. It converts protobuf requests into domain queries,
 //! delegates to the backend, and converts domain results and errors back to protobuf. Per-RPC
 //! observability lives here: the tower layer in `main` opens the server span, and the handlers
-//! annotate it with the dataset target and the gRPC status, emit one request/latency metric per
-//! call, and log failures with the target context. Sampled vector, text, and hybrid requests
+//! annotate it with low-cardinality search state and the gRPC status, emit one request/latency
+//! metric per call, and log bounded failures without target identity. Sampled vector, text, and hybrid requests
 //! additionally get `recall.*` capture attributes on the server span (see
 //! [`crate::telemetry::recall`]), and a request carrying a rerank spec with `top_n` set truncates
 //! the results to that count after the backend returns.
@@ -14,6 +14,8 @@
 //! - [`timeout`]: the per-route request-timeout tower layer applied by `main` (and by any test
 //!   that mirrors the production server stack).
 
+pub mod admission;
+pub mod auth;
 pub mod convert;
 pub mod timeout;
 
@@ -26,6 +28,8 @@ use tonic::{Code, Request, Response, Status};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::domain::{DatasetTarget, SearchBackend, SearchError};
+use crate::grpc::admission::AdmissionController;
+use crate::grpc::auth::{RequestAuthorizer, RequiredRole};
 use crate::grpc::convert::{
     dataset_target_from_proto, fused_hit_to_proto, fused_to_hit, hybrid_query_from_proto, text_hit_to_proto,
     text_query_from_proto, time_range_from_proto, vector_hit_to_proto, vector_query_from_proto, warning_to_proto,
@@ -42,16 +46,25 @@ pub struct SearchGrpc<B> {
     backend: Arc<B>,
     metrics: Arc<Metrics>,
     recall: RecallCapture,
+    authorizer: Arc<dyn RequestAuthorizer>,
+    admission: Arc<AdmissionController>,
 }
 
 impl<B> SearchGrpc<B> {
     /// Creates the adapter emitting per-RPC metrics through the given facade, with recall
     /// capture disabled.
-    pub fn with_metrics(backend: Arc<B>, metrics: Arc<Metrics>) -> Self {
+    pub fn with_metrics(
+        backend: Arc<B>,
+        metrics: Arc<Metrics>,
+        authorizer: Arc<dyn RequestAuthorizer>,
+        admission: Arc<AdmissionController>,
+    ) -> Self {
         Self {
             backend,
             metrics,
             recall: RecallCapture::disabled(),
+            authorizer,
+            admission,
         }
     }
 
@@ -61,11 +74,12 @@ impl<B> SearchGrpc<B> {
         self
     }
 
-    /// Shared per-RPC scaffold: converts and annotates the target, runs the handler body, and
+    /// Shared per-RPC scaffold: validates and authorizes the target, runs the handler body, and
     /// records the outcome (status span attribute, metrics, failure log).
     async fn handle<T>(
         &self,
         rpc: Rpc,
+        metadata: &tonic::metadata::MetadataMap,
         target: Option<crate::pb::DatasetTarget>,
         run: impl AsyncFnOnce(&DatasetTarget) -> Result<T, Status>,
     ) -> Result<Response<T>, Status> {
@@ -73,9 +87,19 @@ impl<B> SearchGrpc<B> {
         let target = take_target(target);
         let result = match &target {
             Err(status) => Err(status.clone()),
-            Ok(target) => run(target).await.map(Response::new),
+            Ok(target) => match self.authorizer.authorize(metadata, target, RequiredRole::Search).await {
+                Err(status) => Err(status),
+                Ok(()) => match self.admission.admit(target) {
+                    Err(status) => Err(status),
+                    Ok(permit) => {
+                        let result = run(target).await.map(Response::new);
+                        drop(permit);
+                        result
+                    }
+                },
+            },
         };
-        record_outcome(&self.metrics, rpc, target.as_ref().ok(), started, &result);
+        record_outcome(&self.metrics, rpc, started, &result);
         result
     }
 }
@@ -113,32 +137,9 @@ pub(crate) fn code_tag(code: Code) -> &'static str {
     }
 }
 
-/// Annotates the current (server) span with the canonical dataset-target attributes.
-///
-/// Target identifiers are allowed on traces and logs but never on metrics. `set_attribute`
-/// writes through the OpenTelemetry layer, so it works even though the tower layer's span does
-/// not declare these tracing fields, and degrades to a no-op when telemetry is disabled.
-fn annotate_request_span(target: &DatasetTarget) {
-    let span = tracing::Span::current();
-    span.set_attribute("org_id", target.org_id.clone());
-    span.set_attribute("tenant_id", target.tenant_id.clone());
-    span.set_attribute("namespace", target.namespace.clone());
-}
-
-/// Renders the target for failure logs.
-fn target_label(target: &DatasetTarget) -> String {
-    format!("{}/{}/{}", target.org_id, target.tenant_id, target.namespace)
-}
-
 /// Records the RPC outcome: gRPC status code on the span, request/latency/error metrics, and a
-/// warn-level event with the target context on failure.
-fn record_outcome<T>(
-    metrics: &Metrics,
-    rpc: Rpc,
-    target: Option<&DatasetTarget>,
-    started: Instant,
-    result: &Result<T, Status>,
-) {
+/// warn-level bounded event on failure.
+fn record_outcome<T>(metrics: &Metrics, rpc: Rpc, started: Instant, result: &Result<T, Status>) {
     let code = match result {
         Ok(_) => Code::Ok,
         Err(status) => status.code(),
@@ -146,22 +147,14 @@ fn record_outcome<T>(
     let span = tracing::Span::current();
     span.set_attribute("rpc.grpc.status_code", code as i64);
     metrics.rpc(rpc, code_tag(code), started.elapsed());
-    if let Err(status) = result {
-        tracing::warn!(
-            target = target.map(target_label).unwrap_or_default(),
-            rpc = rpc.as_tag(),
-            status = code_tag(code),
-            message = status.message(),
-            "rpc failed"
-        );
+    if result.is_err() {
+        tracing::warn!(rpc = rpc.as_tag(), status = code_tag(code), "rpc failed");
     }
 }
 
-/// Converts the request target, annotating the span on success.
+/// Converts and validates the request target without emitting its identity.
 fn take_target(target: Option<crate::pb::DatasetTarget>) -> Result<DatasetTarget, Status> {
-    let target = dataset_target_from_proto(target).map_err(status_from_error)?;
-    annotate_request_span(&target);
-    Ok(target)
+    dataset_target_from_proto(target).map_err(status_from_error)
 }
 
 #[tonic::async_trait]
@@ -171,8 +164,9 @@ impl<B: SearchBackend> SearchService for SearchGrpc<B> {
         &self,
         request: Request<VectorSearchRequest>,
     ) -> Result<Response<VectorSearchResponse>, Status> {
+        let metadata = request.metadata().clone();
         let request = request.into_inner();
-        self.handle(Rpc::VectorSearch, request.target, async |target| {
+        self.handle(Rpc::VectorSearch, &metadata, request.target, async |target| {
             let time_range = time_range_from_proto(request.time_range);
             let query =
                 vector_query_from_proto(request.query, request.k, request.filter, request.projection, time_range)
@@ -204,8 +198,9 @@ impl<B: SearchBackend> SearchService for SearchGrpc<B> {
 
     /// Full-text search via the INVERTED index.
     async fn text_search(&self, request: Request<TextSearchRequest>) -> Result<Response<TextSearchResponse>, Status> {
+        let metadata = request.metadata().clone();
         let request = request.into_inner();
-        self.handle(Rpc::TextSearch, request.target, async |target| {
+        self.handle(Rpc::TextSearch, &metadata, request.target, async |target| {
             let time_range = time_range_from_proto(request.time_range);
             let query = text_query_from_proto(request.query, request.k, request.filter, request.projection, time_range)
                 .map_err(status_from_error)?;
@@ -239,10 +234,11 @@ impl<B: SearchBackend> SearchService for SearchGrpc<B> {
         &self,
         request: Request<HybridSearchRequest>,
     ) -> Result<Response<HybridSearchResponse>, Status> {
+        let metadata = request.metadata().clone();
         let mut request = request.into_inner();
         let target = request.target.take();
         tracing::Span::current().set_attribute("search.hybrid", true);
-        self.handle(Rpc::HybridSearch, target, async |target| {
+        self.handle(Rpc::HybridSearch, &metadata, target, async |target| {
             let query = hybrid_query_from_proto(request).map_err(status_from_error)?;
             tracing::Span::current().set_attribute("search.k", query.k as i64);
             let pending = self.recall.begin_hybrid(target, &query);
