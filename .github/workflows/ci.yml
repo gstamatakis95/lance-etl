@@ -6,89 +6,120 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   python:
     name: Python lint and tests
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16-bookworm@sha256:6374b678afc82d28b31a7058e50dbfd665fa2199ab192a768fc5eedbc3abfa89
+        env:
+          POSTGRES_DB: lance_etl
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres -d lance_etl"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+        ports:
+          - 5432:5432
+    env:
+      LANCE_ETL_TEST_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/lance_etl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: "3.14"
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Install uv
-        run: pip install uv
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: "0.9.8"
+          enable-cache: true
 
-      - name: Install package with dev and bench dependency groups
-        run: uv pip install --system -e . --group dev --group bench
+      - name: Synchronize locked Python environment
+        run: uv sync --locked --group dev --group bench --no-group airflow --python 3.14
 
-      - name: ruff format check
-        run: uvx ruff format --check src/ tests/ airflow/ bench/
+      - name: Check Python formatting
+        run: uv run --locked --no-sync ruff format --check src/ tests/ airflow/ bench/
 
-      - name: ruff lint
-        run: uvx ruff check src/ tests/ airflow/ bench/
+      - name: Lint Python
+        run: uv run --locked --no-sync ruff check src/ tests/ airflow/ bench/
 
-      - name: pytest (non-integration)
-        run: pytest -m "not integration"
+      - name: Run non-integration tests
+        run: uv run --locked --no-sync pytest -m "not integration"
 
   airflow:
-    name: Airflow DAG-parse tests
+    name: Airflow DAG parse tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: "3.14"
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Install uv
-        run: pip install uv
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: "0.9.8"
+          enable-cache: true
 
-      - name: Install package with dev and airflow dependency groups
-        run: uv pip install --system -e . --group dev --group airflow
+      - name: Synchronize locked Airflow environment
+        run: uv sync --locked --group dev --group airflow --no-group bench --python 3.14
 
-      - name: pytest airflow DAG-parse tests
-        run: pytest tests/test_airflow_dags.py -v
+      - name: Parse every production DAG
+        run: uv run --locked --no-sync pytest tests/test_airflow_dags.py -v
 
   rust:
-    name: Rust search-api
+    name: Rust search API
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: rust/search-api
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
+          toolchain: "1.91.0"
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           workspaces: rust/search-api
 
-      - name: cargo fmt check
+      - name: Check Rust formatting
         run: cargo fmt --check
 
-      - name: cargo clippy
-        run: cargo clippy -- -D warnings
+      - name: Lint Rust
+        run: cargo clippy --locked -- -D warnings
 
-      - name: cargo test
-        run: cargo test
+      - name: Test Rust
+        run: cargo test --locked
+
+      - name: Build release server
+        run: cargo build --release --locked
+
+  integration:
+    name: Required integration and benchmark gates
+    uses: ./.github/workflows/integration.yml

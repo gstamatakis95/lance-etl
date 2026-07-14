@@ -222,8 +222,9 @@ def test_optimizer_compacts_data_files(tmp_path: Path) -> None:
     Args:
         tmp_path: Pytest-provided temporary directory.
     """
-    if jvm_gateway_already_launched():
-        pytest.skip("Iceberg catalog jars resolve only at JVM launch. Run this file in its own pytest process.")
+    assert not jvm_gateway_already_launched(), (
+        "Iceberg integration must run in its own pytest process before any Spark gateway launches"
+    )
     config: BenchConfig = bench_config(tmp_path)
     table: str = config.table()
     spark = build_spark(config, "iceberg-optimize-test")
