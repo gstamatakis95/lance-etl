@@ -149,6 +149,7 @@ cargo test
   observability, rejected decisions and operator tools). Every original ADR number resolves through
   the index.
 - `docs/datadog-dashboard-guide.md` — guide to the Datadog dashboards shipped with the pipeline.
+- `docs/production-release.md` — immutable image, deployment, canary, and exact catalog rollback runbook.
 - `market-research/` — detailed evaluation notes, plans, and evidence underlying the ADRs.
 
 For contributors and coding agents, the repo-wide rules are in `AGENTS.md`, with package specifics

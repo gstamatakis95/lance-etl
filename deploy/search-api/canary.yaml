@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lance-etl-search-canary
+  labels:
+    app.kubernetes.io/name: lance-etl-search
+    app.kubernetes.io/component: search
+    app.kubernetes.io/track: canary
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lance-etl-search
+      app.kubernetes.io/track: canary
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lance-etl-search
+        app.kubernetes.io/component: search
+        app.kubernetes.io/track: canary
+    spec:
+      serviceAccountName: lance-etl-search
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 660
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: search-api
+          image: ghcr.io/gstamatakis95/lance-etl-search@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          env:
+            - name: LANCE_ETL_BASE_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: lance-etl-search
+                  key: lance-base-uri
+            - name: LANCE_ETL_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: lance-etl-search
+                  key: database-url
+            - name: SEARCH_API_CACHE_BACKEND
+              value: disk
+            - name: SEARCH_API_PORT
+              value: "8080"
+          ports:
+            - name: grpc
+              containerPort: 8080
+          readinessProbe:
+            grpc:
+              port: 8080
+              service: lance_etl.v1.SearchService
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+              ephemeral-storage: 14Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+              ephemeral-storage: 16Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsGroup: 65532
+            runAsUser: 65532
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/search-api
+            - name: temporary
+              mountPath: /tmp
+      volumes:
+        - name: cache
+          emptyDir:
+            sizeLimit: 12Gi
+        - name: temporary
+          emptyDir:
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lance-etl-search-canary
+spec:
+  selector:
+    app.kubernetes.io/name: lance-etl-search
+    app.kubernetes.io/track: canary
+  ports:
+    - name: grpc
+      port: 8080
+      targetPort: grpc

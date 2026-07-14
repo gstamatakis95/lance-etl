@@ -1,0 +1,114 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lance-etl-search
+  labels:
+    app.kubernetes.io/name: lance-etl-search
+    app.kubernetes.io/component: search
+spec:
+  replicas: 3
+  revisionHistoryLimit: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lance-etl-search
+      app.kubernetes.io/track: stable
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lance-etl-search
+        app.kubernetes.io/component: search
+        app.kubernetes.io/track: stable
+    spec:
+      serviceAccountName: lance-etl-search
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 660
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: search-api
+          image: ghcr.io/gstamatakis95/lance-etl-search@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: LANCE_ETL_BASE_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: lance-etl-search
+                  key: lance-base-uri
+            - name: LANCE_ETL_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: lance-etl-search
+                  key: database-url
+            - name: SEARCH_API_CACHE_BACKEND
+              value: disk
+            - name: SEARCH_API_PORT
+              value: "8080"
+          ports:
+            - name: grpc
+              containerPort: 8080
+              protocol: TCP
+          startupProbe:
+            grpc:
+              port: 8080
+              service: lance_etl.v1.SearchService
+            failureThreshold: 60
+            periodSeconds: 5
+            timeoutSeconds: 2
+          readinessProbe:
+            grpc:
+              port: 8080
+              service: lance_etl.v1.SearchService
+            failureThreshold: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            grpc:
+              port: 8080
+              service: lance_etl.v1.SearchService
+            failureThreshold: 3
+            periodSeconds: 20
+            timeoutSeconds: 2
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+              ephemeral-storage: 14Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+              ephemeral-storage: 16Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsGroup: 65532
+            runAsUser: 65532
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/search-api
+            - name: temporary
+              mountPath: /tmp
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: lance-etl-search
+              app.kubernetes.io/track: stable
+      volumes:
+        - name: cache
+          emptyDir:
+            sizeLimit: 12Gi
+        - name: temporary
+          emptyDir:
+            sizeLimit: 1Gi
