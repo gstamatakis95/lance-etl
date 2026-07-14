@@ -11,10 +11,11 @@ Required Lance baseline: v8.0.0 at 15f2ff594a25b97f9bedd21a253b612ce14e39ec
 
 ## Production decision and current implementation state
 
-This repository is not production ready yet. It has a sound Lance v8 indexing core and the current
-branch has already removed several unsafe surfaces, but durable source ownership, target-scoped
-retry state, replay-safe tombstones, exact publication orchestration, authenticated serving, and
-scale qualification remain release blockers.
+This repository is not production ready yet. Its Lance v8 segment API choices are substantially
+correct and the current branch has already removed several unsafe surfaces. The live indexing
+state machine still has known stuck-state edges, and durable source ownership, target-scoped retry
+state, replay-safe tombstones, exact publication orchestration, authenticated serving, and scale
+qualification remain release blockers.
 
 The initial production claim is billions of rows across the fleet. It is not a claim that one
 logical target containing one billion rows meets latency, recall, or recovery objectives.
@@ -320,15 +321,25 @@ The checked-in source column is `processing_timestamp`. In the shorthand `hour(t
 that column. If production uses a different timestamp, change the DDL and code-owned source
 contract together. Never let Airflow select the column.
 
-Add `mutation_version BIGINT NOT NULL` to the Iceberg CDC contract. It is non-decreasing for each
-named target and vector_id. Every distinct mutation must strictly increase it, while equality is
-allowed only for an exact duplicate of the same immutable mutation. This is the only reliable way
-to distinguish an exact duplicate from an older mutation delivered in a later snapshot. If the
-producer cannot supply this sequence, production can support deterministic ingestion-order wins,
-but it cannot truthfully claim out-of-order duplicate safety. Do not launch with that ambiguity.
+Do not add a mutation-version column to Iceberg. The production contract uses deterministic
+ingestion-order wins. For every BASELINE or APPEND window, attach the window's
+iceberg_sequence_number to each row as the internal source_sequence. That value is stable across
+retries, and a later snapshot has a greater source sequence.
+
+This choice has one explicit limitation. Iceberg arrival order is authoritative, not business-event
+order. An exact duplicate of the currently stored terminal mutation is detected by its canonical
+digest and becomes a no-op. A duplicate of an older mutation after an intervening change is
+indistinguishable from an intended correction and therefore wins when appended later. The same is
+true for any different mutation whose event_timestamp is older. The source must therefore avoid
+redelivering superseded business mutations after newer ones. Without an upstream event identity or
+record version, the system cannot distinguish those cases from intended new corrections.
+
+Within one Iceberg snapshot, allow any number of byte-equivalent duplicate rows for one target and
+vector_id, but require at most one distinct mutation. Two different payloads or operations for the
+same key in one snapshot have no defined order and BLOCK that target before its first Lance write.
 
 `event_timestamp` remains query and TTL time. `processing_timestamp` remains the Iceberg hour
-partition. Neither column is the cross-snapshot mutation sequence.
+partition. Neither column determines mutation order.
 
 The hour transform is a pruning dimension, not the ingestion cursor. A late event can be appended
 into an older hour partition. Snapshot membership must still capture it. Spark supports reads
@@ -337,9 +348,14 @@ pinned by `snapshot-id`, which is the required basis for deterministic replay
 
 Use one Iceberg snapshot as one source window. An append snapshot is one immutable CDC increment.
 Its direct parent is the exclusive start and the snapshot itself is the inclusive end. A trusted
-logical maintenance snapshot is recorded as a completed no-op. The initial canonical snapshot is
-one BASELINE window. Do not coalesce consecutive append snapshots in the first implementation.
-Coalescing is an internal optimization only after the one-snapshot path is qualified.
+logical maintenance snapshot is recorded as a completed no-op. A BASELINE is valid only when it is
+a separately validated canonical snapshot containing at most one distinct terminal mutation per
+target and vector_id. Otherwise bootstrap by replaying retained APPEND snapshots in lineage order
+from the earliest accepted ancestor, with the same per-snapshot conflict rule as normal ingestion.
+Never treat an arbitrary current snapshot of an append-only CDC table as a baseline because it can
+contain several historical mutations for one key without recoverable row order. Do not coalesce
+consecutive append snapshots in the first implementation. Coalescing is an internal optimization
+only after the one-snapshot path is qualified.
 
 One serial planner must:
 
@@ -369,8 +385,11 @@ touched across several hour partitions in one snapshot is one work item. Its ret
 parent-to-snapshot increment and filters `tenant_id`, `namespace`, and `org_id`. Iceberg uses the
 hour partitions in the immutable snapshot manifests for pruning. Do not persist a second hours
 array that can disagree with those manifests. All hours for the target are unioned and collapsed
-once. This uses the physical partition layout without turning processing time into correctness
-state.
+once. Persist or checkpoint that collapsed terminal-mutation DataFrame before digest calculation,
+validation, and Lance writes consume it. Unpersist it after the target reaches a durable
+source-applied outcome. This prevents several actions from recomputing the billion-row-class
+collapse shuffle. This uses the physical partition layout without turning processing time into
+correctness state.
 
 Remove wall-clock source ownership and apply_window_filter from correctness. Do not collect and
 sort complete snapshot history on the driver.
@@ -478,13 +497,13 @@ promotion, and warmth entities.
 
 `source_digest` is SHA-256 over one frozen byte stream for this target and snapshot. The stream
 starts with the exact ASCII header `lance-etl-source-digest-v1\0`, followed by terminal
-`(vector_id, mutation_version, event_digest)` tuples in unsigned UTF-8 byte order. Encode vector_id
-as an unsigned 64-bit big-endian byte length followed by UTF-8 bytes, mutation_version as signed
-64-bit big-endian, and event_digest as 32 raw bytes. Compute it with a distributed external sort and
-one streaming executor-side reduction per target. It is independent of Spark partition count and
-never collects terminal tuples to the driver. Set `source_applied_at` once, only after the matching
-Lance dataset marker is durable. A source window becomes COMPLETE when every child INGEST row has
-source_applied_at. SERVE and Lance-to-Lance REBUILD state never hold Iceberg retention.
+`(vector_id, source_sequence, event_digest)` tuples in unsigned UTF-8 byte order. Encode vector_id
+as an unsigned 64-bit big-endian byte length followed by UTF-8 bytes, source_sequence as signed
+64-bit big-endian, and event_digest as 32 raw bytes. Compute it with a distributed external sort
+and one streaming executor-side reduction per target. It is independent of Spark partition count
+and never collects terminal tuples to the driver. Set `source_applied_at` once, only after the
+matching Lance dataset marker is durable. A source window becomes COMPLETE when every child INGEST
+row has source_applied_at. SERVE and Lance-to-Lance REBUILD state never hold Iceberg retention.
 
 Use unique idempotency constraints and FOR UPDATE SKIP LOCKED claims. An INGEST row is eligible only
 when no smaller unfinished INGEST sequence exists for that target. Enforce that rule in the claim
@@ -505,12 +524,12 @@ open-SERVE index, not a nullable source key, provides SERVE coalescing.
 
 Claiming increments `targets.fence_epoch` and writes a fresh lease_token into the work row. Every
 phase verifies both values before an external commit and again before advancing state.
-Data merge retries may rebase only because the stored mutation version makes the mutation
-monotonic. Maintenance, index publication, rebuild, and catalog publication operate against exact
-input versions. They do not blindly rebase after a conflict. Extend commit_with_retries with a
-guard callback and a replan result rather than bypassing the repository commit helper. A stale
-worker may finish harmless computation, but it cannot complete control state or overwrite a newer
-exact-version phase.
+Data merge retries may rebase only because the stored Iceberg source sequence is monotonic along
+the accepted snapshot lineage. Maintenance, index publication, rebuild, and catalog publication
+operate against exact input versions. They do not blindly rebase after a conflict. Extend
+commit_with_retries with a guard callback and a replan result rather than bypassing the repository
+commit helper. A stale worker may finish harmless computation, but it cannot complete control state
+or overwrite a newer exact-version phase.
 
 Keep only active and recent work in PostgreSQL. Launch with one unpartitioned target_work table so
 its primary key and per-target partial unique indexes are global and obvious. Delete completed work
@@ -538,8 +557,9 @@ and an explicitly source-backed REBUILD may retry only while their exact Iceberg
 inside the replay horizon. SERVE and Lance-to-Lance REBUILD retry from their persisted exact Lance,
 artifact, and catalog inputs without holding Iceberg retention. Alert at fixed internal thresholds
 such as attempts 5, 20, and 100 without changing the state to BLOCKED. BLOCKED is only for contract
-failures such as invalid schema, conflicting mutation-version reuse, authorization, corrupt source
-lineage, or an expired required input. A later operator retry changes state, not the work identity.
+failures such as invalid schema, conflicting distinct mutations within one source snapshot,
+authorization, corrupt source lineage, or an expired required input. A later operator retry changes
+state, not the work identity.
 Use a fixed high Airflow policy for dispatcher crashes, with exponential backoff capped at one
 hour. The initial code-owned dispatcher policy is 24 retries, one-minute base delay, exponential
 backoff, and one-hour maximum delay. Durable target work continues across later DAG runs after
@@ -549,15 +569,15 @@ and Lance retry counts.
 Every stored row carries:
 
 - lance_etl_window_seq
-- lance_etl_mutation_version
+- lance_etl_source_sequence
 - lance_etl_event_digest as fixed 32-byte binary SHA-256
 - is_deleted
 
-Incoming rows update only when mutation_version is greater than the stored mutation_version. A
-lower version is a stale mutation and becomes a metered no-op. An equal version with the same
-digest is an exact duplicate and becomes a no-op. An equal version with a different digest is a
-source-contract conflict and blocks the target work. A stale zombie cannot overwrite or delete
-newer state.
+Compare the incoming digest first. The same digest is an exact duplicate and becomes a no-op even
+when it was appended again in a later snapshot. With a different digest, a greater source_sequence
+updates the row, a lower source_sequence is a stale retry and becomes a metered no-op, and an equal
+source_sequence is an unordered same-snapshot conflict that blocks the target work. A stale zombie
+cannot overwrite or delete state committed from a newer Iceberg snapshot.
 
 Detect conflicting reuse both inside the append snapshot and against existing target rows before
 the first Lance write for that target. A conflict visible in preflight writes nothing. A conflict
@@ -569,37 +589,45 @@ Within one source window:
 
 1. Validate routing, vector_id, operation, and timestamps.
 2. Canonicalize maps by sorted entries.
-3. Compute SHA-256 over routing identity, vector_id, mutation version, operation, event timestamp,
-   and the complete normalized payload. Exclude processing_timestamp, Iceberg snapshot and file
-   metadata, and other delivery-envelope fields so a redelivery in a later processing hour remains
-   an exact duplicate.
+3. Compute SHA-256 over routing identity, vector_id, operation, event timestamp, and the complete
+   normalized payload. Exclude source_sequence, processing_timestamp, Iceberg snapshot and file
+   metadata, and other delivery-envelope fields so a redelivery in a later snapshot or processing
+   hour remains an exact duplicate.
 4. Collapse exact duplicates.
-5. BLOCK any equal mutation version carrying a different operation or payload.
-6. Select the greatest mutation_version per target and vector_id.
+5. BLOCK when more than one distinct digest remains for the same target and vector_id.
+6. Emit one terminal mutation per target and vector_id with the window's source_sequence.
 
 Freeze the canonical digest encoding as a persisted contract. Normalize timestamps to UTC
 microseconds, encode null and each scalar type unambiguously, sort map keys, preserve list order,
 and reject non-finite vector values. A release cannot change this encoding for an existing target.
 An intentional replacement requires a fenced REBUILD into a new URI with every digest recomputed.
 
-Across windows, greater mutation_version wins regardless of snapshot arrival order or
-event_timestamp. `lance_etl_window_seq` remains the work provenance and completion fence. It is not
-the business mutation order.
+Across windows, the same digest is an exact duplicate regardless of source_sequence. Otherwise the
+greater Iceberg source_sequence wins regardless of event_timestamp. `lance_etl_window_seq` remains
+the work provenance and completion fence. This is deterministic arrival ordering, not business
+mutation ordering.
 
-Implement the write with Lance v8's conditional merge update using
-`target.lance_etl_mutation_version < source.lance_etl_mutation_version`, plus insert-if-absent. Do
-not depend only on a pre-read. After every merge group, join the affected keys back to the reopened
-dataset. For each incoming terminal row, the stored version must be greater, or it must be equal
-with the same digest. Equal version with a different digest blocks before the dataset completion
-marker. This post-write check closes the race where an expired worker commits after its successor's
-initial conflict scan.
+Implement the write with Lance v8's conditional merge update using this condition:
+
+~~~text
+target.lance_etl_source_sequence < source.lance_etl_source_sequence
+AND target.lance_etl_event_digest != source.lance_etl_event_digest
+~~~
+
+Also use insert-if-absent. Do not depend only on a pre-read. After every merge group, join the
+affected keys back to the reopened dataset. For each incoming terminal row, the stored digest must
+match, or the stored source sequence must be greater. Equal source sequence with a different digest
+blocks before the dataset completion marker. This post-write check closes the race where an expired
+worker commits after its successor's initial conflict scan.
 
 Replace physical when_matched_delete with a guarded tombstone upsert. Search always injects
 is_deleted = false. Make `is_deleted` non-null and create its BITMAP index through the code-owned
 profile. A tombstone keeps vector_id, window sequence, event digest, and ordering fields while
 explicitly nulling payload columns. Keep tombstones through the replay and recovery horizon. Purge
 them only after every older work item is impossible to replay and a validated recovery baseline
-exists, otherwise an old UPSERT can resurrect a deleted key.
+exists, otherwise a retry from an older Iceberg source sequence can resurrect a deleted key. A
+stale business UPSERT newly appended in a later snapshot still wins under the documented
+ingestion-order contract.
 
 UPSERT is a complete post-image. Before merge, union allowed new fields with the current target
 schema and materialize explicit null for every absent existing payload field.
@@ -627,7 +655,7 @@ The required idempotency boundary is explicit:
 | SERVE enqueue | partial unique open row for target_id and kind SERVE | Pending work is advanced or running work leaves a durable dirty target |
 | REBUILD request | deterministic work_id for target_id and operator request ID | Retrying one request reuses its exact plan |
 | Worker claim | work_id, lease_token, and target fence_epoch | Only the current owner can advance control state |
-| Row mutation | vector_id plus lance_etl_mutation_version and digest | Exact replay is a no-op, old delivery is ignored, and conflicting reuse blocks |
+| Row mutation | vector_id plus lance_etl_source_sequence and digest | Replay of the same work and redelivery matching the currently stored terminal digest are no-ops, older source work is ignored, and same-snapshot conflicts block |
 | Index build | exact data version, fragment set, artifact digest | Existing valid segments are reused or the exact phase is replanned |
 | Catalog publication | target_id, expected ingest and served tuples, candidate URI, exact served version, and fence epoch | Desired mapping is success, expected prior mapping is replaced by CAS, unexpected mapping blocks |
 | Database completion | work_id plus exact data, index, or catalog version | Repeating completion is a no-op |
@@ -636,9 +664,11 @@ On every ambiguous Lance commit, reopen the dataset and reconcile the durable co
 exact version, row count, and digest before retrying. Never infer failure only from a client
 timeout. Never blindly repeat a raw append.
 
-Disable raw bulk append until deterministic ambiguous-outcome reconciliation exists. Disable
-clustered overwrite until its memory and writer-overlap behavior are qualified. Never enable
-stable row IDs.
+Disable raw bulk append until deterministic ambiguous-outcome reconciliation exists. Keep
+clustered overwrite disabled until writer-overlap behavior is qualified, an absent or zero-count
+partition cannot collide with the integer error sentinel, rewrite memory has one global bound
+rather than `num_buckets` times the per-bucket chunk cap, and an unopenable dataset remains an
+isolated target failure instead of changing the whole job result. Never enable stable row IDs.
 
 Audit destination uniqueness by vector_id. Repair duplicates through an exclusive REBUILD that
 writes a new Lance version while the serving catalog keeps readers on the old exact version.
@@ -692,7 +722,27 @@ code-owned profile values reviewed through normal releases.
 
 ### Exact index and catalog publication
 
-Preserve the exact Lance v8 segment recipes in AGENTS.md.
+Resolve the current FTS recipe contradiction before changing index code. The live atomic-swap
+implementation calls `create_scalar_index` with `replace=True`, while the root AGENTS.md FTS recipe
+says `replace=False`. Verify the atomic-swap behavior against pinned Lance v8, add a regression
+test, and correct the canonical guide in the same commit. Do not ask later agents to preserve a
+recipe that disagrees with the qualified implementation. After that correction, preserve every
+type-specific Lance v8 segment recipe in AGENTS.md.
+
+The existing index runner also has three live state-machine gaps that are release blockers:
+
+- a fully covered non-FTS index above its delta cap must run delta optimization even when no new
+  fragments were built in the current run
+- validation failure is isolated to its index so unrelated indexes can finish, while publication
+  still blocks if any required index is invalid
+- an existing zero-coverage vector index without stored artifact configuration must select bounded
+  bootstrap training, never a segment build that requires missing artifacts
+
+Add focused regression tests for all three cases before treating the indexing core as qualified.
+Delete the duplicate delta-merge helper and dead per-handler vector artifact memoization during
+that refactor so there is one implementation of each state transition. Persist per-index outcomes
+in the immutable artifact manifest referenced by target_work. Do not add an index-work table or any
+other PostgreSQL entity.
 
 Centroids, the RaBitQ model, and configuration form one immutable content-addressed artifact
 generation. Store one manifest URI and digest in target_work and committed index metadata. Every
@@ -766,7 +816,16 @@ Before exposure:
 - make readiness dependency-aware
 - add bounded graceful drain
 - remove target identity and URI from normal telemetry
-- ensure outer route timeouts record timeout outcomes
+- ensure outer route timeouts emit the normal `search_api.rpc` outcome and one bounded failure log
+- negative-cache only definitive dataset, reference, or version absence, never a generic transient
+  object-store `NotFound`
+- execute cached multi-range reads concurrently with a code-owned bound or coalesce adjacent
+  ranges, never issue a cold large-index read as a sequential latency chain
+- make the disk-cache janitor ignore young in-progress temporary files
+- preserve `prefixes.json` through cache sweeps and update it atomically without clobbering a
+  concurrent prefix registration
+- fail startup on conflicting pre-set fixed Lance I/O environment values instead of silently
+  overwriting them or turning them into public configuration
 
 The public search request exposes only target, query, bounded k, typed filter AST, allowlisted
 projection, exact time range, and an optional allowlisted product fusion mode.
@@ -796,6 +855,12 @@ claims batches from target_work, and executor partitions process target-scoped w
 must scale with new snapshot ancestry plus touched targets, never source rows, all historical
 snapshots, or the fleet's full fragment inventory. Executor memory must scale with one bounded
 target chunk or index shard.
+
+Persist or checkpoint a target's collapsed terminal-mutation DataFrame once when more than one
+action consumes it. Bound every repartition, index shard fan-out, and object-store request group by
+the code-owned deployment profile. Derive a useful width from measured input size, then clamp it to
+the qualified minimum and maximum. Never derive task count as an unbounded sum across targets and
+never expose shuffle width as an Airflow parameter.
 
 Every code-owned profile needs explicit budgets for rows per fragment, fragment count, versions,
 deletion ratio, schema width, index delta count, artifact bytes, build memory, build duration,
@@ -858,11 +923,18 @@ floor. Remove stale Intake dashboard text and add a descriptor test proving the 
 cannot return. Seed removed Airflow variables in negative tests and prove they are ignored. Do not
 fold STATE-01 or the full SEARCH-01 public API redesign into this safety stage.
 
+Before index implementation begins, record the FTS `replace` contradiction as a failing regression
+test against pinned Lance v8 and correct the root guide with the proven result. Also make the shared
+CLI entry point log unexpected top-level exceptions before returning failure. Remove the stale
+package version global so pyproject.toml is the sole Python package version source.
+
 Acceptance:
 
 - production entry points cannot reach removed or qualification-only mutation surfaces
 - a normal request cannot serve unpromoted Latest
 - startup cannot warm an unpromoted Latest target list
+- canonical FTS instructions and the pinned Lance v8 regression test agree
+- unexpected top-level CLI failure produces a bounded diagnostic
 - repository remains green
 - old DAGs remain only until the reconciler replacement commit
 
@@ -919,6 +991,10 @@ Implement:
 Acceptance:
 
 - late old-hour append is captured
+- two parent-linked snapshots committed in the same millisecond are processed in lineage order
+- an arbitrary current CDC snapshot with several distinct mutations for one key is rejected as a
+  baseline
+- retained append lineage replays from the earliest accepted ancestor without losing key order
 - append, trusted replace, append emits only append CDC
 - untrusted overwrite and physical delete block
 - retry reads the same plan after newer snapshots arrive
@@ -934,11 +1010,13 @@ feat: make Lance mutations replay safe
 
 Implement:
 
-- required mutation_version source contract
+- Iceberg-derived source_sequence with ingestion-order-wins semantics
 - SHA-256 canonical identity
 - exact duplicate collapse and conflict detection
 - full-row null materialization
-- mutation-version guarded upsert and tombstone
+- one persisted or checkpointed terminal-mutation lineage per target, released after durable
+  source-applied completion
+- source-sequence guarded upsert and tombstone
 - completion marker
 - partial-commit retry
 - uniqueness audit and rebuild
@@ -948,15 +1026,16 @@ Implement:
 Acceptance:
 
 - 100 repeated retries converge
-- an exact duplicate in a later snapshot is a no-op
-- a greater mutation version wins even with older event time
-- an older mutation delivered in a later snapshot is ignored
+- an exact duplicate of the current terminal mutation in a later snapshot is a no-op
+- a different mutation in a later Iceberg snapshot wins even with older event time
+- work from an older Iceberg source sequence is ignored
+- two distinct mutations for one key in one snapshot block before the first Lance write
 - stale zombie cannot change newer state
 - omitted fields clear
-- delete and recreate with increasing mutation versions works
-- conflicting reuse blocks before the worker writes when visible at preflight and before completion
-  when introduced by a concurrent race
+- delete and recreate in later snapshots works
+- a same-source-sequence conflict introduced by a concurrent race blocks before completion
 - existing duplicate repair creates one live vector_id
+- repeated digest, validation, and write actions do not recompute the collapse shuffle
 
 ### 4. ORCH-01
 
@@ -998,6 +1077,10 @@ feat: publish exact validated Lance versions
 Implement:
 
 - immutable index artifact generation
+- corrected and regression-tested pinned-v8 FTS atomic-swap recipe
+- delta optimization independent of whether the current run built new segments
+- per-index validation isolation with required-index publication blocking
+- zero-coverage vector artifact recovery through bootstrap
 - exact input and output versions
 - exact validation and prewarm
 - fenced targets-catalog compare-and-swap
@@ -1014,6 +1097,9 @@ Acceptance:
 - search never serves unvalidated Latest
 - centroid and RaBitQ generations cannot mix
 - required index coverage is complete at served version
+- a full-coverage index above its delta cap converges without a new fragment
+- one invalid index cannot strand valid unrelated index work
+- missing vector artifacts cannot route into a segment build
 
 ### 6. SEARCH-01
 
@@ -1034,6 +1120,10 @@ Implement:
 - global admission and fairness
 - readiness and bounded drain
 - truthful timeout accounting
+- definitive-only negative-open caching
+- bounded concurrent or coalesced cached range reads
+- race-safe disk-cache temporary-file and prefix-registry cleanup
+- fail-fast fixed Lance I/O environment ownership
 - privacy-safe telemetry
 
 Acceptance:
@@ -1043,6 +1133,10 @@ Acceptance:
 - duplicate physical rows cannot produce duplicate logical hits
 - overload sheds without unbounded memory
 - served_version is always returned
+- a timed-out request emits the normal RPC outcome and one bounded failure log
+- transient object-store NotFound cannot poison a dataset open
+- cold cached range latency scales with bounded concurrency, not range count times round-trip
+- a janitor sweep cannot remove an active cache write or lose the prefix registry
 - normal metrics and spans contain no target identity or URI
 
 ### 7. RELEASE-01
@@ -1061,6 +1155,7 @@ Implement:
 - locked Cargo commands
 - pinned CI actions and tools
 - mandatory Airflow and integration jobs
+- Iceberg optimization integration in its own pytest process with an assertion that it executed
 - remove continue-on-error from required benchmark gates
 - immutable container images
 - deployment manifests
@@ -1070,6 +1165,8 @@ Acceptance:
 
 - clean checkout reproduces dependencies
 - every CI command is locked
+- every scheduled Iceberg procedure has a non-skipped end-to-end test in a fresh Spark process or
+  is removed from the scheduled production path
 - release image records exact Git and Lance versions
 - rollback restores the prior catalog URI and exact served version
 
@@ -1090,12 +1187,16 @@ Implement:
 - object-store failure injection
 - recall and latency cohorts
 - capacity artifact with hardware, cache state, commit, and Lance version
+- materialization and shuffle-width measurements for the largest collapse cohort
+- cold multi-range cache-open cohort
 
 Acceptance:
 
 - all local fault tests pass
 - SIFT1M smoke passes
 - largest available scale passes with documented headroom
+- collapse shuffle executes once per target attempt and stays within the internal task-width cap
+- cold cached multi-range reads satisfy the qualified latency budget
 - unavailable 100M or 1B infrastructure is recorded as an exact external gate
 - no unmeasured billion-row claim is made
 
@@ -1176,9 +1277,15 @@ uvx ruff check src/ tests/ airflow/ bench/
 .venv/bin/pytest -m "not integration"
 .venv/bin/pytest tests/test_airflow_dags.py -v
 .venv/bin/pytest -m integration \
+  --ignore=tests/test_iceberg_optimize.py \
   --ignore=tests/test_bench_e2e.py \
   --ignore=tests/test_bench_e2e_tagged.py
+.venv/bin/pytest -m integration tests/test_iceberg_optimize.py -x -q
 ~~~
+
+Run the Iceberg optimization file in its own process so an earlier Spark gateway cannot make its
+real procedure test skip. When a procedure is enabled in the scheduled production path, lack of a
+compatible Iceberg runtime is a failing release gate rather than a pytest skip.
 
 Then from rust/search-api:
 
@@ -1229,6 +1336,7 @@ hardware, dataset checksum, and cache state for every scale result.
 Before branch completion, cover:
 
 - delayed append into an old hour partition
+- two lineage-linked snapshots with the same commit millisecond
 - trusted replace between append snapshots
 - untrusted overwrite
 - changed table UUID and forked lineage
@@ -1236,12 +1344,19 @@ Before branch completion, cover:
 - crash before and after every Lance commit
 - lease expiry with a live zombie
 - exact duplicate UPSERT and DELETE
-- conflicting same-version mutation across one or several snapshots
+- conflicting distinct mutations for one key in the same snapshot
+- a stale business mutation appended in a later snapshot follows documented arrival-order wins
 - same vector_id across hours and windows
 - stale delete, delete then recreate, and null clearing
 - partial salted target commit
 - ambiguous index and catalog publication
+- full-coverage index over its delta cap with no new fragment
+- invalid vector index beside valid required scalar indexes
+- zero-coverage vector index with missing stored artifacts
 - cache corruption and restart
+- transient generic NotFound followed by a successful open
+- janitor sweep concurrent with a cache write and prefix registration
+- cold multi-range index open under object-store latency
 - Redis unavailable and slow
 - object-store throttle, timeout, and stale read
 - global overload and graceful-drain deadline
@@ -1259,7 +1374,7 @@ Allowed states are NOT_STARTED, IN_PROGRESS, DONE, and BLOCKED.
 
 | Stage | State | Verification | Notes or blocker |
 |---|---|---|---|
-| Safety removal | IN_PROGRESS | Python: 679 passed, 36 deselected. Airflow: 6 passed. Rust fmt and Clippy green, 180 locked tests passed, release build green | Commits 6c9ffaa, fd82a0c, fbac425, and 6cef023 disabled raw bulk and clustered mutation controls, removed placeholder intake, required explicit Python HEAD publication, and committed fixed-HEAD serving with a missing-HEAD fail-closed test. Startup prewarm, benchmark version mismatch, benchmark tag verification, source retention, and stale Intake docs remain before DONE. |
+| Safety removal | IN_PROGRESS | Python: 679 passed, 36 deselected. Airflow: 6 passed. Rust fmt and Clippy green, 180 locked tests passed, release build green | Commits 6c9ffaa, fd82a0c, fbac425, and 6cef023 disabled raw bulk and clustered mutation controls, removed placeholder intake, required explicit Python HEAD publication, and committed fixed-HEAD serving with a missing-HEAD fail-closed test. Startup prewarm, benchmark version mismatch, benchmark tag verification, source retention, stale Intake docs, the FTS guide contradiction, and shared CLI diagnostics remain before DONE. |
 | STATE-01 | NOT_STARTED | | |
 | SOURCE-01 | NOT_STARTED | | |
 | MUTATION-01 | NOT_STARTED | | |
