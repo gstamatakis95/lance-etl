@@ -159,11 +159,11 @@ uvx ruff check src/ tests/ airflow/ bench/
 .venv/bin/pytest -m "not integration"
 ```
 
-pylance `>=8.0.0,<9` installs from PyPI (8.0.0 released 2026-07-01, superseding the
+pylance `==8.0.0` installs from PyPI (8.0.0 released 2026-07-01, superseding the
 build-from-checkout requirement of the 8.0.0b6 era):
 
 ```bash
-uv pip install "pylance>=8.0.0,<9"
+uv pip install "pylance==8.0.0"
 ```
 
 The Rust service sources the lance crates from crates.io at the same version. Bump the two

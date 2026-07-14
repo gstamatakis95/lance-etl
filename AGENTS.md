@@ -34,7 +34,7 @@ lance-etl/
 The lance checkout at `/Users/gstamatakis/IdeaProjects/lance` is the API ground truth. When you are
 unsure whether a pylance API exists or what its signature is, read that checkout. Do not guess. The
 checkout tracks lance main and can be ahead of the pin this repo actually ships: at the time of
-writing the checkout is at `9.0.0-beta.20` while `pyproject.toml` pins `pylance>=8.0.0,<9`. When a
+writing the checkout is at `9.0.0-beta.20` while `pyproject.toml` pins `pylance==8.0.0`. When a
 behavior difference between major versions could matter, verify the API against the pinned major
 (read the installed `pylance` package in `etl/venv`, or the release notes) rather than assuming the
 checkout's behavior applies unchanged.
@@ -136,7 +136,7 @@ executor later. ZONEMAP is the exception: its per-shard segments ARE merged with
 `dataset.merge_existing_index_segments(segments)` before `dataset.commit_existing_index_segments(name,
 column, [merged])` — it is the only scalar type that merges before commit. Zonemap segment merging
 requires lance 8 (upstream commits e8748a405 and cc657c5e3), which this repo already pins
-(`pylance>=8.0.0,<9`).
+(`pylance==8.0.0`).
 
 **FTS (INVERTED only):**
 1. Driver mints one shared `index_uuid = str(uuid.uuid4())`.

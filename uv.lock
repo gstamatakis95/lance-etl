@@ -1416,7 +1416,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=2.2.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
     { name = "pyarrow", specifier = ">=23" },
-    { name = "pylance", specifier = ">=8.0.0,<9" },
+    { name = "pylance", specifier = "==8.0.0" },
     { name = "pyspark", specifier = ">=4.1" },
     { name = "sqlalchemy", specifier = ">=2.0,<3" },
 ]
