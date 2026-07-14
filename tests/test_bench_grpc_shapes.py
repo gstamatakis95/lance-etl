@@ -27,7 +27,7 @@ from bench.grpc_client import (
     validate_served_version,
     vector_query,
 )
-from bench.search import ghz_payload
+from bench.search import run_load_level
 
 EXPECTED_RPCS: frozenset[str] = frozenset({"VectorSearch", "TextSearch", "HybridSearch"})
 
@@ -241,17 +241,94 @@ class TestSearchRequests:
         assert request.fusion_mode == pb2.HYBRID_FUSION_MODE_BALANCED
 
 
-class TestGhzPayload:
-    """The ghz replay body matches the final request shape."""
+class TestAuthenticatedLoad:
+    """The fixed in-process load profile preserves authentication and publication fencing."""
 
-    def test_payload_has_target(self) -> None:
-        """The body nests the full DatasetTarget and the vector query."""
-        payload: dict[str, Any] = ghz_payload(np.asarray([1.0, 2.0], dtype=np.float32))
-        assert payload["target"] == {"org_id": "org0", "tenant_id": "tenant0", "namespace": "ns"}
-        assert payload["query"]["vector"] == [1.0, 2.0]
-        assert payload["k"] == 10
-        assert set(payload["query"]) == {"vector"}
-        assert "org_id" not in payload
+    def test_level_measures_authenticated_requests(
+        self, pb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every successful load response contributes latency and throughput evidence."""
+        token_dir: Path = tmp_path / "tokens"
+        token_dir.mkdir()
+        (token_dir / "tenant0--ns--org0.jwt").write_text("load.jwt", encoding="utf-8")
+        config = BenchConfig(
+            command="search",
+            endpoint="search.example:443",
+            search_ca_path=tmp_path / "ca.pem",
+            search_token_dir=token_dir,
+            search_expected_versions_path=tmp_path / "expected.json",
+        )
+        calls: list[Any] = []
+
+        def vector_search_rpc(request: Any, metadata: Any, timeout: float) -> Any:
+            """Capture one authenticated load request.
+
+            Args:
+                request: Typed vector request.
+                metadata: Per-request bearer metadata.
+                timeout: Bounded RPC deadline.
+
+            Returns:
+                Response fenced to the expected publication.
+            """
+            calls.append((request, metadata, timeout))
+            return SimpleNamespace(served_version=17)
+
+        monkeypatch.setattr("bench.search.LOAD_DURATION_SECONDS", 0.001)
+        level: dict[str, Any] = run_load_level(
+            SimpleNamespace(VectorSearch=vector_search_rpc),
+            pb2,
+            config,
+            np.asarray([1.0, 2.0], dtype=np.float32),
+            {"org0": 17},
+            2,
+        )
+
+        assert level["concurrency"] == 2
+        assert level["requests"] == len(calls)
+        assert level["requests"] >= 2
+        assert level["qps"] > 0
+        assert all(call[0].target.org_id == "org0" for call in calls)
+        assert all(call[1] == (("authorization", "Bearer load.jwt"),) for call in calls)
+        assert all(call[2] == 5.0 for call in calls)
+
+    def test_version_failure_propagates(self, pb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A load response from an unapproved version fails the benchmark."""
+        token_dir: Path = tmp_path / "tokens"
+        token_dir.mkdir()
+        (token_dir / "tenant0--ns--org0.jwt").write_text("load.jwt", encoding="utf-8")
+        config = BenchConfig(
+            command="search",
+            endpoint="search.example:443",
+            search_ca_path=tmp_path / "ca.pem",
+            search_token_dir=token_dir,
+            search_expected_versions_path=tmp_path / "expected.json",
+        )
+
+        def vector_search_rpc(request: Any, metadata: Any, timeout: float) -> Any:
+            """Return an unfenced response.
+
+            Args:
+                request: Typed vector request.
+                metadata: Per-request bearer metadata.
+                timeout: Bounded RPC deadline.
+
+            Returns:
+                Response from the wrong publication.
+            """
+            del request, metadata, timeout
+            return SimpleNamespace(served_version=16)
+
+        monkeypatch.setattr("bench.search.LOAD_DURATION_SECONDS", 0.0)
+        with pytest.raises(RuntimeError, match="expected published version 17"):
+            run_load_level(
+                SimpleNamespace(VectorSearch=vector_search_rpc),
+                pb2,
+                config,
+                np.asarray([1.0, 2.0], dtype=np.float32),
+                {"org0": 17},
+                1,
+            )
 
 
 class TestResultParsing:

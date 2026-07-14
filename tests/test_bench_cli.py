@@ -14,7 +14,6 @@ from bench.config import (
     SUBCOMMANDS,
     BenchConfig,
     build_parser,
-    parse_int_list,
 )
 
 
@@ -28,14 +27,6 @@ def config_for(argv: list[str]) -> BenchConfig:
         The parsed configuration.
     """
     return BenchConfig.from_args(build_parser().parse_args(argv))
-
-
-class TestListParsing:
-    """The comma-list flag parsers."""
-
-    def test_parse_int_list(self) -> None:
-        """Comma-separated integers parse with whitespace tolerated."""
-        assert parse_int_list("1, 10,25") == [1, 10, 25]
 
 
 class TestEverySubcommandParses:
@@ -52,7 +43,6 @@ class TestEverySubcommandParses:
         assert config.seed == 42
         assert config.batches == 1
         assert config.endpoint == ""
-        assert config.concurrency == [1, 8, 32]
         assert config.ivf_partitions is None
         assert config.max_queries is None
         assert config.iceberg_package == DEFAULT_ICEBERG_PACKAGE
@@ -118,7 +108,7 @@ class TestSubcommandFlags:
         assert config.compact_target_rows == 500000
 
     def test_search_flags(self, tmp_path: Path) -> None:
-        """Search accepts an external authenticated endpoint, query caps, and load knobs."""
+        """Search accepts an external authenticated endpoint and query cap."""
         config: BenchConfig = config_for(
             [
                 "search",
@@ -132,10 +122,6 @@ class TestSubcommandFlags:
                 str(tmp_path / "expected.json"),
                 "--max-queries",
                 "100",
-                "--concurrency",
-                "2,4",
-                "--load-duration",
-                "5s",
             ]
         )
         assert config.endpoint == "localhost:9999"
@@ -143,8 +129,6 @@ class TestSubcommandFlags:
         assert config.search_token_dir == (tmp_path / "tokens").resolve()
         assert config.search_expected_versions_path == (tmp_path / "expected.json").resolve()
         assert config.max_queries == 100
-        assert config.concurrency == [2, 4]
-        assert config.load_duration == "5s"
 
     def test_report_and_run_id(self) -> None:
         """Report accepts an explicit run id and results root."""

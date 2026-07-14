@@ -178,6 +178,9 @@ python -m bench search \
 The search request cannot select a tag or version. The benchmark instead validates every response's
 `served_version` against the operator-owned publication file and fails on any mismatch. Build and
 service artifacts remain separate, so an external result cannot be attributed to local index knobs.
+The load leg uses a fixed in-process profile at 1, 8, and 32 workers for 15 seconds per level. It
+does not expose runner tuning flags. Authentication, deadline, transport, and version failures make
+the command exit nonzero instead of producing partial qualification evidence.
 
 ---
 

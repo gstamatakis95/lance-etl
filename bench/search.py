@@ -1,15 +1,14 @@
 """Search benchmarks against the Rust gRPC search service.
 
-Four legs run against the catalog-resolved targets through the real server:
+Four legs run against catalog-resolved targets through the real server:
 
 - recall: the SIFT query vectors measure the release-owned target profile. Recall@1/@10/@100 is computed against the
   prepared ground truth and latency statistics are recorded.
 - fts: deterministic cluster-vocabulary text queries measure BM25 latency and the
   cluster-consistency hit rate (the fraction of hits whose vector belongs to the queried cluster).
 - hybrid: vector + text legs fused with reciprocal-rank fusion. Latency and fused recall@10 are recorded.
-- load: when the external ``ghz`` binary is on PATH, sustained QPS and p50/p95/p99 latency are measured per
-  ``--concurrency`` level with the raw ghz JSON written into the run directory. Absent ghz the leg is skipped with a
-  clear message.
+- load: a fixed in-process profile measures sustained QPS and p50/p95/p99 latency at bounded concurrency levels.
+  It re-reads rotating token files for every request and applies the same exact-version checks as the recall legs.
 Every request addresses its dataset through a ``DatasetTarget`` (org, fixed tenant, fixed namespace) matching the
 serving catalog identity. Cold-vs-warm first-query latency is recorded per org. Cache warming and index geometry are
 operator-only concerns and have no public RPC.
@@ -18,12 +17,14 @@ operator-only concerns and have no public RPC.
 from __future__ import annotations
 
 import logging
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from bench.config import NAMESPACE, RECALL_CUTOFFS, TENANT_ID, BenchConfig
+from bench.config import RECALL_CUTOFFS, BenchConfig
 from bench.groundtruth import recall_at
 from bench.grpc_client import (
     authorization_metadata,
@@ -42,7 +43,8 @@ from bench.results import read_json, save_phase
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-NANOS_PER_MILLI: float = 1_000_000.0
+LOAD_CONCURRENCY_LEVELS: tuple[int, ...] = (1, 8, 32)
+LOAD_DURATION_SECONDS: float = 15.0
 
 
 def latency_stats(latencies_ms: list[float]) -> dict[str, float]:
@@ -297,62 +299,118 @@ def run_hybrid_leg(
     }
 
 
-def ghz_payload(sample_vector: np.ndarray, org_id: str = "org0") -> dict[str, Any]:
-    """Build the JSON body ghz replays against ``VectorSearch``.
+def run_load_worker(
+    stub: Any,
+    pb2: Any,
+    config: BenchConfig,
+    sample_vector: np.ndarray,
+    org_id: str,
+    expected_version: int,
+    stop_at: float,
+) -> list[float]:
+    """Issue authenticated requests until one fixed load interval ends.
 
     Args:
-        sample_vector: The query vector replayed by every request.
-        org_id: The targeted org.
-
-    Returns:
-        The protojson-compatible request body with the full ``DatasetTarget``.
-    """
-    return {
-        "target": {"org_id": org_id, "tenant_id": TENANT_ID, "namespace": NAMESPACE},
-        "query": {"vector": [float(value) for value in sample_vector]},
-        "k": 10,
-    }
-
-
-def ghz_summary(raw: dict[str, Any]) -> dict[str, Any]:
-    """Extract the headline numbers from a raw ghz JSON report.
-
-    Args:
-        raw: The parsed ghz output.
-
-    Returns:
-        QPS and latency percentiles in milliseconds.
-    """
-    percentiles: dict[int, float] = {}
-    for entry in raw.get("latencyDistribution") or []:
-        percentiles[int(entry["percentage"])] = float(entry["latency"]) / NANOS_PER_MILLI
-    return {
-        "qps": round(float(raw.get("rps", 0.0)), 1),
-        "mean_ms": round(float(raw.get("average", 0.0)) / NANOS_PER_MILLI, 3),
-        "p50_ms": round(percentiles.get(50, 0.0), 3),
-        "p95_ms": round(percentiles.get(95, 0.0), 3),
-        "p99_ms": round(percentiles.get(99, 0.0), 3),
-    }
-
-
-def run_load_leg(config: BenchConfig, sample_vector: np.ndarray) -> dict[str, Any]:
-    """Record the external authenticated load-test gate.
-
-    Args:
+        stub: Generated search stub shared by the load workers.
+        pb2: Generated protobuf module.
         config: Benchmark configuration.
-        sample_vector: The query vector replayed by every request.
+        sample_vector: Query vector replayed by this worker.
+        org_id: Exact logical target assigned to this worker.
+        expected_version: Operator-approved exact publication.
+        stop_at: Monotonic end time for the load interval.
 
     Returns:
-        An explicit not-run record. Passing rotating bearer credentials through a child
-        process argument would expose them through the process table, so the benchmark does
-        not claim a production load result from the obsolete unauthenticated ghz path.
+        Successful per-request latencies in milliseconds.
+
+    Raises:
+        Exception: Propagates authentication, deadline, transport, and version failures so the benchmark exits nonzero.
     """
-    del sample_vector
+    request = pb2.VectorSearchRequest(
+        target=dataset_target(pb2, org_id),
+        query=vector_query(pb2, sample_vector),
+        k=10,
+    )
+    latencies: list[float] = []
+    while not latencies or time.perf_counter() < stop_at:
+        response, elapsed_ms = timed_call(stub.VectorSearch, request, authorization_metadata(config, org_id))
+        validate_served_version(response, org_id, expected_version)
+        latencies.append(elapsed_ms)
+    return latencies
+
+
+def run_load_level(
+    stub: Any,
+    pb2: Any,
+    config: BenchConfig,
+    sample_vector: np.ndarray,
+    expected_versions: dict[str, int],
+    concurrency: int,
+) -> dict[str, Any]:
+    """Measure one fixed authenticated concurrency level.
+
+    Args:
+        stub: Generated search stub shared by the load workers.
+        pb2: Generated protobuf module.
+        config: Benchmark configuration.
+        sample_vector: Query vector replayed by every worker.
+        expected_versions: Operator-approved exact publication per organization.
+        concurrency: Fixed worker count for this profile level.
+
+    Returns:
+        Request count, throughput, and latency distribution.
+    """
+    started: float = time.perf_counter()
+    stop_at: float = started + LOAD_DURATION_SECONDS
+    orgs: list[str] = config.org_ids()
+    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="bench-load") as executor:
+        futures: list[Future[list[float]]] = [
+            executor.submit(
+                run_load_worker,
+                stub,
+                pb2,
+                config,
+                sample_vector,
+                orgs[worker % len(orgs)],
+                expected_versions[orgs[worker % len(orgs)]],
+                stop_at,
+            )
+            for worker in range(concurrency)
+        ]
+        latencies: list[float] = [latency for future in futures for latency in future.result()]
+    elapsed_seconds: float = time.perf_counter() - started
     return {
-        "status": "NOT_RUN",
-        "reason": "authenticated fleet load requires an external secret-aware load runner",
-        "endpoint": config.endpoint,
+        "concurrency": concurrency,
+        "requests": len(latencies),
+        "duration_seconds": round(elapsed_seconds, 3),
+        "qps": round(len(latencies) / elapsed_seconds, 1),
+        **latency_stats(latencies),
     }
+
+
+def run_load_leg(
+    stub: Any,
+    pb2: Any,
+    config: BenchConfig,
+    sample_vector: np.ndarray,
+    expected_versions: dict[str, int],
+) -> dict[str, Any]:
+    """Run the fixed, authenticated fleet load profile.
+
+    Args:
+        stub: Generated search stub shared by load workers.
+        pb2: Generated protobuf module.
+        config: Benchmark configuration.
+        sample_vector: Query vector replayed by every worker.
+        expected_versions: Operator-approved exact publication per organization.
+
+    Returns:
+        Measured load levels and exact-version evidence.
+    """
+    levels: list[dict[str, Any]] = [
+        run_load_level(stub, pb2, config, sample_vector, expected_versions, concurrency)
+        for concurrency in LOAD_CONCURRENCY_LEVELS
+    ]
+    return {"status": "MEASURED", "served_versions": expected_versions, "levels": levels}
 
 
 def run_search(config: BenchConfig) -> dict[str, Any]:
@@ -387,7 +445,7 @@ def run_search(config: BenchConfig) -> dict[str, Any]:
     sweep: list[dict[str, Any]] = [
         sweep_point(stub, pb2, config, queries, artifacts["ground_truth"], expected_versions)
     ]
-    load: dict[str, Any] = run_load_leg(config, queries[0])
+    load: dict[str, Any] = run_load_leg(stub, pb2, config, queries[0], expected_versions)
     result: dict[str, Any] = {
         "endpoint": config.endpoint,
         "status": "MEASURED",

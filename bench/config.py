@@ -54,18 +54,6 @@ def default_run_id() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
-def parse_int_list(text: str) -> list[int]:
-    """Parse a comma-separated list of integers.
-
-    Args:
-        text: The raw flag value, such as ``"1,10,25"``.
-
-    Returns:
-        The parsed integers.
-    """
-    return [int(item.strip()) for item in text.split(",") if item.strip()]
-
-
 @dataclass
 class BenchConfig:
     """Configuration shared by every benchmark phase.
@@ -106,8 +94,6 @@ class BenchConfig:
         max_queries: Cap on query vectors per sweep point. ``None`` sends all 10k.
         fts_query_count: Deterministic full-text queries drawn from cluster vocabularies in the FTS leg.
         hybrid_query_count: Queries in the hybrid (vector + text, RRF) leg.
-        concurrency: ghz concurrency levels for the load mode.
-        load_duration: ghz test duration per concurrency level.
         sha256: Optional pinned checksum for the downloaded sift archive.
         force: Rebuild prepared artifacts even when a manifest already exists.
         warmup_queries: Queries issued at the maximum nprobes before the timed sweep. Set to 0 to skip warmup.
@@ -158,8 +144,6 @@ class BenchConfig:
     max_queries: int | None = None
     fts_query_count: int = 100
     hybrid_query_count: int = 100
-    concurrency: list[int] = field(default_factory=lambda: [1, 8, 32])
-    load_duration: str = "15s"
     sha256: str | None = None
     force: bool = False
     warmup_queries: int = 100
@@ -425,8 +409,6 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-queries", type=int, default=None, help="Cap query vectors per sweep point")
     parser.add_argument("--fts-queries", dest="fts_query_count", type=int, default=100)
     parser.add_argument("--hybrid-queries", dest="hybrid_query_count", type=int, default=100)
-    parser.add_argument("--concurrency", type=parse_int_list, default=None, help="ghz concurrency levels, e.g. 1,8,32")
-    parser.add_argument("--load-duration", default="15s")
     parser.add_argument("--sha256", default=None, help="Pinned sha256 of sift.tar.gz")
     parser.add_argument("--force", action="store_true", help="Rebuild prepared artifacts")
     parser.add_argument("--warmup-queries", type=int, default=100, help="Warmup queries before timed sweep; 0 skips")
@@ -489,7 +471,7 @@ def build_parser() -> argparse.ArgumentParser:
         "ingest": "Run the real Iceberg-to-Lance ETL into per-tenant datasets",
         "index": "Build IVF_RQ, BTREE, BITMAP, and INVERTED indices with LanceIndexer",
         "compact": "Compact the datasets with MaintenanceJob and record fragment counts",
-        "search": "Run recall, FTS, hybrid, and ghz load modes against the gRPC server",
+        "search": "Run recall, FTS, hybrid, and the fixed authenticated load profile against the gRPC server",
         "report": "Aggregate run artifacts into summary.md, results.csv, and pareto.png",
         "all": "Run the full chain: download, prepare, ingest, index, compact, search, report",
         "e2e": "Batch-major e2e: per-batch ETL+index+compact+tag, historical-tag verification, optional gRPC legs",
