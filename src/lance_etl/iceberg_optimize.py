@@ -101,7 +101,7 @@ class IcebergOptimizeConfig:
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     rewrite_data_files: bool = True
     rewrite_manifests: bool = True
-    expire_snapshots: bool = True
+    expire_snapshots: bool = False
     remove_orphan_files: bool = False
     expire_retain_last: int = DEFAULT_EXPIRE_RETAIN_LAST
     expire_older_than_days: int = DEFAULT_EXPIRE_OLDER_THAN_DAYS

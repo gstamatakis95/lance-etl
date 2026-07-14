@@ -137,7 +137,7 @@ def test_optimize_iceberg_cli_defaults() -> None:
     assert args.table == "cat.db.t"
     assert args.no_rewrite_data_files is False
     assert args.no_rewrite_manifests is False
-    assert args.no_expire_snapshots is False
+    assert args.expire_snapshots is False
     assert args.remove_orphan_files is False
     assert args.expire_retain_last == DEFAULT_EXPIRE_RETAIN_LAST
     assert args.expire_older_than_days == DEFAULT_EXPIRE_OLDER_THAN_DAYS
@@ -151,14 +151,14 @@ def test_optimize_iceberg_cli_toggles() -> None:
             "--table",
             "cat.db.t",
             "--no-rewrite-data-files",
-            "--no-expire-snapshots",
+            "--expire-snapshots",
             "--remove-orphan-files",
             "--expire-retain-last",
             "2",
         ]
     )
     assert args.no_rewrite_data_files is True
-    assert args.no_expire_snapshots is True
+    assert args.expire_snapshots is True
     assert args.remove_orphan_files is True
     assert args.expire_retain_last == 2
 

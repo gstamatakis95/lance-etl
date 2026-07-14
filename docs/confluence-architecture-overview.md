@@ -499,7 +499,7 @@ Both planes report to Datadog. Every emitter on the Rust side is infallible by c
 | `tag` | Flip `HEAD` to an explicit target dataset version for blue-green promotion. |
 | `migrate-manifests` | Migrate dataset manifest paths to the V2 naming scheme. |
 | `migrate-namespace` | Copy a whole namespace to a new namespace name. One-off operator tool, not scheduled. |
-| `optimize-iceberg` | Optimize the upstream Iceberg source table via Iceberg's own `CALL` maintenance procedures. Distinct from `maintenance`, which optimizes Lance datasets. Steps (all on by default except orphan removal): `rewrite_data_files`, `rewrite_manifests`, `expire_snapshots`, opt-in `remove_orphan_files`. |
+| `optimize-iceberg` | Optimize the upstream Iceberg source table via Iceberg's own `CALL` maintenance procedures. Distinct from `maintenance`, which optimizes Lance datasets. Data-file and manifest rewrites default on. Snapshot expiration and orphan removal require explicit retention-gated opt-in. |
 
 ### The Airflow DAG
 

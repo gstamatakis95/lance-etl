@@ -145,7 +145,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-rewrite-manifests", action="store_true", help="Skip the manifest rewrite."
     )
     optimize_iceberg_parser.add_argument(
-        "--no-expire-snapshots", action="store_true", help="Skip snapshot-history expiration."
+        "--expire-snapshots",
+        action="store_true",
+        help="Expire snapshot history only after the durable source retention gate authorizes it.",
     )
     optimize_iceberg_parser.add_argument(
         "--remove-orphan-files",
@@ -252,7 +254,7 @@ def run_optimize_iceberg(args: argparse.Namespace) -> None:
             telemetry=build_telemetry_config(args),
             rewrite_data_files=not args.no_rewrite_data_files,
             rewrite_manifests=not args.no_rewrite_manifests,
-            expire_snapshots=not args.no_expire_snapshots,
+            expire_snapshots=args.expire_snapshots,
             remove_orphan_files=args.remove_orphan_files,
             expire_retain_last=args.expire_retain_last,
             expire_older_than_days=args.expire_older_than_days,

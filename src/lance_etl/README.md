@@ -324,7 +324,8 @@ Four steps run in a fixed safe order. `rewrite_data_files` bin-packs small data 
 ones (default on). `rewrite_manifests` rewrites the manifest list to align with the new file layout
 (default on, runs after the rewrite to stay consistent). `expire_snapshots` prunes snapshot history
 beyond a retention horizon — at least the last 5 snapshots are always kept regardless of age, and
-snapshots older than 7 days beyond that count are expired (default on). `remove_orphan_files`
+snapshots older than 7 days beyond that count are expired only with `--expire-snapshots`. Scheduled
+production calls require the durable source retention gate first. `remove_orphan_files`
 deletes files no live snapshot references — opt-in because it is the only step that can delete data
 files outright. Iceberg's own three-day safety horizon is respected so an in-flight write is never
 mistaken for an orphan. Heavy work runs distributed in Spark.
@@ -334,7 +335,7 @@ mistaken for an orphan. Heavy work runs distributed in Spark.
 | `--table` | (required) | Fully-qualified Iceberg source table: `catalog.namespace.table` |
 | `--no-rewrite-data-files` | off | Skip the bin-pack rewrite of small data files |
 | `--no-rewrite-manifests` | off | Skip the manifest rewrite |
-| `--no-expire-snapshots` | off | Skip snapshot-history expiration |
+| `--expire-snapshots` | off | Expire snapshot history after the durable retention gate authorizes it |
 | `--remove-orphan-files` | off (opt-in) | Delete files no live snapshot references |
 | `--expire-retain-last` | `5` | Snapshots always retained regardless of age |
 | `--expire-older-than-days` | `7` | Age horizon in days for snapshot expiration |

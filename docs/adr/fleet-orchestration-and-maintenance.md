@@ -107,7 +107,7 @@ The upstream Iceberg table has its own maintenance needs, served by Iceberg's st
 rather than reimplementation. `lance_etl/iceberg_optimize.py` issues
 `CALL <catalog>.system.<procedure>(...)` statements in a fixed safe order: `rewrite_data_files`
 (default on, 512 MiB target), `rewrite_manifests` (default on, after the data rewrite),
-`expire_snapshots` (default on, keep last 5 and 7 days), and `remove_orphan_files` (default OFF
+`expire_snapshots` (default off until the durable source retention gate authorizes it, keep last 5 and 7 days), and `remove_orphan_files` (default OFF
 — the only step that deletes data files outright, respecting Iceberg's three-day safety
 horizon). Each `CALL` plans and executes as a distributed Spark job. The table identifier is
 validated as a dotted `catalog.namespace.table` before reaching any statement.
