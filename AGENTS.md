@@ -140,10 +140,15 @@ requires lance 8 (upstream commits e8748a405 and cc657c5e3), which this repo alr
 
 **FTS (INVERTED only):**
 1. Driver mints one shared `index_uuid = str(uuid.uuid4())`.
-2. Executor: `dataset.create_scalar_index(column, "INVERTED", name=, replace=False,
-   index_uuid=shared, fragment_ids=[...], **fts_params)`.
+2. Executor: `dataset.create_scalar_index(column, "INVERTED", name=, replace=True,
+   index_uuid=shared, fragment_ids=[...], **fts_params)`. Pylance 8 checks committed same-name
+   metadata even on the uncommitted fragment path, so `replace=False` is valid only for an initial
+   build whose name does not exist. Atomic rebuilds must use `replace=True` or every shard raises
+   before building.
 3. Driver: `dataset.merge_index_metadata(index_uuid, index_type="INVERTED")`.
-4. Driver: `LanceDataset.commit(uri, LanceOperation.CreateIndex(...), read_version=...)`.
+4. Driver: re-list the old same-name segments and commit one
+   `LanceOperation.CreateIndex(new_indices=[rebuilt], removed_indices=old_segments)` transaction.
+   The old index remains queryable until this atomic swap commits.
 
 Never call `merge_index_metadata` for BTREE, BITMAP, or vector types. The call raises.
 

@@ -78,7 +78,7 @@ target through the replay-safe merge path.
 - `build_one_shard` — one flat Spark job that builds vector, scalar, and FTS segments per shard
   through `make_handler(kind, ...)`, whose handler exposes `prepare` / `build_segment` / `merges()`.
 - `commit_one_index` — executor fan-out that merges (vector and ZONEMAP) and publishes.
-- `merge_deltas_if_needed` — bounds accumulated BTREE/BITMAP deltas with a later `optimize_indices`
+- `merge_index_deltas` — bounds accumulated BTREE/BITMAP deltas with a later `optimize_indices`
   pass on an executor.
 
 Index builds are segment-API only. The full per-type recipe (Vector IVF_RQ, BTREE, BITMAP, ZONEMAP,

@@ -15,7 +15,7 @@ end-to-end pass through the unified fleet run. Covers:
   dataset's ``lance-etl.columns`` metadata.
 - The unified :class:`~lance_etl.indexing.runner.LanceIndexer` plan-artifacts-build-commit run
   builds a ZONEMAP index end-to-end alongside the other index types.
-- The delta-bound maintenance pass (:func:`~lance_etl.indexing.runner.merge_deltas_if_needed`,
+- The delta-bound maintenance pass (:func:`~lance_etl.indexing.optimize.merge_index_deltas`,
   ``optimize_indices`` under the hood) also accepts ZONEMAP and merges its accumulated deltas.
 """
 
@@ -35,7 +35,7 @@ from lance_etl.indexing import (
     LanceIndexer,
     ZonemapIndexHandler,
     commit_segments,
-    merge_deltas_if_needed,
+    merge_index_deltas,
     resolve_index_targets,
     serialize_segment,
     split_evenly,
@@ -285,7 +285,7 @@ def test_unified_run_builds_zonemap_end_to_end(dataset_uri: str) -> None:
 
 
 def test_zonemap_delta_bound_merges_accumulated_deltas(dataset_uri: str, telemetry: Telemetry) -> None:
-    """``merge_deltas_if_needed`` (``optimize_indices``) also accepts and merges ZONEMAP deltas.
+    """``merge_index_deltas`` (``optimize_indices``) also accepts and merges ZONEMAP deltas.
 
     Each fragment is committed as its own single-segment delta (one commit per fragment, so
     ``merges()`` never fires within a call), simulating one incremental run per fragment. Once
@@ -302,7 +302,7 @@ def test_zonemap_delta_bound_merges_accumulated_deltas(dataset_uri: str, telemet
     before: list[object] = index_segments(dataset_uri, "id_zonemap_idx")
     assert len(before) == len(fragment_ids_of(dataset_uri))
 
-    merged: bool = merge_deltas_if_needed(dataset_uri, "id_zonemap_idx", config, telemetry)
+    merged: bool = merge_index_deltas(dataset_uri, "id_zonemap_idx", config, telemetry)
     assert merged is True
 
     after: list[object] = index_segments(dataset_uri, "id_zonemap_idx")

@@ -477,6 +477,7 @@ def run_cli_main(
         failed: int | None = runner(args)
         return resolve_exit_code(failed if failed is not None else 0)
     except Exception:
+        logging.getLogger(__name__).exception("unexpected top-level CLI failure")
         return 1
 
 

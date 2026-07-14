@@ -26,6 +26,33 @@ def test_help_exits_zero() -> None:
         assert exc_info.value.code == 0
 
 
+def test_top_level_cli_exception_is_logged(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """An exception escaping a job runner produces a bounded diagnostic before exit 1.
+
+    Args:
+        monkeypatch: Pytest monkeypatch used to replace the ETL runner.
+        capsys: Pytest output capture fixture.
+    """
+
+    def fail_runner(args: object) -> int:
+        """Raise a representative startup failure.
+
+        Args:
+            args: Parsed CLI arguments, unused.
+
+        Raises:
+            RuntimeError: Always.
+        """
+        del args
+        raise RuntimeError("spark startup failed")
+
+    monkeypatch.setattr(etl_cli, "run", fail_runner)
+    assert etl_cli.main(REQUIRED_ETL_ARGV) == 1
+    captured: pytest.CaptureResult[str] = capsys.readouterr()
+    assert "unexpected top-level CLI failure" in captured.err
+    assert "spark startup failed" in captured.err
+
+
 def test_etl_parser_builds() -> None:
     """The ETL argument parser constructs without error."""
     parser = etl_cli.build_parser()

@@ -21,7 +21,7 @@ APIs, and a small dataset is simply the one-shard case:
   segments and publishes through the production commit paths, keeping the heavy merge off the
   driver. A stale-fragment commit (a concurrent compaction rewrote planned fragments) marks the
   index for the next replan round instead of failing the run.
-- Delta bound (:func:`merge_deltas_if_needed`): a final per-(dataset, index) fan-out merges
+- Delta bound (:func:`~lance_etl.indexing.optimize.merge_index_deltas`): a final per-(dataset, index) fan-out merges
   accumulated index deltas once they exceed ``max_index_deltas``.
 
 :meth:`LanceIndexer.run` repeats plan-build-commit for stale indexes up to
@@ -79,7 +79,7 @@ from lance_etl.indexing.optimize import (
     index_delta_count,
     load_vector_config,
     maintain_index_locally,
-    optimize_existing_index,
+    merge_index_deltas,
     save_centroids,
     write_vector_config,
 )
@@ -321,6 +321,47 @@ def shard_count(target_fragments: int, config: IndexJobConfig) -> int:
     return max(1, math.ceil(target_fragments / config.fragments_per_index_task))
 
 
+def index_preflight_outcome(
+    handler: IndexHandler,
+    dataset: lance.LanceDataset,
+    uri: str,
+    column: str,
+    index_name: str,
+    telemetry: Telemetry,
+) -> dict[str, Any] | None:
+    """Return a terminal skip or validation-error outcome for one index.
+
+    Args:
+        handler: Type-specific index handler.
+        dataset: Dataset being planned.
+        uri: Dataset URI for diagnostics.
+        column: Indexed column.
+        index_name: Published index name.
+        telemetry: Executor telemetry facade.
+
+    Returns:
+        A terminal result when the index should skip or fails validation, otherwise ``None``.
+    """
+    reason: str | None = handler.skip_reason(dataset)
+    if reason is not None:
+        telemetry.incr("index.skipped", tags=[f"index:{index_name}"])
+        return {"column": column, "index": index_name, "segments": 0, "fragments": 0, "skipped": reason}
+    try:
+        handler.validate(dataset)
+    except Exception as exc:
+        telemetry.incr("index.validation_error", tags=[f"index:{index_name}"])
+        logger.warning("index validation failed for %s on %s, isolating: %s", index_name, uri, exc)
+        return {
+            "column": column,
+            "index": index_name,
+            "segments": 0,
+            "fragments": 0,
+            "error": str(exc),
+            "phase": "validation",
+        }
+    return None
+
+
 def plan_dataset_indexes(
     uri: str,
     config: IndexJobConfig,
@@ -364,12 +405,10 @@ def plan_dataset_indexes(
     done: list[dict[str, Any]] = []
     for kind, column, index_name in targets:
         handler: IndexHandler = make_handler(kind, column, index_name, config)
-        reason: str | None = handler.skip_reason(dataset)
-        if reason is not None:
-            telemetry.incr("index.skipped", tags=[f"index:{index_name}"])
-            done.append({"column": column, "index": index_name, "segments": 0, "fragments": 0, "skipped": reason})
+        preflight: dict[str, Any] | None = index_preflight_outcome(handler, dataset, uri, column, index_name, telemetry)
+        if preflight is not None:
+            done.append(preflight)
             continue
-        handler.validate(dataset)
 
         if kind == FTS_KIND:
             fts_handler: FtsIndexHandler = handler
@@ -411,7 +450,10 @@ def plan_dataset_indexes(
                 continue
         target_ids: list[int] = handler.target_fragments(dataset)
         if not target_ids:
-            done.append({"column": column, "index": index_name, "segments": 0, "fragments": 0})
+            stats: dict[str, Any] = {"column": column, "index": index_name, "segments": 0, "fragments": 0}
+            if index_name in existing_names and index_delta_count(dataset, index_name) > config.max_index_deltas:
+                stats["needs_delta_merge"] = True
+            done.append(stats)
             continue
         specs.append(
             {
@@ -885,37 +927,6 @@ def record_commit_outcomes(
     return stale_uris
 
 
-def merge_deltas_if_needed(uri: str, index_name: str, config: IndexJobConfig, telemetry: Telemetry) -> bool:
-    """Merge one index's accumulated deltas on an executor when over the configured cap.
-
-    Calls :func:`~lance_etl.indexing.optimize.optimize_existing_index` directly with the delta
-    count already computed here, rather than going through
-    :func:`~lance_etl.indexing.optimize.merge_index_deltas`, which would re-open the dataset and
-    recompute the same count a second time. The ``index.deltas_merged`` telemetry increment and
-    the "merged N index deltas" log line are reproduced here to match that helper's behavior.
-
-    Args:
-        uri: Dataset URI.
-        index_name: The index whose deltas to bound.
-        config: Indexing configuration.
-        telemetry: Telemetry facade for the current executor process.
-
-    Returns:
-        ``True`` if a merge ran.
-    """
-    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-    if index_name not in {description.name for description in dataset.describe_indices()}:
-        return False
-    deltas: int = index_delta_count(dataset, index_name)
-    if deltas <= config.max_index_deltas:
-        return False
-    with telemetry.timed("index.delta_merge_ms", tags=[f"index:{index_name}"]):
-        optimize_existing_index(uri, index_name, config, telemetry, num_indices_to_merge=deltas)
-        telemetry.incr("index.deltas_merged", tags=[f"index:{index_name}"])
-        logger.info("merged %d index deltas into one for %s on %s", deltas, index_name, uri)
-        return True
-
-
 class LanceIndexer:
     """Builds the configured indices over a Lance fleet with unified task-based phases."""
 
@@ -1072,7 +1083,7 @@ class LanceIndexer:
             executor_telemetry: Telemetry = Telemetry.create(config.telemetry)
             for uri, index_name in items:
                 try:
-                    yield uri, index_name, merge_deltas_if_needed(uri, index_name, config, executor_telemetry)
+                    yield uri, index_name, merge_index_deltas(uri, index_name, config, executor_telemetry)
                 except Exception as exc:
                     logger.warning(
                         "index delta bound failed for %s on %s, leaving deltas for next run: %s",
@@ -1224,7 +1235,10 @@ class LanceIndexer:
                     (uri, item["index"])
                     for uri, stats in stats_by_uri.items()
                     for item in stats["indexes"]
-                    if int(item.get("segments", 0)) > 0 and kind_by_index.get((uri, item["index"])) != FTS_KIND
+                    if (
+                        (int(item.get("segments", 0)) > 0 and kind_by_index.get((uri, item["index"])) != FTS_KIND)
+                        or bool(item.get("needs_delta_merge", False))
+                    )
                 }
             )
             merged_flags: dict[tuple[str, str], bool] = self.bound_fleet_deltas(spark, delta_entries)
@@ -1233,6 +1247,7 @@ class LanceIndexer:
                     key = (uri, item["index"])
                     if key in merged_flags:
                         item["deltas_merged"] = merged_flags[key]
+                    item.pop("needs_delta_merge", None)
                 stats.pop("version", None)
 
             results: list[dict[str, Any]] = [stats_by_uri[uri] for uri in dataset_uris]

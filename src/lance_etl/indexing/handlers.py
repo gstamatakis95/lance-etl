@@ -185,22 +185,9 @@ class VectorIndexHandler(IndexHandler):
     back with :func:`~lance_etl.indexing.optimize.load_vector_config` and the centroids are read
     sidecar-first with :func:`~lance_etl.indexing.optimize.load_centroids`, falling back to the
     committed index via :meth:`lance.LanceDataset.get_ivf_model` and backfilling the sidecar
-    best-effort on a miss. The ``cached_artifacts`` field memoizes the prepare result within one
-    build call so the replan loop does not re-read when a stale-fragment rebuild triggers a second
-    ``prepare``.
+    best-effort on a miss. Each executor shard creates one handler and calls ``prepare`` once, so
+    artifacts are resolved directly without per-instance memoization.
     """
-
-    def __init__(self, config: IndexJobConfig, column: str, index_name: str) -> None:
-        """Initialize the handler.
-
-        Args:
-            config: Indexing configuration.
-            column: The vector column to index.
-            index_name: The index name to publish under.
-        """
-        super().__init__(config, column, index_name)
-        self.reused_artifacts: bool = False
-        self.cached_artifacts: tuple | None = None
 
     def index_type(self) -> str:
         """Return the vector index type.
@@ -305,8 +292,7 @@ class VectorIndexHandler(IndexHandler):
                     self.index_name,
                     dataset.uri,
                 )
-                return True
-            return False
+            return True
         if not config_reusable(cfg, self.dimension(dataset), self.config.metric, IVF_RQ_NUM_BITS):
             logger.warning(
                 "stored vector config for %s on %s no longer matches the current configuration; "
@@ -369,8 +355,7 @@ class VectorIndexHandler(IndexHandler):
     def prepare(self, dataset: lance.LanceDataset, uri: str, telemetry: Telemetry) -> tuple:
         """Resolve this dataset's reusable IVF_RQ artifacts, reading centroids sidecar-first.
 
-        Returns the memoized result immediately on subsequent calls within the same build. The
-        centroids come from :meth:`resolve_centroids` (sidecar cache first, committed-index
+        The centroids come from :meth:`resolve_centroids` (sidecar cache first, committed-index
         fallback with best-effort backfill), the ``rabitq_model`` string from the stored config,
         and the partition count as ``len(centroids)`` (equal to the stored ``num_partitions`` by
         the bootstrap invariant, and always consistent with the centroid array).
@@ -393,9 +378,6 @@ class VectorIndexHandler(IndexHandler):
             RuntimeError: If the artifacts are not reusable. The plan phase should have chosen
                 a bootstrap build for this index.
         """
-        if self.cached_artifacts is not None:
-            return self.cached_artifacts
-
         config: IndexJobConfig = self.config
         cfg: dict[str, Any] | None = load_vector_config(dataset, self.column)
         committed: set[str] = {description.name for description in dataset.describe_indices()}
@@ -410,15 +392,13 @@ class VectorIndexHandler(IndexHandler):
                 "the plan phase should have chosen a streaming bootstrap build"
             )
         centroids: pa.Array = self.resolve_centroids(dataset, uri, cfg, telemetry)
-        self.reused_artifacts = True
         telemetry.incr("artifacts.reused")
-        self.cached_artifacts = (
+        return (
             centroids,
             cfg["rabitq_model"],
             IVF_RQ_NUM_BITS,
             len(centroids),
         )
-        return self.cached_artifacts
 
     def build_segment(self, dataset: lance.LanceDataset, fragment_ids: list[int], artifacts: object | None) -> Index:
         """Build one IVF_RQ segment over a shard of fragments.

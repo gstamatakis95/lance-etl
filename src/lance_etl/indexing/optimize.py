@@ -240,13 +240,16 @@ def merge_index_deltas(uri: str, index_name: str, config: IndexJobConfig, teleme
         ``True`` if a merge ran, ``False`` when the delta count was within the cap.
     """
     dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+    if index_name not in {description.name for description in dataset.describe_indices()}:
+        return False
     deltas: int = index_delta_count(dataset, index_name)
     if deltas <= config.max_index_deltas:
         return False
-    optimize_existing_index(uri, index_name, config, telemetry, num_indices_to_merge=deltas)
-    telemetry.incr("index.deltas_merged", tags=[f"index:{index_name}"])
-    logger.info("merged %d index deltas into one for %s on %s", deltas, index_name, uri)
-    return True
+    with telemetry.timed("index.delta_merge_ms", tags=[f"index:{index_name}"]):
+        optimize_existing_index(uri, index_name, config, telemetry, num_indices_to_merge=deltas)
+        telemetry.incr("index.deltas_merged", tags=[f"index:{index_name}"])
+        logger.info("merged %d index deltas into one for %s on %s", deltas, index_name, uri)
+        return True
 
 
 def maintain_index_locally(uri: str, index_name: str, config: IndexJobConfig, telemetry: Telemetry) -> bool:

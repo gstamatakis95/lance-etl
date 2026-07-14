@@ -224,7 +224,6 @@ def test_vector_segment_path_end_to_end(dataset_uri: str, telemetry: Telemetry) 
     new_targets: list[int] = handler.target_fragments(dataset)
     assert len(new_targets) == 1
     artifacts: object | None = handler.prepare(dataset, dataset_uri, telemetry)
-    assert handler.reused_artifacts is True
     documents: list[str] = []
     for group in split_evenly(new_targets, 2):
         segment: Index = handler.build_segment(lance.dataset(dataset_uri, version=dataset.version), group, artifacts)
@@ -261,11 +260,9 @@ def test_vector_segment_path_reuses_artifacts(dataset_uri: str, telemetry: Telem
 
     first_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
     first: object | None = first_handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
-    assert first_handler.reused_artifacts is True
 
     second_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
     second: object | None = second_handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
-    assert second_handler.reused_artifacts is True
 
     assert first[0].equals(second[0])
     assert second[1] == first[1] == cfg["rabitq_model"]
