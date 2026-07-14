@@ -26,6 +26,7 @@ from bench.experiment import run_experiment
 from bench.indexes import run_index
 from bench.ingest import run_ingest
 from bench.prepare import run_prepare
+from bench.qualification import run_qualification
 from bench.report import run_report
 from bench.results import save_phase, write_json
 from bench.search import run_search
@@ -42,6 +43,7 @@ PHASE_RUNNERS: dict[str, Callable[[BenchConfig], dict[str, Any]]] = {
     "report": run_report,
     "e2e": run_e2e,
     "experiment": run_experiment,
+    "qualify": run_qualification,
 }
 
 

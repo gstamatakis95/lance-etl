@@ -4,6 +4,7 @@ use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use search_api::catalog::PostgresServingCatalog;
 use search_api::config::Config;
 use search_api::grpc::{RouteTimeoutLayer, SearchGrpc};
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
@@ -96,7 +97,8 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     });
     let telemetry_guard = telemetry::init_tracing(config.telemetry_disabled, metrics.clone());
     let addr: SocketAddr = ([0, 0, 0, 0], config.port).into();
-    let provider = CachingDatasetProvider::with_telemetry(&config, metrics.clone()).await;
+    let catalog = Arc::new(PostgresServingCatalog::connect(&config.database_url).await?);
+    let provider = CachingDatasetProvider::with_catalog_and_telemetry(&config, catalog, metrics.clone()).await;
     if let Some(janitor) = provider.janitor(&config) {
         janitor.spawn(std::time::Duration::from_secs(
             search_api::config::DEFAULT_DISK_CACHE_SWEEP_SECS,
@@ -104,11 +106,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     }
     let backend = Arc::new(LanceSearchBackend::new(provider).with_metrics(metrics.clone()));
 
-    let recall = RecallCapture::new(
-        search_api::config::DEFAULT_RECALL_SAMPLE_RATE,
-        search_api::config::DEFAULT_ID_COLUMN,
-        metrics.clone(),
-    );
+    let recall = RecallCapture::new(search_api::config::DEFAULT_RECALL_SAMPLE_RATE, metrics.clone());
     let service = SearchGrpc::with_metrics(backend, metrics.clone()).with_recall(recall);
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter

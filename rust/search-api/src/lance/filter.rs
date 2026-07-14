@@ -54,9 +54,9 @@ pub fn time_range_to_expr(range: &TimeRange, column: &str, data_type: &DataType)
 
 /// Which side of the half-open `[start, end)` window a bound literal sits on.
 ///
-/// Needed by resolutions coarser than a millisecond: the start bound rounds down and the end
-/// bound rounds up, so the coarse predicate covers a superset of the requested window instead of
-/// silently dropping rows whose second-resolution value truncated past a bound.
+/// Needed by resolutions coarser than a millisecond: both bounds round up. A second-resolution
+/// timestamp is an exact instant at a whole second, so this preserves the millisecond half-open
+/// interval without admitting a row from the second before a non-aligned start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimeBound {
     /// The inclusive lower bound (`column >= start`).
@@ -75,8 +75,8 @@ enum TimeBound {
 /// other column type is rejected as an invalid argument. Scaling to microsecond or nanosecond
 /// resolution goes through `checked_mul`: an epoch-millisecond bound near `i64::MAX` would
 /// otherwise wrap in release builds and silently produce the wrong time predicate, so an
-/// out-of-range bound is rejected instead. Scaling down to second resolution rounds according to
-/// `bound` (start floors, end ceils), keeping the coarse window conservative-correct.
+/// out-of-range bound is rejected instead. Scaling down to second resolution rounds both bounds
+/// up, preserving exact membership for whole-second instants.
 fn time_literal(epoch_ms: i64, data_type: &DataType, bound: TimeBound) -> Result<Expr, SearchError> {
     match data_type {
         DataType::Timestamp(unit, tz) => {
@@ -108,17 +108,14 @@ fn time_literal(epoch_ms: i64, data_type: &DataType, bound: TimeBound) -> Result
 
 /// Converts an epoch-millisecond bound to whole seconds with bound-aware rounding.
 ///
-/// The start bound floors and the end bound ceils, so the second-resolution window
-/// `[floor(start), ceil(end))` is a superset of the requested millisecond window: a
-/// second-resolution row overlapping the requested window is never excluded. Both roundings use
-/// euclidean division so negative (pre-epoch) bounds round in the same direction as positive
-/// ones.
+/// Both bounds ceil, so the second-resolution window `[ceil(start), ceil(end))` contains exactly
+/// the whole-second instants in the requested millisecond window. Euclidean division keeps
+/// negative pre-epoch bounds correct.
 fn epoch_ms_to_seconds(epoch_ms: i64, bound: TimeBound) -> i64 {
     let floor = epoch_ms.div_euclid(MILLIS_PER_SECOND);
-    match bound {
-        TimeBound::Start => floor,
-        TimeBound::End if epoch_ms.rem_euclid(MILLIS_PER_SECOND) == 0 => floor,
-        TimeBound::End => floor + 1,
+    match (bound, epoch_ms.rem_euclid(MILLIS_PER_SECOND)) {
+        (_, 0) => floor,
+        (TimeBound::Start | TimeBound::End, _) => floor + 1,
     }
 }
 
@@ -478,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn time_range_on_a_second_resolution_column_rounds_conservatively() {
+    fn time_range_on_a_second_resolution_column_preserves_millisecond_semantics() {
         let seconds = DataType::Timestamp(TimeUnit::Second, None);
         let expr = time_range_to_expr(
             &TimeRange {
@@ -491,11 +488,11 @@ mod tests {
         .unwrap()
         .unwrap();
         let expected = col("event_timestamp")
-            .gt_eq(lit(ScalarValue::TimestampSecond(Some(1), None)))
+            .gt_eq(lit(ScalarValue::TimestampSecond(Some(2), None)))
             .and(col("event_timestamp").lt(lit(ScalarValue::TimestampSecond(Some(3), None))));
         assert_eq!(
             expr, expected,
-            "the start bound must floor and the end bound must ceil so the coarse window is a superset"
+            "both bounds must ceil so coarse storage never admits values outside the millisecond window"
         );
 
         let exact = time_range_to_expr(
@@ -524,11 +521,11 @@ mod tests {
         .unwrap()
         .unwrap();
         let expected_negative = col("event_timestamp")
-            .gt_eq(lit(ScalarValue::TimestampSecond(Some(-2), None)))
+            .gt_eq(lit(ScalarValue::TimestampSecond(Some(-1), None)))
             .and(col("event_timestamp").lt(lit(ScalarValue::TimestampSecond(Some(0), None))));
         assert_eq!(
             negative, expected_negative,
-            "pre-epoch bounds must round in the same conservative directions"
+            "pre-epoch bounds must preserve the same millisecond semantics"
         );
     }
 

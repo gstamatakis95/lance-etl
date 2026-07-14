@@ -1,0 +1,99 @@
+//! PostgreSQL implementation of the exact serving catalog.
+
+use bb8::Pool;
+use bb8_postgres::PostgresConnectionManager;
+use native_tls::TlsConnector;
+use postgres_native_tls::MakeTlsConnector;
+use tokio_postgres::{Config, config::SslMode};
+
+use crate::domain::{DatasetTarget, SearchError, ServingCatalog, ServingRoute};
+
+/// Fixed maximum number of PostgreSQL connections used by one search process.
+const CATALOG_POOL_SIZE: u32 = 16;
+
+/// PostgreSQL-backed serving catalog over the three-table control plane.
+pub struct PostgresServingCatalog {
+    pool: Pool<PostgresConnectionManager<MakeTlsConnector>>,
+}
+
+impl PostgresServingCatalog {
+    /// Connects a bounded pool to the control-plane PostgreSQL database.
+    pub async fn connect(database_url: &str) -> Result<Self, String> {
+        let config = catalog_config(database_url)?;
+        let connector = TlsConnector::builder()
+            .build()
+            .map_err(|error| format!("failed to configure serving catalog TLS: {error}"))?;
+        let manager = PostgresConnectionManager::new(config, MakeTlsConnector::new(connector));
+        let pool = Pool::builder()
+            .max_size(CATALOG_POOL_SIZE)
+            .build(manager)
+            .await
+            .map_err(|error| format!("failed to connect to the serving catalog: {error}"))?;
+        Ok(Self { pool })
+    }
+}
+
+/// Parses a PostgreSQL URL and rejects any configuration that permits plaintext transport.
+fn catalog_config(database_url: &str) -> Result<Config, String> {
+    let normalized_url = database_url.replacen("postgresql+psycopg://", "postgresql://", 1);
+    let config = normalized_url
+        .parse::<Config>()
+        .map_err(|error| format!("invalid LANCE_ETL_DATABASE_URL: {error}"))?;
+    if config.get_ssl_mode() != SslMode::Require {
+        return Err("LANCE_ETL_DATABASE_URL must set sslmode=require".to_owned());
+    }
+    Ok(config)
+}
+
+#[async_trait::async_trait]
+impl ServingCatalog for PostgresServingCatalog {
+    async fn resolve(&self, target: &DatasetTarget) -> Result<ServingRoute, SearchError> {
+        target.validate()?;
+        let connection = self
+            .pool
+            .get()
+            .await
+            .map_err(|error| SearchError::unavailable(format!("serving catalog unavailable: {error}")))?;
+        let row = connection
+            .query_opt(
+                "SELECT served_lance_uri, served_lance_version, profile_id FROM targets WHERE tenant_id = $1 AND namespace = $2 AND org_id = $3",
+                &[&target.tenant_id, &target.namespace, &target.org_id],
+            )
+            .await
+            .map_err(|error| SearchError::unavailable(format!("serving catalog query failed: {error}")))?
+            .ok_or_else(|| SearchError::not_found("target is not published"))?;
+        let lance_uri = row
+            .try_get::<_, Option<String>>(0)
+            .map_err(|error| SearchError::internal(format!("invalid serving catalog URI: {error}")))?
+            .ok_or_else(|| SearchError::not_found("target is not published"))?;
+        let raw_version = row
+            .try_get::<_, Option<i64>>(1)
+            .map_err(|error| SearchError::internal(format!("invalid serving catalog version: {error}")))?
+            .ok_or_else(|| SearchError::not_found("target is not published"))?;
+        let lance_version = u64::try_from(raw_version)
+            .ok()
+            .filter(|version| *version > 0)
+            .ok_or_else(|| SearchError::internal("serving catalog contains an invalid Lance version"))?;
+        let profile_id = row
+            .try_get::<_, String>(2)
+            .map_err(|error| SearchError::internal(format!("invalid serving catalog profile: {error}")))?;
+        Ok(ServingRoute {
+            lance_uri,
+            lance_version,
+            profile_id,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::catalog_config;
+
+    #[test]
+    fn catalog_transport_requires_tls() {
+        let plaintext = catalog_config("postgresql://localhost/control?sslmode=disable").unwrap_err();
+        assert!(plaintext.contains("sslmode=require"));
+        catalog_config("postgresql://localhost/control?sslmode=require").unwrap();
+        catalog_config("postgresql+psycopg://localhost/control?sslmode=require").unwrap();
+    }
+}

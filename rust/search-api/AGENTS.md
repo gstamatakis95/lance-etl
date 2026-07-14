@@ -154,12 +154,9 @@ variable table. These finer-grained normative facts are recorded here so they ar
   and `filter_mode` (field 9) that are ANDed into both the vector leg and the text leg
   independently. When a leg already carries its own filter the two predicates are combined with a
   typed `AND` node. Absent means no additional predicate beyond what each leg specifies.
-- **Fusion and rerank.** `RrfFusion` (default, reciprocal-rank fusion with configurable `rrf_k`) or
-  `WeightedFusion` (min-max normalized legs combined by `vector_weight`). Post-fusion reranking:
-  `IdentityRerank` (no-op identity, with optional `top_n` truncation) is the only shipped strategy
-  and is the seam where a cross-encoder or LLM reranker slots in without changing the request shape.
-- **Prewarm.** The `Prewarm` RPC accepts `version` (explicit committed version id) or `tag`
-  (resolves the named tag at call time) and returns `resolved_version`, enabling the safe
-  green-before-flip workflow: build the green version, prewarm every replica against it explicitly,
-  confirm `resolved_version`, then move the fixed production `HEAD` tag. `DatasetRef::Serve`
-  always resolves `HEAD`. Never move `HEAD` before warming.
+- **Fusion.** Public `HybridSearch` accepts only the closed product modes `BALANCED`,
+  `SEMANTIC_PRIORITY`, and `LEXICAL_PRIORITY`. The service maps them to fixed code-owned fusion
+  policy. It never accepts raw weights or reciprocal-rank constants.
+- **Serving resolution.** Public search requests carry only `DatasetTarget`. The server resolves it
+  through `ServingCatalog` to an allowlisted URI, exact committed version, and profile. URI,
+  version, tag, prewarm, and IVF-cluster inspection are not public search surfaces.

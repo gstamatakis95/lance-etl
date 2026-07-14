@@ -1,20 +1,19 @@
 //! Integration tests for the per-route request timeouts: builds the REAL production server stack
 //! (OpenTelemetry layer plus [`RouteTimeoutLayer::from_defaults`], the same chain `main.rs`
 //! installs) over a controllable slow backend and asserts that a slow search is cut off at the
-//! default budget while a slow prewarm survives well past it.
+//! default budget while a fast search passes unchanged.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use search_api::domain::{
-    ClusterReader, ClusterReport, ClusterSpec, DatasetRef, DatasetTarget, HybridQuery, HybridSearchOutcome,
-    PrewarmReport, PrewarmSpec, Prewarmer, SearchBackend, SearchError, TextQuery, TextSearchOutcome, VectorQuery,
-    VectorSearchOutcome,
+    DatasetTarget, HybridQuery, HybridSearchOutcome, SearchBackend, SearchError, TextQuery, TextSearchOutcome,
+    VectorQuery, VectorSearchOutcome,
 };
 use search_api::grpc::{RouteTimeoutLayer, SearchGrpc};
 use search_api::pb::search_service_client::SearchServiceClient;
 use search_api::pb::search_service_server::SearchServiceServer;
-use search_api::pb::{PrewarmRequest, VectorQuery as VectorQueryProto, VectorSearchRequest};
+use search_api::pb::{VectorQuery as VectorQueryProto, VectorSearchRequest};
 use search_api::telemetry::{self, Metrics};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Code;
@@ -26,7 +25,6 @@ use tonic_tracing_opentelemetry::middleware::server::OtelGrpcLayer;
 /// each RPC past or under the server-side budgets.
 struct SlowBackend {
     search_delay: Duration,
-    prewarm_delay: Duration,
 }
 
 impl SearchBackend for SlowBackend {
@@ -36,7 +34,10 @@ impl SearchBackend for SlowBackend {
         _query: VectorQuery,
     ) -> Result<VectorSearchOutcome, SearchError> {
         tokio::time::sleep(self.search_delay).await;
-        Ok(VectorSearchOutcome::default())
+        Ok(VectorSearchOutcome {
+            served_version: 1,
+            ..Default::default()
+        })
     }
 
     async fn text_search(&self, _target: &DatasetTarget, _query: TextQuery) -> Result<TextSearchOutcome, SearchError> {
@@ -51,35 +52,6 @@ impl SearchBackend for SlowBackend {
     ) -> Result<HybridSearchOutcome, SearchError> {
         tokio::time::sleep(self.search_delay).await;
         Ok(HybridSearchOutcome::default())
-    }
-}
-
-impl Prewarmer for SlowBackend {
-    async fn prewarm(
-        &self,
-        _target: &DatasetTarget,
-        _spec: PrewarmSpec,
-        _reference: DatasetRef,
-    ) -> Result<PrewarmReport, SearchError> {
-        tokio::time::sleep(self.prewarm_delay).await;
-        Ok(PrewarmReport {
-            metadata_warmed: true,
-            indexes: Vec::new(),
-            metadata_duration: Duration::ZERO,
-            total_duration: self.prewarm_delay,
-            index_cache_size_bytes: 0,
-            resolved_version: 1,
-        })
-    }
-}
-
-impl ClusterReader for SlowBackend {
-    async fn clusters(&self, _target: &DatasetTarget, _spec: ClusterSpec) -> Result<ClusterReport, SearchError> {
-        Ok(ClusterReport {
-            centroids: Vec::new(),
-            dimension: 0,
-            index_name: "vector_idx".to_string(),
-        })
     }
 }
 
@@ -116,10 +88,9 @@ fn target() -> Option<search_api::pb::DatasetTarget> {
 }
 
 #[tokio::test]
-async fn slow_search_is_cut_off_while_slow_prewarm_survives_past_the_search_budget() {
+async fn slow_search_is_cut_off_at_the_search_budget() {
     let channel = serve_slow(SlowBackend {
         search_delay: Duration::from_secs(3),
-        prewarm_delay: Duration::from_millis(1_500),
     })
     .await;
     let mut client = SearchServiceClient::new(channel);
@@ -127,15 +98,14 @@ async fn slow_search_is_cut_off_while_slow_prewarm_survives_past_the_search_budg
     let started = Instant::now();
     let status = client
         .vector_search(VectorSearchRequest {
-            rerank: None,
             time_range: None,
-            version_ref: None,
             target: target(),
             query: Some(VectorQueryProto {
                 vector: vec![1.0, 0.0, 0.0, 0.0],
-                k: 1,
-                ..Default::default()
             }),
+            k: 1,
+            filter: None,
+            projection: Vec::new(),
         })
         .await
         .unwrap_err();
@@ -149,42 +119,25 @@ async fn slow_search_is_cut_off_while_slow_prewarm_survives_past_the_search_budg
         search_elapsed < Duration::from_millis(2_500),
         "the cutoff must fire at the 800 ms budget, not wait out the handler: {search_elapsed:?}"
     );
-
-    let response = client
-        .prewarm(PrewarmRequest {
-            target: target(),
-            metadata: true,
-            all_indexes: true,
-            index_names: vec![],
-            fts_with_position: false,
-            version_ref: None,
-        })
-        .await
-        .expect("a prewarm slower than the search budget must survive under the long budget")
-        .into_inner();
-    assert!(response.metadata_warmed);
-    assert_eq!(response.resolved_version, 1);
 }
 
 #[tokio::test]
 async fn fast_search_passes_through_the_timeout_layer_untouched() {
     let channel = serve_slow(SlowBackend {
         search_delay: Duration::from_millis(10),
-        prewarm_delay: Duration::from_millis(10),
     })
     .await;
     let mut client = SearchServiceClient::new(channel);
     let response = client
         .vector_search(VectorSearchRequest {
-            rerank: None,
             time_range: None,
-            version_ref: None,
             target: target(),
             query: Some(VectorQueryProto {
                 vector: vec![1.0, 0.0, 0.0, 0.0],
-                k: 1,
-                ..Default::default()
             }),
+            k: 1,
+            filter: None,
+            projection: Vec::new(),
         })
         .await
         .unwrap()

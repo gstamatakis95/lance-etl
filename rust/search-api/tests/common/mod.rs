@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::types::Float32Type;
-use arrow_array::{FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{BooleanArray, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -26,7 +26,7 @@ use object_store::{
     PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
 };
 use search_api::config::Config;
-use search_api::domain::DatasetTarget;
+use search_api::domain::{DatasetTarget, SearchError, ServingCatalog, ServingRoute};
 
 /// Vector dimension of the test dataset.
 pub const DIM: i32 = 4;
@@ -34,6 +34,41 @@ pub const DIM: i32 = 4;
 /// The org/tenant/namespace every disk-cache test dataset lives under.
 pub fn test_target() -> DatasetTarget {
     DatasetTarget::new("org1", "tenant1", "ns1")
+}
+
+/// Exact one-target catalog fake used by search and provider integration tests.
+pub struct FakeServingCatalog {
+    target: DatasetTarget,
+    route: ServingRoute,
+    /// Number of validated catalog lookups.
+    pub calls: AtomicU64,
+}
+
+impl FakeServingCatalog {
+    /// Creates a fake returning one exact published tuple.
+    pub fn new(target: DatasetTarget, lance_uri: impl Into<String>, lance_version: u64) -> Self {
+        Self {
+            target,
+            route: ServingRoute {
+                lance_uri: lance_uri.into(),
+                lance_version,
+                profile_id: "default".to_string(),
+            },
+            calls: AtomicU64::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl ServingCatalog for FakeServingCatalog {
+    async fn resolve(&self, target: &DatasetTarget) -> Result<ServingRoute, SearchError> {
+        target.validate()?;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if target != &self.target {
+            return Err(SearchError::not_found("target is not published"));
+        }
+        Ok(self.route.clone())
+    }
 }
 
 /// Relative dataset path of [`test_target`] under the base URI.
@@ -193,6 +228,8 @@ impl ObjectStore for CountingStore {
 /// positions on `text` plus a BTree index on `id`, so prewarm has both FTS and scalar targets.
 pub async fn build_indexed_dataset(uri: &str) {
     let schema = Arc::new(Schema::new(vec![
+        Field::new("vector_id", DataType::Utf8, false),
+        Field::new("is_deleted", DataType::Boolean, false),
         Field::new("id", DataType::Int32, false),
         Field::new("text", DataType::Utf8, false),
         Field::new(
@@ -213,6 +250,8 @@ pub async fn build_indexed_dataset(uri: &str) {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
+            Arc::new(StringArray::from(vec!["v1", "v2", "v3", "v4"])),
+            Arc::new(BooleanArray::from(vec![false, false, false, false])),
             Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
             Arc::new(StringArray::from(vec![
                 "red apple pie",
@@ -254,6 +293,7 @@ pub async fn build_indexed_dataset(uri: &str) {
 pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) -> Config {
     Config {
         base_uri: format!("file-object-store://{}", dataset_root.display()),
+        database_url: "postgresql://unused/test".to_string(),
         dataset_cache_capacity: 16,
         index_cache_bytes: 64 * 1024 * 1024,
         metadata_cache_bytes: 64 * 1024 * 1024,

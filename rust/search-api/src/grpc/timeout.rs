@@ -1,11 +1,7 @@
 //! Per-route request timeouts for the gRPC server.
 //!
-//! A single global tonic timeout cannot serve this API: search RPCs need a tight sub-second
-//! budget while `SearchService/Prewarm` legitimately loads every requested IVF partition and
-//! BTree page over the object store. [`RouteTimeoutLayer`] therefore matches the gRPC method path
-//! of each request and applies the default search budget to everything except the routes in
-//! [`LONG_TIMEOUT_ROUTES`], which get the long budget instead. A request that exceeds its budget
-//! is answered with a `DEADLINE_EXCEEDED` gRPC status, never a hung connection.
+//! Every public route receives the fixed search budget. A request that exceeds it is answered with
+//! a `DEADLINE_EXCEEDED` gRPC status, never a hung connection.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -19,11 +15,8 @@ use tower::{Layer, Service};
 use crate::config::{DEFAULT_LONG_REQUEST_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS};
 use crate::telemetry::{Metrics, Rpc};
 
-/// gRPC method paths that get the long timeout budget instead of the search default.
-///
-/// `Prewarm` walks every requested index over the object store, so it would be killed mid-flight
-/// by the sub-second search budget.
-pub const LONG_TIMEOUT_ROUTES: [&str; 1] = ["/lance_etl.v1.SearchService/Prewarm"];
+/// No public route receives the internal long-operation timeout budget.
+pub const LONG_TIMEOUT_ROUTES: [&str; 0] = [];
 
 /// Tower layer applying a per-route server-side timeout to every request.
 ///
@@ -149,8 +142,6 @@ fn rpc_for_path(path: &str) -> Option<Rpc> {
         "/lance_etl.v1.SearchService/VectorSearch" => Some(Rpc::VectorSearch),
         "/lance_etl.v1.SearchService/TextSearch" => Some(Rpc::TextSearch),
         "/lance_etl.v1.SearchService/HybridSearch" => Some(Rpc::HybridSearch),
-        "/lance_etl.v1.SearchService/Prewarm" => Some(Rpc::Prewarm),
-        "/lance_etl.v1.SearchService/Clusters" => Some(Rpc::Clusters),
         _ => None,
     }
 }
@@ -203,11 +194,10 @@ mod tests {
         let layer = RouteTimeoutLayer::from_defaults(Arc::new(Metrics::disabled()));
         let default = Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS);
         let long = Duration::from_millis(DEFAULT_LONG_REQUEST_TIMEOUT_MS);
-        assert_eq!(layer.budget_for("/lance_etl.v1.SearchService/Prewarm"), long);
+        assert_ne!(default, long);
         assert_eq!(layer.budget_for("/lance_etl.v1.SearchService/VectorSearch"), default);
         assert_eq!(layer.budget_for("/lance_etl.v1.SearchService/TextSearch"), default);
         assert_eq!(layer.budget_for("/lance_etl.v1.SearchService/HybridSearch"), default);
-        assert_eq!(layer.budget_for("/lance_etl.v1.SearchService/Clusters"), default);
         assert_eq!(layer.budget_for("/grpc.health.v1.Health/Check"), default);
     }
 
@@ -254,20 +244,16 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn long_route_survives_past_the_default_budget() {
+    async fn unlisted_route_uses_the_default_budget() {
         let layer = RouteTimeoutLayer::new(Duration::from_millis(800), Duration::from_secs(600));
         let mut service = layer.layer(SleepyService {
             delay: Duration::from_secs(5),
         });
         let response = service
-            .call(request_for("/lance_etl.v1.SearchService/Prewarm"))
+            .call(request_for("/lance_etl.internal.Admin/Prewarm"))
             .await
             .unwrap();
-        assert_eq!(
-            grpc_status_header(&response),
-            None,
-            "a slow prewarm must complete normally under the long budget"
-        );
+        assert_eq!(grpc_status_header(&response), Some("4"));
     }
 
     #[test]

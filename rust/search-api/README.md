@@ -16,15 +16,15 @@ One gRPC service defined in `proto/lance_etl/v1/lance_etl.proto` (package `lance
 
 | RPC | Purpose |
 |---|---|
-| `SearchService/VectorSearch` | Nearest-neighbor search, optional rerank, optional event-time window |
-| `SearchService/TextSearch` | BM25 full-text search, optional rerank, optional event-time window |
-| `SearchService/HybridSearch` | Fused vector + text (RRF or weighted), optional request-level typed filter applied to both legs |
-| `SearchService/Prewarm` | Pulls caches for a dataset at an explicit version or tag |
-| `SearchService/Clusters` | Reads the IVF centroid vectors of a vector index |
+| `SearchService/VectorSearch` | Nearest-neighbor search with a typed filter and optional event-time window |
+| `SearchService/TextSearch` | BM25 full-text search with a typed filter and optional event-time window |
+| `SearchService/HybridSearch` | Vector and text search fused by a code-owned product mode |
 
-Every request carries a `DatasetTarget` (`org_id`, `tenant_id`, `namespace`) that resolves to
-exactly one dataset at `{base_uri}/{org_id}/{tenant_id}/{namespace}.lance`. There is no
-cross-dataset or cross-org query surface anywhere in the API.
+Every request carries only a logical `DatasetTarget` (`org_id`, `tenant_id`, `namespace`). The
+server resolves it through PostgreSQL to an allowlisted Lance URI, exact committed version, and
+code-owned serving profile. Clients cannot select a URI, version, tag, index, ANN execution knob,
+physical row identifier, result offset, or raw fusion weight. There is no cross-dataset or
+cross-org query surface anywhere in the API.
 
 ---
 
@@ -42,10 +42,10 @@ crate-root doc comment in `src/lib.rs` for the authoritative statement):
 | `telemetry` | `src/telemetry/` | Datadog tracing/metrics/logging facade, usable from every layer above `domain`. |
 
 Extension points follow directly from this layering (see `src/lib.rs` for the full list). A new
-search engine implements `domain::SearchBackend` (+ `Prewarmer`, `ClusterReader`) purely in
-domain types and the transport needs no change. A new dataset-resolution strategy implements
-`lance::DatasetProvider`. A new persistence backend implements `cache::entry_store::EntryStore`. A
-new fusion strategy is a variant on `domain::FusionSpec`.
+search engine implements `domain::SearchBackend` purely in domain types and the transport needs no
+change. A new serving catalog implements `domain::ServingCatalog`. A new dataset-resolution
+strategy implements `lance::DatasetProvider`. A new persistence backend implements
+`cache::entry_store::EntryStore`. A new fusion strategy is a variant on `domain::FusionSpec`.
 
 ### Module map
 
@@ -53,7 +53,8 @@ new fusion strategy is a variant on `domain::FusionSpec`.
 |---|---|---|
 | `domain::filter` | `Filter`, `CompareOp`, `Literal` | Typed predicate AST — no raw SQL accepted anywhere |
 | `domain::query` | `VectorQuery`, `TextQuery`, `HybridQuery`, `Hit`, `FusedHit` | Query and result types |
-| `domain::target` | `DatasetTarget`, `DatasetRef` | Dataset addressing and version/tag selection |
+| `domain::target` | `DatasetTarget`, `DatasetRef` | Validated logical addressing and internal snapshot selection |
+| `domain::catalog` | `ServingCatalog`, `ServingRoute` | Logical-target to exact-serving-route contract |
 | `domain::backend` | `SearchBackend` | The engine trait: `vector_search` / `text_search` / `hybrid_search` |
 | `domain::prewarm` | `PrewarmSpec`, `PrewarmReport`, `Prewarmer` | Cache-warming trait |
 | `domain::clusters` | `ClusterSpec`, `ClusterReport`, `ClusterReader` | IVF centroid introspection trait |
@@ -66,7 +67,8 @@ new fusion strategy is a variant on `domain::FusionSpec`.
 | `cache::layout` | `LANCE_CACHE_STAMP`, `CACHE_SCHEMA_VERSION`, frame/hash helpers | Versioned stamp naming, key hashing, checksummed framing, atomic writes |
 | `cache::janitor` | (sweep loop) | Periodic TTL + byte-budget sweep over the disk tiers |
 | `lance::backend` | `LanceSearchBackend<P>` | `SearchBackend` impl: single-dataset dispatch, vector/text/hybrid fusion, `object_store.*` span accounting |
-| `lance::provider` | `DatasetProvider`, `CachingDatasetProvider` | Shared `Session` + Moka LRU of open dataset handles, tag-version resolution |
+| `catalog` | `PostgresServingCatalog` | TLS-only PostgreSQL implementation of exact target resolution |
+| `lance::provider` | `DatasetProvider`, `CachingDatasetProvider` | Catalog validation, exact-version opens, shared `Session`, and handle LRU |
 | `lance::filter` | `filter_to_expr` | Domain `Filter` -> DataFusion `Expr` |
 | `lance::text` | (FTS param mapping) | Domain text query tree -> Lance FTS parameters |
 | `lance::rows` | (row conversion) | Arrow record batch -> JSON row conversion |
@@ -149,19 +151,18 @@ inherits: `enable_stable_row_ids` is rejected everywhere (ADR 0010,
 `docs/adr/rejected-and-operator-tools.md`), and one Lance dataset per org is firm — never add a
 shared-dataset or cross-org query mode to the domain or gRPC layers.
 
-**Query-at-a-tag.** Every search RPC carries an optional `version_ref` naming a committed version
-id or a tag (e.g. an ETL hourly interval tag). `DatasetRef::Serve` (the default) always resolves
-the fixed production `HEAD` tag. A pinned request opens exactly that snapshot, coexisting in the
-handle LRU with the production handle (ADR 0032, `docs/adr/serving-filters-and-tags.md`). Build the
-green version, prewarm every replica against it explicitly via the `Prewarm` RPC's `version`/`tag`
-field, verify the resolved version, then move `HEAD`. Never move `HEAD` before warming.
+**Catalog-pinned serving.** Public requests cannot choose a version or tag. `DatasetRef::Serve`
+resolves the validated logical target through `ServingCatalog`, rejects routes outside
+`LANCE_ETL_BASE_URI`, and opens exactly `served_lance_version`. Responses return that immutable
+`served_version`. Publication changes are therefore atomic catalog changes and an in-flight
+request remains pinned to the version it resolved.
 
 ---
 
 ## Configuration
 
 All configuration is read once at startup by `Config::from_env` in `src/config.rs`.
-`LANCE_ETL_BASE_URI` is the only required variable. Every other tuning knob (dataset-handle cache
+`LANCE_ETL_BASE_URI` and `LANCE_ETL_DATABASE_URL` are required. Every other tuning knob (dataset-handle cache
 sizing, index/metadata/disk cache budgets, serve-tag TTL, IO concurrency, ANN probe/refine/
 fast-search defaults, gRPC timeout and concurrency limits, the event-timestamp column, recall
 sampling, and the search `k` ceiling) is a fixed constant in `src/config.rs`, not an env knob.
@@ -169,6 +170,7 @@ sampling, and the search `k` ceiling) is a fixed constant in `src/config.rs`, no
 | Variable | Default | Purpose |
 |---|---|---|
 | `LANCE_ETL_BASE_URI` | (required) | Base URI all dataset paths resolve under: `{base}/{org_id}/{tenant_id}/{namespace}.lance` |
+| `LANCE_ETL_DATABASE_URL` | (required) | PostgreSQL control-plane URL. Must set `sslmode=require`. The `postgresql+psycopg://` scheme is accepted. |
 | `SEARCH_API_PORT` | `8080` | TCP port |
 | `SEARCH_API_CACHE_BACKEND` | `disk` | Persistent cache backend: `disk`, `redis`, or `memory` |
 | `SEARCH_API_REDIS_URL` | (none) | Redis connection URL (`redis://` or `rediss://`), required when the backend is `redis` |
@@ -210,6 +212,7 @@ The Redis cache-backend integration tests (`tests/redis_cache.rs`) spawn a throw
 ```bash
 cargo build --release
 LANCE_ETL_BASE_URI=s3://my-bucket/lance \
+  LANCE_ETL_DATABASE_URL='postgresql://search@catalog/control?sslmode=require' \
   SEARCH_API_PORT=8080 \
   ./target/release/search-api
 ```

@@ -179,6 +179,12 @@ pub const DEFAULT_LONG_REQUEST_TIMEOUT_MS: u64 = 600_000;
 /// so it is not an env knob.
 pub const DEFAULT_NEGATIVE_OPEN_TTL_SECS: u64 = 5;
 
+/// Fixed TTL for an exact PostgreSQL serving tuple cached in one search process.
+///
+/// Publication can therefore leave one replica on the prior validated version for at most this
+/// interval. The cache never substitutes latest or a tag-selected version.
+pub const DEFAULT_SERVING_CATALOG_TTL_SECS: u64 = 5;
+
 /// Fixed maximum concurrent streams (and connections) the gRPC server admits.
 ///
 /// Matches the per-process IO concurrency budget. Hardcoded: no deployment has ever retuned this,
@@ -227,6 +233,9 @@ pub struct Config {
     /// Base URI under which all datasets live, e.g. `s3://bucket/lance`. Each dataset resolves to
     /// `{base}/{org_id}/{tenant_id}/{namespace}.lance`.
     pub base_uri: String,
+    /// PostgreSQL control-plane URL used to resolve exact published serving tuples.
+    /// Env: `LANCE_ETL_DATABASE_URL`.
+    pub database_url: String,
     /// Weighted capacity of the open-`Dataset` handle LRU (default [`DEFAULT_DATASET_CACHE_CAPACITY`]).
     /// Fixed: no longer env-configurable.
     pub dataset_cache_capacity: u64,
@@ -270,8 +279,8 @@ pub struct Config {
 impl Config {
     /// Builds a configuration from environment variables.
     ///
-    /// `LANCE_ETL_BASE_URI` is required: the base URI all dataset paths are resolved under
-    /// (a trailing slash is stripped). Optional overrides: `SEARCH_API_PORT`,
+    /// `LANCE_ETL_BASE_URI` and `LANCE_ETL_DATABASE_URL` are required. The base URI is the only
+    /// object-store prefix catalog routes may use. Optional overrides: `SEARCH_API_PORT`,
     /// `SEARCH_API_CACHE_DIR`, `SEARCH_API_CACHE_BACKEND` (`disk`, `redis`, or `memory`),
     /// `SEARCH_API_REDIS_URL` (required for the `redis` backend), `SEARCH_API_REDIS_NAMESPACE`
     /// (default `search-api`), `SEARCH_API_STATSD_ADDR` (default honors `DD_AGENT_HOST`),
@@ -291,6 +300,11 @@ impl Config {
         if base_uri.is_empty() {
             return Err("LANCE_ETL_BASE_URI must be a non-empty base URI".to_string());
         }
+        let database_url =
+            std::env::var("LANCE_ETL_DATABASE_URL").map_err(|_| "LANCE_ETL_DATABASE_URL must be set".to_string())?;
+        if database_url.is_empty() {
+            return Err("LANCE_ETL_DATABASE_URL must be non-empty".to_string());
+        }
         let cache_backend = env_cache_backend()?;
         let redis_url = std::env::var("SEARCH_API_REDIS_URL").ok().filter(|url| !url.is_empty());
         if cache_backend == CacheBackendKind::Redis && redis_url.is_none() {
@@ -298,6 +312,7 @@ impl Config {
         }
         Ok(Self {
             base_uri,
+            database_url,
             dataset_cache_capacity: DEFAULT_DATASET_CACHE_CAPACITY,
             index_cache_bytes: DEFAULT_INDEX_CACHE_BYTES,
             metadata_cache_bytes: DEFAULT_METADATA_CACHE_BYTES,
@@ -375,11 +390,15 @@ mod tests {
     /// Runs `body` with the given env vars set, restoring the previous state afterwards.
     fn with_env(vars: &[(&str, Option<&str>)], body: impl FnOnce()) {
         let guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous: Vec<(String, Option<String>)> = vars
+        let mut effective = vars.to_vec();
+        if !effective.iter().any(|(name, _)| *name == "LANCE_ETL_DATABASE_URL") {
+            effective.push(("LANCE_ETL_DATABASE_URL", Some("postgresql://catalog/test")));
+        }
+        let previous: Vec<(String, Option<String>)> = effective
             .iter()
             .map(|(name, _)| ((*name).to_string(), std::env::var(name).ok()))
             .collect();
-        for (name, value) in vars {
+        for (name, value) in &effective {
             match value {
                 Some(value) => unsafe { std::env::set_var(name, value) },
                 None => unsafe { std::env::remove_var(name) },
@@ -415,6 +434,7 @@ mod tests {
         with_env(&vars, || {
             let config = Config::from_env().unwrap();
             assert_eq!(config.base_uri, "/data/lance", "trailing slash must be stripped");
+            assert_eq!(config.database_url, "postgresql://catalog/test");
             assert_eq!(config.dataset_cache_capacity, DEFAULT_DATASET_CACHE_CAPACITY);
             assert_eq!(config.index_cache_bytes, DEFAULT_INDEX_CACHE_BYTES);
             assert_eq!(config.metadata_cache_bytes, DEFAULT_METADATA_CACHE_BYTES);

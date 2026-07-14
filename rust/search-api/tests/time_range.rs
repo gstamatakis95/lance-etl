@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 
 use arrow_array::types::Float32Type;
 use arrow_array::{
-    FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray, TimestampMicrosecondArray,
+    BooleanArray, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
+    TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use common::{TEST_DATASET_PATH, test_config, test_target};
@@ -44,6 +45,8 @@ fn event_ms(index: i64) -> i64 {
 /// `text` so the text and hybrid legs run, with one row per day on the timestamp column.
 async fn build_timestamped_dataset(uri: &str) {
     let schema = Arc::new(Schema::new(vec![
+        Field::new("vector_id", DataType::Utf8, false),
+        Field::new("is_deleted", DataType::Boolean, false),
         Field::new("id", DataType::Int32, false),
         Field::new("text", DataType::Utf8, false),
         Field::new(
@@ -71,6 +74,8 @@ async fn build_timestamped_dataset(uri: &str) {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
+            Arc::new(StringArray::from(vec!["v1", "v2", "v3", "v4"])),
+            Arc::new(BooleanArray::from(vec![false, false, false, false])),
             Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
             Arc::new(StringArray::from(vec![
                 "red apple pie",
@@ -254,7 +259,6 @@ async fn text_and_hybrid_time_range_restricts_the_window() {
         },
         k: 10,
         fusion: search_api::domain::FusionSpec::default(),
-        reference: search_api::domain::DatasetRef::default(),
     };
     let fused = backend.hybrid_search(&target, hybrid).await.unwrap();
     let mut ids: Vec<i64> = fused.hits.iter().map(|hit| hit_id(&hit.row)).collect();

@@ -66,15 +66,16 @@ impl FusionSpec {
 /// The fused score of a row is the sum over the legs containing it of `1 / (rrf_k + rank)` with
 /// 1-based ranks. Row JSON objects are merged across legs, first leg wins on key conflicts.
 fn rrf_fuse(rrf_k: f64, legs: Vec<Vec<Hit>>, k: usize) -> Vec<FusedHit> {
-    let mut fused: HashMap<u64, FusedHit> = HashMap::new();
-    let mut order: Vec<u64> = Vec::new();
+    let mut fused: HashMap<String, FusedHit> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
     for leg in legs {
         for (rank, hit) in leg.into_iter().enumerate() {
             let contribution = 1.0 / (rrf_k + (rank as f64) + 1.0);
-            let entry = fused.entry(hit.row_id).or_insert_with(|| {
-                order.push(hit.row_id);
+            let vector_id = hit.vector_id.clone();
+            let entry = fused.entry(vector_id.clone()).or_insert_with(|| {
+                order.push(vector_id.clone());
                 FusedHit {
-                    row_id: hit.row_id,
+                    vector_id,
                     score: 0.0,
                     row: Map::new(),
                 }
@@ -85,7 +86,10 @@ fn rrf_fuse(rrf_k: f64, legs: Vec<Vec<Hit>>, k: usize) -> Vec<FusedHit> {
             }
         }
     }
-    let mut ranked: Vec<FusedHit> = order.into_iter().filter_map(|row_id| fused.remove(&row_id)).collect();
+    let mut ranked: Vec<FusedHit> = order
+        .into_iter()
+        .filter_map(|vector_id| fused.remove(&vector_id))
+        .collect();
     ranked.sort_by(|left, right| {
         right
             .score
@@ -112,18 +116,18 @@ fn weighted_fuse(vector_weight: f64, legs: Vec<Vec<Hit>>, k: usize) -> Vec<Fused
         legs.len()
     );
     let text_weight = 1.0 - vector_weight;
-    let mut fused: HashMap<u64, FusedHit> = HashMap::new();
-    let mut order: Vec<u64> = Vec::new();
+    let mut fused: HashMap<String, FusedHit> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
     for (leg_index, leg) in legs.into_iter().enumerate() {
         let lower_is_better = leg_index == 0;
         let weight = if lower_is_better { vector_weight } else { text_weight };
         let normalized = min_max_normalize(&leg, lower_is_better);
         for (hit, norm) in leg.into_iter().zip(normalized) {
-            let row_id = hit.row_id;
-            let entry = fused.entry(row_id).or_insert_with(|| {
-                order.push(row_id);
+            let vector_id = hit.vector_id.clone();
+            let entry = fused.entry(vector_id.clone()).or_insert_with(|| {
+                order.push(vector_id.clone());
                 FusedHit {
-                    row_id,
+                    vector_id,
                     score: 0.0,
                     row: Map::new(),
                 }
@@ -134,7 +138,10 @@ fn weighted_fuse(vector_weight: f64, legs: Vec<Vec<Hit>>, k: usize) -> Vec<Fused
             }
         }
     }
-    let mut ranked: Vec<FusedHit> = order.into_iter().filter_map(|row_id| fused.remove(&row_id)).collect();
+    let mut ranked: Vec<FusedHit> = order
+        .into_iter()
+        .filter_map(|vector_id| fused.remove(&vector_id))
+        .collect();
     ranked.sort_by(|left, right| {
         right
             .score
@@ -185,7 +192,7 @@ mod tests {
         let mut row = Map::new();
         row.insert("id".to_string(), Value::from(row_id));
         Hit {
-            row_id,
+            vector_id: row_id.to_string(),
             score: 0.0,
             row,
         }
@@ -196,7 +203,7 @@ mod tests {
         let fusion = FusionSpec::Rrf { rrf_k: 60.0 };
         let fused = fusion.fuse(vec![vec![hit(1), hit(2)], vec![hit(2), hit(3)]], 10);
         assert_eq!(fused.len(), 3);
-        assert_eq!(fused[0].row_id, 2);
+        assert_eq!(fused[0].vector_id, "2");
         let expected_top = 1.0 / 62.0 + 1.0 / 61.0;
         assert!((fused[0].score - expected_top).abs() < 1e-12);
         let expected_single = 1.0 / 61.0;
@@ -209,7 +216,7 @@ mod tests {
         let fusion = FusionSpec::Rrf { rrf_k: 1.0 };
         let fused = fusion.fuse(vec![vec![hit(7), hit(8)], vec![hit(7)]], 1);
         assert_eq!(fused.len(), 1);
-        assert_eq!(fused[0].row_id, 7);
+        assert_eq!(fused[0].vector_id, "7");
         assert!((fused[0].score - 1.0).abs() < 1e-12);
     }
 
@@ -221,12 +228,12 @@ mod tests {
         right_row.insert("b".to_string(), Value::from(2));
         let legs = vec![
             vec![Hit {
-                row_id: 5,
+                vector_id: "5".to_string(),
                 score: 0.0,
                 row: left_row,
             }],
             vec![Hit {
-                row_id: 5,
+                vector_id: "5".to_string(),
                 score: 0.0,
                 row: right_row,
             }],
@@ -249,7 +256,11 @@ mod tests {
     fn scored(row_id: u64, score: f64) -> Hit {
         let mut row = Map::new();
         row.insert("id".to_string(), Value::from(row_id));
-        Hit { row_id, score, row }
+        Hit {
+            vector_id: row_id.to_string(),
+            score,
+            row,
+        }
     }
 
     #[test]
@@ -257,7 +268,13 @@ mod tests {
         let vector_leg = vec![scored(1, 0.0), scored(2, 1.0)];
         let text_leg = vec![scored(2, 10.0), scored(3, 0.0)];
         let fused = FusionSpec::Weighted { vector_weight: 0.6 }.fuse(vec![vector_leg, text_leg], 10);
-        let score = |id: u64| fused.iter().find(|hit| hit.row_id == id).map(|hit| hit.score).unwrap();
+        let score = |id: u64| {
+            fused
+                .iter()
+                .find(|hit| hit.vector_id == id.to_string())
+                .map(|hit| hit.score)
+                .unwrap()
+        };
         assert!(
             (score(1) - 0.6).abs() < 1e-12,
             "best vector hit gets full vector weight"
@@ -267,7 +284,7 @@ mod tests {
             "worst vector + best text gets full text weight"
         );
         assert!((score(3) - 0.0).abs() < 1e-12, "worst in both legs scores zero");
-        assert_eq!(fused[0].row_id, 1, "ordering is by fused score, best first");
+        assert_eq!(fused[0].vector_id, "1", "ordering is by fused score, best first");
     }
 
     #[test]
@@ -294,7 +311,13 @@ mod tests {
         let vector_leg = vec![scored(1, 0.0), scored(2, 1.0)];
         let text_leg = vec![scored(2, 10.0), scored(3, 0.0)];
         let fused = FusionSpec::Weighted { vector_weight: 0.0 }.fuse(vec![vector_leg, text_leg], 10);
-        let score = |id: u64| fused.iter().find(|hit| hit.row_id == id).map(|hit| hit.score).unwrap();
+        let score = |id: u64| {
+            fused
+                .iter()
+                .find(|hit| hit.vector_id == id.to_string())
+                .map(|hit| hit.score)
+                .unwrap()
+        };
         assert!(
             (score(1) - 0.0).abs() < 1e-12,
             "vector-only hit contributes nothing at weight 0"
@@ -303,7 +326,7 @@ mod tests {
             (score(2) - 1.0).abs() < 1e-12,
             "best text hit takes the full text weight"
         );
-        assert_eq!(fused[0].row_id, 2);
+        assert_eq!(fused[0].vector_id, "2");
     }
 
     #[test]
@@ -311,7 +334,13 @@ mod tests {
         let vector_leg = vec![scored(1, 0.0), scored(2, 1.0)];
         let text_leg = vec![scored(2, 10.0), scored(3, 0.0)];
         let fused = FusionSpec::Weighted { vector_weight: 1.0 }.fuse(vec![vector_leg, text_leg], 10);
-        let score = |id: u64| fused.iter().find(|hit| hit.row_id == id).map(|hit| hit.score).unwrap();
+        let score = |id: u64| {
+            fused
+                .iter()
+                .find(|hit| hit.vector_id == id.to_string())
+                .map(|hit| hit.score)
+                .unwrap()
+        };
         assert!(
             (score(1) - 1.0).abs() < 1e-12,
             "best vector hit takes the full vector weight"

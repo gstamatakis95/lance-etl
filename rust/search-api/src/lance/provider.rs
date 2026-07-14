@@ -18,7 +18,8 @@ use crate::cache::layout::prepare_cache_root;
 use crate::cache::redis_store::RedisEntryStore;
 use crate::cache::store_cache::MetadataByteCache;
 use crate::config::{CacheBackendKind, Config, PRODUCTION_SERVE_TAG};
-use crate::domain::{DatasetRef, DatasetTarget, SearchError};
+use crate::domain::target::validate_path_segment;
+use crate::domain::{DatasetRef, DatasetTarget, SearchError, ServingCatalog, ServingRoute};
 use crate::lance::error::{classify_lance_error, is_definitive_open_absence};
 use crate::telemetry::{CacheName, Metrics, Tier};
 
@@ -147,6 +148,8 @@ pub fn build_session(config: &Config, index_backend: Option<Arc<HybridIndexCache
 /// the tag flips onto it, while the draining blue handle ages out by capacity.
 pub struct CachingDatasetProvider {
     base_uri: String,
+    catalog: Option<Arc<dyn ServingCatalog>>,
+    serving_routes: Cache<DatasetTarget, ServingRoute>,
     session: Arc<Session>,
     /// Open-handle LRU keyed by `(uri, resolved version)` and bounded by total [`handle_weight`].
     datasets: Cache<(String, Option<u64>), Arc<Dataset>>,
@@ -176,12 +179,30 @@ impl CachingDatasetProvider {
     /// persistent cache tiers, and sizing the dataset-handle LRU. Cache backend setup failures
     /// fall back to in-memory caching so the service still serves traffic.
     pub async fn new(config: &Config) -> Self {
-        Self::build(config, Arc::new(Metrics::disabled()), None).await
+        Self::build(config, Arc::new(Metrics::disabled()), None, None).await
     }
 
     /// Like [`Self::new`] but emitting cache and dataset-resolution metrics through `metrics`.
     pub async fn with_telemetry(config: &Config, metrics: Arc<Metrics>) -> Self {
-        Self::build(config, metrics, None).await
+        Self::build(config, metrics, None, None).await
+    }
+
+    /// Creates the production provider backed by an exact serving catalog.
+    pub async fn with_catalog_and_telemetry(
+        config: &Config,
+        catalog: Arc<dyn ServingCatalog>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self::build(config, metrics, None, Some(catalog)).await
+    }
+
+    /// Creates a provider with an exact serving catalog and an optional inner store wrapper.
+    pub async fn with_catalog_and_inner_store_wrapper(
+        config: &Config,
+        catalog: Arc<dyn ServingCatalog>,
+        inner_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    ) -> Self {
+        Self::build(config, Arc::new(Metrics::disabled()), inner_wrapper, Some(catalog)).await
     }
 
     /// Like [`Self::new`] but chains an extra wrapper *inside* the metadata byte cache (between
@@ -190,7 +211,7 @@ impl CachingDatasetProvider {
         config: &Config,
         inner_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     ) -> Self {
-        Self::build(config, Arc::new(Metrics::disabled()), inner_wrapper).await
+        Self::build(config, Arc::new(Metrics::disabled()), inner_wrapper, None).await
     }
 
     /// Shared constructor wiring the persistent tiers, the store wrapper chain, and telemetry.
@@ -198,6 +219,7 @@ impl CachingDatasetProvider {
         config: &Config,
         metrics: Arc<Metrics>,
         inner_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+        catalog: Option<Arc<dyn ServingCatalog>>,
     ) -> Self {
         let caches = match config.cache_backend {
             CacheBackendKind::Memory => BuiltCaches::none(),
@@ -240,6 +262,11 @@ impl CachingDatasetProvider {
         };
         Self {
             base_uri: config.base_uri.clone(),
+            catalog,
+            serving_routes: Cache::builder()
+                .max_capacity(config.dataset_cache_capacity)
+                .time_to_live(Duration::from_secs(crate::config::DEFAULT_SERVING_CATALOG_TTL_SECS))
+                .build(),
             session: build_session(config, index_cache.clone()),
             datasets: Cache::builder()
                 .max_capacity(config.dataset_cache_capacity)
@@ -308,6 +335,24 @@ impl CachingDatasetProvider {
         let base = &self.base_uri;
         let (org, tenant, namespace) = (&target.org_id, &target.tenant_id, &target.namespace);
         format!("{base}/{org}/{tenant}/{namespace}.lance")
+    }
+
+    /// Resolves and validates the exact catalog tuple for one production serving request.
+    async fn serving_route(&self, target: &DatasetTarget) -> Result<ServingRoute, SearchError> {
+        target.validate()?;
+        let catalog = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| SearchError::internal("serving catalog is not configured"))?
+            .clone();
+        let target_key = target.clone();
+        let route = self
+            .serving_routes
+            .try_get_with(target_key.clone(), async move { catalog.resolve(&target_key).await })
+            .await
+            .map_err(|error| error.as_ref().clone())?;
+        validate_serving_route(&self.base_uri, &route)?;
+        Ok(route)
     }
 
     /// Builds the `negative_opens` key for a `(uri, reference)` pair.
@@ -433,6 +478,26 @@ async fn classify_open_failure(
     error
 }
 
+/// Validates that a catalog route stays inside the deployment-owned storage prefix.
+fn validate_serving_route(base_uri: &str, route: &ServingRoute) -> Result<(), SearchError> {
+    if route.lance_version == 0 {
+        return Err(SearchError::internal("serving catalog contains Lance version zero"));
+    }
+    validate_path_segment(&route.profile_id, "profile_id")
+        .map_err(|_| SearchError::internal("serving catalog contains an invalid profile_id"))?;
+    let allowed_prefix = format!("{}/", base_uri.trim_end_matches('/'));
+    if !route.lance_uri.starts_with(&allowed_prefix)
+        || route.lance_uri[allowed_prefix.len()..]
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(SearchError::internal(
+            "serving catalog URI is outside the allowed base URI",
+        ));
+    }
+    Ok(())
+}
+
 /// Opens the two disk cache tiers under the versioned stamp directory.
 fn build_disk_caches(config: &Config, metrics: Arc<Metrics>) -> std::io::Result<BuiltCaches> {
     let root = prepare_cache_root(&config.cache_dir)?;
@@ -531,17 +596,31 @@ impl CachingDatasetProvider {
     ) -> Result<Arc<Dataset>, SearchError> {
         target.validate()?;
         let started = std::time::Instant::now();
-        let uri = self.dataset_uri(target);
-        let negative_key = self.negative_open_key(&uri, &reference);
+        let catalog_route = if reference == DatasetRef::Serve && self.catalog.is_some() {
+            Some(self.serving_route(target).await?)
+        } else {
+            None
+        };
+        let uri = catalog_route
+            .as_ref()
+            .map(|route| route.lance_uri.clone())
+            .unwrap_or_else(|| self.dataset_uri(target));
+        let negative_key = match &catalog_route {
+            Some(route) => (uri.clone(), format!("version:{}", route.lance_version)),
+            None => self.negative_open_key(&uri, &reference),
+        };
         if let Some(cached) = self.negative_opens.get(&negative_key).await {
             return Err(cached);
         }
-        let version = match self.resolve_reference(&uri, reference).await {
-            Ok(version) => version,
-            Err(raw) => {
-                let error = classify_open_failure(&self.negative_opens, negative_key, raw.as_ref()).await;
-                return Err(error);
-            }
+        let version = match catalog_route {
+            Some(route) => Some(route.lance_version),
+            None => match self.resolve_reference(&uri, reference).await {
+                Ok(version) => version,
+                Err(raw) => {
+                    let error = classify_open_failure(&self.negative_opens, negative_key, raw.as_ref()).await;
+                    return Err(error);
+                }
+            },
         };
         let key = (uri.clone(), version);
         let session = self.session.clone();

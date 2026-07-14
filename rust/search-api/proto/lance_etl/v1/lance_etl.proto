@@ -2,145 +2,29 @@ syntax = "proto3";
 
 package lance_etl.v1;
 
-import "google/protobuf/struct.proto";
-
-// Search over per-tenant Lance datasets: nearest-neighbor, full-text, and hybrid fusion.
+// Production search over one catalog-resolved logical target.
 service SearchService {
-  // Nearest-neighbor search on a vector column of the target dataset(s).
+  // Nearest-neighbor search.
   rpc VectorSearch(VectorSearchRequest) returns (VectorSearchResponse);
-  // Full-text search via the INVERTED index.
+  // Full-text search.
   rpc TextSearch(TextSearchRequest) returns (TextSearchResponse);
-  // Runs a vector leg and a text leg, then fuses the ranked lists with the configured strategy.
+  // Vector and full-text search fused by a code-owned product mode.
   rpc HybridSearch(HybridSearchRequest) returns (HybridSearchResponse);
-  // Proactively pulls one dataset's metadata and index structures into the local caches.
-  rpc Prewarm(PrewarmRequest) returns (PrewarmResponse);
-  // Reads the IVF cluster centroids of a vector index from the target dataset.
-  rpc Clusters(ClustersRequest) returns (ClustersResponse);
 }
 
-// Addresses the dataset a request operates on.
-//
-// The target resolves to the single dataset at
-// {base}/{org_id}/{tenant_id}/{namespace}.lance.
+// Logical target resolved server-side through the serving catalog.
 message DatasetTarget {
-  // Organization id. Must match [A-Za-z0-9_-]+.
+  // Organization identifier.
   string org_id = 1;
-  // Tenant id. Must match [A-Za-z0-9_-]+.
+  // Tenant identifier.
   string tenant_id = 2;
-  // Namespace. Must match [A-Za-z0-9_-]+.
+  // Namespace identifier.
   string namespace = 3;
 }
 
-// Request for SearchService.Prewarm.
-message PrewarmRequest {
-  // Dataset to prewarm.
-  DatasetTarget target = 1;
-  // Warm dataset metadata (manifest, transaction, index listing). Implied by warming any index,
-  // since opening the dataset warms its metadata. When false with no index targets the prewarm is
-  // a no-op that never opens the dataset.
-  bool metadata = 2;
-  // Warm all indexes of the dataset; ignored when index_names is non-empty.
-  bool all_indexes = 3;
-  // Warm only these named indexes.
-  repeated string index_names = 4;
-  // Also pull FTS position data for inverted indexes (needed for phrase queries).
-  bool fts_with_position = 5;
-  // Pins which committed version to warm. Additive and optional: when unset the latest version
-  // is warmed (the original behavior, so existing clients keep working). Setting an explicit
-  // version (or a tag that resolves to one) lets an operator warm a freshly built green version
-  // into every replica's caches BEFORE flipping the serve tag, so the first post-flip query is
-  // warm instead of cold.
-  oneof version_ref {
-    // Warm this exact committed version id.
-    uint64 version = 6;
-    // Warm the version this tag currently resolves to.
-    string tag = 7;
-  }
-}
-
-// Request for SearchService.Clusters.
-message ClustersRequest {
-  // Dataset whose vector index is read.
-  DatasetTarget target = 1;
-  // Vector index to read. Defaults to the dataset's vector index when omitted.
-  optional string index_name = 2;
-}
-
-// Response for SearchService.Clusters.
-message ClustersResponse {
-  // IVF partitions in partition order.
-  repeated Cluster clusters = 1;
-  // Vector dimension of every centroid.
-  uint32 dimension = 2;
-  // Name of the index the centroids were read from.
-  string index_name = 3;
-  // Number of IVF partitions (equals the number of clusters).
-  uint32 num_partitions = 4;
-}
-
-// One IVF partition centroid.
-message Cluster {
-  // Partition id (0-based, in partition order).
-  uint32 id = 1;
-  // Centroid vector.
-  repeated float centroid = 2;
-}
-
-// Response for SearchService.Prewarm.
-message PrewarmResponse {
-  // True when dataset metadata was loaded into the cache.
-  bool metadata_warmed = 1;
-  // Per-index outcomes in completion order.
-  repeated PrewarmedIndex indexes = 2;
-  // Wall-clock milliseconds spent opening the dataset and loading metadata.
-  uint64 metadata_duration_ms = 3;
-  // Wall-clock milliseconds for the whole call.
-  uint64 total_duration_ms = 4;
-  // Approximate bytes resident in the shared index cache after the call.
-  uint64 index_cache_size_bytes = 5;
-  // The concrete committed version id that was actually warmed. With a tag (or serve-tag)
-  // target this is the version the tag resolved to at warm time, so the caller can confirm the
-  // green version is warm before flipping the serve tag onto it.
-  uint64 resolved_version = 6;
-}
-
-// Outcome of prewarming one index.
-message PrewarmedIndex {
-  // Index name as listed in the dataset manifest.
-  string name = 1;
-  // Milliseconds spent prewarming this index (all delta segments).
-  uint64 duration_ms = 2;
-  // Empty on success; a client-safe reason when this index was skipped or failed.
-  string error = 3;
-}
-
-// Distance metric for nearest-neighbor search.
-enum DistanceType {
-  // Defaults to the metric the vector index was built with (L2 for flat search).
-  DISTANCE_TYPE_UNSPECIFIED = 0;
-  // Euclidean (L2) distance.
-  DISTANCE_TYPE_L2 = 1;
-  // Cosine distance.
-  DISTANCE_TYPE_COSINE = 2;
-  // Negative dot-product distance.
-  DISTANCE_TYPE_DOT = 3;
-  // Hamming distance (binary vectors).
-  DISTANCE_TYPE_HAMMING = 4;
-}
-
-// Whether a filter runs before or after the index search.
-enum FilterMode {
-  // Defaults to FILTER_MODE_PREFILTER.
-  FILTER_MODE_UNSPECIFIED = 0;
-  // Apply the filter before the index search; exact but potentially more expensive.
-  FILTER_MODE_PREFILTER = 1;
-  // Apply the filter to the index results; may return fewer rows than requested.
-  FILTER_MODE_POSTFILTER = 2;
-}
-
-// Comparison operator for a column-vs-literal predicate.
+// Comparison operator for a typed predicate.
 enum CompareOp {
-  // Invalid; requests using it are rejected.
+  // Invalid value.
   COMPARE_OP_UNSPECIFIED = 0;
   // Equal.
   COMPARE_OP_EQ = 1;
@@ -156,79 +40,79 @@ enum CompareOp {
   COMPARE_OP_GE = 6;
 }
 
-// A typed literal used in filter predicates.
+// Typed literal transported without expression parsing.
 message LiteralValue {
   // Exactly one literal kind.
   oneof kind {
     // Boolean literal.
     bool bool_value = 1;
-    // 64-bit integer literal; coerced to the column type by the engine.
+    // Signed integer literal.
     int64 int64_value = 2;
-    // Double literal; coerced to the column type by the engine.
+    // Floating-point literal.
     double double_value = 3;
-    // String literal; transported verbatim, never interpreted as an expression.
+    // String literal.
     string string_value = 4;
   }
 }
 
-// Typed predicate AST evaluated server-side; clients can never inject expression text.
+// Typed predicate AST.
 message Filter {
   // Exactly one predicate kind.
   oneof predicate {
-    // column <op> literal.
+    // Column comparison.
     Comparison comparison = 1;
-    // column IN (...) or NOT IN (...).
+    // Membership predicate.
     InList in_list = 2;
-    // column IS NULL.
+    // Null predicate.
     IsNull is_null = 3;
-    // column IS NOT NULL.
+    // Non-null predicate.
     IsNotNull is_not_null = 4;
-    // low <= column <= high.
+    // Inclusive range predicate.
     Between between = 5;
-    // All child filters must hold.
+    // Logical conjunction.
     FilterList and = 6;
-    // At least one child filter must hold.
+    // Logical disjunction.
     FilterList or = 7;
-    // The child filter must not hold.
+    // Logical negation.
     Filter not = 8;
   }
 }
 
-// A column-vs-literal comparison predicate.
+// Column comparison.
 message Comparison {
-  // Column name; must exist in the dataset schema.
+  // Column name.
   string column = 1;
-  // Comparison operator.
+  // Operator.
   CompareOp op = 2;
-  // Right-hand literal.
+  // Literal.
   LiteralValue value = 3;
 }
 
-// Membership predicate: column IN (values) or, when negated, column NOT IN (values).
+// Membership predicate.
 message InList {
-  // Column name; must exist in the dataset schema.
+  // Column name.
   string column = 1;
-  // Candidate values; must be non-empty.
+  // Candidate values.
   repeated LiteralValue values = 2;
-  // When true, the predicate is NOT IN.
+  // Negates membership when true.
   bool negated = 3;
 }
 
-// Null-check predicate: column IS NULL.
+// Null predicate.
 message IsNull {
-  // Column name; must exist in the dataset schema.
+  // Column name.
   string column = 1;
 }
 
-// Null-check predicate: column IS NOT NULL.
+// Non-null predicate.
 message IsNotNull {
-  // Column name; must exist in the dataset schema.
+  // Column name.
   string column = 1;
 }
 
-// Range predicate: low <= column <= high.
+// Inclusive range predicate.
 message Between {
-  // Column name; must exist in the dataset schema.
+  // Column name.
   string column = 1;
   // Inclusive lower bound.
   LiteralValue low = 2;
@@ -236,348 +120,317 @@ message Between {
   LiteralValue high = 3;
 }
 
-// A non-empty list of child filters combined by the enclosing AND/OR.
+// Non-empty logical child list.
 message FilterList {
-  // Child predicates; must be non-empty.
+  // Child predicates.
   repeated Filter filters = 1;
 }
 
-// An event-time window in epoch milliseconds, always applied to the event-timestamp column.
-//
-// The window is start-inclusive and end-exclusive. Either bound may be omitted to leave that side
-// unbounded. The service translates the window into a typed range predicate on the configured
-// event-timestamp column and ANDs it with any caller-provided filter, so a BTREE or zone-map on
-// that column prunes the scan.
+// Half-open event-time window in epoch milliseconds.
 message TimeRange {
-  // Inclusive lower bound in epoch milliseconds. Omitted leaves the window open on the low side.
+  // Inclusive lower bound.
   optional int64 start_ms = 1;
-  // Exclusive upper bound in epoch milliseconds. Omitted leaves the window open on the high side.
+  // Exclusive upper bound.
   optional int64 end_ms = 2;
 }
 
-// Parameters for one nearest-neighbor query, reused by VectorSearch and the hybrid vector leg.
+// Vector query semantics. Execution policy comes from the target profile.
 message VectorQuery {
-  // Query vector; its length must match the vector column dimension.
+  // Query vector.
   repeated float vector = 1;
-  // Number of nearest neighbors to return. In a hybrid query, 0 inherits the fused k.
-  uint32 k = 2;
-  // Vector column name; defaults to the first fixed-size-list column in the schema.
-  optional string column = 3;
-  // Distance metric override.
-  DistanceType distance_type = 4;
-  // Sets minimum and maximum probed partitions to the same value (IVF indexes).
-  optional uint32 nprobes = 5;
-  // Minimum number of index partitions to probe; ignored when nprobes is set.
-  optional uint32 minimum_nprobes = 6;
-  // Maximum number of index partitions to probe; only effective with a prefilter.
-  optional uint32 maximum_nprobes = 7;
-  // Read refine_factor * k candidates and re-rank them with the raw vectors.
-  optional uint32 refine_factor = 8;
-  // HNSW ef-search parameter.
-  optional uint32 ef = 9;
-  // Search only indexed data, skipping fragments added after the last index build (weak
-  // consistency, lower latency). When set explicitly the client value always wins; when absent the
-  // server applies its configured default only when the dataset has a vector index for the queried
-  // column — so unindexed datasets and read-after-write clients are both served correctly.
-  optional bool fast_search = 10;
-  // Skip the vector index and do a flat (exact) scan.
-  bool bypass_vector_index = 11;
-  // Optional typed predicate applied to the search.
-  Filter filter = 12;
-  // Whether the filter runs before or after the index search.
-  FilterMode filter_mode = 13;
-  // Columns to return; defaults to all non-vector columns.
-  repeated string projection = 14;
-  // Include the physical `_rowid` row-address column (changes across compaction; use only for the duration of the request).
-  bool with_row_id = 15;
-  // Number of leading hits to skip.
-  optional uint64 offset = 16;
+  reserved 2 to 16;
+  reserved "k", "column", "distance_type", "nprobes", "minimum_nprobes", "maximum_nprobes";
+  reserved "refine_factor", "ef", "fast_search", "bypass_vector_index", "filter", "filter_mode";
+  reserved "projection", "with_row_id", "offset";
 }
 
 // How match-query terms combine.
 enum TextOperator {
-  // Defaults to TEXT_OPERATOR_OR.
+  // Defaults to OR.
   TEXT_OPERATOR_UNSPECIFIED = 0;
-  // At least one term must match.
+  // At least one term matches.
   TEXT_OPERATOR_OR = 1;
-  // All terms must match.
+  // Every term matches.
   TEXT_OPERATOR_AND = 2;
 }
 
-// Full-text query node tree mirroring the Lance FTS query model.
+// Full-text query tree.
 message FtsQuery {
-  // Exactly one query node kind.
+  // Exactly one node.
   oneof query {
-    // Terms matching with OR/AND semantics and optional fuzziness.
+    // Match terms.
     MatchQuery match = 1;
-    // Exact phrase matching; requires an index built with positions.
+    // Match a phrase.
     PhraseQuery phrase = 2;
-    // Re-weights hits of a negative query against a positive query.
+    // Reweight a negative query.
     BoostQuery boost = 3;
-    // The same terms matched over several columns with per-column boosts.
+    // Match terms across columns.
     MultiMatchQuery multi_match = 4;
-    // Boolean combination of sub-queries (should / must / must_not).
+    // Combine query nodes.
     BooleanQuery boolean = 5;
   }
 }
 
-// Terms query against one column.
+// Terms query.
 message MatchQuery {
-  // Query terms, tokenized by the index tokenizer.
+  // Terms.
   string terms = 1;
-  // Column to search; may be omitted when the enclosing TextQuery sets columns.
+  // Optional allowlisted column.
   optional string column = 2;
-  // Score multiplier for this query (default 1.0).
+  // Semantic score multiplier.
   optional float boost = 3;
-  // How terms combine: OR (default, any term matches) or AND (all terms must match).
+  // Term operator.
   TextOperator operator = 4;
-  // Fuzzy matching; absent means exact term matching.
+  // Semantic fuzzy-match selection.
   oneof fuzziness {
-    // Pick the edit distance automatically from each term length.
+    // Automatic edit distance.
     bool auto_fuzziness = 5;
-    // Maximum edit distance for fuzzy matching.
+    // Maximum edit distance.
     uint32 max_distance = 6;
   }
-  // Maximum number of expanded terms for fuzzy matching (default 50).
-  optional uint32 max_expansions = 7;
-  // Number of beginning characters kept unchanged for fuzzy matching (default 0).
+  reserved 7;
+  reserved "max_expansions";
+  // Unchanged leading characters for fuzzy semantics.
   optional uint32 prefix_length = 8;
 }
 
-// Exact phrase query; the index must store positions.
+// Exact phrase query.
 message PhraseQuery {
-  // Phrase terms in order.
+  // Terms.
   string terms = 1;
-  // Column to search; may be omitted when the enclosing TextQuery sets columns.
+  // Optional allowlisted column.
   optional string column = 2;
-  // Maximum number of intervening unmatched positions allowed (default 0).
+  // Allowed intervening positions.
   uint32 slop = 3;
 }
 
-// Boost query: hits of `negative` have their scores multiplied by `negative_boost`.
+// Positive and down-weighted negative query.
 message BoostQuery {
-  // Query whose hits keep full score.
+  // Positive query.
   FtsQuery positive = 1;
-  // Query whose hits are down-weighted.
+  // Negative query.
   FtsQuery negative = 2;
-  // Multiplier applied to negative hits (default 0.5).
+  // Semantic negative multiplier.
   optional float negative_boost = 3;
 }
 
-// Multi-column terms query with optional per-column boosts.
+// Multi-column terms query.
 message MultiMatchQuery {
-  // Query terms.
+  // Terms.
   string terms = 1;
-  // Columns to search; must be non-empty.
+  // Allowlisted columns.
   repeated string columns = 2;
-  // Per-column boosts; when present its length must equal columns.
+  // Semantic per-column boosts.
   repeated float boosts = 3;
-  // How terms combine within each column.
+  // Term operator.
   TextOperator operator = 4;
 }
 
-// Boolean combination of sub-queries.
+// Boolean query.
 message BooleanQuery {
-  // Optional clauses; matching them increases the score.
+  // Optional clauses.
   repeated FtsQuery should = 1;
-  // Required clauses; every hit must match all of them.
+  // Required clauses.
   repeated FtsQuery must = 2;
-  // Excluding clauses; hits matching any of them are dropped.
+  // Excluding clauses.
   repeated FtsQuery must_not = 3;
 }
 
-// Parameters for one full-text query, reused by TextSearch and the hybrid text leg.
+// Text query semantics. Execution policy comes from the target profile.
 message TextQuery {
-  // The query: either a simple match string or a full query tree.
+  // Query input.
   oneof input {
-    // Fast path: terms matched (OR semantics) over `columns` or all indexed text columns.
+    // Simple OR-match terms.
     string simple = 1;
     // Full typed query tree.
     FtsQuery fts = 2;
   }
-  // Columns to fill into query nodes that do not name a column themselves.
+  // Allowlisted search columns.
   repeated string columns = 3;
-  // Maximum number of hits to return. In a hybrid query, 0 inherits the fused k.
-  uint32 k = 4;
-  // WAND ranking factor; values above 1.0 trade recall for speed (default 1.0).
-  optional float wand_factor = 5;
-  // Optional typed predicate applied to the search.
-  Filter filter = 6;
-  // Whether the filter runs before or after the index search.
-  FilterMode filter_mode = 7;
-  // Columns to return; defaults to all non-vector columns.
-  repeated string projection = 8;
-  // Include the physical `_rowid` row-address column (changes across compaction; use only for the duration of the request).
-  bool with_row_id = 9;
-  // Number of leading hits to skip.
-  optional uint64 offset = 10;
-  // Search only indexed (INVERTED) data, skipping fragments appended after the last FTS index
-  // build. When set explicitly the client value always wins; when absent the server applies its
-  // configured default only when the dataset has an FTS index for the queried column — bounding
-  // tail latency from the unindexed fragment flat-scan under continuous ingest without losing
-  // freshness for datasets that have no FTS index at all.
-  optional bool fast_search = 11;
+  reserved 4 to 11;
+  reserved "k", "wand_factor", "filter", "filter_mode", "projection", "with_row_id", "offset", "fast_search";
 }
 
-// Fusion strategy for merging the hybrid legs.
-message Fusion {
-  // Exactly one strategy; defaults to reciprocal-rank fusion when the message is absent.
-  oneof strategy {
-    // Reciprocal-rank fusion.
-    RrfFusion rrf = 1;
-    // Weighted score fusion of min-max normalized legs.
-    WeightedFusion weighted = 2;
+// Small product-level hybrid strategy selector.
+enum HybridFusionMode {
+  // Use the target profile default.
+  HYBRID_FUSION_MODE_UNSPECIFIED = 0;
+  // Balance semantic and lexical relevance.
+  HYBRID_FUSION_MODE_BALANCED = 1;
+  // Prefer semantic relevance.
+  HYBRID_FUSION_MODE_SEMANTIC_PRIORITY = 2;
+  // Prefer lexical relevance.
+  HYBRID_FUSION_MODE_LEXICAL_PRIORITY = 3;
+}
+
+// Closed warning codes for bounded partial responses.
+enum SearchWarning {
+  // Invalid value.
+  SEARCH_WARNING_UNSPECIFIED = 0;
+  // Deduplication left fewer than k logical results.
+  SEARCH_WARNING_RESULTS_UNDERFILLED = 1;
+  // The vector leg was unavailable.
+  SEARCH_WARNING_VECTOR_LEG_UNAVAILABLE = 2;
+  // The text leg was unavailable.
+  SEARCH_WARNING_TEXT_LEG_UNAVAILABLE = 3;
+}
+
+// Explicit null projection value.
+message NullProjectionValue {}
+
+// Closed typed scalar projection value.
+message ProjectionValue {
+  // Exactly one scalar kind.
+  oneof kind {
+    // Null value.
+    NullProjectionValue null_value = 1;
+    // Boolean value.
+    bool bool_value = 2;
+    // Signed integer value.
+    sint64 int64_value = 3;
+    // Unsigned integer value.
+    uint64 uint64_value = 4;
+    // Floating-point value.
+    double double_value = 5;
+    // UTF-8 string value.
+    string string_value = 6;
   }
 }
 
-// Reciprocal-rank fusion: each row scores sum over legs of 1 / (rrf_k + rank) with 1-based ranks.
-message RrfFusion {
-  // Rank-smoothing constant; must be positive (default 60).
-  optional double rrf_k = 1;
+// One named projected scalar.
+message ProjectedField {
+  // Column name.
+  string name = 1;
+  // Typed value.
+  ProjectionValue value = 2;
 }
 
-// Weighted score fusion: each leg's scores are min-max normalized into [0, 1] (the vector leg is
-// inverted so the nearest neighbor maps to 1.0, the text leg's top BM25 hit maps to 1.0), then the
-// fused score is vector_weight * vector_norm + (1 - vector_weight) * text_norm.
-message WeightedFusion {
-  // Vector-leg weight in [0, 1]; the text leg takes the complement (default 0.7).
-  optional double vector_weight = 1;
-}
-
-// Post-fusion reranking strategy applied to the top candidates of a vector, text, or hybrid result.
-message Rerank {
-  // Exactly one strategy; when the message is absent the result order is returned unchanged.
-  oneof strategy {
-    // Identity reranking: keep the post-fusion order, optionally truncating to top_n.
-    IdentityRerank identity = 1;
-  }
-}
-
-// Identity reranking: preserves the incoming candidate order. The seam where a cross-encoder or
-// LLM reranker slots in later without changing the request shape.
-message IdentityRerank {
-  // Number of leading candidates to keep; absent keeps all.
-  optional uint64 top_n = 1;
-}
-
-// Request for SearchService.VectorSearch.
+// Vector search request.
 message VectorSearchRequest {
-  // Dataset to search.
+  // Logical target.
   DatasetTarget target = 1;
-  // Nearest-neighbor query parameters.
+  // Query semantics.
   VectorQuery query = 2;
-  // Optional post-search reranking of the top candidates. Absent returns the order unchanged.
-  Rerank rerank = 3;
-  // Optional event-time window. When set, restricts results to rows whose event-timestamp column
-  // falls in the window, ANDed with any filter on the query. Absent searches all event times.
-  TimeRange time_range = 4;
-  // Pins which committed version to search. When unset, DatasetRef::Serve resolves the fixed
-  // production HEAD tag.
-  oneof version_ref {
-    // Search this exact committed version id.
-    uint64 version = 5;
-    // Search the version this tag currently resolves to.
-    string tag = 6;
-  }
-}
-
-// Response for SearchService.VectorSearch.
-message VectorSearchResponse {
-  // Hits ordered nearest-first.
-  repeated VectorSearchResult results = 1;
-}
-
-// One nearest-neighbor hit.
-message VectorSearchResult {
-  // Projected columns of the row.
-  google.protobuf.Struct row = 1;
-  // Distance between the query vector and the row vector (smaller is closer).
-  float distance = 2;
-}
-
-// Request for SearchService.TextSearch.
-message TextSearchRequest {
-  // Dataset to search.
-  DatasetTarget target = 1;
-  // Full-text query parameters.
-  TextQuery query = 2;
-  // Optional post-search reranking of the top candidates. Absent returns the order unchanged.
-  Rerank rerank = 3;
-  // Optional event-time window. When set, restricts results to rows whose event-timestamp column
-  // falls in the window, ANDed with any filter on the query. Absent searches all event times.
-  TimeRange time_range = 4;
-  // Pins which committed version to search. When unset, DatasetRef::Serve resolves the fixed
-  // production HEAD tag.
-  oneof version_ref {
-    // Search this exact committed version id.
-    uint64 version = 5;
-    // Search the version this tag currently resolves to.
-    string tag = 6;
-  }
-}
-
-// Response for SearchService.TextSearch.
-message TextSearchResponse {
-  // Hits ordered best-first.
-  repeated TextSearchResult results = 1;
-}
-
-// One full-text hit.
-message TextSearchResult {
-  // Projected columns of the row.
-  google.protobuf.Struct row = 1;
-  // BM25 relevance score (larger is better).
-  float score = 2;
-}
-
-// Request for SearchService.HybridSearch.
-message HybridSearchRequest {
-  // Dataset to search.
-  DatasetTarget target = 1;
-  // Vector leg parameters.
-  VectorQuery vector = 2;
-  // Text leg parameters.
-  TextQuery text = 3;
-  // Number of fused results to return.
-  uint32 k = 4;
-  // Fusion strategy; defaults to reciprocal-rank fusion with rrf_k = 60.
-  Fusion fusion = 5;
-  // Optional post-fusion reranking of the top candidates. Absent returns the fused order unchanged.
-  Rerank rerank = 6;
-  // Optional event-time window. When set, both legs restrict results to rows whose event-timestamp
-  // column falls in the window, ANDed with any per-leg filter. Absent searches all event times.
-  TimeRange time_range = 7;
-  // Optional typed predicate applied to both legs of the hybrid query. The filter is ANDed into
-  // each leg independently before the index search. When a leg already carries its own filter,
-  // the request-level filter is ANDed with it so both constraints apply. String-equality
-  // predicates (column = "value") are safe: literals are transported verbatim and never
-  // interpreted as SQL. Absent means no additional predicate beyond what each leg specifies.
+  reserved 3, 5, 6;
+  reserved "rerank", "version", "tag";
+  // Bounded result count.
+  uint32 k = 7;
+  // Typed predicate.
   Filter filter = 8;
-  // Whether the request-level filter runs before or after the index search on both legs.
-  // Applies only when filter is set. When a leg has its own filter_mode and no request-level
-  // filter is present, the leg's own mode is used unchanged.
-  FilterMode filter_mode = 9;
-  // Pins which committed version to search on both legs. When unset, DatasetRef::Serve resolves
-  // the fixed production HEAD tag. Both legs are always opened at the same resolved version so
-  // fusion dedup is consistent.
-  oneof version_ref {
-    // Search this exact committed version id.
-    uint64 version = 10;
-    // Search the version this tag currently resolves to.
-    string tag = 11;
-  }
+  // Allowlisted scalar projection.
+  repeated string projection = 9;
+  // Event-time window.
+  TimeRange time_range = 4;
 }
 
-// Response for SearchService.HybridSearch.
+// Vector search response.
+message VectorSearchResponse {
+  // Results ordered nearest-first.
+  repeated VectorSearchResult results = 1;
+  // Exact catalog-served Lance version.
+  uint64 served_version = 2;
+  // True only when warnings describe a permitted degraded result.
+  bool partial = 3;
+  // Bounded closed warning codes.
+  repeated SearchWarning warnings = 4;
+}
+
+// One vector result.
+message VectorSearchResult {
+  reserved 1;
+  reserved "row";
+  // Vector distance.
+  float distance = 2;
+  // Stable logical identifier.
+  string vector_id = 3;
+  // Requested scalar projection.
+  repeated ProjectedField projection = 4;
+}
+
+// Text search request.
+message TextSearchRequest {
+  // Logical target.
+  DatasetTarget target = 1;
+  // Query semantics.
+  TextQuery query = 2;
+  reserved 3, 5, 6;
+  reserved "rerank", "version", "tag";
+  // Bounded result count.
+  uint32 k = 7;
+  // Typed predicate.
+  Filter filter = 8;
+  // Allowlisted scalar projection.
+  repeated string projection = 9;
+  // Event-time window.
+  TimeRange time_range = 4;
+}
+
+// Text search response.
+message TextSearchResponse {
+  // Results ordered best-first.
+  repeated TextSearchResult results = 1;
+  // Exact catalog-served Lance version.
+  uint64 served_version = 2;
+  // True only when warnings describe a permitted degraded result.
+  bool partial = 3;
+  // Bounded closed warning codes.
+  repeated SearchWarning warnings = 4;
+}
+
+// One text result.
+message TextSearchResult {
+  reserved 1;
+  reserved "row";
+  // BM25 score.
+  float score = 2;
+  // Stable logical identifier.
+  string vector_id = 3;
+  // Requested scalar projection.
+  repeated ProjectedField projection = 4;
+}
+
+// Hybrid search request.
+message HybridSearchRequest {
+  // Logical target.
+  DatasetTarget target = 1;
+  // Vector query semantics.
+  VectorQuery vector = 2;
+  // Text query semantics.
+  TextQuery text = 3;
+  // Bounded fused result count.
+  uint32 k = 4;
+  reserved 5, 6, 9, 10, 11;
+  reserved "fusion", "rerank", "filter_mode", "version", "tag";
+  // Event-time window shared by both legs.
+  TimeRange time_range = 7;
+  // Typed predicate shared by both legs.
+  Filter filter = 8;
+  // Product fusion mode.
+  HybridFusionMode fusion_mode = 12;
+  // Allowlisted scalar projection shared by both legs.
+  repeated string projection = 13;
+}
+
+// Hybrid search response.
 message HybridSearchResponse {
-  // Fused hits ordered best-first.
+  // Fused results ordered best-first.
   repeated HybridSearchResult results = 1;
+  // Exact catalog-served Lance version.
+  uint64 served_version = 2;
+  // True only when warnings describe a permitted degraded result.
+  bool partial = 3;
+  // Bounded closed warning codes.
+  repeated SearchWarning warnings = 4;
 }
 
-// One fused hit.
+// One hybrid result.
 message HybridSearchResult {
-  // Union of the projected columns returned by the legs that contained the row.
-  google.protobuf.Struct row = 1;
-  // Fused score under the configured strategy (larger is better).
+  reserved 1;
+  reserved "row";
+  // Fused score.
   double fused_score = 2;
+  // Stable logical identifier.
+  string vector_id = 3;
+  // Requested scalar projection.
+  repeated ProjectedField projection = 4;
 }

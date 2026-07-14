@@ -14,6 +14,7 @@
 //! - [`error`]: the single domain error type shared below the transport.
 
 pub mod backend;
+pub mod catalog;
 pub mod clusters;
 pub mod error;
 pub mod filter;
@@ -23,6 +24,7 @@ pub mod query;
 pub mod target;
 
 pub use backend::SearchBackend;
+pub use catalog::{ServingCatalog, ServingRoute};
 pub use clusters::{ClusterReader, ClusterReport, ClusterSpec};
 pub use error::SearchError;
 pub use filter::{CompareOp, Filter, Literal};
@@ -30,6 +32,7 @@ pub use fusion::FusionSpec;
 pub use prewarm::{PrewarmReport, PrewarmSpec, PrewarmedIndex, Prewarmer};
 pub use query::{
     DistanceKind, FilterMode, FusedHit, Fuzziness, Hit, HybridQuery, HybridSearchOutcome, MatchSpec, PhraseSpec,
-    TextOperator, TextQuery, TextQueryNode, TextSearchOutcome, TimeRange, VectorQuery, VectorSearchOutcome,
+    SearchWarning, TextOperator, TextQuery, TextQueryNode, TextSearchOutcome, TimeRange, VectorQuery,
+    VectorSearchOutcome,
 };
 pub use target::{DatasetRef, DatasetTarget};

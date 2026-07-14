@@ -25,7 +25,7 @@ pub enum DatasetRef {
 /// Addresses the dataset a request operates on.
 ///
 /// The target names the single dataset at `{base}/{org_id}/{tenant_id}/{namespace}.lance`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DatasetTarget {
     /// Organization id. Must match `[A-Za-z0-9_-]+`.
     pub org_id: String,

@@ -38,6 +38,7 @@ SUBCOMMANDS: tuple[str, ...] = (
     "all",
     "e2e",
     "experiment",
+    "qualify",
 )
 PHASE_NAMES: tuple[str, ...] = ("download", "prepare", "ingest", "index", "compact", "search", "report")
 RECALL_CUTOFFS: tuple[int, ...] = (1, 10, 100)
@@ -166,6 +167,8 @@ class BenchConfig:
             flags. This is how an iteration varies server-side knobs such as the cache backend or cache budgets.
         baseline: Run id of a previous experiment whose ``metrics.json`` is diffed against this run's headline
             numbers.
+        qualification_rows: Rows in the bounded deterministic scale and fault cohort.
+        allow_large_qualification: Explicit opt-in for a synthetic cohort above the local safety bound.
     """
 
     command: str
@@ -217,6 +220,8 @@ class BenchConfig:
     spawn_server: bool = True
     server_env: dict[str, str] = field(default_factory=dict)
     baseline: str | None = None
+    qualification_rows: int = 25_000
+    allow_large_qualification: bool = False
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants after the dataclass fields are populated.
@@ -458,6 +463,17 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
         default=14317,
         help="gRPC port for the local OTLP trace capture receiver (default 14317)",
     )
+    parser.add_argument(
+        "--qualification-rows",
+        type=int,
+        default=25_000,
+        help="Rows in the deterministic local scale qualification cohort",
+    )
+    parser.add_argument(
+        "--allow-large-qualification",
+        action="store_true",
+        help="Allow a qualification cohort above the local one-million-row safety bound",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -480,6 +496,7 @@ def build_parser() -> argparse.ArgumentParser:
         "all": "Run the full chain: download, prepare, ingest, index, compact, search, report",
         "e2e": "Batch-major e2e: per-batch ETL+index+compact+tag, historical-tag verification, optional gRPC legs",
         "experiment": "One agent iteration: prepare if needed, spawn the server, e2e, sizes, sweep, metrics.json",
+        "qualify": "Measure deterministic mutation collapse, skew, shuffle width, capacity, and external scale gates",
     }
     for name in SUBCOMMANDS:
         sub: argparse.ArgumentParser = subparsers.add_parser(name, help=help_texts[name])

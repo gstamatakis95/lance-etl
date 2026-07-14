@@ -80,7 +80,6 @@ async fn searches_after_prewarm_do_no_index_or_manifest_io() {
                 text: TextQuery::simple("pear", 0),
                 k: 2,
                 fusion: FusionSpec::default(),
-                reference: search_api::domain::DatasetRef::default(),
             },
         )
         .await
