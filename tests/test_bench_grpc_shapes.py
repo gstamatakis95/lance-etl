@@ -62,6 +62,10 @@ class TestServiceSurface:
         for rpc in EXPECTED_RPCS:
             assert hasattr(pb2_grpc.SearchServiceServicer, rpc)
 
+    def test_intake_service_cannot_return(self, pb2: ModuleType) -> None:
+        """The generated descriptor proves the removed Intake service is absent."""
+        assert "IntakeService" not in pb2.DESCRIPTOR.services_by_name
+
 
 class TestDatasetTarget:
     """The DatasetTarget helper matches what the benchmark ingest writes."""

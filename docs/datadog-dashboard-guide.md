@@ -19,13 +19,12 @@ widgets and template variables in Datadog.
    - 4.3 Search Quality and Recall
    - 4.4 Cache Effectiveness
    - 4.5 Prewarm
-   - 4.6 Intake
-   - 4.7 ETL Pipeline
-   - 4.8 Compaction (Maintenance)
-   - 4.9 TTL Expiry
-   - 4.10 Indexing
-   - 4.11 Errors and Saturation
-   - 4.12 Resource and IO
+   - 4.6 ETL Pipeline
+   - 4.7 Compaction (Maintenance)
+   - 4.8 TTL Expiry
+   - 4.9 Indexing
+   - 4.10 Errors and Saturation
+   - 4.11 Resource and IO
 5. [Widget Type Reference](#5-widget-type-reference)
 6. [Monitors and Alerts](#6-monitors-and-alerts)
 7. [Tips and Pitfalls](#7-tips-and-pitfalls)
@@ -41,7 +40,7 @@ It covers two distinct planes:
   into Lance datasets, builds and commits indexes, compacts fragments, expires TTL rows, and scores
   recall. Metrics are emitted under the `lance.pipeline.*` namespace via DogStatsD.
 - **Serving plane (Rust).** The gRPC search service (`search-api`) that handles VectorSearch,
-  TextSearch, HybridSearch, Prewarm, Clusters, and Intake RPCs. Metrics are emitted under the
+  TextSearch, HybridSearch, Prewarm, and Clusters RPCs. Metrics are emitted under the
   `search_api.*` namespace. Traces are forwarded over OTLP to the Datadog Agent.
 
 Primary readers are on-call engineers responding to alerts, platform engineers tuning pipeline
