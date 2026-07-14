@@ -616,6 +616,7 @@ class ControlPlaneRepository:
                 .where(target_work.c.work_id == claim.work_id)
                 .where(target_work.c.state == WorkState.RUNNING.value)
                 .where(target_work.c.lease_token == claim.lease_token)
+                .where(target_work.c.lease_expires_at > current)
                 .where(self.lease_is_current(claim))
                 .values(lease_expires_at=current + lease_duration, updated_at=current)
             )
@@ -669,6 +670,7 @@ class ControlPlaneRepository:
                     .where(target_work.c.work_id == claim.work_id)
                     .where(target_work.c.state == WorkState.RUNNING.value)
                     .where(target_work.c.lease_token == claim.lease_token)
+                    .where(target_work.c.lease_expires_at > current)
                     .where(self.lease_is_current(claim))
                     .with_for_update()
                 )
@@ -716,6 +718,7 @@ class ControlPlaneRepository:
                 "error_message": bounded_error(error_message, ERROR_MESSAGE_LIMIT),
                 "updated_at": current,
             },
+            current,
         )
 
     def block_work(
@@ -743,6 +746,7 @@ class ControlPlaneRepository:
                 .where(target_work.c.work_id == claim.work_id)
                 .where(target_work.c.state == WorkState.RUNNING.value)
                 .where(target_work.c.lease_token == claim.lease_token)
+                .where(target_work.c.lease_expires_at > current)
                 .where(self.lease_is_current(claim))
                 .values(
                     state=WorkState.BLOCKED.value,
@@ -811,12 +815,13 @@ class ControlPlaneRepository:
             )
             return result.rowcount == 1
 
-    def finish_running_transition(self, claim: WorkClaim, values: dict[str, Any]) -> bool:
+    def finish_running_transition(self, claim: WorkClaim, values: dict[str, Any], current: datetime) -> bool:
         """Apply a lease-clearing transition guarded by token and target fence.
 
         Args:
             claim: Current fenced claim.
             values: Transition values excluding cleared lease fields.
+            current: Transaction clock used to reject an expired lease.
 
         Returns:
             True when transitioned, false for a stale worker.
@@ -827,6 +832,7 @@ class ControlPlaneRepository:
                 .where(target_work.c.work_id == claim.work_id)
                 .where(target_work.c.state == WorkState.RUNNING.value)
                 .where(target_work.c.lease_token == claim.lease_token)
+                .where(target_work.c.lease_expires_at > current)
                 .where(self.lease_is_current(claim))
                 .values(**values, lease_token=None, lease_expires_at=None)
             )
@@ -882,6 +888,7 @@ class ControlPlaneRepository:
                 .where(target_work.c.work_id == claim.work_id)
                 .where(target_work.c.state == WorkState.RUNNING.value)
                 .where(target_work.c.lease_token == claim.lease_token)
+                .where(target_work.c.lease_expires_at > current)
                 .where(self.lease_is_current(claim))
                 .values(
                     state=WorkState.SUCCEEDED.value,
@@ -1047,6 +1054,7 @@ class ControlPlaneRepository:
                 "error_message": None,
                 "updated_at": current,
             },
+            current,
         )
 
     def resolve_serving_target(self, identity: RoutingIdentity) -> ServingTarget | None:
