@@ -296,7 +296,7 @@ def vector_search_at_tag(
 
     Sets the ``version_ref`` oneof on the ``VectorSearchRequest`` message so the server opens
     exactly the tagged snapshot. When neither ``tag`` nor ``version`` is supplied the request
-    follows the server's default serve policy (latest committed version or configured serve tag).
+    resolves the fixed production ``HEAD`` tag.
 
     Args:
         stub: The connected service stub.
@@ -332,8 +332,8 @@ def text_search_at_tag(
 ) -> tuple[Any, float]:
     """Run a text search pinned to a tag or exact version via the ``version_ref`` oneof.
 
-    When neither ``tag`` nor ``version`` is supplied the request follows the server's default
-    serve policy (latest committed version or configured serve tag).
+    When neither ``tag`` nor ``version`` is supplied the request resolves the fixed production
+    ``HEAD`` tag.
 
     Args:
         stub: The connected service stub.

@@ -55,8 +55,7 @@ pub fn prewarm_ref_from_proto(request: &pb::PrewarmRequest) -> DatasetRef {
 ///
 /// The three generated oneof types are structurally identical but distinct Rust types, so one
 /// macro emits the identical `Version`/`Tag`/unset mapping for each. An unset selector defaults
-/// to [`DatasetRef::Serve`] (follow the serve policy), preserving the behavior of existing
-/// clients that never set the field.
+/// to [`DatasetRef::Serve`], which resolves the fixed production `HEAD` tag.
 macro_rules! search_ref_from_proto {
     ($(#[$doc:meta])* $name:ident, $oneof:path) => {
         $(#[$doc])*

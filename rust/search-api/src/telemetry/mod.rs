@@ -62,8 +62,8 @@
 //!   (distribution), `prewarm.last_version` (gauge: most recently warmed version).
 //! - `serve.cold_open` (count, tagged `warmed`): a serving cold open whose version had or had not
 //!   been prewarmed. `warmed:false` is the flip-without-prewarm signal.
-//! - `serve.tag_resolved` (count, tagged `changed`): a serve-tag re-resolution after the TTL
-//!   lapsed. `changed:true` marks a replica observing a tag flip.
+//! - `serve.tag_resolved` (count, tagged `changed`): a `HEAD` re-resolution after the TTL lapsed.
+//!   `changed:true` marks a replica observing a `HEAD` move.
 //!
 //! Clusters and recall ([`metrics::Metrics::clusters_read`], `clusters_centroids`,
 //! `recall_sample`):

@@ -161,4 +161,5 @@ variable table. These finer-grained normative facts are recorded here so they ar
 - **Prewarm.** The `Prewarm` RPC accepts `version` (explicit committed version id) or `tag`
   (resolves the named tag at call time) and returns `resolved_version`, enabling the safe
   green-before-flip workflow: build the green version, prewarm every replica against it explicitly,
-  confirm `resolved_version`, then flip the serving tag. Never flip then warm.
+  confirm `resolved_version`, then move the fixed production `HEAD` tag. `DatasetRef::Serve`
+  always resolves `HEAD`. Never move `HEAD` before warming.

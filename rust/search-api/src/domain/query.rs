@@ -97,9 +97,9 @@ pub struct VectorQuery {
     /// Number of leading hits to skip.
     pub offset: Option<usize>,
     /// Which committed version of the dataset to open for this query. Defaults to
-    /// [`DatasetRef::Serve`], which follows the provider's configured serve policy (the serve tag
-    /// when enabled, otherwise the latest committed version). Setting an explicit version id or tag
-    /// name pins the search to that snapshot without affecting other in-flight requests.
+    /// [`DatasetRef::Serve`], which resolves the fixed production `HEAD` tag. Setting an explicit
+    /// version id or tag name pins the search to that snapshot without affecting other in-flight
+    /// requests.
     pub reference: DatasetRef,
 }
 
@@ -244,9 +244,9 @@ pub struct TextQuery {
     /// `None` on datasets where the server default is off.
     pub fast_search: Option<bool>,
     /// Which committed version of the dataset to open for this query. Defaults to
-    /// [`DatasetRef::Serve`], which follows the provider's configured serve policy (the serve tag
-    /// when enabled, otherwise the latest committed version). Setting an explicit version id or tag
-    /// name pins the search to that snapshot without affecting other in-flight requests.
+    /// [`DatasetRef::Serve`], which resolves the fixed production `HEAD` tag. Setting an explicit
+    /// version id or tag name pins the search to that snapshot without affecting other in-flight
+    /// requests.
     pub reference: DatasetRef,
 }
 
@@ -282,10 +282,10 @@ pub struct HybridQuery {
     /// Fusion strategy for merging the legs.
     pub fusion: FusionSpec,
     /// Which committed version of the dataset to open for both legs. Defaults to
-    /// [`DatasetRef::Serve`], which follows the provider's configured serve policy (the serve tag
-    /// when enabled, otherwise the latest committed version). Both legs are always opened at the
-    /// same resolved version so fusion dedup is consistent. Setting an explicit version id or tag
-    /// name pins the search to that snapshot without affecting other in-flight requests.
+    /// [`DatasetRef::Serve`], which resolves the fixed production `HEAD` tag. Both legs are always
+    /// opened at the same resolved version so fusion dedup is consistent. Setting an explicit
+    /// version id or tag name pins the search to that snapshot without affecting other in-flight
+    /// requests.
     pub reference: DatasetRef,
 }
 

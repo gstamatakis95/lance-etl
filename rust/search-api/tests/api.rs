@@ -116,6 +116,12 @@ async fn build_test_dataset(uri: &str) {
         )
         .await
         .unwrap();
+    let head_version = dataset.version_id();
+    dataset
+        .tags()
+        .create(search_api::config::PRODUCTION_SERVE_TAG, head_version)
+        .await
+        .unwrap();
 }
 
 /// Serves the gRPC API on an ephemeral local port and returns a connected channel.
@@ -150,8 +156,6 @@ async fn serve_full(tmp: &TempDir, metrics: Arc<Metrics>, recall: Option<RecallC
         redis_namespace: search_api::config::DEFAULT_REDIS_NAMESPACE.to_string(),
         statsd_addr: "127.0.0.1:8125".to_string(),
         telemetry_disabled: true,
-        serve_by_tag: search_api::config::DEFAULT_SERVE_BY_TAG,
-        serve_tag: search_api::config::DEFAULT_SERVE_TAG.to_string(),
         serve_tag_ttl_secs: search_api::config::DEFAULT_SERVE_TAG_TTL_SECS,
         prewarm_targets_path: None,
     };
@@ -661,6 +665,12 @@ async fn clusters_rpc_returns_ivf_centroids() {
             &VectorIndexParams::ivf_flat(4, LanceDistanceType::L2),
             true,
         )
+        .await
+        .unwrap();
+    let head_version = dataset.version_id();
+    dataset
+        .tags()
+        .create(search_api::config::PRODUCTION_SERVE_TAG, head_version)
         .await
         .unwrap();
     let channel = serve(&tmp).await;
@@ -1484,7 +1494,7 @@ async fn version_ref_pins_a_search_to_a_tagged_or_explicit_snapshot() {
     let channel = serve(&tmp).await;
     let mut client = SearchServiceClient::new(channel);
 
-    let latest = client
+    let served = client
         .vector_search(VectorSearchRequest {
             rerank: None,
             time_range: None,
@@ -1495,8 +1505,15 @@ async fn version_ref_pins_a_search_to_a_tagged_or_explicit_snapshot() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(latest.results.len(), 5, "an unpinned search must see the appended row");
-    assert_eq!(row_number(&latest.results[0].row, "id"), 9.0);
+    assert_eq!(
+        served.results.len(),
+        4,
+        "an unpinned search must resolve HEAD rather than the later commit"
+    );
+    assert!(
+        served.results.iter().all(|hit| row_number(&hit.row, "id") != 9.0),
+        "the post-HEAD append must be invisible to production serving"
+    );
 
     let at_tag = client
         .vector_search(VectorSearchRequest {

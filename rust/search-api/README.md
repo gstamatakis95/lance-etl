@@ -150,12 +150,11 @@ inherits: `enable_stable_row_ids` is rejected everywhere (ADR 0010,
 shared-dataset or cross-org query mode to the domain or gRPC layers.
 
 **Query-at-a-tag.** Every search RPC carries an optional `version_ref` naming a committed version
-id or a tag (e.g. an ETL hourly interval tag). `DatasetRef::Serve` (the default) follows the
-provider's configured serve policy so the common latest-version path pays no extra cost. A pinned
-request opens exactly that snapshot, coexisting in the handle LRU with the serve handle (ADR 0032,
-`docs/adr/serving-filters-and-tags.md`). Blue-green flips go through a named tag: build the green
-version, prewarm every replica against it explicitly via the `Prewarm` RPC's `version`/`tag`
-field, then flip the tag. Never flip before warming.
+id or a tag (e.g. an ETL hourly interval tag). `DatasetRef::Serve` (the default) always resolves
+the fixed production `HEAD` tag. A pinned request opens exactly that snapshot, coexisting in the
+handle LRU with the production handle (ADR 0032, `docs/adr/serving-filters-and-tags.md`). Build the
+green version, prewarm every replica against it explicitly via the `Prewarm` RPC's `version`/`tag`
+field, verify the resolved version, then move `HEAD`. Never move `HEAD` before warming.
 
 ---
 
@@ -175,9 +174,6 @@ sampling, and the search `k` ceiling) is a fixed constant in `src/config.rs`, no
 | `SEARCH_API_REDIS_URL` | (none) | Redis connection URL (`redis://` or `rediss://`), required when the backend is `redis` |
 | `SEARCH_API_REDIS_NAMESPACE` | `search-api` | Key namespace prepended to every Redis cache key |
 | `SEARCH_API_CACHE_DIR` | `/tmp/rust-search/cache` | Root directory for the `disk` backend's caches |
-| `SEARCH_API_DISK_CACHE_DISABLED` | `false` | Deprecated alias for `SEARCH_API_CACHE_BACKEND=memory`, honored only when the latter is unset |
-| `SEARCH_API_SERVE_BY_TAG` | `false` | Resolve the configured serve tag instead of opening the latest committed version |
-| `SEARCH_API_SERVE_TAG` | `HEAD` | Tag name resolved when `SEARCH_API_SERVE_BY_TAG=true` |
 | `SEARCH_API_PREWARM_TARGETS_PATH` | (empty, disabled) | Path to a startup prewarm-targets file, one `{org_id}/{tenant_id}/{namespace}` per line, warmed in the background before those datasets would otherwise be opened cold |
 | `SEARCH_API_STATSD_ADDR` | `127.0.0.1:8125` (or `{DD_AGENT_HOST}:8125` when `DD_AGENT_HOST` is set) | DogStatsD UDP address |
 | `SEARCH_API_TELEMETRY_DISABLED` | `false` | Disables trace export and DogStatsD entirely (JSON logs only) |

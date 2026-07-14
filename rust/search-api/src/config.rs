@@ -206,16 +206,13 @@ pub const DEFAULT_PREWARM_TARGETS_PATH: &str = "";
 /// varies it, so it is no longer an env knob.
 pub const DEFAULT_IO_BLOCK_SIZE_BYTES: usize = 256 * 1024;
 
-/// Default for whether serving resolves the configured serve tag instead of opening latest.
+/// Fixed tag resolved by production serving requests.
 ///
-/// Off by default so the legacy latest-resolution behavior is preserved until an operator has
-/// verified prewarm-by-version and is ready to cut serving over to tag-based blue-green.
-pub const DEFAULT_SERVE_BY_TAG: bool = false;
+/// This is deliberately not configurable. Publishers move `HEAD` only after the target version
+/// has been prewarmed and verified on every required replica.
+pub const PRODUCTION_SERVE_TAG: &str = "HEAD";
 
-/// Default serve tag resolved to a concrete version when serve-by-tag is enabled.
-pub const DEFAULT_SERVE_TAG: &str = "HEAD";
-
-/// Fixed TTL in seconds for trusting a resolved serve-tag version before re-reading the tag.
+/// Fixed TTL in seconds for trusting the resolved `HEAD` version before re-reading the tag.
 ///
 /// Bounds how long a tag flip can go unobserved by a replica. Hardcoded: no deployment has ever
 /// retuned this, so it is no longer an env knob.
@@ -261,8 +258,7 @@ pub struct Config {
     /// Fixed: no longer env-configurable.
     pub disk_store_cache_bytes: u64,
     /// Which persistent backend the cache tiers use (default `Disk`). Env: `SEARCH_API_CACHE_BACKEND`
-    /// (`disk`, `redis`, or `memory`). The deprecated `SEARCH_API_DISK_CACHE_DISABLED=true` is
-    /// honored as an alias for `memory` when `SEARCH_API_CACHE_BACKEND` is unset.
+    /// (`disk`, `redis`, or `memory`).
     pub cache_backend: CacheBackendKind,
     /// Redis connection URL (`redis://` or `rediss://`), required when the backend is `redis`.
     /// Env: `SEARCH_API_REDIS_URL`.
@@ -276,15 +272,7 @@ pub struct Config {
     /// Disables trace export and DogStatsD entirely (tests / local runs keep JSON logs only).
     /// Env: `SEARCH_API_TELEMETRY_DISABLED`.
     pub telemetry_disabled: bool,
-    /// Whether serving resolves the configured serve tag to a concrete version instead of opening
-    /// the latest committed version (default false). When on, the provider keys its caches on the
-    /// resolved version so blue and green coexist and a tag flip is observed within the serve-tag
-    /// TTL. Env: `SEARCH_API_SERVE_BY_TAG`.
-    pub serve_by_tag: bool,
-    /// Tag serving resolves to a committed version when `serve_by_tag` is on (default `HEAD`).
-    /// Env: `SEARCH_API_SERVE_TAG`.
-    pub serve_tag: String,
-    /// Seconds a resolved serve-tag version is trusted before the tag JSON is re-read (default
+    /// Seconds the resolved `HEAD` version is trusted before the tag JSON is re-read (default
     /// [`DEFAULT_SERVE_TAG_TTL_SECS`]). Fixed: no longer env-configurable.
     pub serve_tag_ttl_secs: u64,
     /// Path to the startup prewarm targets file (empty = disabled).
@@ -302,13 +290,11 @@ impl Config {
     ///
     /// `LANCE_ETL_BASE_URI` is required: the base URI all dataset paths are resolved under
     /// (a trailing slash is stripped). Optional overrides: `SEARCH_API_PORT`,
-    /// `SEARCH_API_CACHE_DIR`, `SEARCH_API_CACHE_BACKEND` (`disk`, `redis`, or `memory`, with
-    /// `SEARCH_API_DISK_CACHE_DISABLED=true` honored as a deprecated alias for `memory`),
+    /// `SEARCH_API_CACHE_DIR`, `SEARCH_API_CACHE_BACKEND` (`disk`, `redis`, or `memory`),
     /// `SEARCH_API_REDIS_URL` (required for the `redis` backend), `SEARCH_API_REDIS_NAMESPACE`
     /// (default `search-api`), `SEARCH_API_STATSD_ADDR` (default honors `DD_AGENT_HOST`),
-    /// `SEARCH_API_TELEMETRY_DISABLED`, `SEARCH_API_SERVE_BY_TAG` (default false),
-    /// `SEARCH_API_SERVE_TAG` (default `HEAD`), and `SEARCH_API_PREWARM_TARGETS_PATH` (default
-    /// empty, disabled).
+    /// `SEARCH_API_TELEMETRY_DISABLED`, and `SEARCH_API_PREWARM_TARGETS_PATH` (default empty,
+    /// disabled). Production serving always resolves the fixed [`PRODUCTION_SERVE_TAG`].
     ///
     /// Every other knob — dataset-handle cache sizing, index/metadata/disk cache budgets,
     /// serve-tag TTL, IO concurrency, ANN probe/refine/fast-search defaults, gRPC timeout and
@@ -342,8 +328,6 @@ impl Config {
             redis_namespace: env_string("SEARCH_API_REDIS_NAMESPACE", DEFAULT_REDIS_NAMESPACE),
             statsd_addr: env_string("SEARCH_API_STATSD_ADDR", &default_statsd_addr()),
             telemetry_disabled: env_bool("SEARCH_API_TELEMETRY_DISABLED", false)?,
-            serve_by_tag: env_bool("SEARCH_API_SERVE_BY_TAG", DEFAULT_SERVE_BY_TAG)?,
-            serve_tag: env_string("SEARCH_API_SERVE_TAG", DEFAULT_SERVE_TAG),
             serve_tag_ttl_secs: DEFAULT_SERVE_TAG_TTL_SECS,
             prewarm_targets_path: {
                 let raw = env_string("SEARCH_API_PREWARM_TARGETS_PATH", DEFAULT_PREWARM_TARGETS_PATH);
@@ -359,18 +343,13 @@ impl Config {
 
 /// Resolves the cache backend selection.
 ///
-/// `SEARCH_API_CACHE_BACKEND` wins when set. Otherwise the deprecated
-/// `SEARCH_API_DISK_CACHE_DISABLED=true` alias maps to [`CacheBackendKind::Memory`] (with a
-/// deprecation warning), and the default is [`CacheBackendKind::Disk`].
+/// `SEARCH_API_CACHE_BACKEND` selects the backend when set. Otherwise the default is
+/// [`CacheBackendKind::Disk`].
 fn env_cache_backend() -> Result<CacheBackendKind, String> {
     if let Ok(raw) = std::env::var("SEARCH_API_CACHE_BACKEND") {
         return raw
             .parse::<CacheBackendKind>()
             .map_err(|err| format!("SEARCH_API_CACHE_BACKEND {err}"));
-    }
-    if env_bool("SEARCH_API_DISK_CACHE_DISABLED", false)? {
-        tracing::warn!("SEARCH_API_DISK_CACHE_DISABLED is deprecated, use SEARCH_API_CACHE_BACKEND=memory");
-        return Ok(CacheBackendKind::Memory);
     }
     Ok(CacheBackendKind::Disk)
 }
@@ -443,15 +422,12 @@ mod tests {
     }
 
     /// Env var names cleared so defaults apply in tests.
-    const OPTIONAL_VARS: [&str; 12] = [
+    const OPTIONAL_VARS: [&str; 9] = [
         "SEARCH_API_CACHE_BACKEND",
         "SEARCH_API_REDIS_URL",
         "SEARCH_API_REDIS_NAMESPACE",
-        "SEARCH_API_SERVE_BY_TAG",
-        "SEARCH_API_SERVE_TAG",
         "SEARCH_API_PORT",
         "SEARCH_API_CACHE_DIR",
-        "SEARCH_API_DISK_CACHE_DISABLED",
         "SEARCH_API_STATSD_ADDR",
         "SEARCH_API_TELEMETRY_DISABLED",
         "DD_AGENT_HOST",
@@ -476,29 +452,27 @@ mod tests {
             assert_eq!(config.redis_namespace, DEFAULT_REDIS_NAMESPACE);
             assert_eq!(config.statsd_addr, DEFAULT_STATSD_ADDR);
             assert!(!config.telemetry_disabled);
-            assert_eq!(config.serve_by_tag, DEFAULT_SERVE_BY_TAG);
-            assert_eq!(config.serve_tag, DEFAULT_SERVE_TAG);
-            assert_eq!(config.serve_tag, "HEAD", "the default serve tag is HEAD");
             assert_eq!(config.serve_tag_ttl_secs, DEFAULT_SERVE_TAG_TTL_SECS);
             assert!(config.prewarm_targets_path.is_none());
         });
     }
 
     #[test]
-    fn serve_tag_env_overrides_apply() {
+    fn removed_env_surfaces_are_ignored() {
         with_env(
             &[
                 ("LANCE_ETL_BASE_URI", Some("/data/lance")),
-                ("SEARCH_API_SERVE_BY_TAG", Some("true")),
+                ("SEARCH_API_CACHE_BACKEND", None),
+                ("SEARCH_API_SERVE_BY_TAG", Some("false")),
                 ("SEARCH_API_SERVE_TAG", Some("green")),
+                ("SEARCH_API_DISK_CACHE_DISABLED", Some("true")),
             ],
             || {
                 let config = Config::from_env().unwrap();
-                assert!(config.serve_by_tag);
-                assert_eq!(config.serve_tag, "green");
+                assert_eq!(config.cache_backend, CacheBackendKind::Disk);
                 assert_eq!(
                     config.serve_tag_ttl_secs, DEFAULT_SERVE_TAG_TTL_SECS,
-                    "serve_tag_ttl_secs is fixed and no longer env-configurable"
+                    "HEAD resolution TTL remains fixed"
                 );
             },
         );
@@ -541,8 +515,7 @@ mod tests {
             &[
                 ("LANCE_ETL_BASE_URI", Some("/data/lance")),
                 ("SEARCH_API_CACHE_DIR", Some("/var/cache/search")),
-                ("SEARCH_API_CACHE_BACKEND", None),
-                ("SEARCH_API_DISK_CACHE_DISABLED", Some("true")),
+                ("SEARCH_API_CACHE_BACKEND", Some("memory")),
             ],
             || {
                 let config = Config::from_env().unwrap();
@@ -554,28 +527,21 @@ mod tests {
 
     #[test]
     fn bool_parsing_accepts_common_spellings_and_rejects_garbage() {
-        for (raw, expected) in [
-            ("1", CacheBackendKind::Memory),
-            ("Yes", CacheBackendKind::Memory),
-            ("off", CacheBackendKind::Disk),
-            ("FALSE", CacheBackendKind::Disk),
-        ] {
+        for (raw, expected) in [("1", true), ("Yes", true), ("off", false), ("FALSE", false)] {
             with_env(
                 &[
                     ("LANCE_ETL_BASE_URI", Some("/data/lance")),
-                    ("SEARCH_API_CACHE_BACKEND", None),
-                    ("SEARCH_API_DISK_CACHE_DISABLED", Some(raw)),
+                    ("SEARCH_API_TELEMETRY_DISABLED", Some(raw)),
                 ],
                 || {
-                    assert_eq!(Config::from_env().unwrap().cache_backend, expected);
+                    assert_eq!(Config::from_env().unwrap().telemetry_disabled, expected);
                 },
             );
         }
         with_env(
             &[
                 ("LANCE_ETL_BASE_URI", Some("/data/lance")),
-                ("SEARCH_API_CACHE_BACKEND", None),
-                ("SEARCH_API_DISK_CACHE_DISABLED", Some("maybe")),
+                ("SEARCH_API_TELEMETRY_DISABLED", Some("maybe")),
             ],
             || {
                 assert!(Config::from_env().is_err());
@@ -638,20 +604,6 @@ mod tests {
                 assert_eq!(config.cache_backend, CacheBackendKind::Redis);
                 assert_eq!(config.redis_url.as_deref(), Some("rediss://cache.internal:6380"));
                 assert_eq!(config.redis_namespace, "staging");
-            },
-        );
-    }
-
-    #[test]
-    fn explicit_backend_wins_over_the_deprecated_disabled_alias() {
-        with_env(
-            &[
-                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
-                ("SEARCH_API_CACHE_BACKEND", Some("disk")),
-                ("SEARCH_API_DISK_CACHE_DISABLED", Some("true")),
-            ],
-            || {
-                assert_eq!(Config::from_env().unwrap().cache_backend, CacheBackendKind::Disk);
             },
         );
     }

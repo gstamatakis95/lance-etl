@@ -60,9 +60,10 @@ Five-layer design over tonic, each layer with a one-directional dependency on th
 Filters are a typed AST — raw SQL is never accepted or constructed. Every request carries exactly
 one `DatasetTarget` (`org_id`, `tenant_id`, `namespace`). A hybrid persistent cache extends the
 in-process session caches beyond the process (local disk by default or shared Redis) and never
-caches raw row data. Blue-green flips go through a named tag, warmed before the flip. The full
-service guide — RPCs, environment variables, invariants, and observability — is in
-`rust/search-api/README.md`.
+caches raw row data. The current production search path resolves the fixed `HEAD` tag and fails
+closed when it is absent. The required publication protocol will warm and validate an exact version
+before moving `HEAD`. The full service guide — RPCs, environment variables, invariants, and
+observability — is in `rust/search-api/README.md`.
 
 ---
 

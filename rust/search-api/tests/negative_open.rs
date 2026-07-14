@@ -7,8 +7,18 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+use arrow_schema::{DataType, Field, Schema};
+use lance::Dataset;
 use search_api::domain::{DatasetRef, SearchError};
 use search_api::lance::{CachingDatasetProvider, DatasetProvider};
+
+async fn write_unpublished_dataset(uri: &str) {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    Dataset::write(reader, uri, None).await.unwrap();
+}
 
 #[tokio::test]
 async fn missing_dataset_opens_are_negatively_cached_and_expire_with_the_ttl() {
@@ -79,4 +89,21 @@ async fn missing_tag_opens_are_negatively_cached_within_the_ttl() {
         operations_after_first,
         "repeat tag probes within the negative-cache TTL must not touch the store"
     );
+}
+
+#[tokio::test]
+async fn serve_fails_closed_when_existing_dataset_has_no_head_tag() {
+    let dataset_root = tempfile::TempDir::new().unwrap();
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let uri = format!("{}/{}", dataset_root.path().display(), common::TEST_DATASET_PATH);
+    write_unpublished_dataset(&uri).await;
+
+    let config = common::test_config(dataset_root.path(), cache_dir.path());
+    let provider = CachingDatasetProvider::new(&config).await;
+    let err = provider
+        .dataset(&common::test_target(), DatasetRef::Serve)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, SearchError::NotFound(_)), "unexpected error: {err:?}");
 }

@@ -95,6 +95,12 @@ async fn build_timestamped_dataset(uri: &str) {
         )
         .await
         .unwrap();
+    let head_version = dataset.version_id();
+    dataset
+        .tags()
+        .create(search_api::config::PRODUCTION_SERVE_TAG, head_version)
+        .await
+        .unwrap();
 }
 
 /// Builds a backend over a fresh provider rooted at `data_root`, with the given cache dir.

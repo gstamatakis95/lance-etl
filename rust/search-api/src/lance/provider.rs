@@ -17,7 +17,7 @@ use crate::cache::janitor::CacheJanitor;
 use crate::cache::layout::prepare_cache_root;
 use crate::cache::redis_store::RedisEntryStore;
 use crate::cache::store_cache::MetadataByteCache;
-use crate::config::{CacheBackendKind, Config};
+use crate::config::{CacheBackendKind, Config, PRODUCTION_SERVE_TAG};
 use crate::domain::{DatasetRef, DatasetTarget, SearchError};
 use crate::lance::error::classify_lance_error;
 use crate::telemetry::{CacheName, Metrics, Tier};
@@ -46,8 +46,7 @@ pub fn handle_weight(dataset: &Dataset) -> u32 {
 /// outlive the freshness window — otherwise a low-traffic tenant would keep serving the version
 /// captured at first open until capacity pressure happened to evict the handle. Version-pinned
 /// `(uri, Some(v))` handles are immutable snapshots and never expire by time; capacity weighting
-/// alone bounds them. The window reuses `serve_tag_ttl_secs`, giving `Latest` and default
-/// `Serve` opens the same staleness bound the serve-by-tag path already has.
+/// alone bounds them. The window reuses `serve_tag_ttl_secs` for the explicit `Latest` path.
 struct UnpinnedHandleExpiry {
     ttl: Duration,
 }
@@ -77,10 +76,10 @@ pub trait DatasetProvider: Send + Sync + 'static {
     ///
     /// The target resolves to `{base}/{org}/{tenant}/{namespace}.lance`.
     ///
-    /// `reference` selects the committed version: [`DatasetRef::Serve`] follows the provider's
-    /// configured serve policy (a resolved serve tag, or latest), [`DatasetRef::Latest`] opens
-    /// latest (freshness-bounded: a cached latest handle is refreshed within the serve-tag TTL,
-    /// so a new commit becomes visible within that window), and
+    /// `reference` selects the committed version: [`DatasetRef::Serve`] resolves the fixed
+    /// production `HEAD` tag, [`DatasetRef::Latest`] opens latest (freshness-bounded: a cached
+    /// latest handle is refreshed within the tag TTL, so a new commit becomes visible within that
+    /// window), and
     /// [`DatasetRef::Version`]/[`DatasetRef::Tag`] pin an explicit version. A version-pinned
     /// open keys the handle cache on the resolved version, so blue and green versions of one
     /// dataset coexist and a tag flip selects a different handle rather than mutating one.
@@ -140,9 +139,9 @@ pub fn build_session(config: &Config, index_backend: Option<Arc<HybridIndexCache
 /// weight ([`handle_weight`]) rather than a flat entry count, so the cheap tiny-tenant tail stays
 /// resident while a few heavy whale handles are capped.
 ///
-/// Blue-green serving: when `serve_by_tag` is on, [`DatasetRef::Serve`] resolves `serve_tag` to a
-/// concrete version through `tag_versions` (a short-TTL cache, so a tag flip propagates within the
-/// TTL without a manifest read per request) and opens that exact version. Because the handle cache
+/// Blue-green serving: [`DatasetRef::Serve`] resolves the fixed production `HEAD` tag to a concrete
+/// version through `tag_versions` (a short-TTL cache, so a tag flip propagates within the TTL
+/// without a manifest read per request) and opens that exact version. Because the handle cache
 /// and Lance's own version- and index-UUID-scoped disk/metadata caches all key on the resolved
 /// version, a freshly built green version that was prewarmed by version is served warm the moment
 /// the tag flips onto it, while the draining blue handle ages out by capacity.
@@ -155,7 +154,7 @@ pub struct CachingDatasetProvider {
     /// `(uri, selector)` where the selector encodes the resolved reference intent (`latest`,
     /// `version:{n}`, or `tag:{name}`). Keying on the reference — rather than a resolved version
     /// that a failed tag resolution never produces — lets the cache cover tag-addressed misses
-    /// (`DatasetRef::Tag` and every serve-by-tag request) as well as `Latest`/`Version`, so a hot
+    /// (`DatasetRef::Tag` and every production `HEAD` request) as well as `Latest`/`Version`, so a hot
     /// loop of requests for a nonexistent dataset or tag is answered from here instead of hammering
     /// the object store. Only NotFound outcomes are cached — a missing dataset OR a missing tag,
     /// never a transient failure — and the TTL
@@ -165,8 +164,6 @@ pub struct CachingDatasetProvider {
     tag_versions: Cache<(String, String), u64>,
     last_tag_version: Cache<(String, String), u64>,
     last_prewarmed: Cache<String, u64>,
-    serve_by_tag: bool,
-    serve_tag: String,
     store_params: Option<ObjectStoreParams>,
     index_cache: Option<Arc<HybridIndexCacheBackend>>,
     store_cache: Option<Arc<MetadataByteCache>>,
@@ -261,8 +258,6 @@ impl CachingDatasetProvider {
                 .build(),
             last_tag_version: Cache::new(config.dataset_cache_capacity),
             last_prewarmed: Cache::new(config.dataset_cache_capacity),
-            serve_by_tag: config.serve_by_tag,
-            serve_tag: config.serve_tag.clone(),
             store_params,
             index_cache,
             store_cache,
@@ -320,13 +315,12 @@ impl CachingDatasetProvider {
     /// The selector mirrors what [`Self::resolve_reference`] will consult, so a NotFound recorded
     /// under this key short-circuits every subsequent identical request within the TTL — including
     /// the tag paths, whose resolution failure happens before any version is known. `Serve`
-    /// collapses onto `latest` or `tag:{serve_tag}` exactly as the serve policy resolves it, and a
-    /// `Tag` request naming the serve tag shares that key because both open the same thing.
+    /// collapses onto `tag:HEAD`, and an explicit `Tag("HEAD")` request shares that key because
+    /// both open the same thing.
     fn negative_open_key(&self, uri: &str, reference: &DatasetRef) -> (String, String) {
         let selector = match reference {
             DatasetRef::Latest => "latest".to_string(),
-            DatasetRef::Serve if !self.serve_by_tag => "latest".to_string(),
-            DatasetRef::Serve => format!("tag:{}", self.serve_tag),
+            DatasetRef::Serve => format!("tag:{PRODUCTION_SERVE_TAG}"),
             DatasetRef::Version(version) => format!("version:{version}"),
             DatasetRef::Tag(tag) => format!("tag:{tag}"),
         };
@@ -335,8 +329,8 @@ impl CachingDatasetProvider {
 
     /// Resolves a [`DatasetRef`] to the concrete version to open.
     ///
-    /// `Serve` follows the serve policy: the serve tag when `serve_by_tag` is on, else latest.
-    /// `Latest` resolves to no version (the `(uri, None)` handle key), so a later serving open
+    /// `Serve` resolves the fixed production `HEAD` tag. `Latest` resolves to no version (the
+    /// `(uri, None)` handle key), so a later open
     /// of the same latest handle reads back a prewarmed version and reports `warmed:true`. The
     /// `(uri, None)` handle itself expires after the serve-tag TTL ([`UnpinnedHandleExpiry`]),
     /// so a commit that lands after the open becomes visible within one TTL window.
@@ -347,8 +341,7 @@ impl CachingDatasetProvider {
     async fn resolve_reference(&self, uri: &str, reference: DatasetRef) -> Result<Option<u64>, SearchError> {
         Ok(match reference {
             DatasetRef::Latest => None,
-            DatasetRef::Serve if !self.serve_by_tag => None,
-            DatasetRef::Serve => Some(self.resolve_tag_version(uri, &self.serve_tag).await?),
+            DatasetRef::Serve => Some(self.resolve_tag_version(uri, PRODUCTION_SERVE_TAG).await?),
             DatasetRef::Version(version) => Some(version),
             DatasetRef::Tag(tag) => Some(self.resolve_tag_version(uri, &tag).await?),
         })

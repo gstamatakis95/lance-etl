@@ -240,6 +240,12 @@ pub async fn build_indexed_dataset(uri: &str) {
         .create_index(&["id"], IndexType::BTree, None, &ScalarIndexParams::default(), true)
         .await
         .unwrap();
+    let head_version = dataset.version_id();
+    dataset
+        .tags()
+        .create(search_api::config::PRODUCTION_SERVE_TAG, head_version)
+        .await
+        .unwrap();
 }
 
 /// Builds a config over the given dataset root and cache dir, using the `file-object-store`
@@ -260,8 +266,6 @@ pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) 
         redis_namespace: search_api::config::DEFAULT_REDIS_NAMESPACE.to_string(),
         statsd_addr: "127.0.0.1:8125".to_string(),
         telemetry_disabled: true,
-        serve_by_tag: search_api::config::DEFAULT_SERVE_BY_TAG,
-        serve_tag: search_api::config::DEFAULT_SERVE_TAG.to_string(),
         serve_tag_ttl_secs: search_api::config::DEFAULT_SERVE_TAG_TTL_SECS,
         prewarm_targets_path: None,
     }

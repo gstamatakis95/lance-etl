@@ -15,18 +15,9 @@ use arrow_schema::{DataType, Field, Schema};
 use common::{DIM, TEST_DATASET_PATH, build_indexed_dataset, test_config, test_target};
 use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
-use search_api::config::Config;
 use search_api::domain::{DatasetRef, HybridQuery, SearchBackend, TextQuery, VectorQuery};
 use search_api::lance::{CachingDatasetProvider, DatasetProvider, LanceSearchBackend};
 use tempfile::TempDir;
-
-/// Like [`test_config`] but serving through the `prod` tag.
-fn serve_by_tag_config(data_root: &std::path::Path, cache_root: &std::path::Path) -> Config {
-    let mut config = test_config(data_root, cache_root);
-    config.serve_by_tag = true;
-    config.serve_tag = "prod".to_string();
-    config
-}
 
 /// A small nearest-neighbor probe using flat search (no index required), identical to the probe
 /// in `blue_green.rs` so the dataset helpers can be shared without modification.
@@ -115,7 +106,7 @@ async fn vector_search_at_tag_pins_the_tagged_version() {
     assert_eq!(
         at_serve.dataset_version,
         Some(latest),
-        "Serve with no serve-by-tag enabled must return the latest version"
+        "Serve must resolve HEAD, which points at this version"
     );
 
     assert!(
@@ -258,8 +249,8 @@ async fn text_search_at_tag_pins_the_tagged_version() {
         .unwrap();
     assert_eq!(
         at_serve.dataset_version,
-        Some(latest),
-        "an unset reference must serve the latest version"
+        Some(tagged),
+        "an unset reference must serve the version selected by HEAD"
     );
 }
 
@@ -298,7 +289,7 @@ async fn hybrid_search_at_tag_opens_both_legs_at_the_pinned_snapshot() {
 }
 
 #[tokio::test]
-async fn serve_by_tag_resolves_the_serve_tag_while_an_explicit_tag_overrides_it() {
+async fn serve_resolves_fixed_head_while_an_explicit_tag_overrides_it() {
     let data_tmp = TempDir::new().unwrap();
     let cache_tmp = TempDir::new().unwrap();
     let uri = format!("file-object-store://{}/{TEST_DATASET_PATH}", data_tmp.path().display());
@@ -306,12 +297,11 @@ async fn serve_by_tag_resolves_the_serve_tag_while_an_explicit_tag_overrides_it(
 
     let dataset = Dataset::open(&uri).await.unwrap();
     let prod_version = dataset.version_id();
-    dataset.tags().create("prod", prod_version).await.unwrap();
     dataset.tags().create("t1", 1u64).await.unwrap();
     let plain_uri = format!("{}/{TEST_DATASET_PATH}", data_tmp.path().display());
     append_rows(&plain_uri).await;
 
-    let config = serve_by_tag_config(data_tmp.path(), cache_tmp.path());
+    let config = test_config(data_tmp.path(), cache_tmp.path());
     let provider = CachingDatasetProvider::with_inner_store_wrapper(&config, None).await;
     let backend = LanceSearchBackend::new(provider);
     let target = test_target();
@@ -323,7 +313,7 @@ async fn serve_by_tag_resolves_the_serve_tag_while_an_explicit_tag_overrides_it(
     assert_eq!(
         at_serve.dataset_version,
         Some(prod_version),
-        "Serve with serve-by-tag on must resolve the prod tag, not latest"
+        "Serve must resolve the fixed HEAD tag, not latest"
     );
 
     let at_pin = backend
@@ -333,7 +323,7 @@ async fn serve_by_tag_resolves_the_serve_tag_while_an_explicit_tag_overrides_it(
     assert_eq!(
         at_pin.dataset_version,
         Some(1),
-        "an explicit tag pin must override the serve policy"
+        "an explicit tag pin must override production HEAD"
     );
 }
 
@@ -372,14 +362,18 @@ async fn pinned_tag_and_serve_handles_coexist_in_the_handle_cache() {
 }
 
 #[tokio::test]
-async fn unset_reference_follows_serve_policy() {
+async fn unset_reference_resolves_fixed_head() {
     let data_tmp = TempDir::new().unwrap();
     let cache_tmp = TempDir::new().unwrap();
     let uri = format!("file-object-store://{}/{TEST_DATASET_PATH}", data_tmp.path().display());
     build_indexed_dataset(&uri).await;
 
     let dataset = Dataset::open(&uri).await.unwrap();
-    let latest = dataset.version_id();
+    let head_version = dataset.version_id();
+    let plain_uri = format!("{}/{TEST_DATASET_PATH}", data_tmp.path().display());
+    append_rows(&plain_uri).await;
+    let latest = Dataset::open(&plain_uri).await.unwrap().version_id();
+    assert!(latest > head_version, "append must produce a newer version than HEAD");
 
     let config = test_config(data_tmp.path(), cache_tmp.path());
     let provider = CachingDatasetProvider::with_inner_store_wrapper(&config, None).await;
@@ -401,7 +395,7 @@ async fn unset_reference_follows_serve_policy() {
     let outcome = backend.vector_search(&target, default_query).await.unwrap();
     assert_eq!(
         outcome.dataset_version,
-        Some(latest),
-        "an unset reference (Serve) with no serve-by-tag config must open the latest version"
+        Some(head_version),
+        "an unset reference must resolve HEAD rather than the later commit"
     );
 }
