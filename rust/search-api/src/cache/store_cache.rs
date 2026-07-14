@@ -16,8 +16,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
 use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use lance_io::object_store::WrappingObjectStore;
 use object_store::path::Path as ObjectPath;
 use object_store::{
@@ -42,6 +42,9 @@ const TRANSACTIONS_DIR: &str = "_transactions";
 
 /// Directory holding index files.
 const INDICES_DIR: &str = "_indices";
+
+/// Maximum cache-aware range reads issued concurrently for one object-store request.
+const MAX_RANGE_READ_CONCURRENCY: usize = 16;
 
 /// File name of the V1 mutable latest-manifest pointer, which must never be cached.
 const LATEST_MANIFEST_FILE: &str = "_latest.manifest";
@@ -377,15 +380,17 @@ impl ObjectStore for CachedStore {
         if classify(location).is_none() {
             return self.inner.get_ranges(location, ranges).await;
         }
-        let mut results = Vec::with_capacity(ranges.len());
-        for range in ranges {
-            let options = GetOptions {
-                range: Some(GetRange::Bounded(range.clone())),
-                ..Default::default()
-            };
-            results.push(self.get_opts(location, options).await?.bytes().await?);
-        }
-        Ok(results)
+        futures::stream::iter(ranges.iter().cloned())
+            .map(|range| async move {
+                let options = GetOptions {
+                    range: Some(GetRange::Bounded(range)),
+                    ..Default::default()
+                };
+                self.get_opts(location, options).await?.bytes().await
+            })
+            .buffered(MAX_RANGE_READ_CONCURRENCY)
+            .try_collect()
+            .await
     }
 
     fn delete_stream(
@@ -447,6 +452,7 @@ mod tests {
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     /// Inner store counting reads so tests can assert what passes through the cache.
     #[derive(Debug)]
@@ -454,6 +460,9 @@ mod tests {
         inner: InMemory,
         gets: AtomicU64,
         lists: AtomicU64,
+        active_gets: AtomicU64,
+        max_active_gets: AtomicU64,
+        get_delay: Duration,
     }
 
     impl std::fmt::Display for CountingStore {
@@ -483,7 +492,12 @@ mod tests {
 
         async fn get_opts(&self, location: &ObjectPath, options: GetOptions) -> ObjectStoreResult<GetResult> {
             self.gets.fetch_add(1, Ordering::SeqCst);
-            self.inner.get_opts(location, options).await
+            let active = self.active_gets.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active_gets.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(self.get_delay).await;
+            let result = self.inner.get_opts(location, options).await;
+            self.active_gets.fetch_sub(1, Ordering::SeqCst);
+            result
         }
 
         fn delete_stream(
@@ -517,6 +531,9 @@ mod tests {
             inner: InMemory::new(),
             gets: AtomicU64::new(0),
             lists: AtomicU64::new(0),
+            active_gets: AtomicU64::new(0),
+            max_active_gets: AtomicU64::new(0),
+            get_delay: Duration::ZERO,
         });
         for (path, len) in objects {
             counting
@@ -537,6 +554,9 @@ mod tests {
             inner: InMemory::new(),
             gets: AtomicU64::new(0),
             lists: AtomicU64::new(0),
+            active_gets: AtomicU64::new(0),
+            max_active_gets: AtomicU64::new(0),
+            get_delay: Duration::ZERO,
         });
         counting
             .inner
@@ -625,6 +645,40 @@ mod tests {
             "full index get larger than the limit must not be cached"
         );
         drop(tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn cached_multi_range_reads_are_concurrent_bounded_and_ordered() {
+        let counting = Arc::new(CountingStore {
+            inner: InMemory::new(),
+            gets: AtomicU64::new(0),
+            lists: AtomicU64::new(0),
+            active_gets: AtomicU64::new(0),
+            max_active_gets: AtomicU64::new(0),
+            get_delay: Duration::from_millis(20),
+        });
+        let bytes: Vec<u8> = (0..(MAX_RANGE_READ_CONCURRENCY + 4) as u8).collect();
+        let path = ObjectPath::from("ds/_indices/uuid-1/index.idx");
+        counting.inner.put(&path, bytes.clone().into()).await.unwrap();
+        let cache = MetadataByteCache::new(
+            Arc::new(MemoryEntryStore::default()),
+            4096,
+            Arc::new(Metrics::disabled()),
+        );
+        let wrapped = cache.wrap("test$store", counting.clone());
+        let ranges: Vec<std::ops::Range<u64>> = (0..bytes.len() as u64).map(|start| start..start + 1).collect();
+        let results = wrapped.get_ranges(&path, &ranges).await.unwrap();
+        let returned: Vec<u8> = results.into_iter().map(|part| part[0]).collect();
+        assert_eq!(returned, bytes, "bounded concurrency must preserve request order");
+        let observed = counting.max_active_gets.load(Ordering::SeqCst) as usize;
+        assert!(
+            observed > 1,
+            "cold range reads must not form a sequential latency chain"
+        );
+        assert!(
+            observed <= MAX_RANGE_READ_CONCURRENCY,
+            "range concurrency must stay within the code-owned bound: {observed}"
+        );
     }
 
     #[tokio::test]

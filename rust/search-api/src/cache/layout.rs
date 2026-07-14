@@ -21,8 +21,11 @@ const FRAME_MAGIC: &[u8; 4] = b"LEC2";
 /// Bytes a frame adds ahead of the payload: the magic plus a 32-byte blake3 checksum.
 pub const FRAME_OVERHEAD: usize = 4 + 32;
 
-/// Substring marking in-progress write files which readers must ignore and sweeps may delete.
+/// Substring marking in-progress write files which readers ignore and sweeps delete after a grace period.
 const TMP_MARKER: &str = ".tmp-";
+
+/// Minimum age before an abandoned in-progress write may be removed by a directory walk.
+const TMP_FILE_GRACE: Duration = Duration::from_secs(60);
 
 /// File name of the per-object `ObjectMeta` sidecar written by the store cache.
 ///
@@ -30,6 +33,9 @@ const TMP_MARKER: &str = ".tmp-";
 /// counting them in `dir_stats` would make the in-process gauges diverge from the on-disk
 /// reality. Lone sidecars are reclaimed by `prune_empty_dirs`.
 pub const META_FILE: &str = "meta.json";
+
+/// File name of the disk index tier's durable prefix registry.
+pub const PREFIXES_FILE: &str = "prefixes.json";
 
 /// Returns the stamp directory name combining our schema version and the lance version.
 pub fn stamp_dir_name() -> String {
@@ -164,7 +170,7 @@ pub fn touch_file(path: &Path) {
         .and_then(|file| file.set_modified(SystemTime::now()));
 }
 
-/// Recursively collects all regular files under `root`, deleting orphaned temp files on the way.
+/// Recursively collects regular cache entries, deleting only old orphaned temp files on the way.
 fn collect_files(root: &Path, files: &mut Vec<(PathBuf, u64, SystemTime)>) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
@@ -175,25 +181,34 @@ fn collect_files(root: &Path, files: &mut Vec<(PathBuf, u64, SystemTime)>) {
             collect_files(&path, files);
             continue;
         }
-        if path
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().contains(TMP_MARKER))
-        {
-            let _ = std::fs::remove_file(&path);
-            continue;
-        }
-        if path.file_name().is_some_and(|name| name == META_FILE) {
-            continue;
-        }
         if let Ok(meta) = entry.metadata() {
             let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            if path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().contains(TMP_MARKER))
+            {
+                let old_enough = SystemTime::now()
+                    .duration_since(mtime)
+                    .map(|age| age > TMP_FILE_GRACE)
+                    .unwrap_or(false);
+                if old_enough {
+                    let _ = std::fs::remove_file(&path);
+                }
+                continue;
+            }
+            if path
+                .file_name()
+                .is_some_and(|name| name == META_FILE || name == PREFIXES_FILE)
+            {
+                continue;
+            }
             files.push((path, meta.len(), mtime));
         }
     }
 }
 
-/// Walks `root` and returns `(total_bytes, file_count)` of all cache entry files, removing
-/// orphaned temp files as a side effect.
+/// Walks `root` and returns `(total_bytes, file_count)` of all cache entry files, removing old
+/// orphaned temp files as a side effect while leaving active writes and registry sidecars alone.
 pub fn dir_stats(root: &Path) -> (u64, u64) {
     let mut files = Vec::new();
     collect_files(root, &mut files);
@@ -376,6 +391,37 @@ mod tests {
         assert_eq!(stats.ttl_evicted, 1);
         assert_eq!(stats.size_evicted, 1);
         assert_eq!(bytes.load(Ordering::Relaxed), 64);
+    }
+
+    #[test]
+    fn sweep_preserves_young_temps_and_registry_but_removes_old_temps() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let young = root.join("entry.bin.tmp-young");
+        let old = root.join("entry.bin.tmp-old");
+        let registry = root.join(PREFIXES_FILE);
+        std::fs::write(&young, b"active").unwrap();
+        std::fs::write(&old, b"abandoned").unwrap();
+        std::fs::write(&registry, br#"{"prefix":"dir"}"#).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(SystemTime::now() - TMP_FILE_GRACE - Duration::from_secs(1))
+            .unwrap();
+        let bytes = AtomicU64::new(0);
+        let entries = AtomicU64::new(0);
+        let stats = sweep_tier(root, Duration::from_secs(600), 0, &bytes, &entries);
+        assert!(young.exists(), "an active atomic write must survive a concurrent sweep");
+        assert!(
+            !old.exists(),
+            "an abandoned temp may be reclaimed after the grace period"
+        );
+        assert!(
+            registry.exists(),
+            "the prefix registry is not a cache entry and must survive"
+        );
+        assert_eq!(stats, SweepStats::default());
     }
 
     #[test]

@@ -25,6 +25,15 @@ const RESOURCE_NOT_FOUND_MESSAGE: &str = "a required resource was not found";
 /// Client-facing message for an engine-internal timeout.
 const ENGINE_TIMEOUT_MESSAGE: &str = "the storage engine timed out executing the request";
 
+/// Returns whether a failed dataset open proves the selected dataset, reference, or version is
+/// absent rather than exposing a transient missing object inside an otherwise live dataset.
+pub fn is_definitive_open_absence(err: &lance::Error) -> bool {
+    matches!(
+        err,
+        lance::Error::DatasetNotFound { .. } | lance::Error::RefNotFound { .. } | lance::Error::VersionNotFound { .. }
+    )
+}
+
 /// Classifies a Lance error by reference into the closest domain error.
 ///
 /// Not-found conditions map to [`SearchError::NotFound`]: `DatasetNotFound` and `NotFound` carry
@@ -111,6 +120,22 @@ mod tests {
             }
             other => panic!("expected not found, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn only_dataset_reference_and_version_absence_are_definitive_open_misses() {
+        let dataset = lance::Error::dataset_not_found("memory://missing", "no manifest".into());
+        let reference = lance::Error::RefNotFound {
+            message: "tag HEAD does not exist".to_string(),
+        };
+        let version = lance::Error::VersionNotFound {
+            message: "version 17 does not exist".to_string(),
+        };
+        let transient_object = lance::Error::not_found("memory://live/_versions/17.manifest");
+        assert!(is_definitive_open_absence(&dataset));
+        assert!(is_definitive_open_absence(&reference));
+        assert!(is_definitive_open_absence(&version));
+        assert!(!is_definitive_open_absence(&transient_object));
     }
 
     #[test]

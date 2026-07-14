@@ -157,11 +157,10 @@ async fn serve_full(tmp: &TempDir, metrics: Arc<Metrics>, recall: Option<RecallC
         statsd_addr: "127.0.0.1:8125".to_string(),
         telemetry_disabled: true,
         serve_tag_ttl_secs: search_api::config::DEFAULT_SERVE_TAG_TTL_SECS,
-        prewarm_targets_path: None,
     };
     let provider = CachingDatasetProvider::with_telemetry(&config, metrics.clone()).await;
     let backend = Arc::new(LanceSearchBackend::new(provider).with_metrics(metrics.clone()));
-    let mut service = SearchGrpc::with_metrics(backend, metrics);
+    let mut service = SearchGrpc::with_metrics(backend, metrics.clone());
     if let Some(recall) = recall {
         service = service.with_recall(recall);
     }
@@ -174,7 +173,7 @@ async fn serve_full(tmp: &TempDir, metrics: Arc<Metrics>, recall: Option<RecallC
     tokio::spawn(
         Server::builder()
             .layer(OtelGrpcLayer::default().filter(reject_healthcheck))
-            .layer(RouteTimeoutLayer::from_defaults())
+            .layer(RouteTimeoutLayer::from_defaults(metrics.clone()))
             .add_service(health_service)
             .add_service(SearchServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener)),

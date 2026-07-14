@@ -174,16 +174,15 @@ sampling, and the search `k` ceiling) is a fixed constant in `src/config.rs`, no
 | `SEARCH_API_REDIS_URL` | (none) | Redis connection URL (`redis://` or `rediss://`), required when the backend is `redis` |
 | `SEARCH_API_REDIS_NAMESPACE` | `search-api` | Key namespace prepended to every Redis cache key |
 | `SEARCH_API_CACHE_DIR` | `/tmp/rust-search/cache` | Root directory for the `disk` backend's caches |
-| `SEARCH_API_PREWARM_TARGETS_PATH` | (empty, disabled) | Path to a startup prewarm-targets file, one `{org_id}/{tenant_id}/{namespace}` per line, warmed in the background before those datasets would otherwise be opened cold |
 | `SEARCH_API_STATSD_ADDR` | `127.0.0.1:8125` (or `{DD_AGENT_HOST}:8125` when `DD_AGENT_HOST` is set) | DogStatsD UDP address |
 | `SEARCH_API_TELEMETRY_DISABLED` | `false` | Disables trace export and DogStatsD entirely (JSON logs only) |
 
 Two process-global Lance IO knobs (`LANCE_IO_THREADS`, `OBJECT_STORE_CLIENT_RETRY_TIMEOUT`) are
 stamped into the process environment by `main` before the tokio runtime starts, from fixed
 constants in `config.rs` (`DEFAULT_IO_CONCURRENCY` = 256, `DEFAULT_OBJECT_STORE_TIMEOUT_SECS` =
-120). This must happen while the process is still single-threaded — `std::env::set_var` is unsound
-once other threads exist — so `main` is a synchronous entry point that runs it before building the
-runtime.
+120). A matching pre-set value is accepted and a conflicting value fails startup. This must happen
+while the process is still single-threaded — `std::env::set_var` is unsound once other threads
+exist — so `main` is a synchronous entry point that runs it before building the runtime.
 
 ---
 

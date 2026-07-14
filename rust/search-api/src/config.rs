@@ -190,16 +190,6 @@ pub const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 256;
 /// Hardcoded: no deployment has ever retuned this, so it is no longer an env knob.
 pub const DEFAULT_CONCURRENCY_LIMIT_PER_CONNECTION: usize = 256;
 
-/// Path to the startup prewarm targets file (empty = disabled).
-///
-/// When set, the service reads this file on startup and prewarms each listed dataset in a
-/// background task before it would otherwise be opened cold by a live request. The file format
-/// is one target per line: `{org_id}/{tenant_id}/{namespace}` using the same path segments the
-/// service resolves to `{base_uri}/{org_id}/{tenant_id}/{namespace}.lance`. Blank lines and lines
-/// with invalid segments are skipped with a warning. Errors per target are logged but never fatal.
-/// Env: `SEARCH_API_PREWARM_TARGETS_PATH`.
-pub const DEFAULT_PREWARM_TARGETS_PATH: &str = "";
-
 /// Fixed minimum object-store request size in bytes (IO buffer / block size) — 256 KiB.
 ///
 /// Passed as `ObjectStoreParams::block_size` when opening every dataset. Hardcoded: no deployment
@@ -275,14 +265,6 @@ pub struct Config {
     /// Seconds the resolved `HEAD` version is trusted before the tag JSON is re-read (default
     /// [`DEFAULT_SERVE_TAG_TTL_SECS`]). Fixed: no longer env-configurable.
     pub serve_tag_ttl_secs: u64,
-    /// Path to the startup prewarm targets file (empty = disabled).
-    ///
-    /// File format: one target per line as `{org_id}/{tenant_id}/{namespace}`. The service reads
-    /// this file on startup and prewarms each dataset in a background task, eliminating cold-open
-    /// latency for designated whale datasets on rolling deploys. Blank lines and malformed segments
-    /// are skipped with a warning. Per-target errors are logged but never fatal to startup.
-    /// Env: `SEARCH_API_PREWARM_TARGETS_PATH`.
-    pub prewarm_targets_path: Option<std::path::PathBuf>,
 }
 
 impl Config {
@@ -293,8 +275,8 @@ impl Config {
     /// `SEARCH_API_CACHE_DIR`, `SEARCH_API_CACHE_BACKEND` (`disk`, `redis`, or `memory`),
     /// `SEARCH_API_REDIS_URL` (required for the `redis` backend), `SEARCH_API_REDIS_NAMESPACE`
     /// (default `search-api`), `SEARCH_API_STATSD_ADDR` (default honors `DD_AGENT_HOST`),
-    /// `SEARCH_API_TELEMETRY_DISABLED`, and `SEARCH_API_PREWARM_TARGETS_PATH` (default empty,
-    /// disabled). Production serving always resolves the fixed [`PRODUCTION_SERVE_TAG`].
+    /// and `SEARCH_API_TELEMETRY_DISABLED`. Production serving always resolves the fixed
+    /// [`PRODUCTION_SERVE_TAG`].
     ///
     /// Every other knob — dataset-handle cache sizing, index/metadata/disk cache budgets,
     /// serve-tag TTL, IO concurrency, ANN probe/refine/fast-search defaults, gRPC timeout and
@@ -329,14 +311,6 @@ impl Config {
             statsd_addr: env_string("SEARCH_API_STATSD_ADDR", &default_statsd_addr()),
             telemetry_disabled: env_bool("SEARCH_API_TELEMETRY_DISABLED", false)?,
             serve_tag_ttl_secs: DEFAULT_SERVE_TAG_TTL_SECS,
-            prewarm_targets_path: {
-                let raw = env_string("SEARCH_API_PREWARM_TARGETS_PATH", DEFAULT_PREWARM_TARGETS_PATH);
-                if raw.is_empty() {
-                    None
-                } else {
-                    Some(std::path::PathBuf::from(raw))
-                }
-            },
         })
     }
 }
@@ -453,7 +427,6 @@ mod tests {
             assert_eq!(config.statsd_addr, DEFAULT_STATSD_ADDR);
             assert!(!config.telemetry_disabled);
             assert_eq!(config.serve_tag_ttl_secs, DEFAULT_SERVE_TAG_TTL_SECS);
-            assert!(config.prewarm_targets_path.is_none());
         });
     }
 
@@ -466,6 +439,7 @@ mod tests {
                 ("SEARCH_API_SERVE_BY_TAG", Some("false")),
                 ("SEARCH_API_SERVE_TAG", Some("green")),
                 ("SEARCH_API_DISK_CACHE_DISABLED", Some("true")),
+                ("SEARCH_API_PREWARM_TARGETS_PATH", Some("/tmp/targets.txt")),
             ],
             || {
                 let config = Config::from_env().unwrap();

@@ -1,15 +1,14 @@
 //! Binary entry point for the gRPC search service.
 
+use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use search_api::config::Config;
-use search_api::domain::{DatasetRef, DatasetTarget, PrewarmSpec, Prewarmer};
 use search_api::grpc::{RouteTimeoutLayer, SearchGrpc};
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
 use search_api::pb::search_service_server::SearchServiceServer;
 use search_api::telemetry::{self, Metrics, RecallCapture};
-use tokio::sync::Semaphore;
 use tonic::transport::Server;
 use tonic_tracing_opentelemetry::middleware::filters::reject_healthcheck;
 use tonic_tracing_opentelemetry::middleware::server::OtelGrpcLayer;
@@ -30,19 +29,31 @@ type Backend = LanceSearchBackend<CachingDatasetProvider>;
 /// on `getenv` against this `set_var` is a data race under the C11/POSIX memory model.  `main`
 /// is therefore a synchronous entry point that calls this before building the runtime.
 ///
-/// Knobs stamped here must not already be set in the environment; if they are (e.g. in a
-/// Kubernetes pod spec that overrides the default), `set_var` would silently overwrite them.
-fn apply_lance_io_env() {
-    unsafe {
-        std::env::set_var(
-            "LANCE_IO_THREADS",
-            search_api::config::DEFAULT_IO_CONCURRENCY.to_string(),
-        );
-        std::env::set_var(
-            "OBJECT_STORE_CLIENT_RETRY_TIMEOUT",
-            search_api::config::DEFAULT_OBJECT_STORE_TIMEOUT_SECS.to_string(),
-        );
+/// A matching deployment value is accepted. A conflicting pre-set value fails startup before the
+/// runtime is built, so the service never silently replaces deployment state.
+fn apply_fixed_env(name: &str, expected: &str) -> std::io::Result<()> {
+    match std::env::var_os(name) {
+        Some(actual) if actual == OsStr::new(expected) => Ok(()),
+        Some(_) => Err(std::io::Error::other(format!(
+            "{name} conflicts with the search service's fixed production value"
+        ))),
+        None => {
+            unsafe { std::env::set_var(name, expected) };
+            Ok(())
+        }
     }
+}
+
+/// Applies every fixed Lance process-global environment value without overwriting a conflict.
+fn apply_lance_io_env() -> std::io::Result<()> {
+    apply_fixed_env(
+        "LANCE_IO_THREADS",
+        &search_api::config::DEFAULT_IO_CONCURRENCY.to_string(),
+    )?;
+    apply_fixed_env(
+        "OBJECT_STORE_CLIENT_RETRY_TIMEOUT",
+        &search_api::config::DEFAULT_OBJECT_STORE_TIMEOUT_SECS.to_string(),
+    )
 }
 
 /// Reads configuration from the environment, initializes Datadog telemetry (OTLP traces, JSON
@@ -70,46 +81,9 @@ fn apply_lance_io_env() {
 /// fail requests.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
-    apply_lance_io_env();
+    apply_lance_io_env()?;
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(serve(config))
-}
-
-/// Parses a prewarm-targets file and returns the successfully parsed targets.
-///
-/// Each line is expected to be `{org_id}/{tenant_id}/{namespace}`. Blank lines and lines with
-/// fewer than three slash-separated segments or invalid path segment characters are skipped with
-/// a warning. A file that cannot be read at all is also warned and yields an empty list.
-fn parse_prewarm_targets(path: &std::path::Path) -> Vec<DatasetTarget> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(err) => {
-            tracing::warn!(path = %path.display(), error = %err, "failed to read prewarm targets file");
-            return Vec::new();
-        }
-    };
-    content
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return None;
-            }
-            let parts: Vec<&str> = line.splitn(3, '/').collect();
-            if parts.len() != 3 {
-                tracing::warn!(line = %line, "prewarm targets: skipping malformed line (expected org/tenant/namespace)");
-                return None;
-            }
-            let target = DatasetTarget::new(parts[0], parts[1], parts[2]);
-            match target.validate() {
-                Ok(()) => Some(target),
-                Err(err) => {
-                    tracing::warn!(line = %line, error = %err, "prewarm targets: skipping line with invalid path segment");
-                    None
-                }
-            }
-        })
-        .collect()
 }
 
 /// Runs the async service body on the already-built runtime: wires telemetry, provider, backend,
@@ -130,49 +104,6 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     }
     let backend = Arc::new(LanceSearchBackend::new(provider).with_metrics(metrics.clone()));
 
-    if let Some(targets_path) = &config.prewarm_targets_path {
-        let targets = parse_prewarm_targets(targets_path);
-        if !targets.is_empty() {
-            let backend_for_prewarm = backend.clone();
-            let concurrency = search_api::config::DEFAULT_PREWARM_CONCURRENCY;
-            tokio::spawn(async move {
-                let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
-                let mut tasks = tokio::task::JoinSet::new();
-                for target in targets {
-                    let backend = backend_for_prewarm.clone();
-                    let semaphore = semaphore.clone();
-                    tasks.spawn(async move {
-                        let permit = semaphore.acquire_owned().await;
-                        let spec = PrewarmSpec {
-                            metadata: true,
-                            all_indexes: true,
-                            ..Default::default()
-                        };
-                        match backend.prewarm(&target, spec, DatasetRef::Latest).await {
-                            Ok(report) => tracing::info!(
-                                org_id = %target.org_id,
-                                tenant_id = %target.tenant_id,
-                                namespace = %target.namespace,
-                                resolved_version = report.resolved_version,
-                                indexes_warmed = report.indexes.len(),
-                                "startup prewarm succeeded"
-                            ),
-                            Err(err) => tracing::warn!(
-                                org_id = %target.org_id,
-                                tenant_id = %target.tenant_id,
-                                namespace = %target.namespace,
-                                error = %err,
-                                "startup prewarm failed"
-                            ),
-                        }
-                        drop(permit);
-                    });
-                }
-                while tasks.join_next().await.is_some() {}
-            });
-        }
-    }
-
     let recall = RecallCapture::new(
         search_api::config::DEFAULT_RECALL_SAMPLE_RATE,
         search_api::config::DEFAULT_ID_COLUMN,
@@ -189,7 +120,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .max_concurrent_streams(search_api::config::DEFAULT_MAX_CONCURRENT_STREAMS);
     server_builder
         .layer(OtelGrpcLayer::default().filter(reject_healthcheck))
-        .layer(RouteTimeoutLayer::from_defaults())
+        .layer(RouteTimeoutLayer::from_defaults(metrics.clone()))
         .add_service(health_service)
         .add_service(SearchServiceServer::new(service))
         .serve_with_shutdown(addr, shutdown_signal())
@@ -261,8 +192,53 @@ async fn terminate_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::degrade_on_install_error;
+    use super::{apply_fixed_env, degrade_on_install_error};
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    /// Serializes tests that mutate the process environment.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Runs one assertion with an environment value and restores its prior state.
+    fn with_env(name: &str, value: Option<&str>, body: impl FnOnce()) {
+        let guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(name);
+        match value {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+        body();
+        match previous {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn fixed_environment_value_is_set_when_absent() {
+        with_env("SEARCH_API_TEST_FIXED_ENV", None, || {
+            apply_fixed_env("SEARCH_API_TEST_FIXED_ENV", "expected").unwrap();
+            assert_eq!(std::env::var("SEARCH_API_TEST_FIXED_ENV").unwrap(), "expected");
+        });
+    }
+
+    #[test]
+    fn matching_fixed_environment_value_is_accepted() {
+        with_env("SEARCH_API_TEST_FIXED_ENV", Some("expected"), || {
+            apply_fixed_env("SEARCH_API_TEST_FIXED_ENV", "expected").unwrap();
+            assert_eq!(std::env::var("SEARCH_API_TEST_FIXED_ENV").unwrap(), "expected");
+        });
+    }
+
+    #[test]
+    fn conflicting_fixed_environment_value_fails_without_overwrite() {
+        with_env("SEARCH_API_TEST_FIXED_ENV", Some("conflict"), || {
+            let error = apply_fixed_env("SEARCH_API_TEST_FIXED_ENV", "expected").unwrap_err();
+            assert!(error.to_string().contains("SEARCH_API_TEST_FIXED_ENV"));
+            assert_eq!(std::env::var("SEARCH_API_TEST_FIXED_ENV").unwrap(), "conflict");
+        });
+    }
 
     #[tokio::test]
     async fn install_success_resolves_immediately() {

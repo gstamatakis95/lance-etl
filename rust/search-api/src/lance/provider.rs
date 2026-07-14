@@ -19,7 +19,7 @@ use crate::cache::redis_store::RedisEntryStore;
 use crate::cache::store_cache::MetadataByteCache;
 use crate::config::{CacheBackendKind, Config, PRODUCTION_SERVE_TAG};
 use crate::domain::{DatasetRef, DatasetTarget, SearchError};
-use crate::lance::error::classify_lance_error;
+use crate::lance::error::{classify_lance_error, is_definitive_open_absence};
 use crate::telemetry::{CacheName, Metrics, Tier};
 
 /// Upper bound on the weight a single open-dataset handle contributes to the handle-cache budget.
@@ -156,8 +156,8 @@ pub struct CachingDatasetProvider {
     /// that a failed tag resolution never produces — lets the cache cover tag-addressed misses
     /// (`DatasetRef::Tag` and every production `HEAD` request) as well as `Latest`/`Version`, so a hot
     /// loop of requests for a nonexistent dataset or tag is answered from here instead of hammering
-    /// the object store. Only NotFound outcomes are cached — a missing dataset OR a missing tag,
-    /// never a transient failure — and the TTL
+    /// the object store. Only definitive dataset, reference, or version absence is cached. A
+    /// generic missing object inside a live dataset is treated as transient and never cached. The TTL
     /// ([`crate::config::DEFAULT_NEGATIVE_OPEN_TTL_SECS`]) bounds how long a freshly created
     /// dataset can still be reported missing.
     negative_opens: Cache<(String, String), SearchError>,
@@ -338,7 +338,7 @@ impl CachingDatasetProvider {
     /// a serving request pinned by `version_ref` — the open's INTENT is carried separately (see
     /// [`DatasetProvider::dataset_for_prewarm`]), never inferred from the ref. A returned
     /// version of `None` means open the latest manifest.
-    async fn resolve_reference(&self, uri: &str, reference: DatasetRef) -> Result<Option<u64>, SearchError> {
+    async fn resolve_reference(&self, uri: &str, reference: DatasetRef) -> Result<Option<u64>, Arc<lance::Error>> {
         Ok(match reference {
             DatasetRef::Latest => None,
             DatasetRef::Serve => Some(self.resolve_tag_version(uri, PRODUCTION_SERVE_TAG).await?),
@@ -357,7 +357,7 @@ impl CachingDatasetProvider {
     /// Concurrent callers for the same key coalesce onto a single read through the Moka future
     /// cache's `try_get_with`, which runs the loader at most once per key per TTL window. This caps
     /// a fleet-wide simultaneous-expiry burst at one live manifest read per process per tag.
-    async fn resolve_tag_version(&self, uri: &str, tag: &str) -> Result<u64, SearchError> {
+    async fn resolve_tag_version(&self, uri: &str, tag: &str) -> Result<u64, Arc<lance::Error>> {
         let key = (uri.to_string(), tag.to_string());
         self.tag_versions
             .try_get_with(key.clone(), async {
@@ -365,22 +365,21 @@ impl CachingDatasetProvider {
                 let changed = self.last_tag_version.get(&key).await != Some(version);
                 self.metrics.serve_tag_resolved(changed);
                 self.last_tag_version.insert(key.clone(), version).await;
-                Ok::<u64, SearchError>(version)
+                Ok::<u64, lance::Error>(version)
             })
             .await
-            .map_err(|err| (*err).clone())
     }
 
     /// Reads which committed version a tag currently points at by opening at the tag and reporting
     /// the loaded manifest version. The manifest read is cache-served, the tag JSON read is live.
-    async fn read_tag_version(&self, uri: &str, tag: &str) -> Result<u64, SearchError> {
+    async fn read_tag_version(&self, uri: &str, tag: &str) -> Result<u64, lance::Error> {
         let mut builder = DatasetBuilder::from_uri(uri)
             .with_session(self.session.clone())
             .with_tag(tag);
         if let Some(params) = self.store_params.clone() {
             builder = builder.with_store_params(params);
         }
-        let dataset = builder.load().await.map_err(|err| classify_lance_error(&err))?;
+        let dataset = builder.load().await?;
         Ok(dataset.version_id())
     }
 
@@ -419,6 +418,19 @@ impl BuiltCaches {
             disk_stores: None,
         }
     }
+}
+
+/// Classifies one raw open failure and records it only when absence is definitive.
+async fn classify_open_failure(
+    negative_opens: &Cache<(String, String), SearchError>,
+    negative_key: (String, String),
+    raw: &lance::Error,
+) -> SearchError {
+    let error = classify_lance_error(raw);
+    if is_definitive_open_absence(raw) {
+        negative_opens.insert(negative_key, error.clone()).await;
+    }
+    error
 }
 
 /// Opens the two disk cache tiers under the versioned stamp directory.
@@ -497,9 +509,9 @@ impl CachingDatasetProvider {
     /// `serve.cold_open` metric) — it is passed explicitly by the two trait entry points
     /// because serving requests can pin the same tag/version references prewarm uses.
     ///
-    /// A NotFound open is negatively cached for a short TTL (`negative_opens`), so a hot loop of
-    /// requests for a nonexistent dataset does not hammer the object store. Transient failures
-    /// are never negatively cached.
+    /// A definitive absent dataset, reference, or version is negatively cached for a short TTL
+    /// (`negative_opens`), so a hot loop does not hammer the object store. Generic missing-object
+    /// and other transient failures are never negatively cached.
     #[tracing::instrument(
         name = "provider.dataset",
         skip_all,
@@ -526,11 +538,9 @@ impl CachingDatasetProvider {
         }
         let version = match self.resolve_reference(&uri, reference).await {
             Ok(version) => version,
-            Err(err) => {
-                if matches!(err, SearchError::NotFound(_)) {
-                    self.negative_opens.insert(negative_key, err.clone()).await;
-                }
-                return Err(err);
+            Err(raw) => {
+                let error = classify_open_failure(&self.negative_opens, negative_key, raw.as_ref()).await;
+                return Err(error);
             }
         };
         let key = (uri.clone(), version);
@@ -539,7 +549,7 @@ impl CachingDatasetProvider {
         let store_params = self.store_params.clone();
         let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let opened_flag = opened.clone();
-        let result = self
+        let loaded = self
             .datasets
             .try_get_with(key, async move {
                 opened_flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -552,13 +562,11 @@ impl CachingDatasetProvider {
                 }
                 builder.load().await.map(Arc::new)
             })
-            .await
-            .map_err(|err: Arc<lance::Error>| classify_lance_error(err.as_ref()));
-        if let Err(err) = &result
-            && matches!(err, SearchError::NotFound(_))
-        {
-            self.negative_opens.insert(negative_key, err.clone()).await;
-        }
+            .await;
+        let result = match loaded {
+            Ok(dataset) => Ok(dataset),
+            Err(raw) => Err(classify_open_failure(&self.negative_opens, negative_key, raw.as_ref()).await),
+        };
         let cold = opened.load(std::sync::atomic::Ordering::Relaxed);
         tracing::Span::current().record("cache.dataset_handle_hit", !cold);
         self.metrics.cache_lookup(CacheName::Handles, Tier::Memory, !cold);
@@ -595,5 +603,35 @@ impl DatasetProvider for CachingDatasetProvider {
             .as_ref()
             .map(|backend| backend.approx_size_bytes() as u64)
             .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds the small negative cache used by provenance tests.
+    fn negative_cache() -> Cache<(String, String), SearchError> {
+        Cache::builder().max_capacity(8).build()
+    }
+
+    #[tokio::test]
+    async fn generic_missing_object_does_not_poison_the_negative_cache() {
+        let cache = negative_cache();
+        let key = ("memory://live".to_string(), "version:3".to_string());
+        let raw = lance::Error::not_found("memory://live/_versions/3.manifest");
+        let error = classify_open_failure(&cache, key.clone(), &raw).await;
+        assert!(matches!(error, SearchError::NotFound(_)));
+        assert!(cache.get(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn definitive_dataset_absence_is_recorded_in_the_negative_cache() {
+        let cache = negative_cache();
+        let key = ("memory://absent".to_string(), "latest".to_string());
+        let raw = lance::Error::dataset_not_found("memory://absent", "no manifest".into());
+        let error = classify_open_failure(&cache, key.clone(), &raw).await;
+        assert!(matches!(error, SearchError::NotFound(_)));
+        assert_eq!(cache.get(&key).await, Some(error));
     }
 }

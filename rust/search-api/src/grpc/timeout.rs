@@ -9,13 +9,15 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tonic::Status;
 use tower::{Layer, Service};
 
 use crate::config::{DEFAULT_LONG_REQUEST_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS};
+use crate::telemetry::{Metrics, Rpc};
 
 /// gRPC method paths that get the long timeout budget instead of the search default.
 ///
@@ -31,24 +33,32 @@ pub const LONG_TIMEOUT_ROUTES: [&str; 1] = ["/lance_etl.v1.SearchService/Prewarm
 pub struct RouteTimeoutLayer {
     default_budget: Duration,
     long_budget: Duration,
+    metrics: Arc<Metrics>,
 }
 
 impl RouteTimeoutLayer {
     /// Builds a layer with explicit budgets: `default_budget` for every route except the
     /// [`LONG_TIMEOUT_ROUTES`], which get `long_budget`.
     pub fn new(default_budget: Duration, long_budget: Duration) -> Self {
+        Self::with_metrics(default_budget, long_budget, Arc::new(Metrics::disabled()))
+    }
+
+    /// Builds a layer with explicit budgets and the production RPC metrics facade.
+    pub fn with_metrics(default_budget: Duration, long_budget: Duration, metrics: Arc<Metrics>) -> Self {
         Self {
             default_budget,
             long_budget,
+            metrics,
         }
     }
 
     /// Builds the production layer from [`DEFAULT_REQUEST_TIMEOUT_MS`] and
     /// [`DEFAULT_LONG_REQUEST_TIMEOUT_MS`].
-    pub fn from_defaults() -> Self {
-        Self::new(
+    pub fn from_defaults(metrics: Arc<Metrics>) -> Self {
+        Self::with_metrics(
             Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS),
             Duration::from_millis(DEFAULT_LONG_REQUEST_TIMEOUT_MS),
+            metrics,
         )
     }
 
@@ -103,18 +113,45 @@ where
 
     /// Runs the inner service under the budget selected by the request's gRPC method path.
     fn call(&mut self, request: http::Request<ReqBody>) -> Self::Future {
-        let budget = self.budgets.budget_for(request.uri().path());
+        let path = request.uri().path();
+        let budget = self.budgets.budget_for(path);
+        let rpc = rpc_for_path(path);
+        let metrics = self.budgets.metrics.clone();
+        let started = Instant::now();
         let future = self.inner.call(request);
         Box::pin(async move {
             match tokio::time::timeout(budget, future).await {
                 Ok(result) => result,
-                Err(_) => Ok(Status::deadline_exceeded(format!(
-                    "request exceeded the server-side timeout of {} ms",
-                    budget.as_millis()
-                ))
-                .into_http()),
+                Err(_) => {
+                    if let Some(rpc) = rpc {
+                        metrics.rpc(rpc, "deadline_exceeded", started.elapsed());
+                        tracing::warn!(
+                            rpc = rpc.as_tag(),
+                            status = "deadline_exceeded",
+                            budget_ms = budget.as_millis() as u64,
+                            "rpc failed"
+                        );
+                    }
+                    Ok(Status::deadline_exceeded(format!(
+                        "request exceeded the server-side timeout of {} ms",
+                        budget.as_millis()
+                    ))
+                    .into_http())
+                }
             }
         })
+    }
+}
+
+/// Maps a known gRPC method path to the closed RPC metric tag set.
+fn rpc_for_path(path: &str) -> Option<Rpc> {
+    match path {
+        "/lance_etl.v1.SearchService/VectorSearch" => Some(Rpc::VectorSearch),
+        "/lance_etl.v1.SearchService/TextSearch" => Some(Rpc::TextSearch),
+        "/lance_etl.v1.SearchService/HybridSearch" => Some(Rpc::HybridSearch),
+        "/lance_etl.v1.SearchService/Prewarm" => Some(Rpc::Prewarm),
+        "/lance_etl.v1.SearchService/Clusters" => Some(Rpc::Clusters),
+        _ => None,
     }
 }
 
@@ -163,7 +200,7 @@ mod tests {
 
     #[test]
     fn long_budget_applies_only_to_the_listed_routes() {
-        let layer = RouteTimeoutLayer::from_defaults();
+        let layer = RouteTimeoutLayer::from_defaults(Arc::new(Metrics::disabled()));
         let default = Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS);
         let long = Duration::from_millis(DEFAULT_LONG_REQUEST_TIMEOUT_MS);
         assert_eq!(layer.budget_for("/lance_etl.v1.SearchService/Prewarm"), long);
@@ -176,7 +213,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn default_route_over_budget_gets_deadline_exceeded() {
-        let layer = RouteTimeoutLayer::new(Duration::from_millis(800), Duration::from_secs(600));
+        let (receiver, sink) = cadence::SpyMetricSink::new();
+        let layer = RouteTimeoutLayer::with_metrics(
+            Duration::from_millis(800),
+            Duration::from_secs(600),
+            Arc::new(Metrics::from_sink(sink)),
+        );
         let mut service = layer.layer(SleepyService {
             delay: Duration::from_secs(5),
         });
@@ -188,6 +230,26 @@ mod tests {
             grpc_status_header(&response),
             Some((tonic::Code::DeadlineExceeded as i32).to_string().as_str()),
             "a slow search must be answered with DEADLINE_EXCEEDED"
+        );
+        let mut packets = Vec::new();
+        while let Ok(packet) = receiver.try_recv() {
+            packets.push(String::from_utf8(packet).unwrap());
+        }
+        assert!(
+            packets
+                .iter()
+                .any(|packet| packet.starts_with("search_api.rpc.requests:1|c")
+                    && packet.contains("rpc:vector_search")
+                    && packet.contains("status:deadline_exceeded")),
+            "the outer timeout must emit the normal request outcome: {packets:?}"
+        );
+        assert!(
+            packets
+                .iter()
+                .any(|packet| packet.starts_with("search_api.rpc.errors:1|c")
+                    && packet.contains("rpc:vector_search")
+                    && packet.contains("status:deadline_exceeded")),
+            "the outer timeout must emit the normal error outcome: {packets:?}"
         );
     }
 
@@ -206,5 +268,15 @@ mod tests {
             None,
             "a slow prewarm must complete normally under the long budget"
         );
+    }
+
+    #[test]
+    fn rpc_path_mapping_excludes_health_and_unknown_routes() {
+        assert_eq!(
+            rpc_for_path("/lance_etl.v1.SearchService/VectorSearch"),
+            Some(Rpc::VectorSearch)
+        );
+        assert_eq!(rpc_for_path("/grpc.health.v1.Health/Check"), None);
+        assert_eq!(rpc_for_path("/unknown.Service/Method"), None);
     }
 }

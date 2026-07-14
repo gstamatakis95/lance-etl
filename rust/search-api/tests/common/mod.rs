@@ -267,7 +267,6 @@ pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) 
         statsd_addr: "127.0.0.1:8125".to_string(),
         telemetry_disabled: true,
         serve_tag_ttl_secs: search_api::config::DEFAULT_SERVE_TAG_TTL_SECS,
-        prewarm_targets_path: None,
     }
 }
 

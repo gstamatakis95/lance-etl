@@ -95,7 +95,7 @@ async fn serve_slow(backend: SlowBackend) -> Channel {
             .concurrency_limit_per_connection(search_api::config::DEFAULT_CONCURRENCY_LIMIT_PER_CONNECTION)
             .max_concurrent_streams(search_api::config::DEFAULT_MAX_CONCURRENT_STREAMS)
             .layer(OtelGrpcLayer::default().filter(reject_healthcheck))
-            .layer(RouteTimeoutLayer::from_defaults())
+            .layer(RouteTimeoutLayer::from_defaults(Arc::new(Metrics::disabled())))
             .add_service(SearchServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
