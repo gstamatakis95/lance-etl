@@ -2,8 +2,9 @@
 
 Each subcommand maps to one phase runner imported at module load, per the repository rule that all imports live at the
 top of the file. ``all`` chains the full pipeline. ``e2e`` is the batch-major variant that runs ETL, index, compact,
-and tagging per batch then does historical-tag verification. The search phase in the ``all`` chain is skipped with a
-recorded reason when the gRPC server is unreachable. The standalone ``search`` subcommand fails loudly instead.
+and tagging per batch then does historical-tag verification. The search phase in the ``all`` chain is explicitly not
+run without external TLS and bearer-token inputs. The standalone ``search`` subcommand fails loudly when those inputs
+or verified connectivity are absent.
 """
 
 from __future__ import annotations
@@ -14,8 +15,6 @@ import logging
 import os
 from collections.abc import Callable
 from typing import Any
-
-import grpc
 
 from bench.capacity import capacity_artifact
 from bench.compaction import run_compact
@@ -60,30 +59,11 @@ def run_phase(config: BenchConfig, phase: str) -> dict[str, Any]:
     return PHASE_RUNNERS[phase](config)
 
 
-def server_reachable(config: BenchConfig) -> bool:
-    """Probe whether the gRPC search server answers on the configured endpoint.
-
-    Args:
-        config: Benchmark configuration.
-
-    Returns:
-        ``True`` when a channel becomes ready within a short budget.
-    """
-    channel = grpc.insecure_channel(config.endpoint)
-    try:
-        grpc.channel_ready_future(channel).result(timeout=3.0)
-        return True
-    except grpc.FutureTimeoutError:
-        return False
-    finally:
-        channel.close()
-
-
 def run_all(config: BenchConfig) -> dict[str, Any]:
     """Run the full benchmark chain under one run id.
 
-    Compaction is skipped when ``--batches`` is 1 since single-batch ingest produces nothing to merge. The search
-    phase is skipped with a recorded reason when the server is unreachable.
+    Compaction is skipped when ``--batches`` is 1 since single-batch ingest produces nothing to merge. Search is
+    measured only through a configured external authenticated service.
 
     Args:
         config: Benchmark configuration.
@@ -98,12 +78,12 @@ def run_all(config: BenchConfig) -> dict[str, Any]:
         outcomes["compact"] = run_phase(config, "compact")
     else:
         outcomes["compact"] = save_phase(config, "compact", {"skipped": "batches=1 leaves nothing to compact"})
-    if server_reachable(config):
+    if config.search_credentials_configured():
         outcomes["search"] = run_phase(config, "search")
     else:
-        reason: str = f"search server unreachable at {config.endpoint}; start rust/search-api and rerun 'search'"
+        reason: str = "external search requires --endpoint, --search-ca-path, and --search-token-dir"
         logger.warning(reason)
-        outcomes["search"] = save_phase(config, "search", {"skipped": reason})
+        outcomes["search"] = save_phase(config, "search", {"status": "NOT_RUN", "reason": reason})
     outcomes["report"] = run_phase(config, "report")
     return outcomes
 

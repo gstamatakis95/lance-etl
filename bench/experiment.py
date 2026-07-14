@@ -2,11 +2,10 @@
 
 Composes the existing phases into a single command an agent can loop on. Each run: chain
 download and prepare when the prepared shape is missing (cached across iterations), wipe the
-Lance root so every iteration is a clean build of the configured knobs, spawn and own the
-search-api server (:mod:`bench.server`), run the batch-major e2e body (real ETL, pipeline
-compaction, indexing, and hour tags), measure the on-disk data/index/metadata footprint
-(:mod:`bench.sizes`), restart the server for a true cold first query, run the full
-release-profile recall measurement, and write one machine-readable ``metrics.json``
+Lance root so every iteration is a clean build of the configured knobs, run the batch-major
+e2e body (real ETL, pipeline compaction, indexing, and hour tags), measure the on-disk
+data/index/metadata footprint (:mod:`bench.sizes`), optionally measure an externally managed
+authenticated production service, and write one machine-readable ``metrics.json``
 plus a one-line summary appended to ``{results_root}/experiments.jsonl``. With ``--baseline
 RUN_ID`` the headline delta against a previous iteration is computed and logged.
 """
@@ -27,7 +26,6 @@ from bench.grpc_client import generate_stubs, load_stubs, open_stub
 from bench.prepare import run_prepare
 from bench.results import ensure_dir, read_json, save_phase, utc_now
 from bench.search import measure_first_queries, sweep_point
-from bench.server import ServerHandle, resolve_binary
 from bench.sizes import measure_dataset_sizes
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -48,7 +46,6 @@ KNOB_FIELDS: tuple[str, ...] = (
     "fts_with_position",
     "no_text",
     "search_k",
-    "server_env",
 )
 
 
@@ -101,32 +98,35 @@ def ensure_prepared(config: BenchConfig) -> dict[str, Any]:
     return {"reused": False, "prepared_dir": str(config.prepared_dir())}
 
 
-def run_sweep_and_first_queries(config: BenchConfig, server: ServerHandle | None) -> dict[str, Any]:
-    """Run cold and warm first queries plus one release-profile recall point.
-
-    When the experiment owns the server it is restarted first, so the recorded ``cold_ms`` is
-    a true empty-process cold open rather than a warm-cache re-read.
+def run_sweep_and_first_queries(config: BenchConfig) -> dict[str, Any]:
+    """Run first queries plus one release-profile recall point against an external service.
 
     Args:
         config: Benchmark configuration (endpoint already pointing at the live server).
-        server: The owned server handle, or ``None`` when measuring an external server.
 
     Returns:
-        First-query timings per org and one catalog-profile point, or a skip record when no server is reachable.
+        First-query timings and one catalog-profile point, an explicit not-run record when
+        credentials are absent, or a failed record when verified connectivity fails.
     """
-    if server is not None:
-        server.restart()
+    if not config.search_credentials_configured():
+        return {
+            "status": "NOT_RUN",
+            "reason": "external search requires --endpoint, --search-ca-path, and --search-token-dir",
+        }
     grpc_gen_dir: Path = config.workspace / "grpc_gen"
     pb2, pb2_grpc = load_stubs(generate_stubs(grpc_gen_dir))
     try:
-        stub = open_stub(config.endpoint, pb2_grpc, str(config.lance_root()))
+        stub = open_stub(config, pb2_grpc)
     except RuntimeError as exc:
-        return {"skipped": str(exc)}
+        return {"status": "FAILED", "reason": str(exc)}
     queries, ground_truth = load_queries_and_gt(config)
-    first_query: dict[str, Any] = measure_first_queries(stub, pb2, config, queries)
-    point: dict[str, Any] = sweep_point(stub, pb2, config, queries, ground_truth)
+    try:
+        first_query: dict[str, Any] = measure_first_queries(stub, pb2, config, queries)
+        point: dict[str, Any] = sweep_point(stub, pb2, config, queries, ground_truth)
+    except Exception as error:
+        return {"status": "FAILED", "reason": str(error)[:500]}
     logger.info("catalog profile recall@10=%.4f p95=%.2fms", point["recall_at_10"], point["p95_ms"])
-    return {"first_query": first_query, "points": [point]}
+    return {"status": "MEASURED", "first_query": first_query, "points": [point]}
 
 
 def headline_numbers(sweep: dict[str, Any], sizes: dict[str, Any], build_seconds: float) -> dict[str, Any]:
@@ -152,7 +152,7 @@ def headline_numbers(sweep: dict[str, Any], sizes: dict[str, Any], build_seconds
     points: list[dict[str, Any]] = sweep.get("points", [])
     headline["recall_measured"] = bool(points)
     if not points:
-        headline["recall_skip_reason"] = str(sweep.get("skipped", "sweep produced no recall points"))
+        headline["recall_skip_reason"] = str(sweep.get("reason", "sweep produced no recall points"))
     if points:
         best = max(points, key=lambda point: (point["recall_at_10"], -point["p95_ms"]))
         headline["best_recall_at_10"] = best["recall_at_10"]
@@ -239,31 +239,15 @@ def run_experiment(config: BenchConfig) -> dict[str, Any]:
     if lance_root.exists():
         shutil.rmtree(lance_root)
 
-    server: ServerHandle | None = None
-    server_record: dict[str, Any]
-    if config.spawn_server:
-        binary: Path | None = resolve_binary(config)
-        if binary is None:
-            server_record = {"skipped": "no search-api binary found; build with --build-server or pass --server-bin"}
-        else:
-            server = ServerHandle(config, binary)
-            server.spawn()
-            config.endpoint = server.endpoint
-            server_record = {"binary": str(binary), "endpoint": server.endpoint, "env": config.server_env}
-    else:
-        server_record = {"external": True, "endpoint": config.endpoint}
-
-    try:
-        e2e_doc: dict[str, Any] = run_e2e(config)
-        build_seconds: float = sum(batch["etl_seconds"] + batch["pipeline"]["seconds"] for batch in e2e_doc["batches"])
-        sizes: dict[str, Any] = measure_dataset_sizes(lance_root)
-        if server is not None or not config.spawn_server:
-            sweep: dict[str, Any] = run_sweep_and_first_queries(config, server)
-        else:
-            sweep = {"skipped": server_record["skipped"]}
-    finally:
-        if server is not None:
-            server.stop()
+    service_record: dict[str, Any] = {
+        "mode": "external_authenticated" if config.search_credentials_configured() else "not_configured",
+        "endpoint": config.endpoint or None,
+    }
+    e2e_doc: dict[str, Any] = run_e2e(config)
+    build_seconds: float = sum(batch["etl_seconds"] + batch["pipeline"]["seconds"] for batch in e2e_doc["batches"])
+    sizes: dict[str, Any] = measure_dataset_sizes(lance_root)
+    sweep: dict[str, Any] = run_sweep_and_first_queries(config)
+    service_record["status"] = sweep["status"]
 
     headline: dict[str, Any] = headline_numbers(sweep, sizes, build_seconds)
     delta: dict[str, Any] | None = baseline_delta(config, headline)
@@ -273,7 +257,7 @@ def run_experiment(config: BenchConfig) -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "run_id": config.run_id,
         "knobs": config_dump(config),
-        "server": server_record,
+        "search_service": service_record,
         "prepared": prepared,
         "build": {
             "total_seconds": round(build_seconds, 3),

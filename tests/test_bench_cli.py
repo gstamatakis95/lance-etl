@@ -51,7 +51,7 @@ class TestEverySubcommandParses:
         assert config.tenants == 1
         assert config.seed == 42
         assert config.batches == 1
-        assert config.endpoint == "localhost:50051"
+        assert config.endpoint == ""
         assert config.concurrency == [1, 8, 32]
         assert config.ivf_partitions is None
         assert config.max_queries is None
@@ -117,13 +117,17 @@ class TestSubcommandFlags:
         config: BenchConfig = config_for(["compact", "--target-rows-per-fragment", "500000"])
         assert config.compact_target_rows == 500000
 
-    def test_search_flags(self) -> None:
-        """Search accepts the sweep grid, endpoint, query caps, and load knobs."""
+    def test_search_flags(self, tmp_path: Path) -> None:
+        """Search accepts an external authenticated endpoint, query caps, and load knobs."""
         config: BenchConfig = config_for(
             [
                 "search",
                 "--endpoint",
                 "localhost:9999",
+                "--search-ca-path",
+                str(tmp_path / "ca.pem"),
+                "--search-token-dir",
+                str(tmp_path / "tokens"),
                 "--max-queries",
                 "100",
                 "--concurrency",
@@ -133,6 +137,8 @@ class TestSubcommandFlags:
             ]
         )
         assert config.endpoint == "localhost:9999"
+        assert config.search_ca_path == (tmp_path / "ca.pem").resolve()
+        assert config.search_token_dir == (tmp_path / "tokens").resolve()
         assert config.max_queries == 100
         assert config.concurrency == [2, 4]
         assert config.load_duration == "5s"

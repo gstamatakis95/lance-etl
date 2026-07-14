@@ -196,8 +196,5 @@ def test_e2e_tagged_no_text(tmp_path: Path) -> None:
     artifact: dict[str, Any] = read_json(run_dir / "e2e.json")
     assert artifact["phase"] == "e2e"
 
-    for batch_record in outcome["batches"]:
-        grpc_result: dict[str, Any] = outcome["grpc_legs_per_tag"].get(batch_record["tag"], {})
-        assert "skipped" in grpc_result, (
-            f"gRPC leg for tag {batch_record['tag']!r} was not skipped as expected when no server is running"
-        )
+    assert outcome["final_catalog_grpc"]["status"] == "NOT_RUN"
+    assert outcome["final_catalog_recall"] == {}

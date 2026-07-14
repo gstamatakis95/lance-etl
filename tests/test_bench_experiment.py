@@ -1,9 +1,8 @@
 """Unit tests for the bench experiment loop pieces that need no Spark and no server.
 
-Covers the on-disk size measurement, the ``--server-env`` parsing, the headline distillation,
-the experiment history append, and the baseline delta computation. The full experiment
-integration (Spark + spawned server) lives in ``tests/test_bench_e2e.py`` with the other heavy
-bench tests.
+Covers on-disk size measurement, fail-closed external search configuration, headline
+distillation, experiment history, and baseline delta computation. The full offline experiment
+integration lives in ``tests/test_bench_e2e.py`` with the other heavy bench tests.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ import lance
 import pyarrow as pa
 import pytest
 
-from bench.config import BenchConfig, build_parser, parse_env_pairs
+from bench.config import BenchConfig, build_parser
 from bench.experiment import append_history, baseline_delta, headline_numbers, knob_vector
 from bench.sizes import measure_dataset_sizes
 
@@ -71,16 +70,6 @@ def test_measure_dataset_sizes_empty_root(tmp_path: Path) -> None:
     assert sizes["index_to_data_ratio"] == 0.0
 
 
-def test_parse_env_pairs() -> None:
-    """KEY=VALUE pairs parse, values may carry '=', and malformed pairs raise."""
-    assert parse_env_pairs(None) == {}
-    assert parse_env_pairs(["A=1", "B=x=y"]) == {"A": "1", "B": "x=y"}
-    with pytest.raises(ValueError, match="KEY=VALUE"):
-        parse_env_pairs(["NOEQUALS"])
-    with pytest.raises(ValueError, match="KEY=VALUE"):
-        parse_env_pairs(["=value"])
-
-
 def experiment_config(tmp_path: Path, run_id: str, extra: list[str] | None = None) -> BenchConfig:
     """Parse an experiment configuration rooted in the test tmp dir.
 
@@ -106,18 +95,47 @@ def experiment_config(tmp_path: Path, run_id: str, extra: list[str] | None = Non
 
 
 def test_experiment_flags_parse(tmp_path: Path) -> None:
-    """The experiment subcommand exposes the server and baseline flags."""
+    """The experiment exposes only external TLS search credentials and baseline flags."""
     config: BenchConfig = experiment_config(
         tmp_path,
         "r1",
-        ["--server-env", "SEARCH_API_CACHE_BACKEND=memory", "--no-spawn-server", "--baseline", "r0"],
+        [
+            "--endpoint",
+            "search.example:443",
+            "--search-ca-path",
+            str(tmp_path / "ca.pem"),
+            "--search-token-dir",
+            str(tmp_path / "tokens"),
+            "--baseline",
+            "r0",
+        ],
     )
     assert config.command == "experiment"
-    assert config.server_env == {"SEARCH_API_CACHE_BACKEND": "memory"}
-    assert config.spawn_server is False
+    assert config.endpoint == "search.example:443"
+    assert config.search_ca_path == (tmp_path / "ca.pem").resolve()
+    assert config.search_token_path("org7") == (tmp_path / "tokens" / "tenant0--ns--org7.jwt").resolve()
     assert config.baseline == "r0"
-    assert config.server_bin is None
-    assert config.build_server is False
+
+
+def test_external_search_configuration_fails_closed(tmp_path: Path) -> None:
+    """Partial credentials and obsolete local-server flags are rejected."""
+    with pytest.raises(ValueError, match="both --search-ca-path and --search-token-dir"):
+        experiment_config(tmp_path, "partial", ["--search-ca-path", str(tmp_path / "ca.pem")])
+    with pytest.raises(ValueError, match="--endpoint requires"):
+        experiment_config(tmp_path, "endpoint-only", ["--endpoint", "search.example:443"])
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["experiment", "--build-server"])
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["experiment", "--server-env", "SEARCH_API_CACHE_BACKEND=memory"])
+
+
+def test_benchmark_has_no_insecure_spawned_search_path() -> None:
+    """CI cannot interpret a local plaintext binary smoke as production search evidence."""
+    bench_root: Path = Path(__file__).resolve().parents[1] / "bench"
+    assert not (bench_root / "server.py").exists()
+    sources: str = "\n".join(path.read_text(encoding="utf-8") for path in bench_root.glob("*.py"))
+    assert "grpc.insecure_channel" not in sources
+    assert "SEARCH_API_CACHE_BACKEND" not in sources
 
 
 def test_headline_numbers_picks_best_and_knee() -> None:
@@ -166,7 +184,8 @@ def test_history_append_and_baseline_delta(tmp_path: Path) -> None:
     lines = [json.loads(line) for line in history_path.read_text().splitlines()]
     assert [line["run_id"] for line in lines] == ["run-a", "run-b"]
     assert lines[1]["knobs"]["dataset"] == "sift1m"
-    assert set(knob_vector(current)) >= {"ivf_partitions", "compact_target_rows", "server_env"}
+    assert set(knob_vector(current)) >= {"ivf_partitions", "compact_target_rows"}
+    assert "server_env" not in knob_vector(current)
 
     delta = baseline_delta(current, current_headline)
     assert delta is not None

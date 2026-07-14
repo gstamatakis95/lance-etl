@@ -17,18 +17,16 @@ operator-only concerns and have no public RPC.
 
 from __future__ import annotations
 
-import json
 import logging
-import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from bench.config import NAMESPACE, PROTO_PATH, RECALL_CUTOFFS, TENANT_ID, BenchConfig
+from bench.config import NAMESPACE, RECALL_CUTOFFS, TENANT_ID, BenchConfig
 from bench.groundtruth import recall_at
 from bench.grpc_client import (
+    authorization_metadata,
     dataset_target,
     generate_stubs,
     load_stubs,
@@ -38,7 +36,7 @@ from bench.grpc_client import (
     timed_call,
     vector_query,
 )
-from bench.results import ensure_dir, read_json, save_phase
+from bench.results import read_json, save_phase
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -112,8 +110,9 @@ def measure_first_queries(stub: Any, pb2: Any, config: BenchConfig, queries: np.
     timings: dict[str, Any] = {}
     for org in config.org_ids():
         request = pb2.VectorSearchRequest(target=dataset_target(pb2, org), query=vector_query(pb2, queries[0]), k=10)
-        cold_ms = timed_call(stub.VectorSearch, request)[1]
-        warm_ms = timed_call(stub.VectorSearch, request)[1]
+        metadata: tuple[tuple[str, str], ...] = authorization_metadata(config, org)
+        cold_ms = timed_call(stub.VectorSearch, request, metadata)[1]
+        warm_ms = timed_call(stub.VectorSearch, request, metadata)[1]
         timings[org] = {"cold_ms": round(cold_ms, 3), "warm_ms": round(warm_ms, 3)}
     return timings
 
@@ -145,7 +144,7 @@ def sweep_point(
             request = pb2.VectorSearchRequest(
                 target=dataset_target(pb2, org), query=vector_query(pb2, query), k=config.search_k
             )
-            response, elapsed_ms = timed_call(stub.VectorSearch, request)
+            response, elapsed_ms = timed_call(stub.VectorSearch, request, authorization_metadata(config, org))
             latencies.append(elapsed_ms)
             retrieved.append(result_vector_ids(response.results))
         expected: np.ndarray = ground_truth[org][: len(queries)]
@@ -205,7 +204,7 @@ def run_fts_leg(stub: Any, pb2: Any, config: BenchConfig, artifacts: dict[str, A
             query=text_query(pb2, fts_terms(config, cluster_vocab, query_index, cluster)),
             k=10,
         )
-        response, elapsed_ms = timed_call(stub.TextSearch, request)
+        response, elapsed_ms = timed_call(stub.TextSearch, request, authorization_metadata(config, org))
         latencies.append(elapsed_ms)
         hit_ids: np.ndarray = result_vector_ids(response.results)
         if len(hit_ids):
@@ -252,7 +251,7 @@ def run_hybrid_leg(stub: Any, pb2: Any, config: BenchConfig, artifacts: dict[str
             text=text_query(pb2, fts_terms(config, cluster_vocab, query_index, cluster)),
             k=10,
         )
-        response, elapsed_ms = timed_call(stub.HybridSearch, request)
+        response, elapsed_ms = timed_call(stub.HybridSearch, request, authorization_metadata(config, org))
         latencies.append(elapsed_ms)
         recalls.append(recall_at(expected[None, :], [result_vector_ids(response.results)], 10))
     return {
@@ -301,54 +300,23 @@ def ghz_summary(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_load_leg(config: BenchConfig, sample_vector: np.ndarray) -> dict[str, Any]:
-    """Run the sustained-QPS load mode by shelling out to ghz.
+    """Record the external authenticated load-test gate.
 
     Args:
         config: Benchmark configuration.
         sample_vector: The query vector replayed by every request.
 
     Returns:
-        Per-concurrency summaries, or a skip notice when ghz is absent.
+        An explicit not-run record. Passing rotating bearer credentials through a child
+        process argument would expose them through the process table, so the benchmark does
+        not claim a production load result from the obsolete unauthenticated ghz path.
     """
-    ghz_binary: str | None = shutil.which("ghz")
-    if ghz_binary is None:
-        message: str = "ghz not found on PATH; install it (https://ghz.sh) to run the load mode"
-        logger.warning(message)
-        return {"skipped": message}
-    run_directory: Path = ensure_dir(config.run_dir())
-    payload: str = json.dumps(ghz_payload(sample_vector))
-    levels: list[dict[str, Any]] = []
-    for concurrency in config.concurrency:
-        output: Path = run_directory / f"ghz_c{concurrency}.json"
-        command: list[str] = [
-            ghz_binary,
-            "--insecure",
-            "--proto",
-            str(PROTO_PATH),
-            "--import-paths",
-            str(PROTO_PATH.parents[2]),
-            "--call",
-            "lance_etl.v1.SearchService.VectorSearch",
-            "-d",
-            payload,
-            "-c",
-            str(concurrency),
-            "-z",
-            config.load_duration,
-            "--format",
-            "json",
-            "--output",
-            str(output),
-            config.endpoint,
-        ]
-        logger.info("ghz load at concurrency %d for %s", concurrency, config.load_duration)
-        completed = subprocess.run(command, capture_output=True, text=True)
-        if completed.returncode != 0:
-            levels.append({"concurrency": concurrency, "error": completed.stderr.strip()[:500]})
-            continue
-        raw: dict[str, Any] = read_json(output)
-        levels.append({"concurrency": concurrency, "raw_file": output.name, **ghz_summary(raw)})
-    return {"duration": config.load_duration, "execution_policy": "catalog_profile", "levels": levels}
+    del sample_vector
+    return {
+        "status": "NOT_RUN",
+        "reason": "authenticated fleet load requires an external secret-aware load runner",
+        "endpoint": config.endpoint,
+    }
 
 
 def run_search(config: BenchConfig) -> dict[str, Any]:
@@ -362,7 +330,7 @@ def run_search(config: BenchConfig) -> dict[str, Any]:
     """
     artifacts: dict[str, Any] = load_artifacts(config)
     pb2, pb2_grpc = load_stubs(generate_stubs(config.workspace / "grpc_gen"))
-    stub: Any = open_stub(config.endpoint, pb2_grpc, str(config.lance_root()))
+    stub: Any = open_stub(config, pb2_grpc)
     queries: np.ndarray = artifacts["queries"]
     if config.max_queries is not None:
         queries = queries[: config.max_queries]
@@ -376,7 +344,7 @@ def run_search(config: BenchConfig) -> dict[str, Any]:
                 request = pb2.VectorSearchRequest(
                     target=dataset_target(pb2, org), query=vector_query(pb2, query), k=config.search_k
                 )
-                timed_call(stub.VectorSearch, request)
+                timed_call(stub.VectorSearch, request, authorization_metadata(config, org))
     sweep: list[dict[str, Any]] = [sweep_point(stub, pb2, config, queries, artifacts["ground_truth"])]
     load: dict[str, Any] = run_load_leg(config, queries[0])
     result: dict[str, Any] = {

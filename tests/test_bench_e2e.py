@@ -29,7 +29,6 @@ from bench.ingest import run_ingest
 from bench.prepare import run_prepare
 from bench.report import run_report
 from bench.results import read_json
-from bench.server import resolve_binary
 
 pytestmark = pytest.mark.integration
 
@@ -232,10 +231,9 @@ def experiment_argv(tmp_path: Path) -> list[str]:
 def test_offline_experiment_full_loop(tmp_path: Path) -> None:
     """The experiment loop produces metrics.json, sizes, and a history line in one command.
 
-    When a search-api binary exists (the release or debug build), the run spawns it and the
-    sweep and cold/warm first queries must be populated. Without a binary the run must still
-    complete with the server and sweep recorded as skipped, so the loop degrades exactly like
-    the other server-dependent legs.
+    The offline run must complete every local build phase while recording search as ``NOT_RUN``.
+    A release or debug search binary in the checkout must not change that result because the
+    production service requires TLS, JWT authorization, and PostgreSQL catalog state.
     """
     corpus_root: Path = tmp_path / "corpora"
     make_bigann_fixture(corpus_root)
@@ -263,17 +261,7 @@ def test_offline_experiment_full_loop(tmp_path: Path) -> None:
     assert lines[-1]["run_id"] == "exp1"
     assert lines[-1]["knobs"]["batches"] == 2
 
-    if resolve_binary(config) is None:
-        assert "skipped" in metrics["sweep"]
-        assert "skipped" in metrics["server"]
-    else:
-        assert metrics["server"]["endpoint"].startswith("localhost:")
-        points: list[dict[str, Any]] = metrics["sweep"]["points"]
-        assert len(points) == 1, "the catalog release profile produces one qualified operating point"
-        for point in points:
-            assert 0.0 <= point["recall_at_10"] <= 1.0
-            assert point["p95_ms"] > 0
-        assert metrics["headline"]["best_recall_at_10"] == max(point["recall_at_10"] for point in points)
-        first_query: dict[str, Any] = metrics["sweep"]["first_query"]
-        assert any("cold_ms" in timing for timing in first_query.values())
-        assert (run_dir / "server.log").exists()
+    assert metrics["sweep"]["status"] == "NOT_RUN"
+    assert metrics["search_service"] == {"mode": "not_configured", "endpoint": None, "status": "NOT_RUN"}
+    assert metrics["headline"]["recall_measured"] is False
+    assert not (run_dir / "server.log").exists()

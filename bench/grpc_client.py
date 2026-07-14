@@ -27,7 +27,7 @@ import grpc
 import numpy as np
 from grpc_tools import protoc
 
-from bench.config import NAMESPACE, PROTO_PATH, TENANT_ID
+from bench.config import NAMESPACE, PROTO_PATH, TENANT_ID, BenchConfig
 
 
 def generate_stubs(gen_dir: Path) -> Path:
@@ -80,31 +80,58 @@ def load_stubs(gen_dir: Path) -> tuple[ModuleType, ModuleType]:
     return pb2, pb2_grpc
 
 
-def open_stub(endpoint: str, pb2_grpc: ModuleType, lance_root: str, timeout_seconds: float = 5.0) -> Any:
-    """Open an insecure channel to the search service and wait for readiness.
+def open_stub(config: BenchConfig, pb2_grpc: ModuleType, timeout_seconds: float = 5.0) -> Any:
+    """Open a CA-verified TLS channel to the external search service.
 
     Args:
-        endpoint: ``host:port`` of the server.
+        config: Benchmark configuration carrying the endpoint and trusted CA path.
         pb2_grpc: The generated service stub module.
-        lance_root: The Lance base directory, used in the error guidance.
         timeout_seconds: Readiness wait budget.
 
     Returns:
         A ready ``SearchServiceStub``.
 
     Raises:
-        RuntimeError: If the server is unreachable, with instructions to start it.
+        RuntimeError: If credentials are absent, the CA is unreadable, or the service is unreachable.
     """
-    channel = grpc.insecure_channel(endpoint)
+    if not config.search_credentials_configured() or config.search_ca_path is None:
+        raise RuntimeError("external search credentials are not configured")
+    try:
+        trusted_ca: bytes = config.search_ca_path.read_bytes()
+    except OSError as error:
+        raise RuntimeError(f"cannot read search CA file at {config.search_ca_path}") from error
+    if not trusted_ca:
+        raise RuntimeError(f"search CA file is empty at {config.search_ca_path}")
+    channel = grpc.secure_channel(config.endpoint, grpc.ssl_channel_credentials(root_certificates=trusted_ca))
     try:
         grpc.channel_ready_future(channel).result(timeout=timeout_seconds)
     except grpc.FutureTimeoutError as error:
-        raise RuntimeError(
-            f"search server unreachable at {endpoint}; start it with "
-            f'LANCE_ETL_BASE_URI="{lance_root}" SEARCH_API_PORT={endpoint.rsplit(":", 1)[-1]} '
-            f"./rust/search-api/target/release/search-api"
-        ) from error
+        channel.close()
+        raise RuntimeError(f"verified TLS search service unreachable at {config.endpoint}") from error
     return pb2_grpc.SearchServiceStub(channel)
+
+
+def authorization_metadata(config: BenchConfig, org_id: str) -> tuple[tuple[str, str], ...]:
+    """Read the rotating bearer token for one exact target at request time.
+
+    Args:
+        config: Benchmark configuration carrying the token directory.
+        org_id: Organization identity of the request target.
+
+    Returns:
+        gRPC authorization metadata.
+
+    Raises:
+        RuntimeError: If the target token file is absent, unreadable, or empty.
+    """
+    token_path: Path = config.search_token_path(org_id)
+    try:
+        token: str = token_path.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise RuntimeError(f"cannot read bearer token for target {org_id!r} at {token_path}") from error
+    if not token or any(character.isspace() for character in token):
+        raise RuntimeError(f"bearer token for target {org_id!r} is empty or contains whitespace")
+    return (("authorization", f"Bearer {token}"),)
 
 
 def dataset_target(pb2: ModuleType, org_id: str, tenant_id: str = TENANT_ID, namespace: str = NAMESPACE) -> Any:
@@ -189,24 +216,30 @@ def result_vector_ids(results: Any) -> np.ndarray:
     return np.asarray(ids, dtype=np.int64)
 
 
-def timed_call(callable_rpc: Any, request: Any) -> tuple[Any, float]:
+def timed_call(
+    callable_rpc: Any,
+    request: Any,
+    metadata: tuple[tuple[str, str], ...] = (),
+) -> tuple[Any, float]:
     """Invoke one RPC and measure its latency.
 
     Args:
         callable_rpc: The stub method.
         request: The request message.
+        metadata: Authentication metadata attached to the request.
 
     Returns:
         The response and the latency in milliseconds.
     """
     started: float = time.perf_counter()
-    response: Any = callable_rpc(request)
+    response: Any = callable_rpc(request, metadata=metadata)
     return response, (time.perf_counter() - started) * 1000.0
 
 
 def vector_search(
     stub: Any,
     pb2: ModuleType,
+    config: BenchConfig,
     org_id: str,
     query: np.ndarray,
     k: int,
@@ -216,6 +249,7 @@ def vector_search(
     Args:
         stub: The connected service stub.
         pb2: The generated proto module.
+        config: Benchmark configuration carrying target token files.
         org_id: Organization to query.
         query: Query vector.
         k: Bounded result count.
@@ -228,12 +262,13 @@ def vector_search(
         query=vector_query(pb2, query),
         k=k,
     )
-    return timed_call(stub.VectorSearch, request)
+    return timed_call(stub.VectorSearch, request, authorization_metadata(config, org_id))
 
 
 def text_search(
     stub: Any,
     pb2: ModuleType,
+    config: BenchConfig,
     org_id: str,
     terms: str,
     k: int,
@@ -243,6 +278,7 @@ def text_search(
     Args:
         stub: The connected service stub.
         pb2: The generated proto module.
+        config: Benchmark configuration carrying target token files.
         org_id: Organization to query.
         terms: Simple product query terms.
         k: Bounded result count.
@@ -255,12 +291,13 @@ def text_search(
         query=text_query(pb2, terms),
         k=k,
     )
-    return timed_call(stub.TextSearch, request)
+    return timed_call(stub.TextSearch, request, authorization_metadata(config, org_id))
 
 
 def hybrid_search(
     stub: Any,
     pb2: ModuleType,
+    config: BenchConfig,
     org_id: str,
     query: np.ndarray,
     terms: str,
@@ -271,6 +308,7 @@ def hybrid_search(
     Args:
         stub: The connected service stub.
         pb2: The generated proto module.
+        config: Benchmark configuration carrying target token files.
         org_id: The organization to query.
         query: The query vector for the vector leg.
         terms: The space-separated query terms for the text leg.
@@ -285,4 +323,4 @@ def hybrid_search(
         text=text_query(pb2, terms),
         k=k,
     )
-    return timed_call(stub.HybridSearch, request)
+    return timed_call(stub.HybridSearch, request, authorization_metadata(config, org_id))

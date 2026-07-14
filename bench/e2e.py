@@ -28,13 +28,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import grpc
 import lance
 import numpy as np
 
 from bench.config import RECALL_CUTOFFS, BenchConfig
 from bench.groundtruth import recall_at
-from bench.grpc_client import generate_stubs, load_stubs, result_vector_ids, vector_search
+from bench.grpc_client import generate_stubs, load_stubs, open_stub, result_vector_ids, vector_search
 from bench.indexes import union_index_config
 from bench.ingest import batch_windows, run_etl_window
 from bench.results import ensure_dir, save_phase
@@ -209,7 +208,7 @@ def org_catalog_recall(
     kept_indices: list[int] = []
     for index, query in enumerate(queries):
         try:
-            response, elapsed_ms = vector_search(stub, pb2, org, query, config.search_k)
+            response, elapsed_ms = vector_search(stub, pb2, config, org, query, config.search_k)
         except Exception as exc:
             logger.warning("gRPC error during tag recall sweep for org %s: %s", org, exc)
             continue
@@ -240,9 +239,9 @@ def run_catalog_grpc_legs(
 ) -> dict[str, Any]:
     """Run first-query latency and recall through the final catalog publication.
 
-    Probes the server before attempting any RPCs. If the server is unreachable the call
-    returns a skipped record with a descriptive reason so callers can treat the absence of a
-    running server as a non-fatal condition (used in tests and in the ``all`` chain).
+    Search evidence is explicitly not run unless a trusted CA and exact-target token directory
+    are configured. A configured endpoint that cannot establish verified TLS is recorded as a
+    failure and can never be mistaken for built-server benchmark coverage.
 
     Args:
         config: Benchmark configuration.
@@ -253,33 +252,48 @@ def run_catalog_grpc_legs(
     Returns:
         Catalog recall and cold plus warm first-query latency.
     """
+    if not config.search_credentials_configured():
+        return {
+            "status": "NOT_RUN",
+            "reason": "external search requires --endpoint, --search-ca-path, and --search-token-dir",
+        }
     try:
         pb2, pb2_grpc = load_stubs(generate_stubs(grpc_gen_dir))
-        channel = grpc.insecure_channel(config.endpoint)
-        grpc.channel_ready_future(channel).result(timeout=3.0)
-        stub = pb2_grpc.SearchServiceStub(channel)
+        stub = open_stub(config, pb2_grpc, timeout_seconds=3.0)
     except Exception as exc:
-        return {"skipped": f"gRPC server unreachable at {config.endpoint}: {exc}"}
+        return {"status": "FAILED", "reason": str(exc)}
 
     first_latencies: dict[str, Any] = {}
     for org in config.org_ids():
         try:
-            resp, cold_ms = vector_search(stub, pb2, org, queries[0], 10)
+            resp, cold_ms = vector_search(stub, pb2, config, org, queries[0], 10)
             del resp
-            _, warm_ms = vector_search(stub, pb2, org, queries[0], 10)
+            _, warm_ms = vector_search(stub, pb2, config, org, queries[0], 10)
             first_latencies[org] = {"cold_ms": round(cold_ms, 3), "warm_ms": round(warm_ms, 3)}
         except Exception as exc:
             first_latencies[org] = {"error": str(exc)[:500]}
 
     sweep_recalls: list[dict[str, Any]] = []
+    recall_failures: list[str] = []
     for org in config.org_ids():
         if org not in ground_truth:
             continue
         point: dict[str, Any] | None = org_catalog_recall(stub, pb2, config, org, queries, ground_truth[org])
         if point is not None:
             sweep_recalls.append(point)
+            if point["failed_queries"]:
+                recall_failures.append(org)
+        else:
+            recall_failures.append(org)
 
-    return {"first_latencies": first_latencies, "recall": sweep_recalls}
+    failed_targets: list[str] = [org for org, timing in first_latencies.items() if "error" in timing]
+    failed_targets = sorted(set(failed_targets + recall_failures))
+    return {
+        "status": "FAILED" if failed_targets else "MEASURED",
+        "failed_targets": failed_targets,
+        "first_latencies": first_latencies,
+        "recall": sweep_recalls,
+    }
 
 
 def load_queries_and_gt(config: BenchConfig) -> tuple[np.ndarray, dict[str, np.ndarray]]:
@@ -404,7 +418,7 @@ def run_e2e_body(config: BenchConfig) -> dict[str, Any]:
 
     queries, ground_truth = load_queries_and_gt(config)
     catalog_grpc: dict[str, Any] = run_catalog_grpc_legs(config, queries, ground_truth, grpc_gen_dir)
-    final_recall: dict[str, Any] = {} if "skipped" in catalog_grpc else catalog_grpc
+    final_recall: dict[str, Any] = catalog_grpc if catalog_grpc.get("status") == "MEASURED" else {}
 
     return save_phase(
         config,

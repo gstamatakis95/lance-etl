@@ -1,6 +1,9 @@
-# bench — BIGANN / SIFT1B end-to-end benchmark runbook
+# bench — BIGANN / SIFT1M end-to-end benchmark runbook
 
-This runbook covers the reproducible commands for running the benchmark at 1M (smoke), 100M (local), and 1B (remote) scales, the server build and start procedure, disk and time budgets, checksum semantics, and the cold-vs-warm measurement recipe.
+This runbook covers reproducible offline build qualification at 1M, 100M, and 1B scales plus an
+optional authenticated measurement against an externally managed production search fleet. The
+harness never starts a private search binary or bypasses TLS, JWT authentication, or PostgreSQL
+catalog resolution.
 
 ---
 
@@ -65,7 +68,6 @@ python -m bench all \
   --batches 2 \
   --etl-partitions 4 \
   --num-partitions 128 \
-  --endpoint localhost:50051 \
   --workspace bench/workspace \
   --results-root bench/results
 ```
@@ -76,8 +78,10 @@ For an offline fixture run without any download, use the pytest integration test
 .venv/bin/pytest tests/test_bench_e2e.py tests/test_bench_e2e_tagged.py -x -q -m integration
 ```
 
-The tests write minimal bigann u8bin files directly into a temp workspace so no network
-access is needed. They exercise the full real adapter IO path through Spark local mode.
+The tests write minimal BIGANN u8bin files directly into a temporary workspace so no network
+access is needed. They exercise the full real adapter IO path through Spark local mode. Search
+evidence is recorded as `NOT_RUN` unless production credentials are supplied. This status is not
+a built-server search result.
 
 ---
 
@@ -110,24 +114,19 @@ Official ground truth ships for exactly ten prefix sizes:
 
 Any other `--limit` falls back to exact brute-force ground truth computed during the prepare phase (only sensible at small limits).
 
-### Step 2 — Start the search server
+### Step 2 — Prepare the production search gate
 
-```bash
-cd rust/search-api
-cargo build --release
+Deploy the release image through the production manifests and publish the exact benchmark targets
+through the reconciler. Obtain the fleet CA and one short-lived JWT for every exact target. The
+token directory uses this fixed naming convention:
 
-LANCE_ETL_BASE_URI="bench/workspace/lance" \
-SEARCH_API_PORT=50051 \
-./target/release/search-api
+```text
+tokens/tenant0--ns--org0.jwt
+tokens/tenant0--ns--org1.jwt
 ```
 
-Key environment variables (see `rust/search-api/src/config.rs` for the full list):
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `LANCE_ETL_BASE_URI` | (required) | Base directory of the Lance datasets |
-| `SEARCH_API_PORT` | `8080` | TCP port for the gRPC server |
-| `SEARCH_API_CACHE_DIR` | `/tmp/rust-search/cache` | Persistent disk cache root |
+Each JWT must authorize exactly the tenant, namespace, and organization named by its file. Token
+files are read again for every RPC so an operator can rotate them during a long run.
 
 ### Step 3 — Run the e2e benchmark
 
@@ -143,7 +142,9 @@ python -m bench e2e \
   --num-shards 16 \
   --vector-row-floor 1024 \
   --seed 42 \
-  --endpoint localhost:50051 \
+  --endpoint search.production.example:443 \
+  --search-ca-path /run/secrets/search/ca.pem \
+  --search-token-dir /run/secrets/search/tokens \
   --workspace bench/workspace \
   --results-root bench/results
 ```
@@ -171,7 +172,9 @@ python -m bench e2e \
   --num-shards 32 \
   --vector-row-floor 1024 \
   --seed 42 \
-  --endpoint <remote-host>:50051 \
+  --endpoint search.production.example:443 \
+  --search-ca-path /run/secrets/search/ca.pem \
+  --search-token-dir /run/secrets/search/tokens \
   --workspace /mnt/nvme/bench/workspace \
   --results-root /mnt/nvme/bench/results
 ```
@@ -188,7 +191,6 @@ python -m bench all \
   --batches 2 \
   --etl-partitions 4 \
   --num-partitions 128 \
-  --endpoint localhost:50051 \
   --workspace bench/workspace \
   --results-root bench/results
 ```
@@ -268,11 +270,13 @@ publication. These are client-measured single-stream latencies:
 - `cold_ms`: the first query this client sends to the server for a given org.
 - `warm_ms`: the immediately following identical query, benefiting from OS page cache and the server's in-process index cache.
 
-To measure a true cold start (empty page cache and empty server cache):
+The harness reports the first request sent by the benchmark client as `cold_ms`. It does not claim
+that this is a fleet cold start because the production service and shared object-store caches may
+already be warm. To measure a controlled fleet cold start:
 
-1. Start a fresh server with an empty `SEARCH_API_CACHE_DIR`.
-2. Run the e2e benchmark and record `cold_ms` from the e2e artifact.
-3. Stop the server and clear the cache directory before another cold cohort.
+1. Drain and replace the isolated benchmark fleet through the normal deployment workflow.
+2. Confirm its prewarm and serving-catalog state through production controls.
+3. Run the authenticated benchmark and record `cold_ms` from the e2e artifact.
 
 The `warm_ms` value measures the immediately repeated in-process cache latency. Prewarming is an
 internal publication gate and is not exposed to benchmark users through the search API.
@@ -281,38 +285,34 @@ internal publication gate and is not exposed to benchmark users through the sear
 
 ## Agent experiment loop — `python -m bench experiment`
 
-One command runs a complete, measurable iteration: knobs in, `metrics.json` out. It chains
+One command runs a complete, measurable offline build iteration: knobs in, `metrics.json` out. It chains
 download and prepare when the corpus shape is missing (cached afterwards), wipes the Lance root
-so every iteration is a clean build of the configured knobs, spawns and owns the `search-api`
-server, runs the batch-major e2e body (real ETL, pipeline compaction, indexing, hour tags),
-measures the on-disk footprint, restarts the server for a true cold first query, measures the
-catalog-selected release profile, and appends a one-line summary to
+so every iteration is a clean build of the configured knobs, runs the batch-major e2e body, measures
+the on-disk footprint, optionally measures an authenticated external catalog-selected release, and
+appends a one-line summary to
 `{results_root}/experiments.jsonl`.
 
 ```bash
 python -m bench experiment \
   --dataset sift1m --run-id iter-001 \
-  --num-partitions 256 --target-rows-per-fragment 1048576 \
-  --server-env SEARCH_API_CACHE_BACKEND=disk
+  --num-partitions 256 --target-rows-per-fragment 1048576
 ```
 
-Server lifecycle flags: `--server-bin PATH` (default: the release build, then the debug build),
-`--build-server` (run `cargo build --release` first), `--no-spawn-server` (measure an external
-server at `--endpoint`), and repeatable `--server-env KEY=VALUE` for server-side knobs (cache
-backend, cache budgets). Without any binary the run still completes and records the sweep as
-skipped, like the other server-dependent legs. The server's output lands in
-`{run_dir}/server.log`.
+Add `--endpoint`, `--search-ca-path`, and `--search-token-dir` together to measure an external
+production fleet. Without those three inputs, build qualification remains mandatory and search is
+explicitly `NOT_RUN`. A locally built binary is never discovered or started, so CI cannot present
+an insecure process smoke test as production search evidence.
 
 `metrics.json` schema (stable keys, everything an agent needs to compare iterations):
 
 | Key | Contents |
 |---|---|
 | `run_id`, `knobs` | The full configuration dump, paths as strings |
-| `server` | Spawned binary, endpoint, and env, or the skip reason |
+| `search_service` | External endpoint mode and `MEASURED`, `FAILED`, or `NOT_RUN` status |
 | `build` | Total and per-batch ETL and pipeline wall seconds |
 | `sizes` | Per-dataset and fleet `data_bytes` / `index_bytes` / `meta_bytes` / `total_bytes` and the index-to-data ratio |
 | `sweep.points` | One record per `(nprobes, refine_factor)`: recall@1/10/100, mean/p50/p95/p99 ms, single-stream QPS |
-| `sweep.first_query` | Per-org cold and warm first-query ms, cold measured after a server restart |
+| `sweep.first_query` | Per-org first and immediately repeated query latency |
 | `tags` | Tags created and whether historical-tag verification passed |
 | `headline` | The distilled comparison numbers: best recall@10 point, the fastest point at recall@10 >= 0.95 (the knee), cold first-query ms, build seconds, and bytes |
 | `baseline_delta` | Per-metric `{baseline, current, delta}` when `--baseline RUN_ID` was given |

@@ -54,27 +54,6 @@ def default_run_id() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
-def parse_env_pairs(pairs: list[str] | None) -> dict[str, str]:
-    """Parse repeatable ``KEY=VALUE`` environment overrides into a dict.
-
-    Args:
-        pairs: The raw flag values, or ``None`` when the flag was never given.
-
-    Returns:
-        The parsed environment mapping, empty when no pairs were given.
-
-    Raises:
-        ValueError: If a pair carries no ``=`` separator or an empty key.
-    """
-    env: dict[str, str] = {}
-    for pair in pairs or []:
-        key, separator, value = pair.partition("=")
-        if not separator or not key:
-            raise ValueError(f"--server-env expects KEY=VALUE, got {pair!r}")
-        env[key] = value
-    return env
-
-
 def parse_int_list(text: str) -> list[int]:
     """Parse a comma-separated list of integers.
 
@@ -119,7 +98,9 @@ class BenchConfig:
         driver_memory: Spark driver memory for the local-mode JVM.
         catalog: Name of the local Hadoop Iceberg catalog.
         table_name: Bare Iceberg table name under ``<catalog>.db``.
-        endpoint: gRPC endpoint of the Rust search service.
+        endpoint: gRPC endpoint of the external production search service.
+        search_ca_path: PEM certificate authority used to verify the external service.
+        search_token_dir: Directory holding one bearer-token file per benchmark organization.
         search_k: Neighbors requested per query. Must cover the deepest recall cut-off.
         max_queries: Cap on query vectors per sweep point. ``None`` sends all 10k.
         fts_query_count: Deterministic full-text queries drawn from cluster vocabularies in the FTS leg.
@@ -136,13 +117,6 @@ class BenchConfig:
             on 8125).
         otlp_port: gRPC port for the local OTLP trace capture receiver (default 14317, avoids clash with a real agent
             on 4317).
-        server_bin: Explicit path of the search-api binary the experiment spawns. ``None`` resolves the release
-            build then the debug build.
-        build_server: When True, run ``cargo build --release`` for search-api before spawning it.
-        spawn_server: When True (the default) the experiment spawns and owns a server. Disable to measure against
-            an externally managed server at ``endpoint``.
-        server_env: Extra environment variables for the spawned server, from repeatable ``--server-env KEY=VALUE``
-            flags. This is how an iteration varies server-side knobs such as the cache backend or cache budgets.
         baseline: Run id of a previous experiment whose ``metrics.json`` is diffed against this run's headline
             numbers.
         qualification_rows: Rows in the bounded deterministic scale and fault cohort.
@@ -175,7 +149,9 @@ class BenchConfig:
     driver_memory: str = "8g"
     catalog: str = "bench"
     table_name: str = "sift"
-    endpoint: str = "localhost:50051"
+    endpoint: str = ""
+    search_ca_path: Path | None = None
+    search_token_dir: Path | None = None
     search_k: int = SIFT_GT_DEPTH
     max_queries: int | None = None
     fts_query_count: int = 100
@@ -189,10 +165,6 @@ class BenchConfig:
     capture_telemetry: bool = False
     statsd_port: int = 19125
     otlp_port: int = 14317
-    server_bin: str | None = None
-    build_server: bool = False
-    spawn_server: bool = True
-    server_env: dict[str, str] = field(default_factory=dict)
     baseline: str | None = None
     qualification_rows: int = 25_000
     allow_large_qualification: bool = False
@@ -201,7 +173,8 @@ class BenchConfig:
         """Validate cross-field invariants after the dataclass fields are populated.
 
         Raises:
-            ValueError: If ``search_k`` is smaller than the deepest :data:`RECALL_CUTOFFS` depth.
+            ValueError: If ``search_k`` is smaller than the deepest :data:`RECALL_CUTOFFS` depth or external search
+                credentials are only partially configured.
                 ``recall_at`` slices the retrieved-id array to the cut-off width, so a shorter
                 array silently caps recall below its true value instead of raising, which would
                 make ``search_k`` misconfiguration masquerade as a real recall drop.
@@ -213,6 +186,15 @@ class BenchConfig:
                 f"(RECALL_CUTOFFS={RECALL_CUTOFFS}); recall_at_{deepest_cutoff} would be silently "
                 f"deflated by the shorter retrieved-id array. Pass --search-k >= {deepest_cutoff}."
             )
+        credential_fields: tuple[Path | None, Path | None] = (self.search_ca_path, self.search_token_dir)
+        if any(value is not None for value in credential_fields) and not all(
+            value is not None for value in credential_fields
+        ):
+            raise ValueError("external search requires both --search-ca-path and --search-token-dir")
+        if self.endpoint and not self.search_credentials_configured():
+            raise ValueError("--endpoint requires --search-ca-path and --search-token-dir")
+        if self.search_credentials_configured() and not self.endpoint:
+            raise ValueError("external search requires --endpoint")
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> BenchConfig:
@@ -226,12 +208,18 @@ class BenchConfig:
         """
         values: dict[str, Any] = {}
         nullable_fields: frozenset[str] = frozenset(
-            {"ivf_partitions", "compact_target_rows", "max_queries", "sha256", "statsd_port", "otlp_port"}
+            {
+                "ivf_partitions",
+                "compact_target_rows",
+                "max_queries",
+                "sha256",
+                "statsd_port",
+                "otlp_port",
+                "search_ca_path",
+                "search_token_dir",
+            }
         )
-        values["server_env"] = parse_env_pairs(getattr(args, "server_env", None))
         for item in fields(cls):
-            if item.name == "server_env":
-                continue
             if hasattr(args, item.name):
                 value: Any = getattr(args, item.name)
                 if value is not None or item.name in nullable_fields:
@@ -239,6 +227,9 @@ class BenchConfig:
         values["workspace"] = Path(args.workspace).resolve()
         values["corpus_root"] = Path(args.corpus_root).resolve()
         values["results_root"] = Path(args.results_root).resolve()
+        for path_field in ("search_ca_path", "search_token_dir"):
+            if values.get(path_field) is not None:
+                values[path_field] = Path(values[path_field]).resolve()
         return cls(**values)
 
     def table(self) -> str:
@@ -323,6 +314,30 @@ class BenchConfig:
         """
         return self.workspace / "telemetry"
 
+    def search_credentials_configured(self) -> bool:
+        """Return whether the benchmark can authenticate to an external search service.
+
+        Returns:
+            True only when both the trusted CA and token directory are configured.
+        """
+        return self.search_ca_path is not None and self.search_token_dir is not None
+
+    def search_token_path(self, org_id: str) -> Path:
+        """Return the bearer-token file for one exact logical benchmark target.
+
+        Args:
+            org_id: Organization identity carried in the public request and JWT claims.
+
+        Returns:
+            ``{search_token_dir}/{tenant}--{namespace}--{org}.jwt``.
+
+        Raises:
+            ValueError: If external search credentials are not configured.
+        """
+        if self.search_token_dir is None:
+            raise ValueError("external search credentials are not configured")
+        return self.search_token_dir / f"{TENANT_ID}--{NAMESPACE}--{org_id}.jwt"
+
 
 def add_flags(parser: argparse.ArgumentParser) -> None:
     """Add the full benchmark flag set to a subcommand parser.
@@ -361,7 +376,23 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--driver-memory", default="8g")
     parser.add_argument("--catalog", default="bench")
     parser.add_argument("--table-name", default="sift")
-    parser.add_argument("--endpoint", default="localhost:50051")
+    parser.add_argument(
+        "--endpoint",
+        default="",
+        help="External production search endpoint as host:port. Search is not measured when omitted",
+    )
+    parser.add_argument(
+        "--search-ca-path",
+        type=Path,
+        default=None,
+        help="PEM CA file that verifies the external search service certificate",
+    )
+    parser.add_argument(
+        "--search-token-dir",
+        type=Path,
+        default=None,
+        help="Directory of tenant0--ns--ORG.jwt bearer-token files with exact target claims",
+    )
     parser.add_argument(
         "--search-k",
         type=int,
@@ -394,30 +425,6 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=19125,
         help="UDP port for the local DogStatsD capture listener (default 19125)",
-    )
-    parser.add_argument(
-        "--server-bin",
-        default=None,
-        help="Path to the search-api binary the experiment spawns (default: release then debug build)",
-    )
-    parser.add_argument(
-        "--build-server",
-        dest="build_server",
-        action="store_true",
-        help="Run cargo build --release for search-api before spawning it",
-    )
-    parser.add_argument(
-        "--no-spawn-server",
-        dest="spawn_server",
-        action="store_false",
-        help="Do not spawn a server; use the externally managed one at --endpoint",
-    )
-    parser.add_argument(
-        "--server-env",
-        action="append",
-        default=None,
-        metavar="KEY=VALUE",
-        help="Extra environment for the spawned server, repeatable (e.g. SEARCH_API_CACHE_BACKEND=redis)",
     )
     parser.add_argument(
         "--baseline",

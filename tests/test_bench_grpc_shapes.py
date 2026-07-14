@@ -14,7 +14,16 @@ from typing import Any
 import numpy as np
 import pytest
 
-from bench.grpc_client import dataset_target, generate_stubs, load_stubs, result_vector_ids, text_query, vector_query
+from bench.config import BenchConfig
+from bench.grpc_client import (
+    authorization_metadata,
+    dataset_target,
+    generate_stubs,
+    load_stubs,
+    result_vector_ids,
+    text_query,
+    vector_query,
+)
 from bench.search import ghz_payload
 
 EXPECTED_RPCS: frozenset[str] = frozenset({"VectorSearch", "TextSearch", "HybridSearch"})
@@ -88,6 +97,43 @@ class TestDatasetTarget:
         """Tenant and namespace can be overridden explicitly."""
         target: Any = dataset_target(pb2, "org0", tenant_id="t9", namespace="other")
         assert (target.tenant_id, target.namespace) == ("t9", "other")
+
+
+class TestAuthentication:
+    """Bearer authentication is exact-target and rotation-safe."""
+
+    def test_token_is_read_for_every_request(self, tmp_path: Path) -> None:
+        """Replacing an org token changes the next RPC metadata without restarting the client."""
+        ca_path: Path = tmp_path / "ca.pem"
+        token_dir: Path = tmp_path / "tokens"
+        token_dir.mkdir()
+        ca_path.write_text("test-ca", encoding="utf-8")
+        token_path: Path = token_dir / "tenant0--ns--org3.jwt"
+        token_path.write_text("first.jwt.value", encoding="utf-8")
+        config = BenchConfig(
+            command="search",
+            endpoint="search.example:443",
+            search_ca_path=ca_path,
+            search_token_dir=token_dir,
+        )
+
+        assert authorization_metadata(config, "org3") == (("authorization", "Bearer first.jwt.value"),)
+        token_path.write_text("rotated.jwt.value", encoding="utf-8")
+        assert authorization_metadata(config, "org3") == (("authorization", "Bearer rotated.jwt.value"),)
+
+    def test_token_file_cannot_be_reused_for_another_target(self, tmp_path: Path) -> None:
+        """A missing exact-target file fails instead of falling back to another organization's token."""
+        token_dir: Path = tmp_path / "tokens"
+        token_dir.mkdir()
+        (token_dir / "tenant0--ns--org0.jwt").write_text("org0.jwt", encoding="utf-8")
+        config = BenchConfig(
+            command="search",
+            endpoint="search.example:443",
+            search_ca_path=tmp_path / "ca.pem",
+            search_token_dir=token_dir,
+        )
+        with pytest.raises(RuntimeError, match="org1"):
+            authorization_metadata(config, "org1")
 
 
 class TestSearchRequests:
