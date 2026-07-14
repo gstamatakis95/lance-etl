@@ -220,7 +220,7 @@ class TestDogStatsDListener:
 class TestOtlpGrpcReceiver:
     """Integration tests for :class:`~bench.telemetry_capture.OtlpGrpcReceiver`."""
 
-    def _make_export_request(self) -> trace_service_pb2.ExportTraceServiceRequest:
+    def make_export_request(self) -> trace_service_pb2.ExportTraceServiceRequest:
         """Build a synthetic ExportTraceServiceRequest with one span.
 
         Returns:
@@ -245,7 +245,7 @@ class TestOtlpGrpcReceiver:
         try:
             channel = grpc.insecure_channel(f"127.0.0.1:{port}")
             stub = trace_service_pb2_grpc.TraceServiceStub(channel)
-            request = self._make_export_request()
+            request = self.make_export_request()
             stub.Export(request)
             time.sleep(0.15)
         finally:
