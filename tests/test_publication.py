@@ -135,6 +135,7 @@ class FakeArtifacts:
     """In-memory immutable artifact store test double."""
 
     writes: list[tuple[str, bytes, bytes]] = field(default_factory=list)
+    fail_once: bool = False
 
     def put_if_absent(self, uri: str, payload: bytes, digest: bytes) -> None:
         """Record one immutable artifact write.
@@ -145,6 +146,9 @@ class FakeArtifacts:
             digest: Expected digest.
         """
         self.writes.append((uri, payload, digest))
+        if self.fail_once:
+            self.fail_once = False
+            raise OSError("injected artifact crash")
 
 
 @dataclass
@@ -153,6 +157,7 @@ class FakeRuntime:
 
     prewarm_results: tuple[PrewarmResult, ...]
     fail_head: bool = False
+    fail_once_at: str | None = None
     calls: list[tuple[object, ...]] = field(default_factory=list)
 
     def pin_candidate(self, uri: str, version: int, pin: str) -> None:
@@ -164,6 +169,7 @@ class FakeRuntime:
             pin: Immutable pin.
         """
         self.calls.append(("pin", uri, version, pin))
+        self.raise_once("pin")
 
     def prewarm(self, uri: str, version: int) -> tuple[PrewarmResult, ...]:
         """Return configured replica resolutions.
@@ -176,6 +182,7 @@ class FakeRuntime:
             Configured results.
         """
         self.calls.append(("prewarm", uri, version))
+        self.raise_once("prewarm")
         return self.prewarm_results
 
     def mirror_head(self, uri: str, version: int) -> None:
@@ -189,12 +196,23 @@ class FakeRuntime:
         if self.fail_head:
             raise OSError("transient mirror failure")
 
+    def raise_once(self, step: str) -> None:
+        """Raise one injected crash at a selected external step.
+
+        Args:
+            step: Current external step name.
+        """
+        if self.fail_once_at == step:
+            self.fail_once_at = None
+            raise OSError(f"injected {step} crash")
+
 
 @dataclass
 class FakeRepository:
     """Atomic publication repository test double."""
 
     accepted: bool = True
+    fail_once: bool = False
     calls: list[tuple[object, ...]] = field(default_factory=list)
 
     def publish_serve(
@@ -218,6 +236,9 @@ class FakeRepository:
             Configured fence outcome.
         """
         self.calls.append((claim, candidate_lance_uri, indexed_lance_version, artifact_manifest_uri, artifact_digest))
+        if self.fail_once:
+            self.fail_once = False
+            raise OSError("injected ambiguous database result")
         return self.accepted
 
 
@@ -252,3 +273,36 @@ def test_coordinator_blocks_mismatched_replica_before_catalog_write(tmp_path: Pa
     with pytest.raises(ValueError, match="different publication"):
         PublicationCoordinator(repository, FakeArtifacts(), FakeRuntime((result,))).publish(claim, manifest)
     assert repository.calls == []
+
+
+@pytest.mark.parametrize("failed_step", ["pin", "artifact", "prewarm", "publish"])
+def test_retry_converges_after_each_prepublication_external_crash(tmp_path: Path, failed_step: str) -> None:
+    """A repeated fenced attempt converges after every ambiguous external boundary.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        failed_step: External operation that fails once.
+    """
+    work_id = uuid.uuid4()
+    target_id = uuid.uuid4()
+    manifest = build_manifest(tmp_path, work_id, target_id)
+    claim = WorkClaim(
+        work_id,
+        target_id,
+        WorkKind.SERVE,
+        WorkPhase.PREWARM,
+        uuid.uuid4(),
+        2,
+        1,
+        None,
+        manifest.candidate_lance_uri,
+        1,
+    )
+    result = PrewarmResult("replica-a", manifest.candidate_lance_uri, manifest.indexed_lance_version)
+    repository = FakeRepository(fail_once=failed_step == "publish")
+    artifacts = FakeArtifacts(fail_once=failed_step == "artifact")
+    runtime = FakeRuntime((result,), fail_once_at=failed_step if failed_step in ("pin", "prewarm") else None)
+    coordinator = PublicationCoordinator(repository, artifacts, runtime)
+    with pytest.raises(OSError, match="injected"):
+        coordinator.publish(claim, manifest)
+    assert coordinator.publish(claim, manifest)
