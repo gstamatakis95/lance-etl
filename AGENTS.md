@@ -24,7 +24,7 @@ lance-etl/
   src/lance_etl/     Python package: Spark ETL, indexing, maintenance, pipeline, tools, recall (detail: src/lance_etl/AGENTS.md)
   rust/search-api/   Rust gRPC search service: tonic transport over the Lance crate (detail: rust/search-api/AGENTS.md)
   bench/             End-to-end benchmark package, python -m bench (detail: bench/README.md)
-  airflow/           Two Airflow DAGs: the ETL DAG and the unified pipeline DAG
+  airflow/           One parameter-free durable reconciler DAG
   tests/             pytest suite (conftest.py + test_*.py)
   docs/adr/          Architecture decisions, six thematic documents plus a numbered index (docs/adr/README.md)
   market-research/   Detailed evaluation notes, plans, and evidence underlying the ADRs

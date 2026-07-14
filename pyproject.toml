@@ -16,10 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-lance-etl-etl = "lance_etl.etl.cli:main"
-lance-etl-index = "lance_etl.indexing.cli:main"
-lance-etl-maintenance = "lance_etl.maintenance.cli:main"
-lance-etl-pipeline = "lance_etl.pipeline.cli:main"
+lance-etl-reconcile = "lance_etl.reconciler.cli:main"
 lance-etl-tools = "lance_etl.tools.cli:main"
 
 [build-system]

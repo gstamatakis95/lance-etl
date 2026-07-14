@@ -436,7 +436,7 @@ skipping datasets or piling up commit conflicts.
 
 There is no standalone TTL module or CLI command. Per-row TTL expiration is one phase of the
 unified fleet job: `run_ttl_on_open_dataset` in `src/lance_etl/maintenance/job.py`, driven by
-`MaintenanceJob` and, in production, by `lance-etl-pipeline run --ttl-column <column>` (the
+`MaintenanceJob` and, in production, by the code-owned reconciler release profile (the
 Airflow `lance_etl_pipeline` DAG's `lance_etl_ttl_column` Variable). Leaving that column unset
 turns TTL off and the job is compaction plus cleanup only. TTL emits under the same
 `lance.pipeline.dataset.*` namespace as compaction (4.8), not a separate `ttl.*` namespace, because

@@ -17,20 +17,18 @@ rules), `./AGENTS.md` (Python-package agent guide with the layout and pylance AP
 
 ## The jobs and how they compose
 
-Five installed entry points, one per job. Each is also runnable as `python -m lance_etl.<pkg>`.
+Production installs one reconciler entry point and one restricted operator entry point. The legacy
+job modules remain directly importable for implementation reuse and tests. They are not scheduled
+and have no console scripts because direct invocation bypasses durable work fencing.
 
 | Entry point | Module | Role |
 |---|---|---|
-| `lance-etl-etl` | `lance_etl.etl` | Read a snapshot window from Iceberg and upsert/delete into Lance datasets |
-| `lance-etl-index` | `lance_etl.indexing` | Build or incrementally maintain IVF_RQ / scalar / FTS indices |
-| `lance-etl-maintenance` | `lance_etl.maintenance` | TTL expiration, distributed compaction, version cleanup, tag flips, manifest migration |
-| `lance-etl-pipeline` | `lance_etl.pipeline` | The serialized fleet run `prune -> maintenance -> index -> stamp` |
+| `lance-etl-reconcile` | `lance_etl.reconciler` | Run one closed durable production reconciliation action |
 | `lance-etl-tools` | `lance_etl.tools` | Unscheduled operator subcommands: `recall`, `migrate-namespace`, `optimize-iceberg` |
 
-The production cadence is two DAGs (see **Airflow deployment** below). The ETL DAG runs ingestion
-(with an optional upstream Iceberg-source optimize). The pipeline DAG runs
-`prune -> maintenance -> index -> stamp` with `max_active_runs=1`. Maintenance runs before indexing
-so fresh fragments are compacted before the index covers them.
+Production uses one durable reconciler DAG. PostgreSQL owns source-window, target-lane, lease,
+phase, and serving-catalog state. Each scheduled process runs one closed action and can be retried
+without inventing a new identity or accepting stale output.
 
 ---
 
@@ -125,127 +123,20 @@ create-or-move, so a later run in the same hour advances that hour's tag to the 
 pipeline prunes old interval tags (keep-last 48 by default). The search service can pin a query to
 any such tag via `version_ref`.
 
-Safe blue-green flip sequence:
-
-1. Build the green version (ETL + index + compact run).
-2. Prewarm every replica against the green version using the `Prewarm` RPC with an explicit
-   `version` (or `tag`) field. Confirm `resolved_version` matches the green version.
-3. Flip the tag with `lance-etl-maintenance tag --tag-version <green>`. Never flip then warm.
+The reconciler owns the safe sequence. It builds and validates an exact candidate, creates an
+immutable candidate pin, prewarms every required replica at that exact version, commits the serving
+catalog through PostgreSQL compare-and-swap, then mirrors `HEAD` on a best-effort basis.
 
 ---
 
-## CLI reference
+## Production CLI
 
-The CLI is deliberately small. It exposes only the arguments that are genuinely per-deployment: the
-data and identity contract (which table, which window, where datasets live, Datadog service) and
-what to build (partition routing, which index types, the distance metric, the FTS base tokenizer
-and language). Every tuning knob — schema column names, shuffle partitions, retry budgets,
-compaction fragment sizing, streaming k-means parameters, fine-grained FTS tokenizer toggles, task
-sizing — is an opinionated default in the configuration dataclasses (`ETLConfig`, `IndexJobConfig`,
-`MaintenanceConfig`) and stays tunable in code, not from the command line.
+`lance-etl-reconcile` exposes the five parameter-free scheduled actions listed under Airflow and
+one restricted `repair` command. It deliberately has no date, dataset, index, compaction, TTL,
+cache, concurrency, or Spark tuning flags. Those choices belong to the versioned release profile.
 
-### `etl` — read a snapshot window from Iceberg and upsert/delete into Lance
-
-```bash
-lance-etl-etl \
-  --table prod.vectors.events \
-  --start 2024-01-15T00:00:00 \
-  --end 2024-01-16T00:00:00 \
-  --base-uri s3://my-bucket/lance \
-  --dd-service lance-pipeline --dd-env prod
-```
-
-`--start` / `--end` accept ISO 8601 strings or epoch milliseconds and resolve to Iceberg
-snapshot-id bounds. An optional window pushdown filter (`--window-start` / `--window-end`) is
-applied after the Iceberg read. With `--tag-stamp <iso datetime>` the run stamps every dataset it
-wrote with the interval tag of that instant's truncated UTC hour. The Airflow ETL DAG passes
-`--tag-stamp {{ data_interval_end }}` automatically.
-
-| Flag | Default | Purpose |
-|---|---|---|
-| `--table` | (required) | Fully-qualified Iceberg table name |
-| `--start` | (required) | Iceberg snapshot window start (ISO 8601 or epoch ms) |
-| `--end` | (required) | Iceberg snapshot window end (ISO 8601 or epoch ms) |
-| `--base-uri` | (required) | Root URI for per-tenant Lance datasets |
-| `--iceberg-option` | none | Repeatable `key=value` Iceberg read option |
-| `--window-start` | none | Inclusive lower bound for the window pushdown filter |
-| `--window-end` | none | Exclusive upper bound for the window pushdown filter |
-| `--tag-stamp` | none | ISO 8601 datetime whose truncated UTC hour names the interval tag stamped on every written dataset |
-| `--storage-option` | none | Repeatable `key=value` passed to pylance |
-| `--dd-service` | `lance-pipeline` | Datadog service tag |
-| `--dd-env` | `prod` | Datadog env tag |
-| `--dd-version` | empty | Datadog version tag |
-| `--dd-tag` | none | Repeatable constant `key=value` Datadog tag |
-
-### `maintenance run` — TTL expiration, distributed compaction, and version cleanup
-
-```bash
-lance-etl-maintenance run \
-  --base-uri s3://my-bucket/lance \
-  --dd-service lance-pipeline --dd-env prod
-```
-
-Dataset selection: `--dataset-uri` (repeatable), `--datasets-file`, or `--base-uri` (discovers all
-`*.lance` paths recursively). All tuning knobs use `MaintenanceConfig` defaults.
-
-| Flag | Default | Purpose |
-|---|---|---|
-| `--ttl-column` | none (TTL off) | Per-row TTL column holding each row's lifetime as an Arrow `Duration`. When set, rows are deleted before compaction by the predicate `ts_column + ttl_column < now`. Absent means TTL is off. |
-| `--ts-column` | `event_timestamp` | Event timestamp column used as the TTL clock. Must match `ETLConfig.ts_col`. Only consulted when `--ttl-column` is set. |
-
-### `index` — build or incrementally maintain indices
-
-```bash
-lance-etl-index \
-  --base-uri s3://my-bucket/lance \
-  --vector-column vector \
-  --metric cosine \
-  --scalar-column updated_at \
-  --bitmap-column category \
-  --text-column text \
-  --dd-service lance-pipeline --dd-env prod
-```
-
-Data-shape flags only. Tuning knobs use `IndexJobConfig` defaults.
-
-| Flag | Default | Purpose |
-|---|---|---|
-| `--vector-column` | none | Vector column for IVF_RQ index |
-| `--metric` | `L2` | Distance metric: `L2`, `cosine`, or `dot` |
-| `--scalar-column` | none | Repeatable column for a BTREE index |
-| `--bitmap-column` | none | Repeatable column for a BITMAP index |
-| `--text-column` | none | Repeatable column for an INVERTED (BM25) index |
-| `--fts-base-tokenizer` | none | FTS base tokenizer name |
-| `--fts-language` | none | Stemming and stop-word language |
-| `--rebuild` | off | Reindex every fragment (use after tokenizer or parameter changes) |
-
-### `tag` — exact HEAD flip
-
-Updates `HEAD` to an explicit target dataset version. Tagged versions are exempt from version
-cleanup. Omitted versions and caller-selected production tag names are rejected.
-
-```bash
-lance-etl-maintenance tag \
-  --base-uri s3://my-bucket/lance \
-  --tag-version 42 \
-  --dd-service lance-pipeline --dd-env prod
-```
-
-| Flag | Default | Purpose |
-|---|---|---|
-| `--tag-version` | required | Exact target version for `HEAD` |
-
-### `migrate-manifests` — migrate to V2 manifest paths
-
-```bash
-lance-etl-maintenance migrate-manifests \
-  --base-uri s3://my-bucket/lance \
-  --dd-service lance-pipeline --dd-env prod
-```
-
-Migrates each dataset's manifest paths to the V2 naming scheme, turning every subsequent dataset
-open into a single object-store request. Not transactional. Run only with the targeted datasets
-quiesced (no concurrent ingestion, compaction, or indexing).
+The ETL, maintenance, indexing, and pipeline modules have no installed console scripts. Direct
+module execution is a development surface and must not be placed in a production scheduler.
 
 ### `recall` — offline recall audit
 
@@ -344,39 +235,41 @@ mistaken for an orphan. Heavy work runs distributed in Spark.
 
 ## Airflow deployment
 
-Deploy `../../airflow/lance_etl_common.py`, `../../airflow/lance_etl_etl_dag.py`, and
-`../../airflow/lance_etl_pipeline_dag.py` to your Airflow DAGs folder. Set the Airflow Connection
-`spark_default` to point at your Spark cluster. The pipeline DAG runs
-`prune >> maintenance >> index >> stamp` with `max_active_runs=1`. Schedules default to `@hourly`.
-Data-interval windowing and `dag_run.conf` overrides are described in each module docstring.
+Deploy `../../airflow/lance_etl_common.py` and `../../airflow/lance_etl_reconciler_dag.py`. The DAG
+has exactly five serial tasks and `max_active_runs=1`:
 
-Configure via Airflow Variables:
+1. `plan_and_enqueue_window`
+2. `run_due_target_work`
+3. `reconcile_results`
+4. `gate_source_retention`
+5. `emit_slo_status`
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `lance_etl_etl_schedule` / `lance_etl_pipeline_schedule` | `@hourly` | Per-DAG Airflow schedule expressions |
-| `lance_etl_iceberg_table` | `prod.vectors.events` | Fully-qualified Iceberg table name |
-| `lance_etl_lance_base_uri` | `s3://my-bucket/lance` | Base URI for Lance datasets |
-| `lance_etl_datasets_file` | `/opt/lance/datasets.txt` | File listing dataset URIs for `index` and `maintenance` |
-| `lance_etl_index_flags` | empty | Shell-tokenized index column-selection flags for the `index` step |
-| `lance_etl_spark_conn_id` | `spark_default` | Airflow Spark connection id |
-| `lance_etl_executor_instances` | `8` | `spark.executor.instances` |
-| `lance_etl_executor_memory` | `8g` | `spark.executor.memory` |
-| `lance_etl_driver_memory` | `4g` | `spark.driver.memory` |
-| `lance_etl_spark_conf_overrides` | `{}` | JSON object of extra Spark conf key/value pairs |
-| `lance_etl_dd_service` | `lance-pipeline` | Datadog service tag |
-| `lance_etl_dd_env` | `prod` | Datadog env tag |
-| `lance_etl_dd_tags` | empty | Comma-separated `key:value` constant tags |
-| `lance_etl_ttl_column` | empty (TTL off) | Per-row TTL column name forwarded to the `maintenance` step as `--ttl-column`. When set, the column must hold each row's lifetime as an Arrow `Duration`. Rows are expired before compaction by `ts_column + ttl_column < now`. Absent means TTL is off. |
-| `lance_etl_optimize_iceberg_enabled` | `false` | When truthy (`true`/`1`/`yes`), adds an optional `optimize-iceberg` task before `etl` that runs Iceberg's own source-table maintenance procedures. This is source-table maintenance, distinct from the Lance `maintenance` task. |
-| `lance_etl_optimize_remove_orphan_files` | `false` | When truthy, the `optimize-iceberg` task also runs the destructive `remove_orphan_files` procedure. Only files older than Iceberg's three-day safety horizon are removed. |
+Every task has 24 Airflow retries. Durable target work has no attempt ceiling. A lease token and
+target fence reject late workers, while periodic lease renewal protects long Spark phases. Work is
+claimed one target at a time because execution is synchronous.
 
-`lance_etl_index_flags` is required when index maintenance is desired. Without it the `index` step
-configures zero handlers and is a silent no-op. Example value:
-`--vector-column vector --metric cosine --scalar-column updated_at --text-column text`.
+The DAG accepts no params, `dag_run.conf` tuning, date windows, dataset lists, index flags, TTL
+flags, or cache knobs. Release policy lives in `DeploymentProfile`. Deployment supplies only
+secrets and identities through the process environment:
 
-Manual triggers can supply `{"start": "<ISO-8601>", "end": "<ISO-8601>"}` in `dag_run.conf` to
-override the window bounds. Backfill with `airflow dags backfill lance_etl_pipeline`.
+| Environment value | Purpose |
+|---|---|
+| `LANCE_ETL_DATABASE_URL` | PostgreSQL control-plane URL using the psycopg 3 driver |
+| `LANCE_ETL_LANCE_BASE_URI` | Deployment-owned Lance base URI |
+| `LANCE_ETL_SOURCE_TABLE` | Two- or three-part Iceberg table identifier |
+| `LANCE_ETL_CANONICAL_BASELINE_SNAPSHOT_ID` | Explicit first-start snapshot that is executor-qualified before acceptance |
+| `DD_SERVICE`, `DD_ENV` | Low-cardinality telemetry identity |
+| `LANCE_ETL_SPARK_CONN_ID` | Airflow Spark connection, default `spark_default` |
+
+Iceberg is partitioned by `tenant_id`, `namespace`, `org_id`, and `hours(processing_timestamp)`.
+Planning reads exact snapshot metadata and manifests. It never derives correctness from Airflow's
+wall-clock interval. Initial startup scans the exact configured baseline and proves that each
+target and `vector_id` has at most one distinct canonical mutation digest.
+
+Restricted repair is outside the scheduled DAG. `repair --action retry-blocked --work-id ...`
+retries one durable blocked identity. `repair --action rollback` requires the exact tenant,
+namespace, organization, and retained successful work ID. Rollback only enqueues fenced PREWARM
+work and never mutates the serving catalog directly.
 
 The `lance-etl` wheel must be installed on every executor. Either bake it into the cluster image or
 ship it via `spark.submit.pyFiles` (see the module docstring in `../../airflow/lance_etl_common.py`).

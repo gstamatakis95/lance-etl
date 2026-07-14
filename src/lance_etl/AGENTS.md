@@ -93,9 +93,8 @@ bench/                  Benchmark package (python -m bench). See bench/README.md
   grpc_client.py        gRPC stub helpers for the search legs
   results.py            Phase artifact I/O (save_phase, load_phase, read_json, write_json)
 airflow/
-  lance_etl_common.py        Shared DAG helpers: default_args, common environment variables, and task-factory utilities
-  lance_etl_etl_dag.py       Airflow DAG for the ETL job (optimize-iceberg [optional] >> etl)
-  lance_etl_pipeline_dag.py  Airflow DAG for the unified pipeline (prune >> maintenance >> index >> stamp, max_active_runs=1)
+  lance_etl_common.py          Shared fixed Spark and retry policy
+  lance_etl_reconciler_dag.py Sole serialized five-phase reconciler DAG
 tests/                  pytest suite (conftest.py + test_*.py)
 ```
 

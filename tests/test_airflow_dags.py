@@ -1,13 +1,4 @@
-"""DAG-parse smoke tests for the Airflow modules under ``airflow/``.
-
-Imports each DAG module the way the Airflow scheduler would (with the DAG folder on ``sys.path``)
-and asserts the DAG objects construct with the expected identity, task ids, and task ordering.
-``Variable.get`` is stubbed to return its ``default_var`` (with per-test overrides) so no Airflow
-metadata database is required. The whole module self-skips when ``apache-airflow`` or its Spark
-provider is not installed in the test environment. The bare ``import airflow`` probe is not enough
-for that check because the repository's own ``airflow/`` DAG directory is importable as a namespace
-package, so the skip probes ``airflow.models`` and the Spark provider module instead.
-"""
+"""Parse and contract tests for the single parameter-free reconciler DAG."""
 
 from __future__ import annotations
 
@@ -19,168 +10,142 @@ from types import ModuleType
 
 import pytest
 
-airflow_models: ModuleType = pytest.importorskip(
-    "airflow.models", reason="apache-airflow is not installed in the test environment"
-)
+pytest.importorskip("airflow.models", reason="apache-airflow is not installed in the test environment")
 pytest.importorskip(
     "airflow.providers.apache.spark.operators.spark_submit",
     reason="the apache-airflow-providers-apache-spark provider is not installed",
 )
 
+from lance_etl.reconciler import SYSTEMIC_RETRIES, production_profile
+
 AIRFLOW_DAG_DIR: Path = Path(__file__).resolve().parent.parent / "airflow"
-DAG_MODULE_NAMES: tuple[str, str, str] = ("lance_etl_common", "lance_etl_etl_dag", "lance_etl_pipeline_dag")
+MODULE_NAMES: tuple[str, str] = ("lance_etl_common", "lance_etl_reconciler_dag")
+EXPECTED_TASKS: tuple[str, ...] = (
+    "plan_and_enqueue_window",
+    "run_due_target_work",
+    "reconcile_results",
+    "gate_source_retention",
+    "emit_slo_status",
+)
 
 
 @pytest.fixture
-def dag_harness(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[dict[str, str], Callable[[str], ModuleType]]]:
-    """Provide a Variable override map and a fresh-importer for the DAG modules.
-
-    Stubs ``Variable.get`` to serve its ``default_var`` unless the returned override map carries
-    an entry for the full Variable name, so no Airflow metadata database is required. Puts the
-    DAG directory on ``sys.path`` (mirroring the scheduler's DAG-folder import), evicts any
-    previously imported copies of the DAG modules so each test observes its own Variable
-    overrides at module-import time, and restores ``sys.path`` and ``sys.modules`` afterwards.
-
-    Args:
-        monkeypatch: Pytest monkeypatch fixture scoping the Variable stub to one test.
+def import_dag_module() -> Iterator[Callable[[str], ModuleType]]:
+    """Provide fresh Airflow-DAG-folder imports.
 
     Yields:
-        A pair of the mutable override map (keys are full Airflow Variable names such as
-        ``lance_etl_optimize_iceberg_enabled``) and a callable mapping a DAG module name to the
-        freshly imported module object.
+        Callable importing one freshly evicted DAG module.
     """
-    overrides: dict[str, str] = {}
-
-    def fake_get(key: str, default_var: str | None = None) -> str | None:
-        """Return the override for a Variable name, else its ``default_var``.
-
-        Args:
-            key: Full Airflow Variable name.
-            default_var: Fallback value supplied by the caller.
-
-        Returns:
-            The overridden or default value.
-        """
-        return overrides.get(key, default_var)
-
-    monkeypatch.setattr(airflow_models.Variable, "get", fake_get)
     sys.path.insert(0, str(AIRFLOW_DAG_DIR))
-    for name in DAG_MODULE_NAMES:
+    for name in MODULE_NAMES:
         sys.modules.pop(name, None)
 
     def import_fresh(name: str) -> ModuleType:
-        """Import one DAG module by name from the DAG directory.
+        """Import one module after evicting its previous scheduler parse.
 
         Args:
-            name: Module name, for example ``lance_etl_etl_dag``.
+            name: DAG-folder module name.
 
         Returns:
-            The imported module object.
+            Freshly imported module.
         """
+        sys.modules.pop(name, None)
         return importlib.import_module(name)
 
-    yield overrides, import_fresh
-    for name in DAG_MODULE_NAMES:
+    yield import_fresh
+    for name in MODULE_NAMES:
         sys.modules.pop(name, None)
     sys.path.remove(str(AIRFLOW_DAG_DIR))
 
 
-def test_common_module_parses(dag_harness: tuple[dict[str, str], Callable[[str], ModuleType]]) -> None:
-    """The shared helper module imports cleanly and exposes the expected building blocks.
+def test_only_one_dag_module_exists() -> None:
+    """Obsolete ETL and pipeline DAG modules are physically absent."""
+    dag_files = sorted(path.name for path in AIRFLOW_DAG_DIR.glob("*_dag.py"))
+    assert dag_files == ["lance_etl_reconciler_dag.py"]
+
+
+def test_common_helper_has_fixed_release_policy(import_dag_module: Callable[[str], ModuleType]) -> None:
+    """The shared helper exposes no Variable, JSON, dataset, window, or index configuration surface.
 
     Args:
-        dag_harness: Variable override map plus fresh-import helper.
+        import_dag_module: Fresh DAG-folder importer.
     """
-    overrides, import_dag_module = dag_harness
-    common: ModuleType = import_dag_module("lance_etl_common")
-    assert callable(common.make_lance_operator)
-    assert callable(common.build_base_spark_conf)
-    assert callable(common.build_dd_tag_flags)
-    assert callable(common.resolve_variable)
-    assert callable(common.variable_is_truthy)
-    assert common.default_args["retries"] == 2
-    conf: dict[str, str] = common.build_base_spark_conf(common.etl_dag_params)
-    assert conf["spark.executor.memoryOverheadFactor"] == "0.3"
-    assert conf["spark.executor.instances"] == "8"
+    common = import_dag_module("lance_etl_common")
+    assert common.default_args["retries"] == SYSTEMIC_RETRIES == 24
+    assert callable(common.make_reconciler_operator)
+    assert not hasattr(common, "resolve_variable")
+    assert not hasattr(common, "build_base_spark_conf")
+    assert not hasattr(common, "build_dd_tag_flags")
+    assert not hasattr(common, "variable_is_truthy")
+    assert common.make_reconciler_operator("emit_slo_status").conf == production_profile().spark_configuration()
 
 
-def test_etl_dag_default_shape(dag_harness: tuple[dict[str, str], Callable[[str], ModuleType]]) -> None:
-    """The ETL DAG parses with only the ``etl`` task when the optimize gate is off.
+def test_reconciler_dag_has_exact_serial_shape(import_dag_module: Callable[[str], ModuleType]) -> None:
+    """Five closed tasks form one serial, non-overlapping, non-catchup workflow.
 
     Args:
-        dag_harness: Variable override map plus fresh-import helper.
+        import_dag_module: Fresh DAG-folder importer.
     """
-    overrides, import_dag_module = dag_harness
-    module: ModuleType = import_dag_module("lance_etl_etl_dag")
+    module = import_dag_module("lance_etl_reconciler_dag")
     dag = module.dag
-    assert dag.dag_id == "lance_etl_etl"
+    assert dag.dag_id == "lance_etl_reconciler"
     assert dag.max_active_runs == 1
     assert not dag.catchup
-    assert set(dag.task_dict) == {"etl"}
-    assert dag.task_dict["etl"].upstream_task_ids == set()
+    assert tuple(module.RECONCILER_TASKS) == EXPECTED_TASKS
+    assert set(dag.task_dict) == set(EXPECTED_TASKS)
+    for index, task_id in enumerate(EXPECTED_TASKS):
+        task = dag.task_dict[task_id]
+        expected_upstream = {EXPECTED_TASKS[index - 1]} if index else set()
+        expected_downstream = {EXPECTED_TASKS[index + 1]} if index + 1 < len(EXPECTED_TASKS) else set()
+        assert task.upstream_task_ids == expected_upstream
+        assert task.downstream_task_ids == expected_downstream
 
 
-def test_etl_dag_with_optimize_iceberg_enabled(
-    dag_harness: tuple[dict[str, str], Callable[[str], ModuleType]],
+def test_scheduled_tasks_have_no_routine_parameters(import_dag_module: Callable[[str], ModuleType]) -> None:
+    """Every task forwards only its closed action token and receives the fixed retry budget.
+
+    Args:
+        import_dag_module: Fresh DAG-folder importer.
+    """
+    dag = import_dag_module("lance_etl_reconciler_dag").dag
+    assert dict(dag.params) == {}
+    for task_id, task in dag.task_dict.items():
+        assert task.application_args == [task_id]
+        assert task.retries == 24
+        serialized = " ".join(task.application_args)
+        for forbidden in (
+            "--dataset-uri",
+            "--window-start",
+            "--window-end",
+            "--tag",
+            "--scalar-column",
+            "--ttl-column",
+            "--cache-bytes",
+            "--search-api",
+            "--spark-conf",
+        ):
+            assert forbidden not in serialized
+
+
+def test_legacy_airflow_variables_cannot_change_dag(
+    import_dag_module: Callable[[str], ModuleType], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Enabling the optimize gate prepends ``optimize-iceberg`` upstream of ``etl``.
+    """Former tuning names have no effect on schedule, tasks, arguments, or Spark policy.
 
     Args:
-        dag_harness: Variable override map plus fresh-import helper.
+        import_dag_module: Fresh DAG-folder importer.
+        monkeypatch: Scoped environment mutation fixture.
     """
-    overrides, import_dag_module = dag_harness
-    overrides["lance_etl_optimize_iceberg_enabled"] = "true"
-    module: ModuleType = import_dag_module("lance_etl_etl_dag")
-    dag = module.dag
-    assert set(dag.task_dict) == {"optimize-iceberg", "etl"}
-    assert dag.task_dict["etl"].upstream_task_ids == {"optimize-iceberg"}
-    assert dag.task_dict["optimize-iceberg"].downstream_task_ids == {"etl"}
-
-
-def test_etl_application_args_shape(dag_harness: tuple[dict[str, str], Callable[[str], ModuleType]]) -> None:
-    """The ETL application args carry the window, tag-stamp, and identity flags.
-
-    Args:
-        dag_harness: Variable override map plus fresh-import helper.
-    """
-    overrides, import_dag_module = dag_harness
-    module: ModuleType = import_dag_module("lance_etl_etl_dag")
-    args: list[str] = module.build_etl_application_args(module.etl_dag_params)
-    for flag in ("--table", "--start", "--end", "--base-uri", "--window-start", "--window-end", "--tag-stamp"):
-        assert flag in args, f"missing {flag} in ETL application args"
-    assert args[args.index("--table") + 1] == "prod.vectors.events"
-
-
-def test_pipeline_dag_shape(dag_harness: tuple[dict[str, str], Callable[[str], ModuleType]]) -> None:
-    """The pipeline DAG parses with the single serialized ``pipeline`` task.
-
-    Args:
-        dag_harness: Variable override map plus fresh-import helper.
-    """
-    overrides, import_dag_module = dag_harness
-    module: ModuleType = import_dag_module("lance_etl_pipeline_dag")
-    dag = module.dag
-    assert dag.dag_id == "lance_etl_pipeline"
-    assert dag.max_active_runs == 1
-    assert not dag.catchup
-    assert set(dag.task_dict) == {"pipeline"}
-
-
-def test_pipeline_application_args_shape(
-    dag_harness: tuple[dict[str, str], Callable[[str], ModuleType]],
-) -> None:
-    """The pipeline application args start with ``run`` and honor the Variable-driven flags.
-
-    Args:
-        dag_harness: Variable override map plus fresh-import helper.
-    """
-    overrides, import_dag_module = dag_harness
-    overrides["lance_etl_ttl_column"] = "expires_at"
-    module: ModuleType = import_dag_module("lance_etl_pipeline_dag")
-    args: list[str] = module.build_pipeline_application_args(module.pipeline_dag_params)
-    assert args[0] == "run"
-    assert "--datasets-file" in args
-    assert args[args.index("--ttl-column") + 1] == "expires_at"
-    assert "--tag-stamp" in args
-    assert args[args.index("--tag-keep-last") + 1] == "48"
-    assert "--serve-tag" not in args
+    for name in (
+        "LANCE_ETL_DATASETS_FILE",
+        "LANCE_ETL_WINDOW_START",
+        "LANCE_ETL_INDEX_FLAGS",
+        "LANCE_ETL_TTL_COLUMN",
+        "LANCE_ETL_SPARK_CONF_OVERRIDES",
+        "LANCE_ETL_CACHE_BYTES",
+    ):
+        monkeypatch.setenv(name, "adversarial-value")
+    dag = import_dag_module("lance_etl_reconciler_dag").dag
+    assert dag.schedule == production_profile().schedule
+    assert tuple(dag.task_dict) == EXPECTED_TASKS
+    assert all(task.conf == production_profile().spark_configuration() for task in dag.task_dict.values())

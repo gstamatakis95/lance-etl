@@ -5,6 +5,33 @@ orchestration, maintenance (TTL, compaction, cleanup), and source-table upkeep. 
 keeps its original ADR number so references like "ADR 0028" resolve here. Superseded decisions
 are summarized at the end, and the closing section preserves the historical verification runs.
 
+## Current production orchestration
+
+The scheduled portions of ADR 0026 and ADR 0027 are superseded by the durable reconciler. The
+standalone ETL, maintenance, indexing, pipeline, and tools packages remain implementation libraries
+and operator surfaces. They are not independent production schedules.
+
+One parameter-free DAG runs five serial actions with `max_active_runs=1`: plan and enqueue an exact
+Iceberg window, run bounded due target work, reconcile ambiguous outcomes, expose the source
+retention floor, and emit SLO state. PostgreSQL stores only source windows, targets, and target work.
+It owns ordering, leases, target fences, phase evidence, retries, and the exact serving catalog.
+
+Airflow retries systemic task failure 24 times. Target-local failures return to durable retry state
+without an attempt ceiling. Claims are taken one at a time because one synchronous Spark action can
+outlive the lease of later claims in a prefetched batch. A background heartbeat renews the current
+claim. Every completion and checkpoint rejects an expired token or superseded target fence.
+
+The source planner uses the Iceberg partition order `tenant_id`, `namespace`, `org_id`, and
+`hours(processing_timestamp)`. It plans immutable snapshots, not Airflow time intervals. Duplicate
+source delivery is collapsed by canonical event digest. Distinct unordered mutations for the same
+target, snapshot, and vector ID block before any write. Replay-safe Lance merges and a final
+completion marker make partial retries convergent.
+
+SERVE work uses explicit release-owned index declarations. Publication requires exact candidate
+schema, row-count, live-ID uniqueness, per-index full-fragment coverage, vector artifact generation
+evidence, immutable candidate pinning, and exact replica prewarm before the PostgreSQL catalog CAS.
+The shared `HEAD` tag is only a best-effort mirror after the catalog commits.
+
 ## ADR 0026 — Job isolation: separate packages and CLIs
 
 Status: Accepted (the three-separate-DAGs portion superseded by ADR 0027)

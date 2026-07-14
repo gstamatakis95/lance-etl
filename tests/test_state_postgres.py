@@ -334,6 +334,61 @@ def test_expired_lease_reclaims_and_fences_stale_worker(
     assert repository.retry_work(new_claim, timedelta(minutes=2), "X" * 200, "Y" * 3000, start)
 
 
+def test_expired_claim_cannot_transition_before_another_worker_reclaims(
+    postgres_repository: tuple[ControlPlaneRepository, Engine],
+) -> None:
+    """Lease expiry itself fences renew, phase, retry, block, and completion transitions.
+
+    Args:
+        postgres_repository: Fresh repository and engine fixture.
+    """
+    repository, engine = postgres_repository
+    del engine
+    repository.enqueue_source_window(
+        source_plan(uuid.uuid4(), 210, 21, None, SourceWindowKind.BASELINE),
+        [target_plan()],
+    )
+    start = datetime(2026, 7, 14, 13, 0, tzinfo=UTC)
+    claim = repository.claim_due_work(1, timedelta(seconds=30), start)[0]
+    expired = start + timedelta(seconds=31)
+    assert repository.work_execution_context(claim, expired) is None
+    assert not repository.renew_lease(claim, timedelta(minutes=1), expired)
+    assert not repository.advance_phase(claim, WorkPhase.INDEX, now=expired)
+    assert not repository.retry_work(claim, timedelta(0), "TRANSIENT", "expired", expired)
+    assert not repository.block_work(claim, "CONTRACT", "expired", expired)
+    assert not repository.complete_ingest(claim, 1, 1, b"a" * 32, expired)
+
+
+def test_work_execution_context_is_exact_only_while_claim_is_live(
+    postgres_repository: tuple[ControlPlaneRepository, Engine],
+) -> None:
+    """A live claim resolves exact routing and source metadata, while stale tokens resolve nothing.
+
+    Args:
+        postgres_repository: Fresh repository and engine fixture.
+    """
+    repository, engine = postgres_repository
+    del engine
+    plan = target_plan()
+    repository.enqueue_source_window(
+        source_plan(uuid.uuid4(), 220, 22, None, SourceWindowKind.BASELINE),
+        [plan],
+    )
+    start = datetime(2026, 7, 14, 14, 0, tzinfo=UTC)
+    claim = repository.claim_due_work(1, timedelta(minutes=5), start)[0]
+    context = repository.work_execution_context(claim, start + timedelta(minutes=1))
+    assert context is not None
+    assert context.claim == claim
+    assert context.identity == plan.identity
+    assert context.profile_id == plan.profile_id
+    assert context.snapshot_id == 220
+    assert context.parent_snapshot_id is None
+    assert context.iceberg_sequence_number == 22
+    assert context.source_window_kind == SourceWindowKind.BASELINE
+    assert context.candidate_lance_uri is None
+    assert repository.work_execution_context(claim, start + timedelta(minutes=6)) is None
+
+
 def test_concurrent_claimers_cannot_own_the_same_target(
     postgres_repository: tuple[ControlPlaneRepository, Engine],
 ) -> None:
@@ -387,3 +442,103 @@ def test_blocked_ingest_holds_retention_and_prevents_later_ingest(
     retried = repository.claim_due_work(1, timedelta(minutes=5))
     assert len(retried) == 1
     assert retried[0].work_id == claim.work_id
+
+
+def test_control_plane_status_aggregates_queue_and_exact_retention_floor(
+    postgres_repository: tuple[ControlPlaneRepository, Engine],
+) -> None:
+    """The reconciler status API remains constant-size while preserving the exact source floor.
+
+    Args:
+        postgres_repository: Fresh repository and engine fixture.
+    """
+    repository, engine = postgres_repository
+    del engine
+    plan = source_plan(uuid.uuid4(), 500, 50, None, SourceWindowKind.BASELINE)
+    window_seq = repository.enqueue_source_window(plan, [target_plan()])
+    before_claim = repository.control_plane_status()
+    assert before_claim.pending_work == 1
+    assert before_claim.due_work == 1
+    assert before_claim.retention_window_seq == window_seq
+    assert before_claim.retention_snapshot_id == 500
+    assert before_claim.retention_parent_snapshot_id is None
+    assert before_claim.retention_state == SourceWindowState.SEALED
+
+    claim = repository.claim_due_work(1, timedelta(minutes=5))[0]
+    running = repository.control_plane_status()
+    assert running.pending_work == 0
+    assert running.running_work == 1
+    assert running.retention_window_seq == window_seq
+
+    assert repository.complete_ingest(claim, 1, 1, b"z" * 32)
+    applied = repository.control_plane_status()
+    assert applied.retention_window_seq is None
+    assert applied.pending_work == 1
+    assert applied.blocked_source_windows == 0
+
+
+def test_rollback_reuses_retained_evidence_and_publishes_with_catalog_cas(
+    postgres_repository: tuple[ControlPlaneRepository, Engine],
+) -> None:
+    """Rollback PREWARM republishes a retained candidate while leaving the ingest URI unchanged.
+
+    Args:
+        postgres_repository: Fresh repository and engine fixture.
+    """
+    repository, engine = postgres_repository
+    plan = target_plan()
+    table_uuid = uuid.uuid4()
+    repository.enqueue_source_window(
+        source_plan(table_uuid, 600, 60, None, SourceWindowKind.BASELINE),
+        [plan],
+    )
+    ingest_claim = repository.claim_due_work(1, timedelta(minutes=5))[0]
+    ingest_uri = ingest_claim.expected_ingest_lance_uri
+    assert repository.complete_ingest(ingest_claim, 3, 10, b"a" * 32)
+    first = repository.claim_due_work(1, timedelta(minutes=5))[0]
+    assert repository.advance_phase(first, WorkPhase.INDEX, indexed_lance_version=4)
+    assert repository.advance_phase(first, WorkPhase.VALIDATE)
+    assert repository.advance_phase(first, WorkPhase.PREWARM)
+    first_uri = "s3://test-bucket/candidates/generation-one.lance"
+    assert repository.publish_serve(first, first_uri, 4, "s3://artifacts/one.json", b"b" * 32)
+
+    repository.enqueue_source_window(source_plan(table_uuid, 601, 61, 600), [plan])
+    second_ingest = repository.claim_due_work(1, timedelta(minutes=5))[0]
+    assert repository.complete_ingest(second_ingest, 5, 11, b"c" * 32)
+    second = repository.claim_due_work(1, timedelta(minutes=5))[0]
+    assert repository.advance_phase(second, WorkPhase.INDEX, indexed_lance_version=6)
+    assert repository.advance_phase(second, WorkPhase.VALIDATE)
+    assert repository.advance_phase(second, WorkPhase.PREWARM)
+    second_uri = "s3://test-bucket/candidates/generation-two.lance"
+    assert repository.publish_serve(second, second_uri, 6, "s3://artifacts/two.json", b"d" * 32)
+    currently_served = repository.resolve_serving_target(plan.identity)
+    assert currently_served is not None
+    assert currently_served.lance_uri == second_uri
+    assert currently_served.lance_version == 6
+
+    rollback_id = repository.enqueue_rollback(plan.identity, first.work_id)
+    with pytest.raises(StateTransitionError, match="idle target lane"):
+        repository.enqueue_rollback(plan.identity, first.work_id)
+    rollback_claim = repository.claim_due_work(1, timedelta(minutes=5))[0]
+    assert rollback_claim.work_id == rollback_id
+    assert rollback_claim.phase == WorkPhase.PREWARM
+    context = repository.work_execution_context(rollback_claim)
+    assert context is not None
+    assert context.candidate_lance_uri == first_uri
+    assert context.indexed_lance_version == 4
+    assert context.artifact_manifest_uri == "s3://artifacts/one.json"
+    assert context.artifact_digest == b"b" * 32
+    assert repository.publish_serve(
+        rollback_claim,
+        context.candidate_lance_uri,
+        context.indexed_lance_version,
+        context.artifact_manifest_uri,
+        context.artifact_digest,
+    )
+    served = repository.resolve_serving_target(plan.identity)
+    assert served is not None
+    assert served.lance_uri == first_uri
+    assert served.lance_version == 4
+    with engine.connect() as connection:
+        target_row = connection.execute(targets.select()).mappings().one()
+    assert target_row["ingest_lance_uri"] == ingest_uri
