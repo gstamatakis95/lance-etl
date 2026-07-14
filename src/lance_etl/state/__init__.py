@@ -9,7 +9,13 @@ from lance_etl.state.repository import (
     build_control_plane_engine as build_control_plane_engine,
 )
 from lance_etl.state.types import (
+    ControlPlaneStatus as ControlPlaneStatus,
+)
+from lance_etl.state.types import (
     RoutingIdentity as RoutingIdentity,
+)
+from lance_etl.state.types import (
+    ServingTarget as ServingTarget,
 )
 from lance_etl.state.types import (
     SourceWindowKind as SourceWindowKind,

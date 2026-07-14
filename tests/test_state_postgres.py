@@ -233,6 +233,63 @@ def test_duplicate_plan_ordered_ingest_and_serve_coalescing(
     assert repository.retention_floor() is None
 
 
+def test_fenced_publication_updates_exact_serving_catalog_atomically(
+    postgres_repository: tuple[ControlPlaneRepository, Engine],
+) -> None:
+    """PREWARM completion, catalog CAS, and work success form one idempotent transaction.
+
+    Args:
+        postgres_repository: Fresh repository and engine fixture.
+    """
+    repository, engine = postgres_repository
+    plan = target_plan()
+    window_seq = repository.enqueue_source_window(
+        source_plan(uuid.uuid4(), 120, 12, None, SourceWindowKind.BASELINE),
+        [plan],
+    )
+    ingest_claim = repository.claim_due_work(1, timedelta(minutes=5))[0]
+    assert ingest_claim.source_window_seq == window_seq
+    assert repository.complete_ingest(ingest_claim, 3, 10, b"a" * 32)
+    assert repository.resolve_serving_target(plan.identity) is None
+    serve_claim = repository.claim_due_work(1, timedelta(minutes=5))[0]
+    assert repository.advance_phase(serve_claim, WorkPhase.INDEX, indexed_lance_version=4)
+    assert repository.advance_phase(
+        serve_claim,
+        WorkPhase.VALIDATE,
+        artifact_manifest_uri="s3://artifacts/work.json",
+        artifact_digest=b"b" * 32,
+    )
+    assert repository.advance_phase(serve_claim, WorkPhase.PREWARM)
+    candidate_uri = serve_claim.expected_ingest_lance_uri
+    assert repository.publish_serve(
+        serve_claim,
+        candidate_uri,
+        4,
+        "s3://artifacts/work.json",
+        b"b" * 32,
+    )
+    assert repository.publish_serve(
+        serve_claim,
+        candidate_uri,
+        4,
+        "s3://artifacts/work.json",
+        b"b" * 32,
+    )
+    served = repository.resolve_serving_target(plan.identity)
+    assert served is not None
+    assert served.lance_uri == candidate_uri
+    assert served.lance_version == 4
+    assert served.profile_id == plan.profile_id
+    with engine.connect() as connection:
+        work_row = (
+            connection.execute(target_work.select().where(target_work.c.work_id == serve_claim.work_id))
+            .mappings()
+            .one()
+        )
+    assert work_row["state"] == "SUCCEEDED"
+    assert work_row["phase"] == "PUBLISH"
+
+
 def test_duplicate_window_rejects_a_changed_target_set(
     postgres_repository: tuple[ControlPlaneRepository, Engine],
 ) -> None:

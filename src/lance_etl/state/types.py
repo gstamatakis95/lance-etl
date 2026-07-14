@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 
 ROUTING_SEGMENT_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -220,3 +221,40 @@ class WorkClaim:
     source_window_seq: int | None
     expected_ingest_lance_uri: str
     data_lance_version: int | None
+
+
+@dataclass(frozen=True)
+class ControlPlaneStatus:
+    """Bounded operational snapshot used by reconciliation and SLO reporting."""
+
+    pending_work: int
+    running_work: int
+    retry_wait_work: int
+    blocked_work: int
+    due_work: int
+    blocked_source_windows: int
+    oldest_open_work_at: datetime | None
+    retention_window_seq: int | None
+    retention_snapshot_id: int | None
+    retention_parent_snapshot_id: int | None
+    retention_state: SourceWindowState | None
+    retention_created_at: datetime | None
+
+
+@dataclass(frozen=True)
+class ServingTarget:
+    """Exact authenticated serving-catalog result.
+
+    Attributes:
+        target_id: Opaque target identifier.
+        identity: Validated logical target identity.
+        lance_uri: Deployment-owned physical dataset URI.
+        lance_version: Exact validated Lance version.
+        profile_id: Release-owned query policy identifier.
+    """
+
+    target_id: uuid.UUID
+    identity: RoutingIdentity
+    lance_uri: str
+    lance_version: int
+    profile_id: str

@@ -14,7 +14,9 @@ from sqlalchemy.engine import Connection, Engine, RowMapping
 
 from lance_etl.state.tables import source_windows, target_work, targets
 from lance_etl.state.types import (
+    ControlPlaneStatus,
     RoutingIdentity,
+    ServingTarget,
     SourceWindowPlan,
     SourceWindowState,
     TargetPlan,
@@ -68,6 +70,101 @@ def bounded_error(value: str | None, limit: int) -> str | None:
         The original or truncated diagnostic.
     """
     return value[:limit] if value is not None else None
+
+
+def completed_publication_matches(
+    work_row: RowMapping,
+    current_catalog: tuple[str | None, int | None],
+    desired_catalog: tuple[str, int],
+    indexed_lance_version: int,
+    artifact_manifest_uri: str,
+    artifact_digest: bytes,
+) -> bool:
+    """Validate an idempotent replay after publication already succeeded.
+
+    Args:
+        work_row: Locked durable work row.
+        current_catalog: Current exact serving catalog tuple.
+        desired_catalog: Requested exact serving catalog tuple.
+        indexed_lance_version: Requested validated Lance version.
+        artifact_manifest_uri: Requested immutable manifest URI.
+        artifact_digest: Requested immutable artifact digest.
+
+    Returns:
+        True when work was already completed with the exact requested output.
+
+    Raises:
+        StateTransitionError: If completed durable state differs from the replayed request.
+    """
+    if work_row["state"] != WorkState.SUCCEEDED.value:
+        return False
+    stored_digest = work_row["artifact_digest"]
+    actual_outputs = (
+        work_row["indexed_lance_version"],
+        work_row["artifact_manifest_uri"],
+        bytes(stored_digest) if stored_digest is not None else None,
+    )
+    expected_outputs = indexed_lance_version, artifact_manifest_uri, artifact_digest
+    if current_catalog != desired_catalog or actual_outputs != expected_outputs:
+        raise StateTransitionError("completed publication differs from the requested durable result")
+    return True
+
+
+def publication_lease_matches(
+    work_row: RowMapping,
+    target_row: RowMapping,
+    claim: WorkClaim,
+    current: datetime,
+) -> bool:
+    """Check whether a locked publication still belongs to its fenced worker.
+
+    Args:
+        work_row: Locked durable work row.
+        target_row: Locked target catalog row.
+        claim: Worker claim presented for publication.
+        current: Transaction clock.
+
+    Returns:
+        True only while state, lease, fence, and expiry all match.
+    """
+    lease_expires_at = work_row["lease_expires_at"]
+    return (
+        work_row["state"] == WorkState.RUNNING.value
+        and work_row["lease_token"] == claim.lease_token
+        and int(target_row["fence_epoch"]) == claim.fence_epoch
+        and lease_expires_at is not None
+        and lease_expires_at > current
+    )
+
+
+def publication_target_values(
+    claim: WorkClaim,
+    candidate_lance_uri: str,
+    indexed_lance_version: int,
+    current: datetime,
+) -> dict[str, Any]:
+    """Build the atomic target-catalog update for a publication.
+
+    Args:
+        claim: Current SERVE or REBUILD claim.
+        candidate_lance_uri: Validated candidate dataset URI.
+        indexed_lance_version: Exact validated version.
+        current: Transaction clock.
+
+    Returns:
+        Catalog values for the target update.
+    """
+    values: dict[str, Any] = {
+        "served_lance_uri": candidate_lance_uri,
+        "served_lance_version": indexed_lance_version,
+        "updated_at": current,
+    }
+    if claim.kind == WorkKind.REBUILD:
+        values.update(
+            ingest_lance_uri=candidate_lance_uri,
+            last_applied_lance_version=indexed_lance_version,
+        )
+    return values
 
 
 def build_control_plane_engine(database_url: str) -> Engine:
@@ -882,6 +979,133 @@ class ControlPlaneRepository:
             },
         )
 
+    def resolve_serving_target(self, identity: RoutingIdentity) -> ServingTarget | None:
+        """Resolve one validated logical target to an exact published dataset version.
+
+        Args:
+            identity: Logical target identity validated before database access.
+
+        Returns:
+            Exact serving target or null before first publication or for an unknown target.
+        """
+        identity.validate()
+        with self.engine.connect() as connection:
+            row = (
+                connection.execute(
+                    targets.select()
+                    .where(targets.c.tenant_id == identity.tenant_id)
+                    .where(targets.c.namespace == identity.namespace)
+                    .where(targets.c.org_id == identity.org_id)
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if row is None or row["served_lance_uri"] is None or row["served_lance_version"] is None:
+            return None
+        return ServingTarget(
+            target_id=row["target_id"],
+            identity=identity,
+            lance_uri=str(row["served_lance_uri"]),
+            lance_version=int(row["served_lance_version"]),
+            profile_id=str(row["profile_id"]),
+        )
+
+    def publish_serve(
+        self,
+        claim: WorkClaim,
+        candidate_lance_uri: str,
+        indexed_lance_version: int,
+        artifact_manifest_uri: str,
+        artifact_digest: bytes,
+        now: datetime | None = None,
+    ) -> bool:
+        """Atomically publish an exact version and complete its fenced work generation.
+
+        Args:
+            claim: Current fenced SERVE or REBUILD claim.
+            candidate_lance_uri: Persisted validated candidate dataset URI.
+            indexed_lance_version: Exact validated candidate version.
+            artifact_manifest_uri: Immutable artifact manifest URI.
+            artifact_digest: Frozen 32-byte artifact digest.
+            now: Deterministic clock override for tests.
+
+        Returns:
+            True when the desired catalog and work state are durable, false for a stale worker.
+
+        Raises:
+            StateTransitionError: If catalog state differs from both expected and desired tuples.
+            ValueError: If inputs or work kind are invalid.
+        """
+        if claim.kind not in (WorkKind.SERVE, WorkKind.REBUILD):
+            raise ValueError("publish_serve requires a SERVE or REBUILD claim")
+        if indexed_lance_version < 1 or not candidate_lance_uri or not artifact_manifest_uri:
+            raise ValueError("invalid publication values")
+        if len(artifact_digest) != 32:
+            raise ValueError("artifact digest must contain 32 bytes")
+        current = now or utc_now()
+        with self.engine.begin() as connection:
+            work_row = (
+                connection.execute(target_work.select().where(target_work.c.work_id == claim.work_id).with_for_update())
+                .mappings()
+                .one()
+            )
+            target_row = (
+                connection.execute(targets.select().where(targets.c.target_id == claim.target_id).with_for_update())
+                .mappings()
+                .one()
+            )
+            desired_tuple = candidate_lance_uri, indexed_lance_version
+            current_tuple = target_row["served_lance_uri"], target_row["served_lance_version"]
+            if completed_publication_matches(
+                work_row,
+                current_tuple,
+                desired_tuple,
+                indexed_lance_version,
+                artifact_manifest_uri,
+                artifact_digest,
+            ):
+                return True
+            if work_row["phase"] != WorkPhase.PREWARM.value:
+                raise StateTransitionError("publication requires a completed PREWARM phase")
+            if not publication_lease_matches(work_row, target_row, claim, current):
+                return False
+            expected_tuple = work_row["expected_served_lance_uri"], work_row["expected_served_lance_version"]
+            if current_tuple != expected_tuple:
+                if current_tuple == desired_tuple:
+                    raise StateTransitionError("catalog is desired but work completion is missing")
+                raise StateTransitionError("serving catalog differs from the persisted expected tuple")
+            if target_row["ingest_lance_uri"] != work_row["expected_ingest_lance_uri"]:
+                raise StateTransitionError("ingest catalog differs from the persisted expected URI")
+            target_values = publication_target_values(claim, candidate_lance_uri, indexed_lance_version, current)
+            connection.execute(targets.update().where(targets.c.target_id == claim.target_id).values(**target_values))
+            connection.execute(
+                target_work.update()
+                .where(target_work.c.work_id == claim.work_id)
+                .values(
+                    state=WorkState.SUCCEEDED.value,
+                    phase=WorkPhase.PUBLISH.value,
+                    lease_token=None,
+                    lease_expires_at=None,
+                    candidate_lance_uri=candidate_lance_uri,
+                    indexed_lance_version=indexed_lance_version,
+                    artifact_manifest_uri=artifact_manifest_uri,
+                    artifact_digest=artifact_digest,
+                    error_code=None,
+                    error_message=None,
+                    updated_at=current,
+                )
+            )
+            newest_applied = target_row["last_applied_lance_version"]
+            planned_data_version = work_row["data_lance_version"]
+            if (
+                claim.kind == WorkKind.SERVE
+                and newest_applied is not None
+                and planned_data_version is not None
+                and int(newest_applied) > int(planned_data_version)
+            ):
+                self.enqueue_or_advance_serve(connection, claim.target_id, int(newest_applied), current)
+            return True
+
     def retention_floor(self) -> RowMapping | None:
         """Return the oldest source window still holding Iceberg retention.
 
@@ -899,6 +1123,89 @@ class ControlPlaneRepository:
                 .mappings()
                 .one_or_none()
             )
+
+    def latest_source_window(self, table_uuid: uuid.UUID) -> RowMapping | None:
+        """Return the newest durable audit-tip row for one Iceberg table.
+
+        Args:
+            table_uuid: Stable Iceberg table identity.
+
+        Returns:
+            Newest source-window row or ``None`` before initial planning.
+        """
+        with self.engine.connect() as connection:
+            return (
+                connection.execute(
+                    source_windows.select()
+                    .where(source_windows.c.table_uuid == table_uuid)
+                    .order_by(source_windows.c.window_seq.desc())
+                    .limit(1)
+                )
+                .mappings()
+                .one_or_none()
+            )
+
+    def control_plane_status(self, now: datetime | None = None) -> ControlPlaneStatus:
+        """Read bounded queue and retention state for reconciliation SLOs.
+
+        Args:
+            now: Deterministic clock override for tests.
+
+        Returns:
+            Constant-size aggregate status with no target identifiers.
+        """
+        current = now or utc_now()
+        open_states = (WorkState.PENDING.value, WorkState.RUNNING.value, WorkState.RETRY_WAIT.value)
+        with self.engine.connect() as connection:
+            grouped_rows = connection.execute(
+                sa.select(target_work.c.state, sa.func.count()).group_by(target_work.c.state)
+            ).all()
+            counts: dict[str, int] = {str(state): int(count) for state, count in grouped_rows}
+            due_work = int(
+                connection.scalar(
+                    sa.select(sa.func.count()).select_from(target_work).where(self.due_predicate(current))
+                )
+                or 0
+            )
+            blocked_source_windows = int(
+                connection.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(source_windows)
+                    .where(source_windows.c.state == SourceWindowState.BLOCKED.value)
+                )
+                or 0
+            )
+            oldest_open_work_at = connection.scalar(
+                sa.select(sa.func.min(target_work.c.created_at)).where(target_work.c.state.in_(open_states))
+            )
+            floor = (
+                connection.execute(
+                    source_windows.select()
+                    .where(source_windows.c.state != SourceWindowState.COMPLETE.value)
+                    .order_by(source_windows.c.window_seq)
+                    .limit(1)
+                )
+                .mappings()
+                .one_or_none()
+            )
+        return ControlPlaneStatus(
+            pending_work=counts.get(WorkState.PENDING.value, 0),
+            running_work=counts.get(WorkState.RUNNING.value, 0),
+            retry_wait_work=counts.get(WorkState.RETRY_WAIT.value, 0),
+            blocked_work=counts.get(WorkState.BLOCKED.value, 0),
+            due_work=due_work,
+            blocked_source_windows=blocked_source_windows,
+            oldest_open_work_at=oldest_open_work_at,
+            retention_window_seq=int(floor["window_seq"]) if floor is not None else None,
+            retention_snapshot_id=int(floor["snapshot_id"]) if floor is not None else None,
+            retention_parent_snapshot_id=(
+                int(floor["parent_snapshot_id"])
+                if floor is not None and floor["parent_snapshot_id"] is not None
+                else None
+            ),
+            retention_state=SourceWindowState(floor["state"]) if floor is not None else None,
+            retention_created_at=floor["created_at"] if floor is not None else None,
+        )
 
     def delete_completed_work(self, completed_before: datetime, limit: int) -> int:
         """Delete a bounded batch of completed work after external horizons permit it.
