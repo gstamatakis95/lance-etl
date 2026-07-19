@@ -312,8 +312,8 @@ pub struct HybridSearchOutcome {
 /// One ranked hit from a single search leg.
 #[derive(Debug, Clone)]
 pub struct Hit {
-    /// Stable logical vector identifier.
-    pub vector_id: String,
+    /// Stable logical record identifier.
+    pub record_id: String,
     /// Leg-specific score: distance for vector legs, BM25 score for text legs.
     pub score: f64,
     /// Projected columns of the row as a JSON object.
@@ -323,8 +323,8 @@ pub struct Hit {
 /// One fused hit produced by a [`crate::domain::fusion::Fusion`] strategy.
 #[derive(Debug, Clone)]
 pub struct FusedHit {
-    /// Stable logical vector identifier.
-    pub vector_id: String,
+    /// Stable logical record identifier.
+    pub record_id: String,
     /// Fused score (larger is better).
     pub score: f64,
     /// Union of the projected columns of the legs that contained the row.

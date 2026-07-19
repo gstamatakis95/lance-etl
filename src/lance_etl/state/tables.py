@@ -14,7 +14,6 @@ FIELD_ROLES: tuple[str, ...] = (
     "VECTOR",
     "TEXT",
     "METADATA",
-    "TTL",
     "TOMBSTONE",
     "LINEAGE",
 )
@@ -27,7 +26,7 @@ SNAPSHOT_STATES: tuple[str, ...] = ("SEALED", "COMPLETE", "BLOCKED")
 WORK_KINDS: tuple[str, ...] = ("INGEST", "PUBLISH", "REBUILD")
 WORK_STATES: tuple[str, ...] = ("PENDING", "RUNNING", "RETRY_WAIT", "SUCCEEDED", "BLOCKED")
 WORK_PHASES: tuple[str, ...] = ("INGEST", "COMPACT", "INDEX", "VALIDATE", "PREWARM", "PUBLISH")
-WORK_LAUNCHER_KINDS: tuple[str, ...] = ("LOCAL", "AIRFLOW")
+WORK_LAUNCHER_KINDS: tuple[str, ...] = ("LOCAL",)
 VECTOR_METRICS: tuple[str, ...] = ("l2", "cosine", "dot")
 
 
@@ -43,65 +42,13 @@ def quoted_values(values: tuple[str, ...]) -> str:
     return ", ".join(f"'{value}'" for value in values)
 
 
-reconciler_settings: sa.Table = sa.Table(
-    "reconciler_settings",
-    metadata,
-    sa.Column("singleton_id", sa.SmallInteger(), primary_key=True, server_default="1"),
-    sa.Column("poll_interval_seconds", sa.Integer(), nullable=False, server_default="30"),
-    sa.Column("claim_batch_size", sa.Integer(), nullable=False, server_default="1"),
-    sa.Column("max_drain_batches", sa.Integer(), nullable=False, server_default="64"),
-    sa.Column("max_snapshots_per_plan", sa.Integer(), nullable=False, server_default="32"),
-    sa.Column("lease_duration_seconds", sa.Integer(), nullable=False, server_default="900"),
-    sa.Column("lease_heartbeat_seconds", sa.Integer(), nullable=False, server_default="300"),
-    sa.Column("retry_base_delay_seconds", sa.Integer(), nullable=False, server_default="30"),
-    sa.Column("retry_max_delay_seconds", sa.Integer(), nullable=False, server_default="1800"),
-    sa.Column("max_attempts", sa.Integer(), nullable=False, server_default="10"),
-    sa.Column("max_due_work", sa.Integer(), nullable=False, server_default="10000"),
-    sa.Column("max_open_work_age_seconds", sa.BigInteger(), nullable=False, server_default="3600"),
-    sa.Column("max_retention_age_seconds", sa.BigInteger(), nullable=False, server_default="86400"),
-    sa.Column("audit_retention_seconds", sa.BigInteger(), nullable=False, server_default="2592000"),
-    sa.Column("cleanup_batch_size", sa.Integer(), nullable=False, server_default="128"),
-    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
-    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
-    sa.CheckConstraint("singleton_id = 1", name="ck_reconciler_settings_singleton"),
-    sa.CheckConstraint("poll_interval_seconds > 0", name="ck_reconciler_settings_poll_positive"),
-    sa.CheckConstraint("claim_batch_size > 0", name="ck_reconciler_settings_claim_positive"),
-    sa.CheckConstraint("max_drain_batches > 0", name="ck_reconciler_settings_drain_positive"),
-    sa.CheckConstraint("max_snapshots_per_plan > 0", name="ck_reconciler_settings_plan_positive"),
-    sa.CheckConstraint("lease_duration_seconds > 0", name="ck_reconciler_settings_lease_positive"),
-    sa.CheckConstraint(
-        "lease_heartbeat_seconds > 0 AND lease_heartbeat_seconds < lease_duration_seconds",
-        name="ck_reconciler_settings_heartbeat",
-    ),
-    sa.CheckConstraint("retry_base_delay_seconds > 0", name="ck_reconciler_settings_retry_base_positive"),
-    sa.CheckConstraint(
-        "retry_max_delay_seconds >= retry_base_delay_seconds",
-        name="ck_reconciler_settings_retry_range",
-    ),
-    sa.CheckConstraint("max_attempts > 0", name="ck_reconciler_settings_attempts_positive"),
-    sa.CheckConstraint("max_due_work > 0", name="ck_reconciler_settings_due_positive"),
-    sa.CheckConstraint("max_open_work_age_seconds > 0", name="ck_reconciler_settings_open_age_positive"),
-    sa.CheckConstraint("max_retention_age_seconds > 0", name="ck_reconciler_settings_retention_age_positive"),
-    sa.CheckConstraint("audit_retention_seconds > 0", name="ck_reconciler_settings_audit_positive"),
-    sa.CheckConstraint("cleanup_batch_size > 0", name="ck_reconciler_settings_cleanup_positive"),
-)
-
-dataset_specs: sa.Table = sa.Table(
-    "dataset_specs",
-    metadata,
-    sa.Column("spec_id", sa.Uuid(as_uuid=True), primary_key=True),
-    sa.Column("name", sa.String(128), nullable=False),
-    sa.Column("description", sa.Text(), nullable=True),
-    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
-    sa.UniqueConstraint("name", name="uq_dataset_specs_name"),
-    sa.CheckConstraint("name ~ '^[A-Za-z][A-Za-z0-9_-]{0,127}$'", name="ck_dataset_specs_name"),
-)
-
 dataset_spec_revisions: sa.Table = sa.Table(
     "dataset_spec_revisions",
     metadata,
     sa.Column("spec_revision_id", sa.Uuid(as_uuid=True), primary_key=True),
-    sa.Column("spec_id", sa.Uuid(as_uuid=True), sa.ForeignKey("dataset_specs.spec_id"), nullable=False),
+    sa.Column("spec_id", sa.Uuid(as_uuid=True), nullable=False),
+    sa.Column("name", sa.String(128), nullable=False),
+    sa.Column("description", sa.Text(), nullable=True),
     sa.Column("revision_number", sa.BigInteger(), nullable=False),
     sa.Column("state", sa.String(16), nullable=False, server_default="DRAFT"),
     sa.Column(
@@ -130,6 +77,7 @@ dataset_spec_revisions: sa.Table = sa.Table(
     sa.Column("prewarm_required", sa.Boolean(), nullable=False, server_default=sa.true()),
     sa.Column("retained_publications", sa.Integer(), nullable=False),
     sa.Column("artifact_retention_seconds", sa.BigInteger(), nullable=False),
+    sa.Column("record_retention_seconds", sa.BigInteger(), nullable=True),
     sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
     sa.Column("activated_at", sa.DateTime(timezone=True), nullable=True),
     sa.UniqueConstraint("spec_id", "revision_number", name="uq_dataset_spec_revisions_number"),
@@ -141,6 +89,11 @@ dataset_spec_revisions: sa.Table = sa.Table(
         name="fk_dataset_spec_revisions_supersedes_same_spec",
     ),
     sa.CheckConstraint(f"state IN ({quoted_values(SPEC_STATES)})", name="ck_dataset_spec_revisions_state"),
+    sa.CheckConstraint("name ~ '^[A-Za-z][A-Za-z0-9_-]{0,127}$'", name="ck_dataset_spec_revisions_name"),
+    sa.CheckConstraint(
+        "description IS NULL OR length(btrim(description)) > 0",
+        name="ck_dataset_spec_revisions_description",
+    ),
     sa.CheckConstraint("revision_number > 0", name="ck_dataset_spec_revisions_number_positive"),
     sa.CheckConstraint(
         "octet_length(configuration_digest) = 32",
@@ -196,6 +149,10 @@ dataset_spec_revisions: sa.Table = sa.Table(
     sa.CheckConstraint(
         "artifact_retention_seconds > 0",
         name="ck_dataset_spec_revisions_artifact_retention_positive",
+    ),
+    sa.CheckConstraint(
+        "record_retention_seconds IS NULL OR record_retention_seconds > 0",
+        name="ck_dataset_spec_revisions_record_retention_positive",
     ),
 )
 
@@ -256,14 +213,13 @@ dataset_fields: sa.Table = sa.Table(
         name="ck_dataset_fields_map_key_target",
     ),
     sa.CheckConstraint(
-        "(role = 'KEY' AND target_name = 'vector_id' AND source_kind = 'DIRECT' "
-        "AND source_column = 'vector_id') OR "
-        "(role = 'EVENT_TIME' AND target_name = 'event_timestamp' AND source_kind = 'DIRECT' "
-        "AND source_column = 'event_timestamp') OR "
+        "(role = 'KEY' AND target_name = 'record_id' AND source_kind = 'DIRECT' "
+        "AND source_column = 'record_id') OR "
+        "(role = 'EVENT_TIME' AND target_name = 'ts' AND source_kind = 'DIRECT' "
+        "AND source_column = 'ts') OR "
         "(role = 'VECTOR' AND source_kind = 'MAP_KEY' AND source_column = 'vectors') OR "
         "(role = 'TEXT' AND source_kind = 'MAP_KEY' AND source_column = 'texts') OR "
         "(role = 'METADATA' AND source_kind = 'MAP_KEY' AND source_column = 'metadata') OR "
-        "(role = 'TTL' AND target_name = 'ttl' AND source_kind = 'DIRECT' AND source_column = 'ttl') OR "
         "(role = 'TOMBSTONE' AND target_name = 'is_deleted' AND source_kind = 'DERIVED' "
         "AND source_column = target_name) OR "
         "(role = 'LINEAGE' AND target_name IN "
@@ -278,7 +234,6 @@ dataset_fields: sa.Table = sa.Table(
         "(role = 'EVENT_TIME' AND data_type = 'timestamp[us,UTC]') OR "
         "(role = 'TEXT' AND data_type = 'string') OR "
         "(role = 'METADATA' AND data_type = 'string') OR "
-        "(role = 'TTL' AND data_type = 'duration[s]') OR "
         "(role = 'TOMBSTONE' AND data_type = 'bool') OR "
         "(role = 'LINEAGE' AND target_name IN ('lance_etl_window_seq', 'lance_etl_source_sequence') "
         "AND data_type = 'int64') OR "
@@ -294,7 +249,7 @@ dataset_fields: sa.Table = sa.Table(
     sa.CheckConstraint(
         "(role = 'KEY' AND NOT nullable AND required_on_upsert) OR "
         "(role IN ('EVENT_TIME', 'VECTOR') AND nullable AND required_on_upsert) OR "
-        "(role IN ('TEXT', 'METADATA', 'TTL') AND nullable AND NOT required_on_upsert) OR "
+        "(role IN ('TEXT', 'METADATA') AND nullable AND NOT required_on_upsert) OR "
         "(role IN ('TOMBSTONE', 'LINEAGE') AND NOT nullable AND NOT required_on_upsert)",
         name="ck_dataset_fields_flags_contract",
     ),
@@ -305,7 +260,7 @@ sa.Index(
     dataset_fields.c.spec_revision_id,
     dataset_fields.c.role,
     unique=True,
-    postgresql_where=dataset_fields.c.role.in_(("KEY", "EVENT_TIME", "TTL", "TOMBSTONE")),
+    postgresql_where=dataset_fields.c.role.in_(("KEY", "EVENT_TIME", "TOMBSTONE")),
 )
 
 index_definitions: sa.Table = sa.Table(
@@ -322,6 +277,20 @@ index_definitions: sa.Table = sa.Table(
     sa.Column("ordinal", sa.Integer(), nullable=False),
     sa.Column("index_name", sa.String(128), nullable=False),
     sa.Column("index_type", sa.String(16), nullable=False),
+    sa.Column("metric", sa.String(16), nullable=True),
+    sa.Column("num_partitions", sa.Integer(), nullable=True),
+    sa.Column("minimum_partitions", sa.Integer(), nullable=True),
+    sa.Column("maximum_partitions", sa.Integer(), nullable=True),
+    sa.Column("target_rows_per_partition", sa.Integer(), nullable=True),
+    sa.Column("minimum_rows", sa.BigInteger(), nullable=True),
+    sa.Column("num_bits", sa.Integer(), nullable=True),
+    sa.Column("streaming_sample_rate", sa.Integer(), nullable=True),
+    sa.Column("streaming_refine_passes", sa.Integer(), nullable=True),
+    sa.Column("retrain_growth_factor", sa.Numeric(8, 4), nullable=True),
+    sa.Column("with_position", sa.Boolean(), nullable=True),
+    sa.Column("base_tokenizer", sa.String(64), nullable=True),
+    sa.Column("language", sa.String(32), nullable=True),
+    sa.Column("max_unindexed_fragments", sa.Integer(), nullable=True),
     sa.ForeignKeyConstraint(
         ["spec_revision_id", "field_id"],
         ["dataset_fields.spec_revision_id", "dataset_fields.field_id"],
@@ -330,7 +299,6 @@ index_definitions: sa.Table = sa.Table(
     sa.UniqueConstraint("spec_revision_id", "ordinal", name="uq_index_definitions_ordinal"),
     sa.UniqueConstraint("spec_revision_id", "index_name", name="uq_index_definitions_name"),
     sa.UniqueConstraint("spec_revision_id", "field_id", "index_type", name="uq_index_definitions_field_type"),
-    sa.UniqueConstraint("index_definition_id", "index_type", name="uq_index_definitions_id_type"),
     sa.UniqueConstraint(
         "spec_revision_id",
         "index_definition_id",
@@ -348,80 +316,71 @@ index_definitions: sa.Table = sa.Table(
         name="ck_index_definitions_name",
     ),
     sa.CheckConstraint(f"index_type IN ({quoted_values(INDEX_TYPES)})", name="ck_index_definitions_type"),
-)
-
-vector_index_options: sa.Table = sa.Table(
-    "vector_index_options",
-    metadata,
-    sa.Column("index_definition_id", sa.Uuid(as_uuid=True), primary_key=True),
-    sa.Column("index_type", sa.String(16), nullable=False, server_default="IVF_RQ"),
-    sa.Column("metric", sa.String(16), nullable=False),
-    sa.Column("num_partitions", sa.Integer(), nullable=True),
-    sa.Column("minimum_partitions", sa.Integer(), nullable=False),
-    sa.Column("maximum_partitions", sa.Integer(), nullable=False),
-    sa.Column("target_rows_per_partition", sa.Integer(), nullable=False),
-    sa.Column("minimum_rows", sa.BigInteger(), nullable=False),
-    sa.Column("num_bits", sa.Integer(), nullable=False),
-    sa.Column("streaming_sample_rate", sa.Integer(), nullable=False),
-    sa.Column("streaming_refine_passes", sa.Integer(), nullable=False),
-    sa.Column("retrain_growth_factor", sa.Numeric(8, 4), nullable=False),
-    sa.ForeignKeyConstraint(
-        ["index_definition_id", "index_type"],
-        ["index_definitions.index_definition_id", "index_definitions.index_type"],
-        name="fk_vector_index_options_definition_type",
-    ),
-    sa.CheckConstraint("index_type = 'IVF_RQ'", name="ck_vector_index_options_type"),
-    sa.CheckConstraint(f"metric IN ({quoted_values(VECTOR_METRICS)})", name="ck_vector_index_options_metric"),
-    sa.CheckConstraint("num_partitions IS NULL OR num_partitions > 0", name="ck_vector_index_options_partitions"),
-    sa.CheckConstraint("minimum_partitions > 0", name="ck_vector_index_options_min_partitions_positive"),
     sa.CheckConstraint(
-        "maximum_partitions >= minimum_partitions",
-        name="ck_vector_index_options_partition_range",
+        "(index_type = 'IVF_RQ' AND metric IS NOT NULL AND minimum_partitions IS NOT NULL "
+        "AND maximum_partitions IS NOT NULL AND target_rows_per_partition IS NOT NULL "
+        "AND minimum_rows IS NOT NULL AND num_bits IS NOT NULL AND streaming_sample_rate IS NOT NULL "
+        "AND streaming_refine_passes IS NOT NULL AND retrain_growth_factor IS NOT NULL "
+        "AND with_position IS NULL AND base_tokenizer IS NULL AND language IS NULL "
+        "AND max_unindexed_fragments IS NULL) OR "
+        "(index_type = 'INVERTED' AND with_position IS NOT NULL AND max_unindexed_fragments IS NOT NULL "
+        "AND metric IS NULL AND num_partitions IS NULL AND minimum_partitions IS NULL "
+        "AND maximum_partitions IS NULL AND target_rows_per_partition IS NULL AND minimum_rows IS NULL "
+        "AND num_bits IS NULL AND streaming_sample_rate IS NULL AND streaming_refine_passes IS NULL "
+        "AND retrain_growth_factor IS NULL) OR "
+        "(index_type IN ('BTREE', 'BITMAP', 'ZONEMAP') AND metric IS NULL AND num_partitions IS NULL "
+        "AND minimum_partitions IS NULL AND maximum_partitions IS NULL AND target_rows_per_partition IS NULL "
+        "AND minimum_rows IS NULL AND num_bits IS NULL AND streaming_sample_rate IS NULL "
+        "AND streaming_refine_passes IS NULL AND retrain_growth_factor IS NULL "
+        "AND with_position IS NULL AND base_tokenizer IS NULL AND language IS NULL "
+        "AND max_unindexed_fragments IS NULL)",
+        name="ck_index_definitions_option_shape",
+    ),
+    sa.CheckConstraint(
+        f"metric IS NULL OR metric IN ({quoted_values(VECTOR_METRICS)})", name="ck_index_definitions_metric"
+    ),
+    sa.CheckConstraint("num_partitions IS NULL OR num_partitions > 0", name="ck_index_definitions_partitions"),
+    sa.CheckConstraint(
+        "minimum_partitions IS NULL OR minimum_partitions > 0",
+        name="ck_index_definitions_min_partitions_positive",
+    ),
+    sa.CheckConstraint(
+        "maximum_partitions IS NULL OR minimum_partitions IS NULL OR maximum_partitions >= minimum_partitions",
+        name="ck_index_definitions_partition_range",
     ),
     sa.CheckConstraint(
         "num_partitions IS NULL OR (num_partitions >= minimum_partitions AND num_partitions <= maximum_partitions)",
-        name="ck_vector_index_options_explicit_partition_range",
+        name="ck_index_definitions_explicit_partition_range",
     ),
     sa.CheckConstraint(
-        "target_rows_per_partition > 0",
-        name="ck_vector_index_options_target_rows_positive",
-    ),
-    sa.CheckConstraint("minimum_rows >= 0", name="ck_vector_index_options_minimum_rows_nonnegative"),
-    sa.CheckConstraint("num_bits > 0", name="ck_vector_index_options_num_bits_positive"),
-    sa.CheckConstraint(
-        "streaming_sample_rate > 0",
-        name="ck_vector_index_options_sample_rate_positive",
+        "target_rows_per_partition IS NULL OR target_rows_per_partition > 0",
+        name="ck_index_definitions_target_rows_positive",
     ),
     sa.CheckConstraint(
-        "streaming_refine_passes >= 0",
-        name="ck_vector_index_options_refine_passes_nonnegative",
+        "minimum_rows IS NULL OR minimum_rows >= 0",
+        name="ck_index_definitions_minimum_rows_nonnegative",
     ),
-    sa.CheckConstraint("retrain_growth_factor > 1", name="ck_vector_index_options_growth_factor"),
-)
-
-fts_index_options: sa.Table = sa.Table(
-    "fts_index_options",
-    metadata,
-    sa.Column("index_definition_id", sa.Uuid(as_uuid=True), primary_key=True),
-    sa.Column("index_type", sa.String(16), nullable=False, server_default="INVERTED"),
-    sa.Column("with_position", sa.Boolean(), nullable=False, server_default=sa.false()),
-    sa.Column("base_tokenizer", sa.String(64), nullable=True),
-    sa.Column("language", sa.String(32), nullable=True),
-    sa.Column("max_unindexed_fragments", sa.Integer(), nullable=False),
-    sa.ForeignKeyConstraint(
-        ["index_definition_id", "index_type"],
-        ["index_definitions.index_definition_id", "index_definitions.index_type"],
-        name="fk_fts_index_options_definition_type",
+    sa.CheckConstraint("num_bits IS NULL OR num_bits > 0", name="ck_index_definitions_num_bits_positive"),
+    sa.CheckConstraint(
+        "streaming_sample_rate IS NULL OR streaming_sample_rate > 0",
+        name="ck_index_definitions_sample_rate_positive",
     ),
-    sa.CheckConstraint("index_type = 'INVERTED'", name="ck_fts_index_options_type"),
+    sa.CheckConstraint(
+        "streaming_refine_passes IS NULL OR streaming_refine_passes >= 0",
+        name="ck_index_definitions_refine_passes_nonnegative",
+    ),
+    sa.CheckConstraint(
+        "retrain_growth_factor IS NULL OR retrain_growth_factor > 1",
+        name="ck_index_definitions_growth_factor",
+    ),
     sa.CheckConstraint(
         "base_tokenizer IS NULL OR length(base_tokenizer) > 0",
-        name="ck_fts_index_options_tokenizer",
+        name="ck_index_definitions_tokenizer",
     ),
-    sa.CheckConstraint("language IS NULL OR length(language) > 0", name="ck_fts_index_options_language"),
+    sa.CheckConstraint("language IS NULL OR length(language) > 0", name="ck_index_definitions_language"),
     sa.CheckConstraint(
-        "max_unindexed_fragments >= 0",
-        name="ck_fts_index_options_unindexed_nonnegative",
+        "max_unindexed_fragments IS NULL OR max_unindexed_fragments >= 0",
+        name="ck_index_definitions_unindexed_nonnegative",
     ),
 )
 
@@ -436,19 +395,18 @@ iceberg_sources: sa.Table = sa.Table(
     sa.Column("table_uuid", sa.Uuid(as_uuid=True), nullable=False),
     sa.Column("lance_base_uri", sa.Text(), nullable=False),
     sa.Column("lifecycle_state", sa.String(16), nullable=False, server_default="DRAFT"),
-    sa.Column("default_spec_id", sa.Uuid(as_uuid=True), sa.ForeignKey("dataset_specs.spec_id"), nullable=False),
+    sa.Column("default_spec_id", sa.Uuid(as_uuid=True), nullable=False),
     sa.Column("canonical_baseline_snapshot_id", sa.BigInteger(), nullable=True),
     sa.Column("replay_horizon_seconds", sa.BigInteger(), nullable=False, server_default="2592000"),
     sa.Column("tenant_column", sa.String(128), nullable=False, server_default="tenant_id"),
     sa.Column("namespace_column", sa.String(128), nullable=False, server_default="namespace"),
     sa.Column("org_column", sa.String(128), nullable=False, server_default="org_id"),
-    sa.Column("record_id_column", sa.String(128), nullable=False, server_default="vector_id"),
+    sa.Column("record_id_column", sa.String(128), nullable=False, server_default="record_id"),
     sa.Column("operation_column", sa.String(128), nullable=False, server_default="op"),
-    sa.Column("event_time_column", sa.String(128), nullable=False, server_default="event_timestamp"),
+    sa.Column("ts_column", sa.String(128), nullable=False, server_default="ts"),
     sa.Column("vectors_column", sa.String(128), nullable=False, server_default="vectors"),
     sa.Column("texts_column", sa.String(128), nullable=False, server_default="texts"),
     sa.Column("metadata_column", sa.String(128), nullable=False, server_default="metadata"),
-    sa.Column("ttl_column", sa.String(128), nullable=True, server_default="ttl"),
     sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
     sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
     sa.UniqueConstraint("source_name", name="uq_iceberg_sources_name"),
@@ -500,8 +458,8 @@ iceberg_sources: sa.Table = sa.Table(
         name="ck_iceberg_sources_operation_column",
     ),
     sa.CheckConstraint(
-        "event_time_column ~ '^[A-Za-z_][A-Za-z0-9_]{0,127}$'",
-        name="ck_iceberg_sources_event_time_column",
+        "ts_column ~ '^[A-Za-z_][A-Za-z0-9_]{0,127}$'",
+        name="ck_iceberg_sources_ts_column",
     ),
     sa.CheckConstraint(
         "vectors_column ~ '^[A-Za-z_][A-Za-z0-9_]{0,127}$'",
@@ -514,10 +472,6 @@ iceberg_sources: sa.Table = sa.Table(
     sa.CheckConstraint(
         "metadata_column ~ '^[A-Za-z_][A-Za-z0-9_]{0,127}$'",
         name="ck_iceberg_sources_metadata_column",
-    ),
-    sa.CheckConstraint(
-        "ttl_column IS NULL OR ttl_column ~ '^[A-Za-z_][A-Za-z0-9_]{0,127}$'",
-        name="ck_iceberg_sources_ttl_column",
     ),
 )
 
@@ -536,8 +490,29 @@ datasets: sa.Table = sa.Table(
         sa.ForeignKey("dataset_spec_revisions.spec_revision_id"),
         nullable=False,
     ),
+    sa.Column(
+        "materialized_spec_revision_id",
+        sa.Uuid(as_uuid=True),
+        sa.ForeignKey("dataset_spec_revisions.spec_revision_id"),
+        nullable=True,
+    ),
+    sa.Column(
+        "last_applied_source_snapshot_seq",
+        sa.BigInteger(),
+        sa.ForeignKey("source_snapshots.source_snapshot_seq"),
+        nullable=True,
+    ),
+    sa.Column("ingest_lance_uri", sa.Text(), nullable=False),
+    sa.Column("ingest_lance_version", sa.BigInteger(), nullable=True),
+    sa.Column("active_publication_id", sa.Uuid(as_uuid=True), nullable=True),
+    sa.Column("fence_epoch", sa.BigInteger(), nullable=False, server_default="0"),
     sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
     sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+    sa.ForeignKeyConstraint(
+        ["dataset_id", "active_publication_id"],
+        ["dataset_publications.dataset_id", "dataset_publications.publication_id"],
+        name="fk_datasets_active_publication",
+    ),
     sa.UniqueConstraint("dataset_id", "source_id", name="uq_datasets_dataset_source"),
     sa.UniqueConstraint("tenant_id", "namespace", "org_id", name="uq_datasets_routing_identity"),
     sa.CheckConstraint("tenant_id ~ '^[A-Za-z0-9_-]{1,128}$'", name="ck_datasets_tenant_id"),
@@ -547,6 +522,12 @@ datasets: sa.Table = sa.Table(
         f"lifecycle_state IN ({quoted_values(DATASET_LIFECYCLE_STATES)})",
         name="ck_datasets_lifecycle",
     ),
+    sa.CheckConstraint("length(ingest_lance_uri) > 0", name="ck_datasets_ingest_uri"),
+    sa.CheckConstraint(
+        "ingest_lance_version IS NULL OR ingest_lance_version >= 0",
+        name="ck_datasets_ingest_version",
+    ),
+    sa.CheckConstraint("fence_epoch >= 0", name="ck_datasets_fence_nonnegative"),
 )
 
 source_snapshots: sa.Table = sa.Table(
@@ -605,11 +586,6 @@ dataset_work: sa.Table = sa.Table(
     sa.Column("lease_expires_at", sa.DateTime(timezone=True), nullable=True),
     sa.Column("attempt_count", sa.BigInteger(), nullable=False, server_default="0"),
     sa.Column("launcher_kind", sa.String(16), nullable=False, server_default="LOCAL"),
-    sa.Column("airflow_ctx_dag_id", sa.String(250), nullable=True),
-    sa.Column("airflow_ctx_dag_run_id", sa.String(512), nullable=True),
-    sa.Column("airflow_ctx_task_id", sa.String(250), nullable=True),
-    sa.Column("airflow_ctx_map_index", sa.Integer(), nullable=True),
-    sa.Column("airflow_ctx_try_number", sa.Integer(), nullable=True),
     sa.Column("next_attempt_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
     sa.Column("expected_ingest_lance_uri", sa.Text(), nullable=False),
     sa.Column("expected_ingest_lance_version", sa.BigInteger(), nullable=True),
@@ -654,18 +630,6 @@ dataset_work: sa.Table = sa.Table(
     sa.CheckConstraint(
         f"launcher_kind IN ({quoted_values(WORK_LAUNCHER_KINDS)})",
         name="ck_dataset_work_launcher_kind",
-    ),
-    sa.CheckConstraint(
-        "(launcher_kind = 'LOCAL' AND airflow_ctx_dag_id IS NULL "
-        "AND airflow_ctx_dag_run_id IS NULL AND airflow_ctx_task_id IS NULL "
-        "AND airflow_ctx_map_index IS NULL AND airflow_ctx_try_number IS NULL) OR "
-        "(launcher_kind = 'AIRFLOW' AND airflow_ctx_dag_id IS NOT NULL "
-        "AND airflow_ctx_dag_run_id IS NOT NULL AND airflow_ctx_task_id IS NOT NULL "
-        "AND length(airflow_ctx_dag_id) > 0 AND length(airflow_ctx_dag_run_id) > 0 "
-        "AND length(airflow_ctx_task_id) > 0 "
-        "AND (airflow_ctx_map_index IS NULL OR airflow_ctx_map_index >= -1) "
-        "AND (airflow_ctx_try_number IS NULL OR airflow_ctx_try_number > 0))",
-        name="ck_dataset_work_launcher_context",
     ),
     sa.CheckConstraint("length(expected_ingest_lance_uri) > 0", name="ck_dataset_work_expected_ingest_uri"),
     sa.CheckConstraint(
@@ -842,43 +806,4 @@ publication_indexes: sa.Table = sa.Table(
         "artifact_generation_digest IS NULL OR octet_length(artifact_generation_digest) = 32",
         name="ck_publication_indexes_artifact_digest",
     ),
-)
-
-dataset_state: sa.Table = sa.Table(
-    "dataset_state",
-    metadata,
-    sa.Column(
-        "dataset_id",
-        sa.Uuid(as_uuid=True),
-        sa.ForeignKey("datasets.dataset_id"),
-        primary_key=True,
-    ),
-    sa.Column(
-        "materialized_spec_revision_id",
-        sa.Uuid(as_uuid=True),
-        sa.ForeignKey("dataset_spec_revisions.spec_revision_id"),
-        nullable=True,
-    ),
-    sa.Column(
-        "last_applied_source_snapshot_seq",
-        sa.BigInteger(),
-        sa.ForeignKey("source_snapshots.source_snapshot_seq"),
-        nullable=True,
-    ),
-    sa.Column("ingest_lance_uri", sa.Text(), nullable=False),
-    sa.Column("ingest_lance_version", sa.BigInteger(), nullable=True),
-    sa.Column("active_publication_id", sa.Uuid(as_uuid=True), nullable=True),
-    sa.Column("fence_epoch", sa.BigInteger(), nullable=False, server_default="0"),
-    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
-    sa.ForeignKeyConstraint(
-        ["dataset_id", "active_publication_id"],
-        ["dataset_publications.dataset_id", "dataset_publications.publication_id"],
-        name="fk_dataset_state_active_publication",
-    ),
-    sa.CheckConstraint("length(ingest_lance_uri) > 0", name="ck_dataset_state_ingest_uri"),
-    sa.CheckConstraint(
-        "ingest_lance_version IS NULL OR ingest_lance_version >= 0",
-        name="ck_dataset_state_ingest_version",
-    ),
-    sa.CheckConstraint("fence_epoch >= 0", name="ck_dataset_state_fence_nonnegative"),
 )

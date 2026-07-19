@@ -1,11 +1,11 @@
-"""Pure pivot and cast helpers for the Iceberg-to-Lance ETL.
+"""Pure pivot and cast helpers for the Iceberg-to-Lance ingestion path.
 
-Provides the per-group pivot, FSL cast, TTL cast, and stats-batch helpers used by the executor
-closure in :mod:`lance_etl.etl.job`. All functions operate on PyArrow tables and have no Spark
-dependency, so they can be unit-tested without a Spark context.
+Provides the per-group pivot, FSL cast, and stats-batch helpers used by the executor
+closures in :mod:`lance_etl.etl.sink` and the reconciler workers. All functions operate on PyArrow
+tables and have no Spark dependency, so they can be unit-tested without a Spark context.
 
-Also owns :data:`ROUTING_COLS` and :class:`ETLConfig`, which are the two names that
-:mod:`lance_etl.etl.job` imports to avoid a circular dependency.
+Also owns :data:`ROUTING_COLS` and :class:`ETLConfig`, the shared routing contract and merge-sink
+configuration.
 """
 
 from __future__ import annotations
@@ -23,8 +23,8 @@ from lance_etl.telemetry import DEFAULT_CONFLICT_RETRIES, TelemetryConfig
 ROUTING_COLS: tuple[str, str, str] = ("org_id", "tenant_id", "namespace")
 """Fixed routing columns per the source contract in docs/iceberg-source-table.sql."""
 
-KEY_COL: str = "vector_id"
-"""Unique vector id column and per-dataset merge key, per the source contract."""
+KEY_COL: str = "record_id"
+"""Unique record id column and per-dataset merge key, per the source contract."""
 
 OP_COL: str = "op"
 """Operation column carrying insert, update, or delete, per the source contract."""
@@ -36,27 +36,23 @@ Kept as a ``list`` rather than a ``tuple`` because :meth:`pyspark.sql.Column.isi
 single ``list`` or ``set`` argument, not a tuple.
 """
 
-TTL_COL: str = "ttl"
-"""Optional per-row lifetime column (BIGINT seconds). Cast to ``pa.duration("s")`` when present."""
-
 
 @dataclass
 class ETLConfig:
-    """Configuration for :class:`lance_etl.etl.job.IcebergToLanceETL`.
+    """Configuration for the executor-side Lance merge sink and the routing-shuffle sizing math.
 
-    The schema-contract columns (:data:`KEY_COL`, :data:`OP_COL`, :data:`DELETE_OP_VALUES`,
-    :data:`TTL_COL`) and the operational constants (``MAX_SHUFFLE_PARTITIONS`` in
-    :mod:`lance_etl.etl.plan` and ``DATA_STORAGE_VERSION`` in :mod:`lance_etl.etl.sink`) are fixed
+    The schema-contract columns (:data:`KEY_COL`, :data:`OP_COL`, :data:`DELETE_OP_VALUES`) and the
+    operational constant ``DATA_STORAGE_VERSION`` in :mod:`lance_etl.etl.sink` are fixed
     module-level constants, not fields, because they are never varied.
 
     Attributes:
         base_uri: Root location under which per-tenant datasets live.
         telemetry: Telemetry configuration.
-        ts_col: Source event timestamp — single canonical clock for collapse and range queries.
+        ts_col: Source ``ts`` column — single canonical clock for collapse and range queries.
         storage_options: Object-store options forwarded to pylance.
         num_partitions: Manual override of the adaptive routing-shuffle width. ``None`` (the
-            default) lets :func:`lance_etl.etl.plan.compute_routing_plan` size the shuffle by both
-            rows and trio count. An explicit integer pins a fixed-width shuffle.
+            default) lets the shuffle-sizing math size the width by both rows and trio count. An
+            explicit integer pins a fixed-width shuffle.
         bucket_rows: Target rows per merge-writer sub-bucket and per shuffle task; the unit sizing
             both K (buckets per big dataset) and N (shuffle partitions).
         max_buckets_per_dataset: Cap on concurrent merge writers per dataset, bounding
@@ -91,7 +87,7 @@ class ETLConfig:
 
     base_uri: str
     telemetry: TelemetryConfig
-    ts_col: str = "event_timestamp"
+    ts_col: str = "ts"
     storage_options: dict[str, Any] | None = None
     num_partitions: int | None = None
     bucket_rows: int = 2_000_000
@@ -101,7 +97,7 @@ class ETLConfig:
     iceberg_read_options: dict[str, str] = field(default_factory=dict)
     window_start: str | None = None
     window_end: str | None = None
-    window_column: str = "processing_timestamp"
+    window_column: str = "ts"
     retry_backoff_seconds: float = 0.5
     merge_batch_bytes: int | None = 64 * 1024 * 1024
     bulk_append: bool = False
@@ -113,8 +109,8 @@ class ETLConfig:
 def routing_stats_schema(extra_fields: list[tuple[str, pa.DataType]]) -> pa.Schema:
     """Build a per-dataset stats schema: one string column per routing column plus extras.
 
-    Shared builder behind :func:`stats_schema` and :func:`lance_etl.etl.bulk.bulk_stats_schema`,
-    so both the merge and bulk-append fast-path stats schemas agree on the routing-column prefix.
+    Shared builder behind :func:`stats_schema`, so every stats schema agrees on the routing-column
+    prefix.
 
     Args:
         extra_fields: Additional ``(name, type)`` fields appended after the routing columns.
@@ -131,8 +127,7 @@ def routing_stats_schema(extra_fields: list[tuple[str, pa.DataType]]) -> pa.Sche
 def routing_stats_ddl(extra_columns: list[tuple[str, str]]) -> str:
     """Return the Spark DDL string matching :func:`routing_stats_schema`.
 
-    Shared builder behind :func:`stats_spark_ddl` and
-    :func:`lance_etl.etl.bulk.bulk_stats_spark_ddl`.
+    Shared builder behind :func:`stats_spark_ddl`.
 
     Args:
         extra_columns: Additional ``(name, spark_type)`` columns appended after the routing columns.
@@ -428,23 +423,6 @@ def stream_routing_groups(
     yield from flush()
 
 
-def apply_ttl_cast(table: pa.Table, ttl_col: str) -> pa.Table:
-    """Cast the integer TTL column to ``pa.duration("s")`` so Arrow time arithmetic works natively.
-
-    Args:
-        table: The upsert table after pivot.
-        ttl_col: Name of the TTL column, per :data:`TTL_COL`.
-
-    Returns:
-        Table with the TTL column cast to ``pa.duration("s")``, or unchanged when absent or
-        non-integer.
-    """
-    if ttl_col not in table.schema.names or not pa.types.is_integer(table.schema.field(ttl_col).type):
-        return table
-    idx: int = table.schema.get_field_index(ttl_col)
-    return table.set_column(idx, ttl_col, table.column(ttl_col).cast(pa.duration("s")))
-
-
 def align_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
     """Conform a pivoted per-bucket slice to a driver-derived canonical schema.
 
@@ -484,8 +462,7 @@ def build_stats_batch(rows: list[tuple[Any, ...]], schema: pa.Schema) -> pa.Reco
     Args:
         rows: One tuple of values per dataset, matching the schema's column order — the routing
             column values followed by the extra stat values in schema order.
-        schema: The stats schema the rows conform to, e.g. from :func:`stats_schema` or
-            :func:`lance_etl.etl.bulk.bulk_stats_schema`.
+        schema: The stats schema the rows conform to, e.g. from :func:`stats_schema`.
 
     Returns:
         A record batch conforming to the given schema.

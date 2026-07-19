@@ -18,23 +18,24 @@ Create six query-value widgets from the gauges emitted by `TelemetrySloEmitter`:
 | Metric suffix | Meaning | Healthy condition |
 |---|---|---|
 | `reconciler.healthy` | Aggregate local control-loop health | `1` |
-| `reconciler.due_work` | Due claimable work rows | Below `reconciler_settings.max_due_work` |
+| `reconciler.due_work` | Due claimable work rows | Below `ReconcilerSettings.max_due_work` |
 | `reconciler.blocked_work` | Work requiring diagnosis | `0` |
 | `reconciler.blocked_source_snapshots` | Source transitions rejected or blocked | `0` |
 | `reconciler.oldest_open_age_seconds` | Age of oldest unfinished work | Below `max_open_work_age_seconds` |
 | `reconciler.retention_age_seconds` | Age of oldest cleanup-eligible evidence | Below `max_retention_age_seconds` |
 
-Use the PostgreSQL values as the alert thresholds. They are the durable policy and may differ from
-an older dashboard snapshot.
+Use the `ReconcilerSettings` values loaded from environment variables at process startup as the
+alert thresholds. They are the durable policy and may differ from an older dashboard snapshot until
+the process is restarted.
 
 Recommended alert order:
 
 1. `reconciler.healthy` is zero for two consecutive local cycles.
 2. blocked source snapshots are nonzero.
 3. blocked work is nonzero.
-4. oldest open age exceeds its PostgreSQL bound.
-5. due work exceeds its PostgreSQL bound.
-6. retention age exceeds its PostgreSQL bound.
+4. oldest open age exceeds its configured bound.
+5. due work exceeds its configured bound.
+6. retention age exceeds its configured bound.
 
 ## Reconciler investigation
 
@@ -180,7 +181,7 @@ requiring telemetry delivery.
 
 ## Dashboard review checklist
 
-- Thresholds match current `reconciler_settings`.
+- Thresholds match the current `ReconcilerSettings` environment configuration.
 - No high-cardinality dataset or version tags exist.
 - Reconciler health, blocked source, blocked work, open age, due work, and retention age are visible.
 - Search request rate, error ratio, latency, IO, cache, throttle, and open-handle capacity are visible.

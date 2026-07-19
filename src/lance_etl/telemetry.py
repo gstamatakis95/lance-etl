@@ -52,13 +52,13 @@ Raised above the 30-second Lance default to give headroom on hot multi-tenant da
 """
 
 DEFAULT_COMMIT_RETRIES: int = 20
-"""Conflict-retry budget for index commits and the per-row TTL-delete commit.
+"""Conflict-retry budget for index commits and the retention-delete commit.
 
 This is the single home for the budget that was duplicated across :class:`lance_etl.indexing.IndexJobConfig` and
 :class:`lance_etl.maintenance.MaintenanceConfig`. It sizes the only retry layer the binding-less segment-index
-commits and the TTL ``delete`` commit have. The fleet ``Compaction.commit`` call is a separate, smaller layer sized by
-:data:`DEFAULT_LARGE_COMMIT_RETRIES` instead, because its conflict scan is pinned to the plan version so a semantic
-conflict re-fails deterministically and only the raw manifest-write race benefits from a retry.
+commits and the retention ``delete`` commit have. The fleet ``Compaction.commit`` call is a separate, smaller layer
+sized by :data:`DEFAULT_LARGE_COMMIT_RETRIES` instead, because its conflict scan is pinned to the plan version so a
+semantic conflict re-fails deterministically and only the raw manifest-write race benefits from a retry.
 """
 
 DEFAULT_LARGE_COMMIT_RETRIES: int = 2

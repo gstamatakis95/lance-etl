@@ -147,7 +147,7 @@ variable table. These finer-grained normative facts are recorded here so they ar
 - **TimeRange windowing.** `VectorSearch`, `TextSearch`, and `HybridSearch` accept an optional
   `TimeRange { optional int64 start_ms; optional int64 end_ms }` (epoch milliseconds, start
   inclusive, end exclusive, either bound optional). The window always applies to the fixed
-  event-timestamp column (`event_timestamp`) and is translated to a typed range predicate ANDed
+  time column (`ts`) and is translated to a typed range predicate ANDed
   with any `Filter`, pruned by a BTREE or zone-map on that column. A `TimeRange` absent from the
   request leaves every search path behaving exactly as before.
 - **HybridSearch request-level filter.** `HybridSearch` accepts a request-level typed `filter`

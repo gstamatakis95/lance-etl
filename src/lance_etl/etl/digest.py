@@ -67,12 +67,12 @@ def encode_timestamp(value: datetime) -> bytes:
         ValueError: If the timestamp is naive or outside signed 64-bit range.
     """
     if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("event_timestamp must be timezone-aware")
+        raise ValueError("timestamp must be timezone-aware")
     epoch = datetime(1970, 1, 1, tzinfo=UTC)
     delta = value.astimezone(UTC) - epoch
     micros = delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
     if micros < -(1 << 63) or micros >= 1 << 63:
-        raise ValueError("event_timestamp is outside signed 64-bit microsecond range")
+        raise ValueError("timestamp is outside signed 64-bit microsecond range")
     return struct.pack(">q", micros)
 
 
@@ -157,21 +157,21 @@ def encode_value(value: Any) -> bytes:
 
 def canonical_event_digest(
     routing: tuple[str, str, str],
-    vector_id: str,
+    record_id: str,
     operation: str,
-    event_timestamp: datetime,
+    ts: datetime,
     payload: Mapping[str, Any],
 ) -> bytes:
     """Compute the frozen digest for one immutable business mutation.
 
-    Delivery metadata such as Iceberg sequence, snapshot, file, processing timestamp, and work
-    identity is intentionally absent so an exact redelivery has the same digest.
+    Delivery metadata such as Iceberg sequence, snapshot, file, and work identity is intentionally
+    absent so an exact redelivery has the same digest.
 
     Args:
         routing: Tenant, namespace, and organization identity.
-        vector_id: Logical record identity.
+        record_id: Logical record identity.
         operation: Normalized mutation operation.
-        event_timestamp: Query and TTL timestamp.
+        ts: Query and retention timestamp.
         payload: Complete normalized mutation payload.
 
     Returns:
@@ -180,9 +180,9 @@ def canonical_event_digest(
     encoded = bytearray(EVENT_DIGEST_HEADER)
     for component in routing:
         encoded.extend(encode_text(component))
-    encoded.extend(encode_text(vector_id))
+    encoded.extend(encode_text(record_id))
     encoded.extend(encode_text(operation))
-    encoded.extend(encode_timestamp(event_timestamp))
+    encoded.extend(encode_timestamp(ts))
     encoded.extend(encode_mapping(payload))
     return hashlib.sha256(encoded).digest()
 
@@ -191,7 +191,7 @@ def canonical_source_digest(rows: Iterable[tuple[str, int, bytes]]) -> bytes:
     """Compute a partition-independent digest over terminal target mutations.
 
     Args:
-        rows: Vector ID, Iceberg source sequence, and 32-byte event digest tuples.
+        rows: Record ID, Iceberg source sequence, and 32-byte event digest tuples.
 
     Returns:
         Raw 32-byte SHA-256 digest.
@@ -200,12 +200,12 @@ def canonical_source_digest(rows: Iterable[tuple[str, int, bytes]]) -> bytes:
         ValueError: If a source sequence or digest has an invalid representation.
     """
     ordered: list[tuple[bytes, int, bytes]] = []
-    for vector_id, source_sequence, event_digest in rows:
+    for record_id, source_sequence, event_digest in rows:
         if source_sequence < -(1 << 63) or source_sequence >= 1 << 63:
             raise ValueError(f"source sequence is outside signed 64-bit range: {source_sequence}")
         if len(event_digest) != 32:
             raise ValueError(f"event digest must contain 32 bytes, got {len(event_digest)}")
-        ordered.append((vector_id.encode("utf-8"), source_sequence, event_digest))
+        ordered.append((record_id.encode("utf-8"), source_sequence, event_digest))
     ordered.sort(key=lambda item: item[0])
     encoded = bytearray(SOURCE_DIGEST_HEADER)
     for vector_bytes, source_sequence, event_digest in ordered:

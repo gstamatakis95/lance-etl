@@ -12,8 +12,9 @@ that contract.
 
 ## Event time is not source progress
 
-The dataset specification contains exactly one `EVENT_TIME` field. Event time drives search ranges
-and optional TTL expiration. It does not define which source data has been processed.
+The dataset specification contains exactly one `EVENT_TIME` field, the canonical `ts` column. Event
+time drives search ranges and optional retention expiry. It does not define which source data has
+been processed.
 
 Source progress uses:
 
@@ -48,11 +49,13 @@ start bound is inclusive and the end bound is exclusive.
 Time filtering stays within the one resolved dataset and exact publication version. There is no
 date-based dataset fan-out.
 
-## TTL interaction
+## Retention interaction
 
-When the active spec contains a `TTL` field, maintenance computes expiry from event time plus the TTL
-duration. Deletion materialization then follows the revision's `materialize_deletions` and
-`materialize_deletions_threshold` settings. Source snapshot retention remains independent of TTL.
+When the active spec revision sets a `record_retention_seconds` window, maintenance computes expiry
+from the `ts` column plus the window, deleting every row whose `ts` is before now minus the window.
+Deletion materialization then follows the revision's `materialize_deletions` and
+`materialize_deletions_threshold` settings. Source snapshot retention remains independent of record
+retention.
 
 ## Validation checklist
 

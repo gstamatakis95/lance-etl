@@ -3,15 +3,14 @@
 The decisions behind lance-etl are consolidated into seven thematic documents. Inside each
 document, every still-relevant decision keeps its original ADR number as a section heading, so
 a reference like "ADR 0030" anywhere in the code or docs resolves through the table below.
-Superseded decisions are one-line notes in their home document. The evidence behind the
-decisions lives in [`../../market-research/`](../../market-research).
+Superseded decisions are one-line notes in their home document.
 
 The seven documents:
 
 | Document | Covers |
 |---|---|
 | [etl-and-data-model.md](etl-and-data-model.md) | Iceberg reads, routing, the event-time clock, the dynamic map pivot, exact source identities |
-| [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Local PostgreSQL reconciliation, historical workflow evolution, task-based execution, TTL, coexistence, Iceberg upkeep |
+| [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Local PostgreSQL reconciliation, historical workflow evolution, task-based execution, retention, coexistence, Iceberg upkeep |
 | [indexing.md](indexing.md) | Segment-API flows, vector artifact storage, role auto-indexing, the streaming k-means bootstrap, the object-store centroid cache |
 | [serving-filters-and-tags.md](serving-filters-and-tags.md) | Crate layering, the typed filter AST, time ranges, blue-green serving, per-query version pinning |
 | [caching-and-observability.md](caching-and-observability.md) | The persistent cache and its pluggable backends, Prewarm, the Lance trace bridge, recall auditing |
@@ -39,7 +38,7 @@ Index of every original ADR number:
 | 0015 | CLI and config knob reduction | [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | Accepted |
 | 0016 | Event-time canonical clock | [etl-and-data-model.md](etl-and-data-model.md) | Accepted |
 | 0017 | Rust intake service with a pluggable record sink | [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | Superseded |
-| 0018 | Per-row TTL expiration inside maintenance | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
+| 0018 | Retention-window expiry inside maintenance | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
 | 0019 | Namespace copy/migrate utility | [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | Accepted |
 | 0020 | Static declared-field map pivot | [etl-and-data-model.md](etl-and-data-model.md) | Superseded by 0024 |
 | 0021 | Event-time range on the search RPCs | [serving-filters-and-tags.md](serving-filters-and-tags.md) | Accepted |

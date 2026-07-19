@@ -32,18 +32,13 @@ from lance_etl.state.tables import (
     dataset_fields,
     dataset_publications,
     dataset_spec_revisions,
-    dataset_specs,
-    dataset_state,
     dataset_work,
     datasets,
-    fts_index_options,
     iceberg_sources,
     index_definitions,
     metadata,
     publication_indexes,
-    reconciler_settings,
     source_snapshots,
-    vector_index_options,
 )
 from lance_etl.state.types import (
     ControlPlaneStatus,
@@ -60,9 +55,7 @@ from lance_etl.state.types import (
     WorkClaim,
     WorkExecutionContext,
     WorkKind,
-    WorkLauncherKind,
     WorkPhase,
-    WorkProvenance,
     WorkState,
     deterministic_dataset_id,
 )
@@ -74,20 +67,15 @@ REPOSITORY_ROOT: Path = Path(__file__).resolve().parent.parent
 """Repository root used to locate Alembic configuration."""
 
 APPLICATION_TABLES: set[str] = {
-    "reconciler_settings",
-    "dataset_specs",
     "dataset_spec_revisions",
     "dataset_fields",
     "index_definitions",
-    "vector_index_options",
-    "fts_index_options",
     "iceberg_sources",
     "datasets",
     "source_snapshots",
     "dataset_work",
     "dataset_publications",
     "publication_indexes",
-    "dataset_state",
 }
 """Exact application tables installed by the single Alembic baseline."""
 
@@ -440,16 +428,14 @@ def test_migration_creates_exact_entities_and_seeded_typed_configuration(
         "index_definition_id",
         "actual_index_type",
     ]
-    settings: ReconcilerSettings = repository.reconciler_settings()
+    settings: ReconcilerSettings = ReconcilerSettings.from_environment()
     assert settings.claim_batch_size > 0
     with engine.connect() as connection:
-        assert connection.scalar(sa.select(sa.func.count()).select_from(reconciler_settings)) == 1
-        assert connection.scalar(sa.select(sa.func.count()).select_from(dataset_specs)) == 1
         assert connection.scalar(sa.select(sa.func.count()).select_from(dataset_spec_revisions)) == 1
-        assert connection.scalar(sa.select(sa.func.count()).select_from(dataset_fields)) == 10
+        assert connection.scalar(sa.select(sa.func.count()).select_from(dataset_fields)) == len(
+            production_default_spec_revision().fields
+        )
         assert connection.scalar(sa.select(sa.func.count()).select_from(index_definitions)) == 6
-        assert connection.scalar(sa.select(sa.func.count()).select_from(vector_index_options)) == 1
-        assert connection.scalar(sa.select(sa.func.count()).select_from(fts_index_options)) == 1
         revision: DatasetSpecRevision = repository.load_spec_revision(connection, DEFAULT_SPEC_REVISION_ID)
     assert revision.expected_configuration_digest() == revision.configuration_digest
     assert revision.ingest_shuffle_partitions > 0
@@ -468,24 +454,22 @@ def test_specification_lifecycle_freezes_history_and_enqueues_revision_convergen
     """
     repository: ControlPlaneRepository = postgres_repository[0]
     engine: Engine = postgres_repository[1]
-    with pytest.raises(ValueError, match="specification name must match"):
-        repository.create_spec("Étl")
-    requested_spec_id: uuid.UUID = uuid.uuid4()
-    spec_id: uuid.UUID = repository.create_spec("tenant-vectors", "Tenant vector policy", requested_spec_id)
-    assert spec_id == requested_spec_id
-    assert repository.create_spec("tenant-vectors", "Tenant vector policy", requested_spec_id) == spec_id
-    with pytest.raises(StateTransitionError, match="different immutable values"):
-        repository.create_spec("tenant-vectors", "Changed description", requested_spec_id)
-
+    spec_id: uuid.UUID = uuid.uuid4()
     first_input: DatasetSpecRevision = draft_revision(spec_id)
+    with pytest.raises(ValueError, match="specification name must match"):
+        repository.create_draft_spec_revision(first_input, "Étl")
     with pytest.raises(ValueError, match="at most four decimal places"):
-        repository.create_draft_spec_revision(replace(first_input, materialize_deletions_threshold=0.12345))
-    first: DatasetSpecRevision = repository.create_draft_spec_revision(first_input)
+        repository.create_draft_spec_revision(
+            replace(first_input, materialize_deletions_threshold=0.12345), "tenant-vectors"
+        )
+    first: DatasetSpecRevision = repository.create_draft_spec_revision(
+        first_input, "tenant-vectors", "Tenant vector policy"
+    )
     assert first.state is SpecRevisionState.DRAFT
     assert first.configuration_digest == first.expected_configuration_digest()
-    assert repository.create_draft_spec_revision(first_input) == first
+    assert repository.create_draft_spec_revision(first_input, "tenant-vectors", "Tenant vector policy") == first
     with pytest.raises(StateTransitionError, match="different content"):
-        repository.create_draft_spec_revision(replace(first_input, ingest_shuffle_partitions=17))
+        repository.create_draft_spec_revision(replace(first_input, ingest_shuffle_partitions=17), "tenant-vectors")
     first_active: DatasetSpecRevision = repository.activate_spec_revision(first.spec_revision_id)
     assert first_active.state is SpecRevisionState.ACTIVE
     assert repository.activate_spec_revision(first.spec_revision_id) == first_active
@@ -501,7 +485,7 @@ def test_specification_lifecycle_freezes_history_and_enqueues_revision_convergen
         draft_revision(spec_id, 2, first.spec_revision_id),
         ingest_shuffle_partitions=first.ingest_shuffle_partitions + 1,
     )
-    second: DatasetSpecRevision = repository.create_draft_spec_revision(second_input)
+    second: DatasetSpecRevision = repository.create_draft_spec_revision(second_input, "tenant-vectors")
     with (
         pytest.raises(sa.exc.IntegrityError, match="DRAFT revisions may transition only to ACTIVE"),
         engine.begin() as connection,
@@ -570,8 +554,8 @@ def test_specification_lifecycle_freezes_history_and_enqueues_revision_convergen
         engine.begin() as connection,
     ):
         connection.execute(
-            sa.update(vector_index_options)
-            .where(vector_index_options.c.index_definition_id == vector_index.index_definition_id)
+            sa.update(index_definitions)
+            .where(index_definitions.c.index_definition_id == vector_index.index_definition_id)
             .values(num_partitions=3)
         )
     with (
@@ -607,7 +591,7 @@ def test_specification_lifecycle_freezes_history_and_enqueues_revision_convergen
     assert rebuild_rows[0]["spec_revision_id"] == second.spec_revision_id
     assert desired_revision_id == second.spec_revision_id
 
-    empty_spec_id: uuid.UUID = repository.create_spec("empty-policy")
+    empty_spec_id: uuid.UUID = uuid.uuid4()
     with (
         pytest.raises(sa.exc.IntegrityError, match="source default specification must have an ACTIVE revision"),
         engine.begin() as connection,
@@ -617,45 +601,6 @@ def test_specification_lifecycle_freezes_history_and_enqueues_revision_convergen
             .where(iceberg_sources.c.source_id == source.source_id)
             .values(default_spec_id=empty_spec_id)
         )
-
-
-def test_airflow_claim_provenance_is_audit_only_and_persisted(
-    postgres_repository: tuple[ControlPlaneRepository, Engine],
-) -> None:
-    """Optional Airflow context is recorded on a normal PostgreSQL work claim.
-
-    Args:
-        postgres_repository: Fresh repository and engine fixture.
-    """
-    repository: ControlPlaneRepository = postgres_repository[0]
-    engine: Engine = postgres_repository[1]
-    source: IcebergSource = register_source(repository)
-    repository.enqueue_source_snapshot(
-        source_plan(source.source_id, 100, 10, None, SourceSnapshotKind.BASELINE),
-        [dataset_plan()],
-    )
-    provenance: WorkProvenance = WorkProvenance(
-        launcher_kind=WorkLauncherKind.AIRFLOW,
-        airflow_ctx_dag_id="local-reconcile",
-        airflow_ctx_dag_run_id="manual__2026-07-18",
-        airflow_ctx_task_id="reconcile",
-        airflow_ctx_map_index=-1,
-        airflow_ctx_try_number=2,
-    )
-    claims: list[WorkClaim] = repository.claim_due_work(1, timedelta(minutes=5), provenance=provenance)
-    assert len(claims) == 1
-    with engine.connect() as connection:
-        row: RowMapping = (
-            connection.execute(sa.select(dataset_work).where(dataset_work.c.work_id == claims[0].work_id))
-            .mappings()
-            .one()
-        )
-    assert row["launcher_kind"] == WorkLauncherKind.AIRFLOW.value
-    assert row["airflow_ctx_dag_id"] == "local-reconcile"
-    assert row["airflow_ctx_dag_run_id"] == "manual__2026-07-18"
-    assert row["airflow_ctx_task_id"] == "reconcile"
-    assert row["airflow_ctx_map_index"] == -1
-    assert row["airflow_ctx_try_number"] == 2
 
 
 def test_postgres_rejects_fields_outside_the_runtime_contract(
@@ -668,8 +613,8 @@ def test_postgres_rejects_fields_outside_the_runtime_contract(
     """
     repository: ControlPlaneRepository = postgres_repository[0]
     engine: Engine = postgres_repository[1]
-    spec_id: uuid.UUID = repository.create_spec("field-contract-test")
-    draft: DatasetSpecRevision = repository.create_draft_spec_revision(draft_revision(spec_id))
+    spec_id: uuid.UUID = uuid.uuid4()
+    draft: DatasetSpecRevision = repository.create_draft_spec_revision(draft_revision(spec_id), "field-contract-test")
     base_row: dict[str, object] = {
         "field_id": uuid.uuid4(),
         "spec_revision_id": draft.spec_revision_id,
@@ -709,19 +654,6 @@ def test_postgres_rejects_fields_outside_the_runtime_contract(
                 "source_column": "event_time",
                 "source_key": None,
                 "data_type": "timestamp[us,UTC]",
-                "vector_dimension": None,
-            },
-        ),
-        (
-            "ck_dataset_fields_source_contract",
-            {
-                "target_name": "expires",
-                "role": "TTL",
-                "source_kind": "DIRECT",
-                "source_column": "expires",
-                "source_key": None,
-                "data_type": "duration[s]",
-                "required_on_upsert": False,
                 "vector_dimension": None,
             },
         ),
@@ -869,7 +801,6 @@ def test_snapshot_enqueue_is_idempotent_and_fenced_claims_expire_safely(
     dataset_id: uuid.UUID = deterministic_dataset_id(source.source_id, identity)
     with engine.connect() as connection:
         assert connection.scalar(sa.select(sa.func.count()).select_from(datasets)) == 1
-        assert connection.scalar(sa.select(sa.func.count()).select_from(dataset_state)) == 1
         assert connection.scalar(sa.select(sa.func.count()).select_from(source_snapshots)) == 1
         assert connection.scalar(sa.select(sa.func.count()).select_from(dataset_work)) == 1
     claimed_at: datetime = datetime.now(UTC) + timedelta(seconds=1)
@@ -900,7 +831,7 @@ def test_snapshot_enqueue_is_idempotent_and_fenced_claims_expire_safely(
     assert not repository.complete_ingest(first_claim, 1, 10, b"a" * 32, claimed_at + timedelta(seconds=7))
     assert repository.complete_ingest(second_claim, 1, 10, b"a" * 32, claimed_at + timedelta(seconds=7))
     with engine.connect() as connection:
-        state_row: RowMapping = connection.execute(sa.select(dataset_state)).mappings().one()
+        state_row: RowMapping = connection.execute(sa.select(datasets)).mappings().one()
         snapshot_row: RowMapping = connection.execute(sa.select(source_snapshots)).mappings().one()
         work_row: RowMapping = (
             connection.execute(sa.select(dataset_work).where(dataset_work.c.work_id == second_claim.work_id))
@@ -971,7 +902,7 @@ def test_ingest_to_publish_commits_normalized_evidence_and_pointer_atomically(
         )
     with engine.connect() as connection:
         assert connection.scalar(sa.select(sa.func.count()).select_from(dataset_publications)) == 0
-        assert connection.scalar(sa.select(dataset_state.c.active_publication_id)) is None
+        assert connection.scalar(sa.select(datasets.c.active_publication_id)) is None
     assert repository.publish_dataset(
         publish_claim,
         publish_claim.ingest_lance_uri,
@@ -994,7 +925,7 @@ def test_ingest_to_publish_commits_normalized_evidence_and_pointer_atomically(
     assert served.lance_version == 3
     with engine.connect() as connection:
         publication_row: RowMapping = connection.execute(sa.select(dataset_publications)).mappings().one()
-        state_row: RowMapping = connection.execute(sa.select(dataset_state)).mappings().one()
+        state_row: RowMapping = connection.execute(sa.select(datasets)).mappings().one()
         evidence_rows: list[RowMapping] = list(connection.execute(sa.select(publication_indexes)).mappings())
         publish_work: RowMapping = (
             connection.execute(sa.select(dataset_work).where(dataset_work.c.work_id == publish_claim.work_id))
@@ -1122,14 +1053,12 @@ def test_retry_bound_blocks_work_and_explicit_retry_reopens_it(
         source_plan(source.source_id, 100, 10, None, SourceSnapshotKind.BASELINE),
         [dataset_plan()],
     )
-    with engine.begin() as connection:
-        connection.execute(sa.update(reconciler_settings).values(max_attempts=2))
     first_claim: WorkClaim = claim_one(repository)
-    assert repository.retry_work(first_claim, timedelta(0), "TRANSIENT", "try again")
-    assert not repository.retry_work(first_claim, timedelta(0), "STALE", "lost fence")
+    assert repository.retry_work(first_claim, timedelta(0), "TRANSIENT", "try again", 2)
+    assert not repository.retry_work(first_claim, timedelta(0), "STALE", "lost fence", 2)
     second_claim: WorkClaim = claim_one(repository)
     assert second_claim.attempt_count == 2
-    assert repository.retry_work(second_claim, timedelta(0), "TRANSIENT", "still failing")
+    assert repository.retry_work(second_claim, timedelta(0), "TRANSIENT", "still failing", 2)
     status: ControlPlaneStatus = repository.control_plane_status()
     assert status.blocked_work == 1
     assert status.retry_wait_work == 0
@@ -1248,7 +1177,7 @@ def test_rebuild_uses_isolated_uri_and_atomically_replaces_active_generation(
             .mappings()
             .one()
         )
-        state_row: RowMapping = connection.execute(sa.select(dataset_state)).mappings().one()
+        state_row: RowMapping = connection.execute(sa.select(datasets)).mappings().one()
     assert original_row["retired_at"] is not None
     assert state_row["ingest_lance_uri"] == candidate_uri
     assert state_row["ingest_lance_version"] == 2

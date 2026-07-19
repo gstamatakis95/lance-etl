@@ -227,7 +227,7 @@ impl ObjectStore for CountingStore {
 /// positions on `text` plus a BTree index on `id`, so prewarm has both FTS and scalar targets.
 pub async fn build_indexed_dataset(uri: &str) {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("vector_id", DataType::Utf8, false),
+        Field::new("record_id", DataType::Utf8, false),
         Field::new("is_deleted", DataType::Boolean, false),
         Field::new("id", DataType::Int32, false),
         Field::new("text", DataType::Utf8, false),

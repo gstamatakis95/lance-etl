@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import lance
 import pyarrow as pa
 import pytest
 
@@ -34,7 +35,14 @@ from lance_etl.reconciler import (
 from lance_etl.reconciler.cli import build_parser, execute_command
 from lance_etl.reconciler.config import RuntimeSettings
 from lance_etl.reconciler.iceberg import DurableSourcePlanProvider
-from lance_etl.reconciler.workers import FencedWorkExecutor, persisted_arrow_schema, required_indexes
+from lance_etl.reconciler.workers import (
+    ConfiguredPublicationRunner,
+    FencedWorkExecutor,
+    index_kind_matches,
+    persisted_arrow_schema,
+    required_indexes,
+    resolved_actual_index_kind,
+)
 from lance_etl.source import (
     BaselineProof,
     PartitionField,
@@ -213,7 +221,7 @@ def valid_partition_spec(spec_id: int = 7) -> PartitionSpec:
             PartitionField("tenant_id", "tenant_id", "identity"),
             PartitionField("namespace", "namespace", "identity"),
             PartitionField("org_id", "org_id", "identity"),
-            PartitionField("processing_timestamp_hour", "processing_timestamp", "hour"),
+            PartitionField("ts_hour", "ts", "hour"),
         ),
     )
 
@@ -409,7 +417,7 @@ def test_retry_delay_is_reproducible_capped_and_used_by_reconciler() -> None:
     repository.retry_work.return_value = True
     result: WorkResult = WorkResult(claim, ResultKind.RETRY, error_code="TRANSIENT", error_message="try again")
     assert ResultReconciler(repository, settings).reconcile(result)
-    repository.retry_work.assert_called_once_with(claim, first, "TRANSIENT", "try again", None)
+    repository.retry_work.assert_called_once_with(claim, first, "TRANSIENT", "try again", settings.max_attempts, None)
 
 
 def test_bounded_dispatcher_isolates_worker_failures_and_stale_results() -> None:
@@ -453,15 +461,121 @@ def test_required_indexes_are_entirely_specification_driven() -> None:
     )
 
 
+def test_index_kind_gate_accepts_pylance8_unknown_inverted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On pylance 8 an INVERTED index reported as Unknown resolves through its stats type.
+
+    pylance 8.0.0 reports a segment-committed inverted index's ``describe_indices`` type as
+    ``Unknown`` while ``stats.index_stats`` still reports the true ``Inverted`` type. The gate must
+    recover the true type from stats and still reject genuinely wrong types.
+    """
+    monkeypatch.setattr(lance, "__version__", "8.0.0")
+    assert resolved_actual_index_kind("UNKNOWN", "Inverted") == "INVERTED"
+    assert index_kind_matches("INVERTED", resolved_actual_index_kind("UNKNOWN", "Inverted"))
+    assert not index_kind_matches("INVERTED", resolved_actual_index_kind("UNKNOWN", "BTree"))
+    assert resolved_actual_index_kind("IVF_RQ", "IVF_RQ") == "IVF_RQ"
+    assert resolved_actual_index_kind("UNKNOWN", None) == "UNKNOWN"
+
+
+def test_index_kind_gate_does_not_fall_back_on_pylance9(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On pylance 9 the describe type is authoritative and the Unknown fallback is disabled.
+
+    The fallback is scoped to pylance majors below 9 because that behaviour is untested against 9.x.
+    A future bump must re-check the assumption rather than silently accept Unknown as any type.
+    """
+    monkeypatch.setattr(lance, "__version__", "9.0.0-beta.17")
+    assert resolved_actual_index_kind("UNKNOWN", "Inverted") == "UNKNOWN"
+    assert not index_kind_matches("INVERTED", resolved_actual_index_kind("UNKNOWN", "Inverted"))
+
+
+class StopAfterQualify(RuntimeError):
+    """Sentinel raised from the mocked gate to end a publish run after ordering is recorded."""
+
+
+def test_publication_runner_compacts_then_indexes_then_qualifies(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A compaction-enabled first publish runs compaction, then indexing, then qualification.
+
+    Regression guard for the suspected ordering defect: the publish worker must maintain the
+    candidate and build every index before the qualification gate reads it, so the gate never
+    inspects a pre-index compaction output.
+    """
+    order: list[str] = []
+
+    def record_compaction(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        del args, kwargs
+        order.append("compaction")
+        return [{}]
+
+    maintenance_job: MagicMock = MagicMock()
+    maintenance_job.return_value.run.side_effect = record_compaction
+    monkeypatch.setattr("lance_etl.reconciler.workers.MaintenanceJob", maintenance_job)
+
+    class RecordingRunner(ConfiguredPublicationRunner):
+        """Publication runner whose side-effecting steps only record their invocation order."""
+
+        def candidate_pin_version(self, candidate_uri: str, pin: str) -> int | None:
+            """Report the candidate as unpinned so the first-publish branch runs."""
+            del candidate_uri, pin
+            return None
+
+        def run_indexing(self, candidate_uri: str, spec: DatasetSpecRevision) -> list[dict[str, object]]:
+            """Record the indexing step without building any index."""
+            del candidate_uri, spec
+            order.append("indexing")
+            return []
+
+        def candidate_version(self, candidate_uri: str) -> int:
+            """Return a fixed post-index head version."""
+            del candidate_uri
+            return 5
+
+        def pin_candidate(self, candidate_uri: str, candidate_version: int, pin: str) -> None:
+            """Skip immutable pin persistence."""
+            del candidate_uri, candidate_version, pin
+
+        def candidate_counts(
+            self, candidate_uri: str, lance_version: int, spec: DatasetSpecRevision
+        ) -> tuple[int, int, int, int]:
+            """Return fixed distributed count evidence."""
+            del candidate_uri, lance_version, spec
+            return (16, 16, 16, 16)
+
+        def qualify_candidate(
+            self,
+            candidate_uri: str,
+            spec: DatasetSpecRevision,
+            lance_version: int | None,
+            counts: tuple[int, int, int, int] | None,
+        ) -> dict[str, object]:
+            """Record the qualification step and stop the run before persistence."""
+            del candidate_uri, spec, lance_version, counts
+            order.append("qualify")
+            raise StopAfterQualify
+
+    runner: RecordingRunner = RecordingRunner(MagicMock(), MagicMock(), MagicMock())
+
+    claim: MagicMock = MagicMock()
+    claim.kind = WorkKind.PUBLISH
+    claim.work_id = uuid.uuid4()
+    claim.ingest_lance_uri = "memory://candidate"
+    context: MagicMock = MagicMock()
+    context.claim = claim
+    context.candidate_lance_uri = None
+    context.spec_revision = production_default_spec_revision()
+
+    with pytest.raises(StopAfterQualify):
+        runner.run(context)
+    assert order == ["compaction", "indexing", "qualify"]
+
+
 def test_persisted_schema_exactly_matches_the_normalized_field_graph() -> None:
     """The writer and publication qualifier share exact order, physical types, and nullability."""
     spec: DatasetSpecRevision = production_default_spec_revision()
     schema: pa.Schema = persisted_arrow_schema(spec)
 
     assert schema.names == [field.target_name for field in sorted(spec.fields, key=lambda item: item.ordinal)]
-    assert schema.field("vector_id") == pa.field("vector_id", pa.string(), nullable=False)
+    assert schema.field("record_id") == pa.field("record_id", pa.string(), nullable=False)
+    assert schema.field("ts") == pa.field("ts", pa.timestamp("us", "UTC"))
     assert schema.field("vector") == pa.field("vector", pa.list_(pa.float32(), 128))
-    assert schema.field("ttl") == pa.field("ttl", pa.duration("s"))
     assert schema.field("lance_etl_event_digest") == pa.field(
         "lance_etl_event_digest",
         pa.binary(32),

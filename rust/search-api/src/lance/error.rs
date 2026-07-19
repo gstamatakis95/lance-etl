@@ -77,7 +77,46 @@ mod tests {
 
     use super::*;
 
+    /// Process-global no-op subscriber that keeps every callsite dynamically interested.
+    ///
+    /// A callsite first touched while no admitting subscriber is installed (a sibling test calling
+    /// [`classify_lance_error`] without one) can cache its interest as `never`, which permanently
+    /// suppresses that event for any later scoped capture subscriber. Registering a global default
+    /// whose `register_callsite` returns [`Interest::sometimes`] forces per-event evaluation against
+    /// the currently active dispatcher, so a subsequent
+    /// [`rebuild_interest_cache`](tracing::callsite::rebuild_interest_cache) lifts any stale `never`
+    /// and the scoped capture subscriber sees the events. It emits nothing itself.
+    struct AlwaysInterestedSubscriber;
+
+    impl tracing::Subscriber for AlwaysInterestedSubscriber {
+        fn register_callsite(&self, _: &tracing::Metadata<'_>) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {}
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
     /// Cloneable writer collecting one subscriber's formatted events.
+    ///
+    /// Subscribers writing here must disable ANSI styling (`with_ansi(false)`): the default fmt
+    /// layer wraps `field=value` pairs in escape codes, which splits substrings such as
+    /// `error_class="internal"` and defeats a `contains` assertion.
     #[derive(Clone)]
     struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -193,9 +232,13 @@ mod tests {
         let tracing_guard = crate::telemetry::TRACING_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = tracing::subscriber::set_global_default(AlwaysInterestedSubscriber);
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let writer = CaptureWriter(bytes.clone());
-        let subscriber = tracing_subscriber::fmt().with_writer(move || writer.clone()).finish();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
         tracing::subscriber::with_default(subscriber, || {
             tracing::callsite::rebuild_interest_cache();
             classify_lance_error(&lance::Error::dataset_not_found(

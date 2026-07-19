@@ -224,7 +224,7 @@ def score_hybrid_sample(
     distance_type: str = sample.distance_type or default_distance
     query: np.ndarray = np.asarray(sample.query_vector, dtype=np.float64)
     try:
-        vector_ids, vector_scores, vector_count = brute_force_top_k_scored(
+        record_ids, vector_scores, vector_count = brute_force_top_k_scored(
             dataset,
             query,
             sample.k,
@@ -240,7 +240,7 @@ def score_hybrid_sample(
     except (ValueError, OSError, RuntimeError):
         return skipped_score(sample, "scan_error", version_drift)
     return grade_hybrid_reference(
-        sample, vector_ids, vector_scores, vector_count, text_ids, text_scores, text_count, version_drift
+        sample, record_ids, vector_scores, vector_count, text_ids, text_scores, text_count, version_drift
     )
 
 

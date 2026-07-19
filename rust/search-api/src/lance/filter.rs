@@ -364,13 +364,13 @@ mod tests {
             start_ms: Some(1_000),
             end_ms: Some(2_000),
         };
-        let expr = time_range_to_expr(&range, "event_timestamp", &data_type)
+        let expr = time_range_to_expr(&range, "ts", &data_type)
             .unwrap()
             .expect("a bounded window must produce an expression");
         let tz: Option<std::sync::Arc<str>> = Some("UTC".into());
-        let expected = col("event_timestamp")
+        let expected = col("ts")
             .gt_eq(lit(ScalarValue::TimestampMicrosecond(Some(1_000_000), tz.clone())))
-            .and(col("event_timestamp").lt(lit(ScalarValue::TimestampMicrosecond(Some(2_000_000), tz))));
+            .and(col("ts").lt(lit(ScalarValue::TimestampMicrosecond(Some(2_000_000), tz))));
         assert_eq!(expr, expected);
     }
 
@@ -382,14 +382,14 @@ mod tests {
                 start_ms: Some(5),
                 end_ms: None,
             },
-            "event_timestamp",
+            "ts",
             &millis,
         )
         .unwrap()
         .unwrap();
         assert_eq!(
             start_only,
-            col("event_timestamp").gt_eq(lit(ScalarValue::TimestampMillisecond(Some(5), None)))
+            col("ts").gt_eq(lit(ScalarValue::TimestampMillisecond(Some(5), None)))
         );
 
         let nanos = DataType::Timestamp(TimeUnit::Nanosecond, None);
@@ -398,14 +398,14 @@ mod tests {
                 start_ms: None,
                 end_ms: Some(3),
             },
-            "event_timestamp",
+            "ts",
             &nanos,
         )
         .unwrap()
         .unwrap();
         assert_eq!(
             end_only,
-            col("event_timestamp").lt(lit(ScalarValue::TimestampNanosecond(Some(3_000_000), None)))
+            col("ts").lt(lit(ScalarValue::TimestampNanosecond(Some(3_000_000), None)))
         );
     }
 
@@ -416,19 +416,19 @@ mod tests {
                 start_ms: Some(42),
                 end_ms: None,
             },
-            "event_timestamp",
+            "ts",
             &DataType::Int64,
         )
         .unwrap()
         .unwrap();
-        assert_eq!(expr, col("event_timestamp").gt_eq(lit(42_i64)));
+        assert_eq!(expr, col("ts").gt_eq(lit(42_i64)));
     }
 
     #[test]
     fn time_range_without_bounds_produces_no_expression() {
         let none = time_range_to_expr(
             &TimeRange::default(),
-            "event_timestamp",
+            "ts",
             &DataType::Timestamp(TimeUnit::Microsecond, None),
         )
         .unwrap();
@@ -442,7 +442,7 @@ mod tests {
                 start_ms: Some(1),
                 end_ms: None,
             },
-            "event_timestamp",
+            "ts",
             &DataType::Utf8,
         )
         .unwrap_err();
@@ -456,7 +456,7 @@ mod tests {
                 start_ms: Some(i64::MAX),
                 end_ms: None,
             },
-            "event_timestamp",
+            "ts",
             &DataType::Timestamp(TimeUnit::Microsecond, None),
         )
         .unwrap_err();
@@ -467,7 +467,7 @@ mod tests {
                 start_ms: Some(i64::MIN),
                 end_ms: None,
             },
-            "event_timestamp",
+            "ts",
             &DataType::Timestamp(TimeUnit::Nanosecond, None),
         )
         .unwrap_err();
@@ -482,14 +482,14 @@ mod tests {
                 start_ms: Some(1_500),
                 end_ms: Some(2_500),
             },
-            "event_timestamp",
+            "ts",
             &seconds,
         )
         .unwrap()
         .unwrap();
-        let expected = col("event_timestamp")
+        let expected = col("ts")
             .gt_eq(lit(ScalarValue::TimestampSecond(Some(2), None)))
-            .and(col("event_timestamp").lt(lit(ScalarValue::TimestampSecond(Some(3), None))));
+            .and(col("ts").lt(lit(ScalarValue::TimestampSecond(Some(3), None))));
         assert_eq!(
             expr, expected,
             "both bounds must ceil so coarse storage never admits values outside the millisecond window"
@@ -500,14 +500,14 @@ mod tests {
                 start_ms: Some(2_000),
                 end_ms: Some(3_000),
             },
-            "event_timestamp",
+            "ts",
             &seconds,
         )
         .unwrap()
         .unwrap();
-        let expected_exact = col("event_timestamp")
+        let expected_exact = col("ts")
             .gt_eq(lit(ScalarValue::TimestampSecond(Some(2), None)))
-            .and(col("event_timestamp").lt(lit(ScalarValue::TimestampSecond(Some(3), None))));
+            .and(col("ts").lt(lit(ScalarValue::TimestampSecond(Some(3), None))));
         assert_eq!(exact, expected_exact, "exact-second bounds must not be widened");
 
         let negative = time_range_to_expr(
@@ -515,14 +515,14 @@ mod tests {
                 start_ms: Some(-1_500),
                 end_ms: Some(-500),
             },
-            "event_timestamp",
+            "ts",
             &seconds,
         )
         .unwrap()
         .unwrap();
-        let expected_negative = col("event_timestamp")
+        let expected_negative = col("ts")
             .gt_eq(lit(ScalarValue::TimestampSecond(Some(-1), None)))
-            .and(col("event_timestamp").lt(lit(ScalarValue::TimestampSecond(Some(0), None))));
+            .and(col("ts").lt(lit(ScalarValue::TimestampSecond(Some(0), None))));
         assert_eq!(
             negative, expected_negative,
             "pre-epoch bounds must preserve the same millisecond semantics"
@@ -536,12 +536,12 @@ mod tests {
                 start_ms: Some(42),
                 end_ms: None,
             },
-            "event_timestamp",
+            "ts",
             &DataType::Int32,
         )
         .unwrap()
         .unwrap();
-        assert_eq!(in_range, col("event_timestamp").gt_eq(lit(42_i32)));
+        assert_eq!(in_range, col("ts").gt_eq(lit(42_i32)));
 
         let realistic_epoch_ms = 1_770_000_000_000_i64;
         let err = time_range_to_expr(
@@ -549,7 +549,7 @@ mod tests {
                 start_ms: Some(realistic_epoch_ms),
                 end_ms: None,
             },
-            "event_timestamp",
+            "ts",
             &DataType::Int32,
         )
         .unwrap_err();
@@ -563,7 +563,7 @@ mod tests {
                 start_ms: None,
                 end_ms: Some(i64::MIN),
             },
-            "event_timestamp",
+            "ts",
             &DataType::Int32,
         )
         .unwrap_err();

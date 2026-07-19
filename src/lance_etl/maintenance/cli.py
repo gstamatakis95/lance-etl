@@ -1,10 +1,11 @@
-"""Maintenance job CLI: per-dataset TTL expiration, compaction, version cleanup, and manifest migration.
+"""Maintenance job CLI: per-dataset retention expiry, compaction, version cleanup, and manifest migration.
 
-Exposes the ``main()`` entry point consumed by the ``lance-etl-maintenance`` script and
-``python -m lance_etl.maintenance``.  Three subcommands are provided.
+Uninstalled operator CLI, not registered as a console script in ``pyproject.toml``. Exposes the
+``main()`` entry point reachable via ``python -m lance_etl.maintenance.cli``. Three subcommands are
+provided.
 
-``run`` applies maintenance to a fleet of datasets: per-row TTL expiration (when ``--ttl-column``
-names a per-row TTL column), unified distributed compaction, and version cleanup in that order.
+``run`` applies maintenance to a fleet of datasets: retention expiry (when ``--retention-seconds``
+sets a window), unified distributed compaction, and version cleanup in that order.
 ``tag`` flips ``HEAD`` to an explicit target dataset version for blue-green promotion.
 
 ``migrate-manifests`` migrates every selected dataset's manifest paths to the V2 naming scheme
@@ -21,7 +22,7 @@ from collections.abc import Callable, Sequence
 from lance_etl.cliutil import (
     add_common_arguments,
     add_dataset_arguments,
-    add_ttl_arguments,
+    add_retention_arguments,
     build_spark,
     build_telemetry_config,
     load_dataset_uris,
@@ -45,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     """
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
         description=(
-            "Run maintenance operations on Lance datasets: per-row TTL expiration, "
+            "Run maintenance operations on Lance datasets: retention expiry, "
             "distributed compaction, version cleanup, serving-tag promotion, and V2 manifest migration."
         )
     )
@@ -55,13 +56,13 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser: argparse.ArgumentParser = subparsers.add_parser(
         "run",
         help=(
-            "Per-dataset maintenance: per-row TTL expiration (when --ttl-column is set), "
+            "Per-dataset maintenance: retention expiry (when --retention-seconds is set), "
             "unified distributed compaction, and version cleanup, in that order."
         ),
     )
     add_common_arguments(run_parser)
     add_dataset_arguments(run_parser)
-    add_ttl_arguments(run_parser)
+    add_retention_arguments(run_parser)
     tag_parser: argparse.ArgumentParser = subparsers.add_parser(
         "tag",
         help=(
@@ -115,7 +116,7 @@ def run_run(args: argparse.Namespace) -> int:
         config: MaintenanceConfig = MaintenanceConfig(
             telemetry=build_telemetry_config(args),
             storage_options=parse_storage_options(args),
-            ttl_column=args.ttl_column,
+            retention_seconds=args.retention_seconds,
             ts_column=args.ts_column,
         )
         failed: int = count_failed(MaintenanceJob(config).run(spark, uris))

@@ -27,7 +27,6 @@ lance-etl/
   migrations/        Alembic migrations for the local PostgreSQL control plane
   tests/             pytest suite (conftest.py + test_*.py)
   docs/adr/          Architecture decisions, seven thematic documents plus a numbered index (docs/adr/README.md)
-  market-research/   Detailed evaluation notes, plans, and evidence underlying the ADRs
   pyproject.toml     Build, dependencies, ruff config
 ```
 
@@ -180,24 +179,27 @@ stopped by the process. The optional search service is built and started directl
 
 ### 10. PostgreSQL configuration is normalized and revisioned
 
-The control plane has exactly 14 application tables:
-`reconciler_settings`, `dataset_specs`, `dataset_spec_revisions`, `dataset_fields`,
-`index_definitions`, `vector_index_options`, `fts_index_options`, `iceberg_sources`, `datasets`,
-`source_snapshots`, `dataset_work`, `dataset_publications`, `publication_indexes`, and
-`dataset_state`. Do not add JSON configuration blobs or parallel configuration entities. Dataset
-schema plus ingestion, compaction, indexing, prewarm, publication, and retention policy belongs to
-an immutable `dataset_spec_revisions` row and its normalized children. Every work item and
-publication freezes that revision identity. Process bootstrap values and secrets remain outside the
-database. Current lease, monotonic fence, attempt count, and latest bounded error evidence remain on
-the deterministic `dataset_work` row. `reconciler_settings` is loaded once at process startup, so a
-local reconciler restart is required after changing loop policy.
+The control plane has exactly 9 application tables:
+`dataset_spec_revisions`, `dataset_fields`, `index_definitions`, `iceberg_sources`, `datasets`,
+`source_snapshots`, `dataset_work`, `dataset_publications`, and `publication_indexes`. Typed IVF_RQ
+and INVERTED options are nullable columns on `index_definitions`, gated by per-index-type CHECK
+constraints. A specification exists only as its `dataset_spec_revisions` rows, which carry their own
+`spec_id`, `name`, and `description`. The mutable materialization cursor, fence epoch, and active
+publication pointer live directly on the `datasets` row. Do not add JSON configuration blobs or
+parallel configuration entities. Dataset schema plus ingestion, compaction, indexing, prewarm,
+publication, and retention policy belongs to an immutable `dataset_spec_revisions` row and its
+normalized children. Every work item and publication freezes that revision identity. Loop policy is
+process bootstrap configuration built from environment variables in `ReconcilerSettings`, not a
+database table, so a local reconciler restart is required after changing loop policy. Process
+bootstrap values and secrets remain outside the database. Current lease, monotonic fence, attempt
+count, and latest bounded error evidence remain on the deterministic `dataset_work` row.
 
-Specification authoring must use `ControlPlaneRepository.create_spec`,
-`create_draft_spec_revision`, `activate_spec_revision`, `set_source_default_spec`, and
-`assign_dataset_spec_revision`. Only DRAFT graphs may change. PostgreSQL triggers freeze ACTIVE and
-RETIRED parents and all normalized children. Dataset assignment accepts only ACTIVE revisions and
-enqueues deterministic REBUILD work when the materialized revision differs. `dataset_work` may
-store optional `AIRFLOW_CTX_*` launch provenance, but provenance never participates in scheduling.
+Specification authoring must use `ControlPlaneRepository.create_draft_spec_revision`,
+`activate_spec_revision`, `set_source_default_spec`, and `assign_dataset_spec_revision`. Only DRAFT
+graphs may change. PostgreSQL triggers freeze ACTIVE and RETIRED parents and all normalized
+children. Dataset assignment accepts only ACTIVE revisions and enqueues deterministic REBUILD work
+when the materialized revision differs. `dataset_work` records a `launcher_kind` audit label, but it
+never participates in scheduling.
 
 ---
 

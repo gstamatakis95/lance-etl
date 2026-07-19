@@ -193,11 +193,6 @@ impl CachingDatasetProvider {
         Self::build(config, Arc::new(Metrics::disabled()), None, None).await
     }
 
-    /// Like [`Self::new`] but emitting cache and dataset-resolution metrics through `metrics`.
-    pub async fn with_telemetry(config: &Config, metrics: Arc<Metrics>) -> Self {
-        Self::build(config, metrics, None, None).await
-    }
-
     /// Creates the production provider backed by an exact serving catalog.
     pub async fn with_catalog_and_telemetry(
         config: &Config,

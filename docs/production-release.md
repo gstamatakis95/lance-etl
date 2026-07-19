@@ -43,8 +43,9 @@ Apply the single Alembic baseline through the installed command:
 uv run lance-etl-reconcile migrate
 ```
 
-The migration creates exactly 14 application tables and seeds the singleton reconciler settings
-plus the bundled active dataset specification.
+The migration creates exactly 9 application tables and seeds the bundled active dataset
+specification revision. Reconciler loop, lease, retry, SLO, and cleanup settings come from
+`ReconcilerSettings.from_environment()` rather than a seeded table row.
 
 Verify the table set:
 
@@ -59,20 +60,15 @@ Expected application tables:
 dataset_fields
 dataset_publications
 dataset_spec_revisions
-dataset_specs
-dataset_state
 dataset_work
 datasets
-fts_index_options
 iceberg_sources
 index_definitions
 publication_indexes
-reconciler_settings
 source_snapshots
-vector_index_options
 ```
 
-`alembic_version` is Alembic metadata and is not one of the 14 application entities.
+`alembic_version` is Alembic metadata and is not one of the 9 application entities.
 
 ## Configure local paths
 
@@ -107,23 +103,22 @@ CREATE TABLE local.db.events (
     tenant_id STRING NOT NULL,
     namespace STRING NOT NULL,
     org_id STRING NOT NULL,
-    vector_id STRING NOT NULL,
+    record_id STRING NOT NULL,
     op STRING NOT NULL,
-    event_timestamp TIMESTAMP NOT NULL,
-    processing_timestamp TIMESTAMP NOT NULL,
+    ts TIMESTAMP NOT NULL,
     vectors MAP<STRING, ARRAY<FLOAT>> NOT NULL,
     texts MAP<STRING, STRING> NOT NULL,
-    metadata MAP<STRING, STRING> NOT NULL,
-    ttl BIGINT
+    metadata MAP<STRING, STRING> NOT NULL
 ) USING iceberg
-PARTITIONED BY (tenant_id, namespace, org_id, hours(processing_timestamp))
+PARTITIONED BY (tenant_id, namespace, org_id, hours(ts))
 TBLPROPERTIES ('format-version' = '2');
 ```
 
 Mutation values are `insert`, `update`, `upsert`, `delete`, `i`, `u`, or `d`, matched without case
 sensitivity. Map keys must match the active `dataset_fields` contract. Every non-delete row must
-carry each configured vector at its exact dimension. `ttl` is seconds and is required as a source
-column while the active specification includes the TTL field.
+carry each configured vector at its exact dimension. The single `ts` column is the canonical clock,
+the incremental read window, and the Iceberg partition. Record retention derives from `ts` plus the
+active revision's `record_retention_seconds` window rather than a per-row column.
 
 ## Inspect the dataset specification
 
@@ -132,10 +127,9 @@ run:
 
 ```bash
 psql lance_etl -c \
-  "SELECT s.name, r.revision_number, r.state, encode(r.configuration_digest, 'hex') AS digest
-   FROM dataset_specs AS s
-   JOIN dataset_spec_revisions AS r USING (spec_id)
-   ORDER BY s.name, r.revision_number"
+  "SELECT r.name, r.revision_number, r.state, encode(r.configuration_digest, 'hex') AS digest
+   FROM dataset_spec_revisions AS r
+   ORDER BY r.name, r.revision_number"
 ```
 
 Inspect ingestion, compaction, index maintenance, and publication policy:
@@ -152,17 +146,17 @@ psql lance_etl -x -c \
    FROM dataset_spec_revisions WHERE state = 'ACTIVE'"
 ```
 
-Field and index configuration is under `dataset_fields`, `index_definitions`,
-`vector_index_options`, and `fts_index_options`. Do not edit an active revision in place. Insert and
+Field and index configuration is under `dataset_fields` and `index_definitions`, with typed IVF_RQ
+and INVERTED options carried as nullable columns directly on `index_definitions`. Do not edit an
+active revision in place. Insert and
 validate a complete DRAFT through `ControlPlaneRepository.create_draft_spec_revision`, promote it
 with `activate_spec_revision`, and assign existing datasets with `assign_dataset_spec_revision`.
 Use `set_source_default_spec` to select the named spec for newly discovered datasets. PostgreSQL
 freezes ACTIVE and RETIRED graphs. Assignment creates one deterministic REBUILD when the existing
 materialization carries another revision.
 
-Airflow is optional. If a local launch supplies `AIRFLOW_CTX_DAG_ID`, `AIRFLOW_CTX_DAG_RUN_ID`,
-`AIRFLOW_CTX_TASK_ID`, `AIRFLOW_CTX_MAP_INDEX`, and `AIRFLOW_CTX_TRY_NUMBER`, claims persist them on
-`dataset_work` as audit provenance. They do not affect work order or eligibility.
+Each claim records a `launcher_kind` audit label on `dataset_work`. It does not affect work order or
+eligibility.
 
 ## Run one cycle
 
@@ -191,8 +185,8 @@ Override only the local sleep interval for an interactive run:
 uv run lance-etl-reconcile run --poll-seconds 10
 ```
 
-The durable polling, claim, lease, retry, SLO, and cleanup defaults remain in
-`reconciler_settings`.
+The durable polling, claim, lease, retry, SLO, and cleanup defaults remain in the environment
+variables loaded once into `ReconcilerSettings` at process startup.
 
 ## Status checks
 
@@ -230,10 +224,9 @@ psql lance_etl -x -c \
   "SELECT d.tenant_id, d.namespace, d.org_id,
           p.lance_uri, p.lance_version, p.published_at
    FROM datasets AS d
-   JOIN dataset_state AS st USING (dataset_id)
    JOIN dataset_publications AS p
-     ON p.dataset_id = st.dataset_id
-    AND p.publication_id = st.active_publication_id
+     ON p.dataset_id = d.dataset_id
+    AND p.publication_id = d.active_publication_id
    ORDER BY d.tenant_id, d.namespace, d.org_id"
 ```
 

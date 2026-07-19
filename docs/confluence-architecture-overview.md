@@ -29,21 +29,21 @@ configuration, and publication state.
 
 ## PostgreSQL model
 
-The application schema has exactly 14 tables:
+The application schema has exactly 9 tables:
 
 | Area | Entities | Meaning |
 |---|---|---|
-| Loop policy | `reconciler_settings` | Claim, lease, retry, SLO, and cleanup bounds |
-| Dataset contract | `dataset_specs`, `dataset_spec_revisions` | Stable contract name and immutable numbered behavior |
+| Dataset contract | `dataset_spec_revisions` | Immutable numbered behavior carrying its own `spec_id`, `name`, and `description` |
 | Schema | `dataset_fields` | Ordered roles, types, nullability, and source projection |
-| Indexes | `index_definitions`, `vector_index_options`, `fts_index_options` | Required Lance indexes and typed family options |
+| Indexes | `index_definitions` | Required Lance indexes with typed IVF_RQ and INVERTED options as nullable columns gated by per-type CHECK constraints |
 | Source | `iceberg_sources`, `source_snapshots` | Registered table, storage namespace, column mapping, exact lineage, and blocked evidence |
-| Dataset | `datasets`, `dataset_state` | First-class logical identity and mutable materialization, fence, and active pointer |
+| Dataset | `datasets` | First-class logical identity plus the mutable materialization cursor, fence, and active publication pointer |
 | Execution | `dataset_work` | Deterministic work, current lease, attempt count, latest error, and exact fence state |
 | Publication | `dataset_publications`, `publication_indexes` | Immutable Lance version and complete qualification evidence |
 
-Dataset specifications store all schema and data-path policy. Environment values only start local
-processes and identify first-run resources.
+Dataset specifications store all schema and data-path policy. Loop policy is process bootstrap
+configuration read from environment variables, not a database table. Environment values only start
+local processes and identify first-run resources.
 
 ## Dataset specification
 
@@ -80,8 +80,8 @@ Planning follows direct parent snapshot lineage. Snapshot IDs are opaque identit
 records each accepted or rejected transition with sequence number, partition spec, operation, and
 commit time. Unsupported source history becomes durable blocked evidence.
 
-Qualified manifest entries reveal touched dataset routes. Planning creates new `datasets` and
-`dataset_state` rows and deterministic ingest work in the same transaction.
+Qualified manifest entries reveal touched dataset routes. Planning creates new `datasets` rows and
+deterministic ingest work in the same transaction.
 
 ## Work lifecycle
 
@@ -104,9 +104,8 @@ Retry keeps the same work identity and increments its attempt count. The current
 expiry, attempt count, and latest bounded error remain on that work row. The dataset fence rejects
 results from superseded claims.
 
-The same row may record `LOCAL` or `AIRFLOW` launch provenance. Standard Airflow DAG, run, task,
-map, and try values are audit fields only. They never change queue ordering or work eligibility and
-Airflow is not required to run the system.
+The same row records a `launcher_kind` audit label. It never changes queue ordering or work
+eligibility.
 
 ## Data path
 
@@ -130,7 +129,7 @@ A candidate is not serving merely because a Lance commit succeeded. Qualificatio
 - optional index artifact-generation digest
 
 Local exact-version prewarm runs when required. Publication then appends immutable evidence, retires
-the former publication, and changes `dataset_state.active_publication_id` in one transaction. A
+the former publication, and changes `datasets.active_publication_id` in one transaction. A
 failure leaves the former publication active.
 
 ## Search path
@@ -138,7 +137,7 @@ failure leaves the former publication active.
 The local Rust service accepts only a logical target and typed query values. Its catalog resolves:
 
 ```text
-datasets -> dataset_state -> dataset_publications
+datasets -> dataset_publications
 ```
 
 The Lance backend receives one allowlisted URI and exact version. Clients cannot select a physical

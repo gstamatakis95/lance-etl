@@ -9,7 +9,7 @@ REQUIRED_PARTITION_FIELDS: tuple[PartitionField, ...] = (
     PartitionField("tenant_id", "tenant_id", "identity"),
     PartitionField("namespace", "namespace", "identity"),
     PartitionField("org_id", "org_id", "identity"),
-    PartitionField("processing_timestamp_hour", "processing_timestamp", "hour"),
+    PartitionField("ts_hour", "ts", "hour"),
 )
 
 
@@ -26,13 +26,13 @@ def required_partition_fields(
         org_column: Physical organization source column.
 
     Returns:
-        Canonically named routing partitions plus the fixed processing-time hour.
+        Canonically named routing partitions plus the fixed ts hour.
     """
     return (
         PartitionField("tenant_id", tenant_column, "identity"),
         PartitionField("namespace", namespace_column, "identity"),
         PartitionField("org_id", org_column, "identity"),
-        PartitionField("processing_timestamp_hour", "processing_timestamp", "hour"),
+        PartitionField("ts_hour", "ts", "hour"),
     )
 
 
@@ -50,9 +50,7 @@ def validate_partition_contract(
         SourceContractError: If names, sources, transforms, or order differ.
     """
     if spec.fields != required_fields:
-        raise SourceContractError(
-            "active partition spec must be tenant_id, namespace, org_id, and hour(processing_timestamp)"
-        )
+        raise SourceContractError("active partition spec must be tenant_id, namespace, org_id, and hour(ts)")
 
 
 def validate_table_contract(

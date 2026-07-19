@@ -28,7 +28,7 @@ def dataset_uri(tmp_path: Path) -> str:
         Dataset URI.
     """
     uri = str(tmp_path / "completion.lance")
-    lance.write_dataset(pa.table({"vector_id": ["id"]}), uri)
+    lance.write_dataset(pa.table({"record_id": ["id"]}), uri)
     return uri
 
 

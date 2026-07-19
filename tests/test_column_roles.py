@@ -29,7 +29,7 @@ def make_map_group(keys: list[str]) -> pa.Table:
     """Build one routing group carrying all three source map columns.
 
     Args:
-        keys: Vector ids for the rows.
+        keys: Record ids for the rows.
 
     Returns:
         A routed ETL group with ``vectors``, ``texts``, and ``metadata`` maps.
@@ -39,7 +39,7 @@ def make_map_group(keys: list[str]) -> pa.Table:
     string_map: pa.DataType = pa.map_(pa.string(), pa.string())
     return pa.table(
         {
-            "vector_id": pa.array(keys, pa.string()),
+            "record_id": pa.array(keys, pa.string()),
             "org_id": pa.array([ROUTING_KEY[0]] * count),
             "tenant_id": pa.array([ROUTING_KEY[1]] * count),
             "namespace": pa.array([ROUTING_KEY[2]] * count),

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 import uuid
-from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -99,7 +98,6 @@ class WorkLauncherKind(StrEnum):
     """Launch origins recorded on the latest durable work claim."""
 
     LOCAL = "LOCAL"
-    AIRFLOW = "AIRFLOW"
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,81 +105,18 @@ class WorkProvenance:
     """Optional launch provenance that never participates in work ordering."""
 
     launcher_kind: WorkLauncherKind = WorkLauncherKind.LOCAL
-    airflow_ctx_dag_id: str | None = None
-    airflow_ctx_dag_run_id: str | None = None
-    airflow_ctx_task_id: str | None = None
-    airflow_ctx_map_index: int | None = None
-    airflow_ctx_try_number: int | None = None
-
-    @classmethod
-    def from_environment(cls, environment: Mapping[str, str]) -> WorkProvenance:
-        """Parse standard Airflow context variables once at process startup.
-
-        Args:
-            environment: Process environment mapping.
-
-        Returns:
-            Validated local or Airflow launch provenance.
-
-        Raises:
-            ValueError: If integer context values are malformed or context is partial.
-        """
-        dag_id: str | None = environment.get("AIRFLOW_CTX_DAG_ID") or None
-        dag_run_id: str | None = environment.get("AIRFLOW_CTX_DAG_RUN_ID") or None
-        task_id: str | None = environment.get("AIRFLOW_CTX_TASK_ID") or None
-        raw_map_index: str | None = environment.get("AIRFLOW_CTX_MAP_INDEX") or None
-        raw_try_number: str | None = environment.get("AIRFLOW_CTX_TRY_NUMBER") or None
-        map_index: int | None = int(raw_map_index) if raw_map_index is not None else None
-        try_number: int | None = int(raw_try_number) if raw_try_number is not None else None
-        airflow_selected: bool = any(
-            value is not None for value in (dag_id, dag_run_id, task_id, map_index, try_number)
-        )
-        return cls(
-            launcher_kind=WorkLauncherKind.AIRFLOW if airflow_selected else WorkLauncherKind.LOCAL,
-            airflow_ctx_dag_id=dag_id,
-            airflow_ctx_dag_run_id=dag_run_id,
-            airflow_ctx_task_id=task_id,
-            airflow_ctx_map_index=map_index,
-            airflow_ctx_try_number=try_number,
-        ).validate()
 
     def validate(self) -> WorkProvenance:
-        """Validate local emptiness or complete bounded Airflow identity.
+        """Validate the recorded launcher kind.
 
         Returns:
             This validated provenance.
 
         Raises:
-            ValueError: If the launcher kind and context values disagree.
+            ValueError: If the launcher kind is unsupported.
         """
-        context: tuple[str | int | None, ...] = (
-            self.airflow_ctx_dag_id,
-            self.airflow_ctx_dag_run_id,
-            self.airflow_ctx_task_id,
-            self.airflow_ctx_map_index,
-            self.airflow_ctx_try_number,
-        )
-        if self.launcher_kind is WorkLauncherKind.LOCAL:
-            if any(value is not None for value in context):
-                raise ValueError("LOCAL work provenance cannot carry Airflow context")
-            return self
-        if self.launcher_kind is not WorkLauncherKind.AIRFLOW:
+        if not isinstance(self.launcher_kind, WorkLauncherKind):
             raise ValueError("work launcher kind is unsupported")
-        required: tuple[str | None, ...] = (
-            self.airflow_ctx_dag_id,
-            self.airflow_ctx_dag_run_id,
-            self.airflow_ctx_task_id,
-        )
-        if any(value is None or not value.strip() for value in required):
-            raise ValueError("AIRFLOW work provenance requires DAG, run, and task identities")
-        if len(self.airflow_ctx_dag_id or "") > 250 or len(self.airflow_ctx_task_id or "") > 250:
-            raise ValueError("Airflow DAG and task identities must contain at most 250 characters")
-        if len(self.airflow_ctx_dag_run_id or "") > 512:
-            raise ValueError("Airflow run identity must contain at most 512 characters")
-        if self.airflow_ctx_map_index is not None and self.airflow_ctx_map_index < -1:
-            raise ValueError("Airflow map index must be at least -1")
-        if self.airflow_ctx_try_number is not None and self.airflow_ctx_try_number < 1:
-            raise ValueError("Airflow try number must be positive")
         return self
 
 
@@ -250,13 +185,12 @@ class IcebergSource:
     tenant_column: str = "tenant_id"
     namespace_column: str = "namespace"
     org_column: str = "org_id"
-    record_id_column: str = "vector_id"
+    record_id_column: str = "record_id"
     operation_column: str = "op"
-    event_time_column: str = "event_timestamp"
+    ts_column: str = "ts"
     vectors_column: str = "vectors"
     texts_column: str = "texts"
     metadata_column: str = "metadata"
-    ttl_column: str | None = "ttl"
 
     @property
     def spark_table(self) -> str:
@@ -293,15 +227,13 @@ class IcebergSource:
             self.org_column,
             self.record_id_column,
             self.operation_column,
-            self.event_time_column,
+            self.ts_column,
             self.vectors_column,
             self.texts_column,
             self.metadata_column,
         )
         if any(IDENTIFIER_PATTERN.fullmatch(value) is None for value in columns):
             raise ValueError("source projection columns must be valid identifiers")
-        if self.ttl_column is not None and IDENTIFIER_PATTERN.fullmatch(self.ttl_column) is None:
-            raise ValueError("ttl_column must be a valid identifier")
         return self
 
 

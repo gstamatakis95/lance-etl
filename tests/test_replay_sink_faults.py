@@ -26,7 +26,7 @@ def mutation_table(source_sequence: int, text: str) -> pa.Table:
     """
     return pa.table(
         {
-            "vector_id": pa.array(["id"], pa.string()),
+            "record_id": pa.array(["id"], pa.string()),
             "text": pa.array([text], pa.string()),
             "lance_etl_window_seq": pa.array([source_sequence], pa.int64()),
             "lance_etl_source_sequence": pa.array([source_sequence], pa.int64()),

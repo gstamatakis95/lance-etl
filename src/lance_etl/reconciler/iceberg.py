@@ -136,18 +136,13 @@ class BaselineQualifier:
             col(registered_source.tenant_column).alias("tenant_id"),
             col(registered_source.namespace_column).alias("namespace"),
             col(registered_source.org_column).alias("org_id"),
-            col(registered_source.record_id_column).alias("vector_id"),
+            col(registered_source.record_id_column).alias("record_id"),
             col(registered_source.operation_column).alias("op"),
-            col(registered_source.event_time_column).alias("event_timestamp"),
+            col(registered_source.ts_column).alias("ts"),
             col(registered_source.vectors_column).alias("vectors"),
             col(registered_source.texts_column).alias("texts"),
             col(registered_source.metadata_column).alias("metadata"),
         ]
-        include_ttl: bool = (
-            registered_source.ttl_column is not None and registered_source.ttl_column in source_frame.columns
-        )
-        if include_ttl:
-            selected_columns.append(col(str(registered_source.ttl_column)).alias("ttl"))
 
         def digest_batches(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
             """Compute canonical mutation digests for bounded Arrow source batches.
@@ -156,14 +151,14 @@ class BaselineQualifier:
                 batches: Exact-snapshot source batches.
 
             Yields:
-                Routing key, vector ID, and canonical digest batches.
+                Routing key, record ID, and canonical digest batches.
             """
             output_schema: pa.Schema = pa.schema(
                 [
                     pa.field("tenant_id", pa.string()),
                     pa.field("namespace", pa.string()),
                     pa.field("org_id", pa.string()),
-                    pa.field("vector_id", pa.string()),
+                    pa.field("record_id", pa.string()),
                     pa.field("mutation_digest", pa.binary()),
                 ]
             )
@@ -178,8 +173,6 @@ class BaselineQualifier:
                         "texts": dict(row.get("texts") or {}),
                         "metadata": dict(row.get("metadata") or {}),
                     }
-                    if include_ttl:
-                        payload["ttl"] = row.get("ttl")
                     target: tuple[str, str, str] = (
                         str(row["tenant_id"]),
                         str(row["namespace"]),
@@ -187,9 +180,9 @@ class BaselineQualifier:
                     )
                     digest: bytes = canonical_event_digest(
                         target,
-                        str(row["vector_id"]),
+                        str(row["record_id"]),
                         operation,
-                        row["event_timestamp"],
+                        row["ts"],
                         payload,
                     )
                     output.append(
@@ -197,7 +190,7 @@ class BaselineQualifier:
                             "tenant_id": target[0],
                             "namespace": target[1],
                             "org_id": target[2],
-                            "vector_id": row["vector_id"],
+                            "record_id": row["record_id"],
                             "mutation_digest": digest,
                         }
                     )
@@ -205,10 +198,10 @@ class BaselineQualifier:
 
         digests: DataFrame = source_frame.select(*selected_columns).mapInArrow(
             digest_batches,
-            "tenant_id string, namespace string, org_id string, vector_id string, mutation_digest binary",
+            "tenant_id string, namespace string, org_id string, record_id string, mutation_digest binary",
         )
         conflicts: int = (
-            digests.groupBy("tenant_id", "namespace", "org_id", "vector_id")
+            digests.groupBy("tenant_id", "namespace", "org_id", "record_id")
             .agg(countDistinct("mutation_digest").alias("distinct_mutations"))
             .where(col("distinct_mutations") > 1)
             .count()
@@ -237,7 +230,7 @@ class BaselineQualifier:
             registered_source.org_column,
             registered_source.record_id_column,
             registered_source.operation_column,
-            registered_source.event_time_column,
+            registered_source.ts_column,
             registered_source.vectors_column,
             registered_source.texts_column,
             registered_source.metadata_column,
@@ -251,7 +244,7 @@ class BaselineQualifier:
             registered_source.org_column,
             registered_source.record_id_column,
             registered_source.operation_column,
-            registered_source.event_time_column,
+            registered_source.ts_column,
         )
         if source_frame.where(lit(False) | any_null_expression(nonnull)).limit(1).count():
             raise ValueError("baseline source contains null routing, identity, operation, or timestamp")
@@ -457,7 +450,7 @@ class SparkIcebergCatalog:
             col(f"data_file.partition.{self.tenant_column}").cast("string").alias("tenant_id"),
             col(f"data_file.partition.{self.namespace_column}").cast("string").alias("namespace"),
             col(f"data_file.partition.{self.org_column}").cast("string").alias("org_id"),
-            col("data_file.partition.processing_timestamp_hour").cast("int").alias("processing_timestamp_hour"),
+            col("data_file.partition.ts_hour").cast("int").alias("ts_hour"),
         ).distinct()
         return tuple(manifest_from_row(row) for row in selected.collect())
 
@@ -480,7 +473,7 @@ class SparkIcebergCatalog:
             col(f"partition.{self.tenant_column}").cast("string").alias("tenant_id"),
             col(f"partition.{self.namespace_column}").cast("string").alias("namespace"),
             col(f"partition.{self.org_column}").cast("string").alias("org_id"),
-            col("partition.processing_timestamp_hour").cast("int").alias("processing_timestamp_hour"),
+            col("partition.ts_hour").cast("int").alias("ts_hour"),
         ).distinct()
         return tuple(manifest_from_row(row, snapshot_id, ManifestStatus.EXISTING) for row in selected.collect())
 
@@ -810,6 +803,6 @@ def manifest_from_row(
             tenant_id=str(values["tenant_id"]),
             namespace=str(values["namespace"]),
             org_id=str(values["org_id"]),
-            processing_timestamp_hour=int(values["processing_timestamp_hour"]),
+            ts_hour=int(values["ts_hour"]),
         ),
     )

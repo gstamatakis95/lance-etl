@@ -31,7 +31,7 @@ const DISTANCE_KEY: &str = "_distance";
 const SCORE_KEY: &str = "_score";
 
 /// Stable logical identifier column required in every served dataset.
-const VECTOR_ID_COLUMN: &str = "vector_id";
+const RECORD_ID_COLUMN: &str = "record_id";
 
 /// Soft-delete marker excluded from every public search.
 const IS_DELETED_COLUMN: &str = "is_deleted";
@@ -125,7 +125,7 @@ pub struct LanceSearchBackend<P: DatasetProvider> {
     pub(crate) provider: P,
     pub(crate) prewarm_concurrency: usize,
     pub(crate) metrics: Arc<crate::telemetry::Metrics>,
-    pub(crate) event_timestamp_column: String,
+    pub(crate) ts_column: String,
     pub(crate) scan_stats_hook: Option<ScanStatsHook>,
     pub(crate) ann_defaults: AnnDefaults,
     pub(crate) max_k: usize,
@@ -140,7 +140,7 @@ impl<P: DatasetProvider> LanceSearchBackend<P> {
             provider,
             prewarm_concurrency: crate::config::DEFAULT_PREWARM_CONCURRENCY,
             metrics: Arc::new(crate::telemetry::Metrics::disabled()),
-            event_timestamp_column: crate::config::DEFAULT_EVENT_TIMESTAMP_COLUMN.to_string(),
+            ts_column: crate::config::DEFAULT_TS_COLUMN.to_string(),
             scan_stats_hook: None,
             ann_defaults: AnnDefaults::default(),
             max_k: crate::config::DEFAULT_SEARCH_MAX_K,
@@ -154,8 +154,8 @@ impl<P: DatasetProvider> LanceSearchBackend<P> {
     }
 
     /// Sets the column a request time range is applied to.
-    pub fn with_event_timestamp_column(mut self, column: impl Into<String>) -> Self {
-        self.event_timestamp_column = column.into();
+    pub fn with_ts_column(mut self, column: impl Into<String>) -> Self {
+        self.ts_column = column.into();
         self
     }
 
@@ -171,7 +171,7 @@ impl<P: DatasetProvider> LanceSearchBackend<P> {
         QueryContext {
             metrics: &self.metrics,
             rpc,
-            event_timestamp_column: &self.event_timestamp_column,
+            ts_column: &self.ts_column,
             scan_stats_hook: self.scan_stats_hook.as_ref(),
             ann_defaults: self.ann_defaults,
             max_k: self.max_k,
@@ -186,7 +186,7 @@ struct QueryContext<'a> {
     /// RPC tag for metrics and the scan-stats span.
     rpc: Rpc,
     /// Column a request time range is applied to.
-    event_timestamp_column: &'a str,
+    ts_column: &'a str,
     /// Optional observer of the captured scan IO stats (test seam).
     scan_stats_hook: Option<&'a ScanStatsHook>,
     /// Server-side ANN defaults: probe counts, refine factor, and fast-search gate.
@@ -313,7 +313,7 @@ fn scalar_output_columns(dataset: &Dataset) -> Vec<String> {
         .iter()
         .filter(|field| {
             !matches!(field.data_type(), DataType::FixedSizeList(_, _))
-                && field.name != VECTOR_ID_COLUMN
+                && field.name != RECORD_ID_COLUMN
                 && field.name != IS_DELETED_COLUMN
         })
         .map(|field| field.name.clone())
@@ -327,19 +327,19 @@ fn surplus_k(k: usize, max_k: usize) -> usize {
 
 /// Deduplicated candidates and whether repeated logical IDs consumed the bounded surplus.
 struct DeduplicatedHits {
-    /// Best-ranked candidate for each retained logical vector ID.
+    /// Best-ranked candidate for each retained logical record ID.
     hits: Vec<Hit>,
-    /// Whether at least one repeated logical vector ID was discarded.
+    /// Whether at least one repeated logical record ID was discarded.
     removed_duplicate: bool,
 }
 
-/// Keeps the best-ranked occurrence of each logical vector ID and truncates to `k`.
+/// Keeps the best-ranked occurrence of each logical record ID and truncates to `k`.
 fn deduplicate_hits(hits: Vec<Hit>, k: usize) -> DeduplicatedHits {
     let mut seen = HashSet::new();
     let mut removed_duplicate = false;
     let mut unique = Vec::with_capacity(k.min(hits.len()));
     for hit in hits {
-        if seen.insert(hit.vector_id.clone()) {
+        if seen.insert(hit.record_id.clone()) {
             if unique.len() < k {
                 unique.push(hit);
             }
@@ -390,10 +390,10 @@ fn apply_common_options(
     } else {
         if projection
             .iter()
-            .any(|column| column == VECTOR_ID_COLUMN || column == IS_DELETED_COLUMN)
+            .any(|column| column == RECORD_ID_COLUMN || column == IS_DELETED_COLUMN)
         {
             return Err(SearchError::invalid_argument(
-                "vector_id and is_deleted cannot be requested as projected fields",
+                "record_id and is_deleted cannot be requested as projected fields",
             ));
         }
         let unique: HashSet<&String> = projection.iter().collect();
@@ -402,7 +402,7 @@ fn apply_common_options(
         }
         projection.to_vec()
     };
-    output.push(VECTOR_ID_COLUMN.to_string());
+    output.push(RECORD_ID_COLUMN.to_string());
     scanner.project(&output).map_err(|err| classify_lance_error(&err))?;
     if !schema_columns(dataset).contains(IS_DELETED_COLUMN) {
         return Err(SearchError::internal("served dataset is missing is_deleted"));
@@ -425,7 +425,7 @@ struct ScanPredicate<'a> {
     /// Optional event-time window, ANDed with `filter`.
     time_range: Option<&'a TimeRange>,
     /// Column the event-time window is applied to.
-    event_timestamp_column: &'a str,
+    ts_column: &'a str,
 }
 
 impl ScanPredicate<'_> {
@@ -438,8 +438,8 @@ impl ScanPredicate<'_> {
         };
         let range_expr = match self.time_range {
             Some(range) if range.is_bounded() => {
-                let data_type = event_timestamp_data_type(dataset, self.event_timestamp_column)?;
-                time_range_to_expr(range, self.event_timestamp_column, &data_type)?
+                let data_type = ts_data_type(dataset, self.ts_column)?;
+                time_range_to_expr(range, self.ts_column, &data_type)?
             }
             _ => None,
         };
@@ -458,7 +458,7 @@ impl ScanPredicate<'_> {
 }
 
 /// Resolves the Arrow data type of the event-timestamp column, rejecting an absent column.
-fn event_timestamp_data_type(dataset: &Dataset, column: &str) -> Result<DataType, SearchError> {
+fn ts_data_type(dataset: &Dataset, column: &str) -> Result<DataType, SearchError> {
     dataset
         .schema()
         .fields
@@ -654,7 +654,7 @@ async fn run_vector_query(
         ScanPredicate {
             filter: query.filter.as_ref(),
             time_range: query.time_range.as_ref(),
-            event_timestamp_column: context.event_timestamp_column,
+            ts_column: context.ts_column,
         },
         query.k,
     )?;
@@ -714,7 +714,7 @@ async fn run_text_query(
         ScanPredicate {
             filter: query.filter.as_ref(),
             time_range: query.time_range.as_ref(),
-            event_timestamp_column: context.event_timestamp_column,
+            ts_column: context.ts_column,
         },
         query.k,
     )?;
@@ -735,12 +735,12 @@ async fn run_text_query(
 fn rows_to_hits(rows: Vec<Map<String, Value>>, score_key: &str) -> Result<Vec<Hit>, SearchError> {
     rows.into_iter()
         .map(|mut row| {
-            let vector_id = row
-                .remove(VECTOR_ID_COLUMN)
+            let record_id = row
+                .remove(RECORD_ID_COLUMN)
                 .and_then(|value| value.as_str().map(ToOwned::to_owned))
-                .ok_or_else(|| SearchError::internal("search result row is missing a string vector_id"))?;
+                .ok_or_else(|| SearchError::internal("search result row is missing a string record_id"))?;
             let score = row.remove(score_key).and_then(|value| value.as_f64()).unwrap_or(0.0);
-            Ok(Hit { vector_id, score, row })
+            Ok(Hit { record_id, score, row })
         })
         .collect()
 }

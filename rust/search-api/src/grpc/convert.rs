@@ -274,7 +274,7 @@ fn fuzziness_from_proto(fuzziness: Option<pb::match_query::Fuzziness>) -> Fuzzin
 pub fn vector_hit_to_proto(hit: Hit) -> Result<pb::VectorSearchResult, SearchError> {
     Ok(pb::VectorSearchResult {
         distance: hit.score as f32,
-        vector_id: hit.vector_id,
+        record_id: hit.record_id,
         projection: json_map_to_projection(hit.row)?,
     })
 }
@@ -283,7 +283,7 @@ pub fn vector_hit_to_proto(hit: Hit) -> Result<pb::VectorSearchResult, SearchErr
 pub fn text_hit_to_proto(hit: Hit) -> Result<pb::TextSearchResult, SearchError> {
     Ok(pb::TextSearchResult {
         score: hit.score as f32,
-        vector_id: hit.vector_id,
+        record_id: hit.record_id,
         projection: json_map_to_projection(hit.row)?,
     })
 }
@@ -291,7 +291,7 @@ pub fn text_hit_to_proto(hit: Hit) -> Result<pb::TextSearchResult, SearchError> 
 /// Lowers a fused hit into a single-leg hit for recall capture.
 pub fn fused_to_hit(hit: FusedHit) -> Hit {
     Hit {
-        vector_id: hit.vector_id,
+        record_id: hit.record_id,
         score: hit.score,
         row: hit.row,
     }
@@ -301,7 +301,7 @@ pub fn fused_to_hit(hit: FusedHit) -> Hit {
 pub fn fused_hit_to_proto(hit: FusedHit) -> Result<pb::HybridSearchResult, SearchError> {
     Ok(pb::HybridSearchResult {
         fused_score: hit.score,
-        vector_id: hit.vector_id,
+        record_id: hit.record_id,
         projection: json_map_to_projection(hit.row)?,
     })
 }

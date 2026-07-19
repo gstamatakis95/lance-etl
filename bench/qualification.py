@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 import tracemalloc
 from collections import Counter, defaultdict
@@ -18,7 +19,6 @@ from bench.results import save_phase
 from lance_etl.etl.digest import encode_mapping
 from lance_etl.etl.mutation import MutationInput, collapse_snapshot_mutations
 from lance_etl.etl.pivot import ETLConfig
-from lance_etl.etl.plan import MAX_SHUFFLE_PARTITIONS, bucket_count, shuffle_partition_count
 from lance_etl.telemetry import TelemetryConfig
 
 LOCAL_COHORT_ROW_LIMIT: int = 1_000_000
@@ -30,21 +30,65 @@ WIDE_FIELD_COUNT: int = 32
 BASE_TIME: datetime = datetime(2025, 1, 1, tzinfo=UTC)
 """Stable timestamp origin for reproducible cohorts."""
 
+MAX_SHUFFLE_PARTITIONS: int = 32_768
+"""Upper clamp on the routing-shuffle width the collapse cohort qualifies against."""
+
+
+def bucket_count(rows: int, bucket_rows: int, max_buckets: int) -> int:
+    """Compute the number of key-hash sub-buckets for a dataset of ``rows`` rows.
+
+    Args:
+        rows: Row count of the dataset in this increment.
+        bucket_rows: Target rows per sub-bucket. Values below one are treated as one.
+        max_buckets: Upper cap on sub-buckets per dataset.
+
+    Returns:
+        ``min(max_buckets, max(1, ceil(rows / bucket_rows)))``.
+    """
+    safe_bucket_rows: int = max(1, bucket_rows)
+    return min(max_buckets, max(1, math.ceil(rows / safe_bucket_rows)))
+
+
+def shuffle_partition_count(total_rows: int, trio_count: int, config: ETLConfig) -> int:
+    """Size the routing shuffle by both total rows and distinct-trio count.
+
+    Takes the larger of a row floor (so no partition holds far more than ``bucket_rows`` rows) and
+    a dataset floor (so no task serializes far more than ``datasets_per_task`` datasets), clamped
+    to :data:`MAX_SHUFFLE_PARTITIONS`. A manual ``config.num_partitions`` overrides the whole
+    computation.
+
+    Args:
+        total_rows: Total collapsed rows in the increment.
+        trio_count: Number of distinct routing trios in the increment.
+        config: ETL configuration carrying the sizing tunables.
+
+    Returns:
+        The planned shuffle-partition width, at least one.
+    """
+    if config.num_partitions is not None:
+        return config.num_partitions
+    safe_bucket_rows: int = max(1, config.bucket_rows)
+    safe_datasets_per_task: int = max(1, config.datasets_per_task)
+    row_floor: int = math.ceil(total_rows / safe_bucket_rows)
+    dataset_floor: int = math.ceil(trio_count / safe_datasets_per_task)
+    return max(1, min(MAX_SHUFFLE_PARTITIONS, max(row_floor, dataset_floor)))
+
 
 @dataclass(frozen=True)
 class QualificationRow:
-    """One deterministic source delivery carrying business and partition clocks.
+    """One deterministic source delivery carrying the single business and partition clock.
 
     Attributes:
         mutation: Business mutation passed to the production collapse contract.
         source_sequence: Iceberg snapshot sequence that totally orders arrival.
-        processing_timestamp: Timestamp whose hour controls Iceberg partition placement.
+        ts: The single ``ts`` whose hour controls Iceberg partition placement, equal to the
+            mutation's own ``ts``.
         scenario: Named qualification feature represented by the row.
     """
 
     mutation: MutationInput
     source_sequence: int
-    processing_timestamp: datetime
+    ts: datetime
     scenario: str
 
 
@@ -76,12 +120,10 @@ def base_row(index: int, row_count: int) -> QualificationRow:
     """
     hot_cutoff: int = row_count * 8 // 10
     org_id: str = "org-hot" if index < hot_cutoff else f"org-tail-{index % 257:03d}"
-    processing_timestamp: datetime = BASE_TIME + timedelta(hours=index % 24)
-    event_timestamp: datetime = processing_timestamp
+    ts: datetime = BASE_TIME + timedelta(hours=index % 24)
     scenario: str = "base"
     if index % 37 == 0:
-        processing_timestamp += timedelta(hours=96)
-        event_timestamp -= timedelta(hours=72)
+        ts += timedelta(hours=96)
         scenario = "late_hour"
     wide: bool = index % 97 == 0
     if wide:
@@ -90,12 +132,12 @@ def base_row(index: int, row_count: int) -> QualificationRow:
         tenant_id="tenant0",
         namespace="vectors",
         org_id=org_id,
-        vector_id=f"vector-{index:012d}",
+        record_id=f"vector-{index:012d}",
         operation="upsert",
-        event_timestamp=event_timestamp,
+        ts=ts,
         payload=payload_for(index, wide),
     )
-    return QualificationRow(mutation, 1 + index // 1_000, processing_timestamp, scenario)
+    return QualificationRow(mutation, 1 + index // 1_000, ts, scenario)
 
 
 def generate_qualification_cohort(row_count: int) -> Iterator[QualificationRow]:
@@ -117,36 +159,38 @@ def generate_qualification_cohort(row_count: int) -> Iterator[QualificationRow]:
         row = base_row(index, row_count)
         yield row
         if index % 29 == 0:
-            yield QualificationRow(row.mutation, row.source_sequence, row.processing_timestamp, "exact_duplicate")
+            yield QualificationRow(row.mutation, row.source_sequence, row.ts, "exact_duplicate")
         if index % 53 == 0:
+            delete_ts: datetime = row.mutation.ts + timedelta(hours=1)
             deleted = MutationInput(
                 tenant_id=row.mutation.tenant_id,
                 namespace=row.mutation.namespace,
                 org_id=row.mutation.org_id,
-                vector_id=row.mutation.vector_id,
+                record_id=row.mutation.record_id,
                 operation="delete",
-                event_timestamp=row.mutation.event_timestamp + timedelta(seconds=1),
+                ts=delete_ts,
                 payload={},
             )
             yield QualificationRow(
                 deleted,
                 lifecycle_sequence,
-                row.processing_timestamp + timedelta(hours=1),
+                delete_ts,
                 "delete",
             )
+            recreate_ts: datetime = row.mutation.ts + timedelta(hours=2)
             recreated = MutationInput(
                 tenant_id=row.mutation.tenant_id,
                 namespace=row.mutation.namespace,
                 org_id=row.mutation.org_id,
-                vector_id=row.mutation.vector_id,
+                record_id=row.mutation.record_id,
                 operation="upsert",
-                event_timestamp=row.mutation.event_timestamp + timedelta(seconds=2),
+                ts=recreate_ts,
                 payload=payload_for(index + row_count, index % 97 == 0),
             )
             yield QualificationRow(
                 recreated,
                 lifecycle_sequence + 1,
-                row.processing_timestamp + timedelta(hours=2),
+                recreate_ts,
                 "recreate",
             )
             lifecycle_sequence += 2
@@ -163,10 +207,9 @@ def row_fingerprint(row: QualificationRow) -> bytes:
     """
     document = {
         "target": row.mutation.target,
-        "vector_id": row.mutation.vector_id,
+        "record_id": row.mutation.record_id,
         "operation": row.mutation.operation,
-        "event_timestamp": row.mutation.event_timestamp.isoformat(),
-        "processing_timestamp": row.processing_timestamp.isoformat(),
+        "ts": row.mutation.ts.isoformat(),
         "source_sequence": row.source_sequence,
         "scenario": row.scenario,
         "payload_digest": hashlib.sha256(encode_mapping(row.mutation.payload)).hexdigest(),

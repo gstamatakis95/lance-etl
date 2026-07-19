@@ -300,7 +300,7 @@ def replay_safe_merge(
     table: pa.Table,
     telemetry: Telemetry,
     storage_options: Mapping[str, str] | None = None,
-    key_column: str = "vector_id",
+    key_column: str = "record_id",
     conflict_retries: int = 10,
     retry_backoff_seconds: float = 0.25,
     max_rows_per_file: int = 1_048_576,

@@ -1,10 +1,9 @@
 """Command-line dispatch for the benchmark phases.
 
 Each subcommand maps to one phase runner imported at module load, per the repository rule that all imports live at the
-top of the file. ``all`` chains the full pipeline. ``e2e`` is the batch-major variant that runs ETL, index, compact,
-and tagging per batch then does historical-tag verification. The search phase in the ``all`` chain is explicitly not
-run without external TLS and bearer-token inputs. The standalone ``search`` subcommand fails loudly when those inputs
-or verified connectivity are absent.
+top of the file. ``e2e`` drives the production PostgreSQL reconciler path per batch then does historical-tag
+verification. The standalone ``search`` subcommand fails loudly when external TLS and bearer-token inputs or verified
+connectivity are absent.
 """
 
 from __future__ import annotations
@@ -17,17 +16,14 @@ from collections.abc import Callable
 from typing import Any
 
 from bench.capacity import capacity_artifact
-from bench.compaction import run_compact
 from bench.config import BenchConfig, build_parser
 from bench.download import run_download
 from bench.e2e import run_e2e
 from bench.experiment import run_experiment
-from bench.indexes import run_index
-from bench.ingest import run_ingest
 from bench.prepare import run_prepare
 from bench.qualification import run_qualification
 from bench.report import run_report
-from bench.results import save_phase, write_json
+from bench.results import write_json
 from bench.search import run_search
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -35,9 +31,6 @@ logger: logging.Logger = logging.getLogger(__name__)
 PHASE_RUNNERS: dict[str, Callable[[BenchConfig], dict[str, Any]]] = {
     "download": run_download,
     "prepare": run_prepare,
-    "ingest": run_ingest,
-    "index": run_index,
-    "compact": run_compact,
     "search": run_search,
     "report": run_report,
     "e2e": run_e2e,
@@ -59,35 +52,6 @@ def run_phase(config: BenchConfig, phase: str) -> dict[str, Any]:
     return PHASE_RUNNERS[phase](config)
 
 
-def run_all(config: BenchConfig) -> dict[str, Any]:
-    """Run the full benchmark chain under one run id.
-
-    Compaction is skipped when ``--batches`` is 1 since single-batch ingest produces nothing to merge. Search is
-    measured only through a configured external authenticated service.
-
-    Args:
-        config: Benchmark configuration.
-
-    Returns:
-        Phase result documents by name.
-    """
-    outcomes: dict[str, Any] = {}
-    for phase in ("download", "prepare", "ingest", "index"):
-        outcomes[phase] = run_phase(config, phase)
-    if config.batches > 1:
-        outcomes["compact"] = run_phase(config, "compact")
-    else:
-        outcomes["compact"] = save_phase(config, "compact", {"skipped": "batches=1 leaves nothing to compact"})
-    if config.search_credentials_configured():
-        outcomes["search"] = run_phase(config, "search")
-    else:
-        reason: str = "run the standalone search command with TLS, token, and expected-version evidence"
-        logger.warning(reason)
-        outcomes["search"] = save_phase(config, "search", {"status": "NOT_RUN", "reason": reason})
-    outcomes["report"] = run_phase(config, "report")
-    return outcomes
-
-
 def main(argv: list[str] | None = None) -> int:
     """Parse arguments and run the selected benchmark subcommand.
 
@@ -106,14 +70,7 @@ def main(argv: list[str] | None = None) -> int:
     config: BenchConfig = BenchConfig.from_args(args)
     write_json(config.run_dir() / "capacity.json", capacity_artifact(config))
     try:
-        if config.command == "all":
-            outcome: dict[str, Any] = run_all(config)
-        elif config.command == "e2e":
-            outcome = run_e2e(config)
-        elif config.command == "experiment":
-            outcome = run_experiment(config)
-        else:
-            outcome = run_phase(config, config.command)
+        outcome: dict[str, Any] = run_phase(config, config.command)
     except Exception:
         logger.exception("benchmark phase %s failed", config.command)
         return 1

@@ -126,6 +126,7 @@ class WorkRepository(Protocol):
         delay: timedelta,
         error_code: str,
         error_message: str,
+        max_attempts: int,
         now: datetime | None = None,
     ) -> bool:
         """Persist a transient failure for unlimited durable retry.
@@ -135,6 +136,7 @@ class WorkRepository(Protocol):
             delay: Code-owned retry delay.
             error_code: Bounded failure classification.
             error_message: Bounded diagnostic.
+            max_attempts: Bootstrap-configured maximum durable attempts before blocking.
             now: Optional deterministic clock.
 
         Returns:
@@ -299,13 +301,16 @@ class ResultReconciler:
             )
             if not advanced:
                 return False
-            return self.repository.retry_work(result.claim, timedelta(0), "PHASE_CHECKPOINTED", "", now)
+            return self.repository.retry_work(
+                result.claim, timedelta(0), "PHASE_CHECKPOINTED", "", self.settings.max_attempts, now
+            )
         if result.kind is ResultKind.RETRY:
             return self.repository.retry_work(
                 result.claim,
                 self.settings.retry_delay(result.claim.attempt_count, result.claim.work_id),
                 required_str(result.error_code),
                 result.error_message or "",
+                self.settings.max_attempts,
                 now,
             )
         return self.repository.block_work(

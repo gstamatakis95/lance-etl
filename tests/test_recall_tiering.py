@@ -159,7 +159,7 @@ def vectors_table(ids: list[int], vectors: np.ndarray) -> pa.Table:
     """Build a Lance-writable table with id, vector, and category columns.
 
     Args:
-        ids: The vector ids.
+        ids: The record ids.
         vectors: The ``(rows, dim)`` float32 matrix.
 
     Returns:
@@ -169,7 +169,7 @@ def vectors_table(ids: list[int], vectors: np.ndarray) -> pa.Table:
     fsl: pa.Array = pa.FixedSizeListArray.from_arrays(flat, vectors.shape[1])
     return pa.table(
         {
-            "vector_id": pa.array(ids, pa.int64()),
+            "record_id": pa.array(ids, pa.int64()),
             "vector": fsl,
             "category": pa.array([f"cat{i % 4}" for i in ids]),
         }
@@ -296,13 +296,13 @@ class TestExactness:
         assert len(dataset.get_fragments()) == 6
         query: np.ndarray = vectors[0].astype(np.float64)
         whole_ids, whole_dists, whole_count = brute_force_top_k_scored(
-            dataset, query, 10, "l2", "vector_id", "vector", None, 8
+            dataset, query, 10, "l2", "record_id", "vector", None, 8
         )
         partials: list[tuple[list[Any], list[float]]] = []
         total: int = 0
         for fragment in dataset.get_fragments():
             partial_ids, partial_dists, partial_count = brute_force_top_k_scored(
-                dataset, query, 10, "l2", "vector_id", "vector", None, 8, fragments=[fragment]
+                dataset, query, 10, "l2", "record_id", "vector", None, 8, fragments=[fragment]
             )
             partials.append((partial_ids, partial_dists))
             total += partial_count
@@ -316,7 +316,7 @@ class TestExactness:
         uri, ids, vectors = tied_dataset(tmp_path, fragments=5, rows_per_fragment=8, tie_span=7)
         dataset: lance.LanceDataset = lance.dataset(uri)
         query: np.ndarray = make_vectors(1, DIM, 17)[0].astype(np.float64)
-        whole_ids, _, whole_count = brute_force_top_k_scored(dataset, query, 10, "l2", "vector_id", "vector", None, 8)
+        whole_ids, _, whole_count = brute_force_top_k_scored(dataset, query, 10, "l2", "record_id", "vector", None, 8)
         config: RecallJobConfig = config_for(tmp_path, telemetry_config)
         version: int = lance.dataset(uri).version
         sample: RecallSample = make_sample(0, version, query, oracle_top_k(ids, vectors, query, 10))

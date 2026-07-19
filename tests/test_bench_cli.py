@@ -77,17 +77,13 @@ class TestSubcommandFlags:
         assert config.num_clusters == 16
         assert config.force is True
 
-    def test_ingest_flags(self) -> None:
-        """Ingest accepts batches and ETL partitioning."""
-        config: BenchConfig = config_for(["ingest", "--batches", "4", "--etl-partitions", "16"])
-        assert config.batches == 4
-        assert config.etl_partitions == 16
-
-    def test_index_flags(self) -> None:
-        """Index accepts the IVF sweep and sharding knobs."""
+    def test_e2e_flags(self) -> None:
+        """The reconciler-driven e2e accepts batches and the IVF sweep and sharding knobs."""
         config: BenchConfig = config_for(
             [
-                "index",
+                "e2e",
+                "--batches",
+                "4",
                 "--num-partitions",
                 "256",
                 "--num-shards",
@@ -97,15 +93,11 @@ class TestSubcommandFlags:
                 "--fts-with-position",
             ]
         )
+        assert config.batches == 4
         assert config.ivf_partitions == 256
         assert config.num_shards == 32
         assert config.vector_row_floor == 10
         assert config.fts_with_position is True
-
-    def test_compact_flags(self) -> None:
-        """Compact accepts the target fragment size."""
-        config: BenchConfig = config_for(["compact", "--target-rows-per-fragment", "500000"])
-        assert config.compact_target_rows == 500000
 
     def test_search_flags(self, tmp_path: Path) -> None:
         """Search accepts an external authenticated endpoint and query cap."""
@@ -136,14 +128,6 @@ class TestSubcommandFlags:
         assert config.run_id == "run42"
         assert config.run_dir() == Path("/tmp/results").resolve() / "run42"
 
-    def test_all_flags(self) -> None:
-        """All accepts the union of phase flags."""
-        config: BenchConfig = config_for(["all", "--limit", "1000", "--batches", "2", "--tenants", "2"])
-        assert config.command == "all"
-        assert config.limit == 1000
-        assert config.batches == 2
-        assert config.tenants == 2
-
 
 class TestDerivedPaths:
     """Derived identifiers and paths follow the documented shapes."""
@@ -165,7 +149,7 @@ class TestDerivedPaths:
 
     def test_dataset_uris_match_etl_routing(self) -> None:
         """Dataset URIs follow base/org/tenant/namespace.lance per tenant."""
-        config: BenchConfig = config_for(["ingest", "--tenants", "2", "--workspace", "/tmp/ws"])
+        config: BenchConfig = config_for(["e2e", "--tenants", "2", "--workspace", "/tmp/ws"])
         base: str = str(Path("/tmp/ws").resolve() / "lance")
         assert config.dataset_uris() == [f"{base}/org0/tenant0/ns.lance", f"{base}/org1/tenant0/ns.lance"]
 

@@ -11,7 +11,6 @@ from pathlib import Path
 
 import pytest
 
-import lance_etl.etl.cli as etl_cli
 import lance_etl.tools.cli as tools_cli
 from lance_etl.cliutil import parse_partition_cols
 from lance_etl.etl import (
@@ -50,29 +49,7 @@ class TestDatasetUri:
 
 
 class TestCliPartitionFlags:
-    """The CLI exposes --partition-by on the migrate-namespace subcommand only.
-
-    The etl subcommand uses the fixed ROUTING_COLS trio and does not accept --partition-by.
-    """
-
-    def test_etl_has_no_partition_by_flag(self) -> None:
-        """The etl subcommand no longer accepts --partition-by."""
-        with pytest.raises(SystemExit) as exc_info:
-            etl_cli.build_parser().parse_args(
-                [
-                    "--table",
-                    "db.t",
-                    "--start",
-                    "0",
-                    "--end",
-                    "1",
-                    "--base-uri",
-                    "s3://bucket/lance",
-                    "--partition-by",
-                    "org_id,tenant_id,namespace",
-                ]
-            )
-        assert exc_info.value.code != 0
+    """The CLI exposes --partition-by on the migrate-namespace subcommand only."""
 
     def test_migrate_namespace_partition_by_defaults_to_absent(self) -> None:
         """Without the flag, migrate-namespace carries None so the ROUTING_COLS default applies."""
@@ -105,13 +82,6 @@ class TestCliPartitionFlags:
             ]
         )
         assert args.partition_by == "org_id,tenant_id,namespace,region"
-
-    def test_no_partition_derive_flag(self) -> None:
-        """The by-date --partition-derive flag is gone from the etl subcommand."""
-        args = etl_cli.build_parser().parse_args(
-            ["--table", "db.t", "--start", "0", "--end", "1", "--base-uri", "s3://bucket/lance"]
-        )
-        assert not hasattr(args, "partition_derive")
 
     def test_parse_partition_cols(self) -> None:
         """Comma-separated columns parse into a trimmed list. Absent stays None."""

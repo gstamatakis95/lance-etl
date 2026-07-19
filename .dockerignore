@@ -1,9 +1,0 @@
-**/.git
-**/.pytest_cache
-**/__pycache__
-**/target
-**/.venv
-bench/corpora
-bench/results
-bench/workspace
-fable_report1.md

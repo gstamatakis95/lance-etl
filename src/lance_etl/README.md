@@ -15,51 +15,47 @@ See the repository [README](../../README.md) for setup and [AGENTS.md](AGENTS.md
 4. Claim dataset-disjoint work with `FOR UPDATE SKIP LOCKED`, a lease token, and a fence epoch.
 5. Run replay-safe ingestion, compaction, indexing, validation, and local exact-version prewarm.
 6. Append an immutable publication with row, fragment, schema, manifest, and index evidence.
-7. Atomically move `dataset_state.active_publication_id` to the qualified publication.
+7. Atomically move `datasets.active_publication_id` to the qualified publication.
 8. Advance the source snapshot only after all related ingest work succeeds.
 
 `lance-etl-reconcile run` repeats the same cycle using the PostgreSQL polling interval. It does not
 introduce another scheduler or retry database.
 
-Loop settings are loaded once when the process starts. Restart the local reconciler after changing
-`reconciler_settings`.
+Loop settings are process bootstrap configuration read from environment variables into
+`ReconcilerSettings`. Restart the local reconciler after changing any loop-policy environment value.
 
 ## PostgreSQL entities
 
-The application schema contains exactly 14 normalized tables:
+The application schema contains exactly 9 normalized tables:
 
 | Table | Responsibility |
 |---|---|
-| `reconciler_settings` | Singleton claim, lease, polling, retry, SLO, and audit cleanup bounds |
-| `dataset_specs` | Stable names for dataset contracts |
-| `dataset_spec_revisions` | Immutable schema and ingestion, compaction, indexing, publication, and retention policy |
+| `dataset_spec_revisions` | Immutable schema and ingestion, compaction, indexing, publication, and retention policy, carrying its own `spec_id`, `name`, and `description` |
 | `dataset_fields` | Ordered target fields, semantic roles, physical types, and Iceberg projections |
-| `index_definitions` | Ordered required Lance indexes and their target fields |
-| `vector_index_options` | Typed IVF_RQ metric, partition sizing, training, and retraining options |
-| `fts_index_options` | Typed INVERTED tokenizer, positions, language, and backlog options |
+| `index_definitions` | Ordered required Lance indexes with typed IVF_RQ and INVERTED options as nullable columns gated by per-type CHECK constraints |
 | `iceberg_sources` | Source identity, local Lance base URI, baseline, replay horizon, and source-column mapping |
-| `datasets` | First-class `(tenant_id, namespace, org_id)` route, source, lifecycle, and desired spec revision |
+| `datasets` | First-class `(tenant_id, namespace, org_id)` route, source, lifecycle, desired spec revision, and the mutable materialization cursor, fence, and active publication pointer |
 | `source_snapshots` | Exact Iceberg lineage and accepted or blocked transition evidence |
 | `dataset_work` | Durable work, lease, retry state, and latest bounded error under the dataset fence |
 | `dataset_publications` | Immutable exact Lance version plus schema, row, fragment, and manifest evidence |
 | `publication_indexes` | Per-publication evidence for every required index definition |
-| `dataset_state` | Mutable ingest cursor, materialized spec, fence epoch, and active publication pointer |
 
-`state/repository.py` is the only owner of transactions and state transitions. Each work item and
-publication freezes one `spec_revision_id`. Retries increment `dataset_work.attempt_count` while
-retaining the same deterministic work identity. A fresh lease token and higher dataset fence reject
-stale executors without a parallel attempt-history entity.
+`state/repository.py` is the only owner of transactions and state transitions. A specification
+exists only as its revisions. Each work item and publication freezes one `spec_revision_id`. Retries
+increment `dataset_work.attempt_count` while retaining the same deterministic work identity. A fresh
+lease token and higher dataset fence reject stale executors without a parallel attempt-history
+entity.
 
 Configuration changes follow the repository lifecycle API:
 
-1. `create_spec` creates or replay-validates a stable named identity.
-2. `create_draft_spec_revision` recomputes the digest and atomically stores the complete typed
-   parent, fields, indexes, and family options.
-3. `activate_spec_revision` validates the graph, retires the former ACTIVE revision, and activates
+1. `create_draft_spec_revision` recomputes the digest and atomically stores the complete typed
+   revision, fields, indexes, and family options under a caller-supplied `name` and optional
+   `description`.
+2. `activate_spec_revision` validates the graph, retires the former ACTIVE revision, and activates
    the DRAFT.
-4. `set_source_default_spec` selects a spec that has an ACTIVE revision for newly discovered
+3. `set_source_default_spec` selects a spec that has an ACTIVE revision for newly discovered
    datasets.
-5. `assign_dataset_spec_revision` changes an existing dataset's desired ACTIVE revision and creates
+4. `assign_dataset_spec_revision` changes an existing dataset's desired ACTIVE revision and creates
    one deterministic REBUILD when its materialized revision differs.
 
 PostgreSQL triggers allow content changes only while a revision is DRAFT. ACTIVE and RETIRED graphs
@@ -67,9 +63,8 @@ cannot be updated or deleted, while historical work and publications continue to
 revisions. A blocked `source_snapshots` row persists both its bounded classification code and
 diagnostic message so a replay must present identical evidence.
 
-`dataset_work` also stores launcher kind and optional standard `AIRFLOW_CTX_*` fields. The local
-runtime reads them once when present. This is audit provenance only and does not introduce an
-Airflow service, DAG, attempt table, or alternate scheduler.
+`dataset_work` also stores a `launcher_kind` audit label. This is audit provenance only and does
+not introduce a scheduler, attempt table, or external orchestrator.
 
 The complete column and transaction design is in
 [ADR 0042](../../docs/adr/postgresql-dataset-control-plane.md).
@@ -100,7 +95,7 @@ Process bootstrap values identify the local Iceberg table and Lance root. On the
 `ensure_source_registration` creates an active `iceberg_sources` row and binds it to the bundled
 active spec. It records the table UUID, catalog and table name, canonical baseline, replay horizon,
 Lance storage namespace, and source-column mapping. Later runs treat the PostgreSQL row as
-authoritative and reject drift. `dataset_state.ingest_lance_uri` and `ingest_lance_version` are the
+authoritative and reject drift. `datasets.ingest_lance_uri` and `ingest_lance_version` are the
 current physical materialization cursor for each dataset.
 
 The source contract requires direct snapshot lineage and the route partition fields configured in
@@ -125,7 +120,7 @@ remain prohibited.
 
 Publication succeeds only after validation produces complete typed evidence for the frozen spec.
 The Rust search service resolves only the active publication's URI and exact Lance version through
-`datasets -> dataset_state -> dataset_publications`.
+`datasets -> dataset_publications`.
 
 ## Local configuration
 

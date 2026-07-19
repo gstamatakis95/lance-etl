@@ -102,15 +102,10 @@ pub const DEFAULT_DISK_CACHE_SWEEP_SECS: u64 = 300;
 /// Hardcoded: no deployment has ever retuned this, so it is no longer an env knob.
 pub const DEFAULT_PREWARM_CONCURRENCY: usize = 4;
 
-/// Fixed logical id column captured for recall scoring.
-///
-/// Hardcoded: matches the standardized ETL and recall schema, so it is no longer an env knob.
-pub const DEFAULT_ID_COLUMN: &str = "vector_id";
-
-/// Fixed event-timestamp column a search time range is applied to.
+/// Fixed time column a search time range is applied to.
 ///
 /// Hardcoded: matches the standardized ETL event clock, so it is no longer an env knob.
-pub const DEFAULT_EVENT_TIMESTAMP_COLUMN: &str = "event_timestamp";
+pub const DEFAULT_TS_COLUMN: &str = "ts";
 
 /// Default DogStatsD address when neither `SEARCH_API_STATSD_ADDR` nor `DD_AGENT_HOST` is set.
 pub const DEFAULT_STATSD_ADDR: &str = "127.0.0.1:8125";

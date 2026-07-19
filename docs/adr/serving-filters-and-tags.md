@@ -41,8 +41,8 @@ Status: Accepted
 
 An optional `TimeRange { start_ms, end_ms }` message (epoch milliseconds, start inclusive, end
 exclusive, either bound optional) rides on all three search requests and always applies to the
-event-timestamp column, fixed to the `DEFAULT_EVENT_TIMESTAMP_COLUMN` constant in `config.rs`
-(`event_timestamp`, no longer env-configurable). The
+time column, fixed to the `DEFAULT_TS_COLUMN` constant in `config.rs`
+(`ts`, no longer env-configurable). The
 range translates through the typed-filter path — each bound becomes a literal of the column's
 own Arrow type (timestamp scaled to the column `TimeUnit` with its timezone, or a plain integer
 for epoch-integer columns), so no cross-type coercion occurs. The range ANDs with any

@@ -58,7 +58,7 @@ def vectors_table(ids: list[int], vectors: np.ndarray) -> pa.Table:
     """Build a Lance-writable table with id, vector, and category columns.
 
     Args:
-        ids: The vector ids.
+        ids: The record ids.
         vectors: The ``(rows, dim)`` float32 matrix.
 
     Returns:
@@ -68,7 +68,7 @@ def vectors_table(ids: list[int], vectors: np.ndarray) -> pa.Table:
     fsl: pa.Array = pa.FixedSizeListArray.from_arrays(flat, vectors.shape[1])
     return pa.table(
         {
-            "vector_id": pa.array(ids, pa.int64()),
+            "record_id": pa.array(ids, pa.int64()),
             "vector": fsl,
             "category": pa.array([f"cat{i % 4}" for i in ids]),
         }
@@ -197,7 +197,7 @@ class TestBruteForce:
         uri, ids, vectors = dataset_setup
         dataset: lance.LanceDataset = lance.dataset(uri)
         query: np.ndarray = make_vectors(1, DIM, 21)[0].astype(np.float64)
-        top_ids, count = brute_force_top_k(dataset, query, 10, distance_type, "vector_id", "vector", None, 16)
+        top_ids, count = brute_force_top_k(dataset, query, 10, distance_type, "record_id", "vector", None, 16)
         assert count == ROWS
         assert top_ids == oracle_top_k(ids, vectors, query, 10, distance_type)
 
@@ -207,7 +207,7 @@ class TestBruteForce:
         dataset: lance.LanceDataset = lance.dataset(uri)
         query: np.ndarray = make_vectors(1, DIM, 22)[0].astype(np.float64)
         keep: list[int] = [i for i in ids if i % 4 == 1]
-        top_ids, count = brute_force_top_k(dataset, query, 5, "l2", "vector_id", "vector", "(category = 'cat1')", 16)
+        top_ids, count = brute_force_top_k(dataset, query, 5, "l2", "record_id", "vector", "(category = 'cat1')", 16)
         assert count == len(keep)
         assert top_ids == oracle_top_k(keep, vectors[keep], query, 5, "l2")
 
@@ -217,7 +217,7 @@ class TestBruteForce:
         del ids, vectors
         dataset: lance.LanceDataset = lance.dataset(uri)
         with pytest.raises(ValueError, match="dimension"):
-            brute_force_top_k(dataset, np.zeros(4), 5, "l2", "vector_id", "vector", None, 16)
+            brute_force_top_k(dataset, np.zeros(4), 5, "l2", "record_id", "vector", None, 16)
 
 
 class TestVersionPinning:
@@ -235,7 +235,7 @@ class TestVersionPinning:
         dataset, drift = resolve_dataset(uri, pinned_version, None)
         assert dataset is not None
         assert drift is False
-        top_ids, count = brute_force_top_k(dataset, query, 10, "l2", "vector_id", "vector", None, 16)
+        top_ids, count = brute_force_top_k(dataset, query, 10, "l2", "record_id", "vector", None, 16)
         assert count == ROWS
         assert all(top_id < ROWS for top_id in top_ids)
         assert top_ids == oracle_top_k(ids, vectors, query, 10, "l2")

@@ -21,7 +21,7 @@ from bench.grpc_client import (
     generate_stubs,
     load_expected_versions,
     load_stubs,
-    result_vector_ids,
+    result_record_ids,
     text_query,
     timed_call,
     validate_served_version,
@@ -332,29 +332,29 @@ class TestAuthenticatedLoad:
 
 
 class TestResultParsing:
-    """Result rows decode back to global vector ids."""
+    """Result rows decode back to global record ids."""
 
-    def test_result_vector_ids_reads_string_values(self, pb2: ModuleType) -> None:
-        """Typed vector_id strings parse to the integer corpus identities."""
+    def test_result_record_ids_reads_string_values(self, pb2: ModuleType) -> None:
+        """Typed record_id strings parse to the integer corpus identities."""
         results: list[Any] = [
-            pb2.VectorSearchResult(vector_id="7", distance=0.1),
-            pb2.VectorSearchResult(vector_id="11", distance=0.2),
+            pb2.VectorSearchResult(record_id="7", distance=0.1),
+            pb2.VectorSearchResult(record_id="11", distance=0.2),
         ]
-        ids: np.ndarray = result_vector_ids(results)
+        ids: np.ndarray = result_record_ids(results)
         assert ids.tolist() == [7, 11]
         assert ids.dtype == np.int64
 
-    def test_result_vector_ids_missing_field_raises(self, pb2: ModuleType) -> None:
+    def test_result_record_ids_missing_field_raises(self, pb2: ModuleType) -> None:
         """An empty required logical identifier raises instead of being silently dropped."""
         results: list[Any] = [
-            pb2.VectorSearchResult(vector_id="7", distance=0.1),
-            pb2.VectorSearchResult(vector_id="", distance=0.2),
+            pb2.VectorSearchResult(record_id="7", distance=0.1),
+            pb2.VectorSearchResult(record_id="", distance=0.2),
         ]
-        with pytest.raises(ValueError, match="vector_id"):
-            result_vector_ids(results)
+        with pytest.raises(ValueError, match="record_id"):
+            result_record_ids(results)
 
-    def test_result_vector_ids_mistyped_field_raises(self, pb2: ModuleType) -> None:
+    def test_result_record_ids_mistyped_field_raises(self, pb2: ModuleType) -> None:
         """A non-numeric product identifier is rejected by integer-corpus recall scoring."""
-        results: list[Any] = [pb2.VectorSearchResult(vector_id="not-an-integer", distance=0.1)]
-        with pytest.raises(ValueError, match="vector_id"):
-            result_vector_ids(results)
+        results: list[Any] = [pb2.VectorSearchResult(record_id="not-an-integer", distance=0.1)]
+        with pytest.raises(ValueError, match="record_id"):
+            result_record_ids(results)

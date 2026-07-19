@@ -39,9 +39,9 @@ the source event time provide reproducible ordering.
 
 Status: Accepted
 
-The active spec requires exactly one `EVENT_TIME` field. Source mapping selects its Iceberg column.
-The value drives time-range filters and TTL expiration. It is not replaced by process start time,
-file modification time, or snapshot commit time.
+The active spec requires exactly one `EVENT_TIME` field, the canonical `ts` column. Source mapping
+selects its Iceberg column. The value drives time-range filters and retention expiry. It is not
+replaced by process start time, file modification time, or snapshot commit time.
 
 ## ADR 0020 — Static map projection
 
@@ -86,8 +86,8 @@ executor closures. Completion is recorded only after all executor results valida
 
 ## Target schema contract
 
-The role set is `KEY`, `EVENT_TIME`, `VECTOR`, `TEXT`, `METADATA`, `TTL`, `TOMBSTONE`,
-and `LINEAGE`. One key and one event time are mandatory. TTL and tombstone are optional singletons.
+The role set is `KEY`, `EVENT_TIME`, `VECTOR`, `TEXT`, `METADATA`, `TOMBSTONE`,
+and `LINEAGE`. One key, one event time, and one tombstone are mandatory singletons.
 Any number of vectors, texts, metadata fields, scalar fields, and lineage fields may be declared
 when their source mapping remains unique.
 
@@ -112,6 +112,6 @@ catalog-qualified name, Lance storage namespace, baseline, replay horizon, and s
 mapping. PostgreSQL becomes authoritative after registration. A later process cannot silently point
 the same source name at a different table or storage root.
 
-New routes discovered in qualified manifests create `datasets` and `dataset_state` rows in the same
-planning transaction as deterministic ingest work. A route is never invented by enumerating all
-possible organizations.
+New routes discovered in qualified manifests create `datasets` rows in the same planning
+transaction as deterministic ingest work. A route is never invented by enumerating all possible
+organizations.

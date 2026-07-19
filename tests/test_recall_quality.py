@@ -55,7 +55,7 @@ def text_table(ids: list[int], bodies: list[str], vectors: np.ndarray) -> pa.Tab
     fsl: pa.Array = pa.FixedSizeListArray.from_arrays(flat, vectors.shape[1])
     return pa.table(
         {
-            "vector_id": pa.array(ids, pa.int64()),
+            "record_id": pa.array(ids, pa.int64()),
             "vector": fsl,
             "body": pa.array(bodies),
         }
@@ -137,7 +137,7 @@ class TestBm25:
         bodies: list[str] = ["apple apple apple", "apple apple", "apple", "banana"]
         lance.write_dataset(text_table([0, 1, 2, 3], bodies, np.zeros((4, DIM), dtype=np.float32)), uri)
         dataset: lance.LanceDataset = lance.dataset(uri)
-        ids, scores, count = bm25_top_k(dataset, [("body", ["apple"], "or", 1.0)], 10, "vector_id", None, 16)
+        ids, scores, count = bm25_top_k(dataset, [("body", ["apple"], "or", 1.0)], 10, "record_id", None, 16)
         assert ids == [0, 1, 2]
         assert count == 3
         assert scores[0] > scores[1] > scores[2]
@@ -146,7 +146,7 @@ class TestBm25:
 class TestTextQueryExtraction:
     """The text-query AST extracts validated per-column scoring clauses."""
 
-    COLUMNS: frozenset[str] = frozenset({"body", "title", "vector_id"})
+    COLUMNS: frozenset[str] = frozenset({"body", "title", "record_id"})
 
     def test_match_without_column_uses_default_columns(self) -> None:
         """A match clause without a column fans out across the default text columns."""

@@ -41,14 +41,16 @@ BTREE and BITMAP segment results commit unmerged. ZONEMAP segments merge before 
 segments reuse preserved centroids and their RaBitQ model. INVERTED shards use one shared index UUID
 and an atomic metadata swap. These rules are normative in the root `AGENTS.md`.
 
-## ADR 0018 — Per-row TTL expiration
+## ADR 0018 — Retention-window expiry
 
-Status: Accepted
+Status: Accepted (supersedes the original per-row TTL field decision)
 
-TTL is a field role in the immutable dataset specification. When present, maintenance derives
-expiry from the event-time field plus TTL duration and applies tombstones before compaction.
-`materialize_deletions` and `materialize_deletions_threshold` control when physical deletion
-materialization occurs. The data model keeps source truth and physical cleanup separate.
+Retention is a window on the immutable dataset specification revision (`record_retention_seconds`),
+not a per-row column. When the window is set, maintenance derives expiry from the `ts` column plus
+the window and applies tombstones before compaction, deleting every row whose `ts` is before now
+minus the window. `materialize_deletions` and `materialize_deletions_threshold` control when
+physical deletion materialization occurs. The data model keeps source truth and physical cleanup
+separate.
 
 ## ADR 0023 — Iceberg source-table maintenance
 

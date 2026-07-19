@@ -30,9 +30,9 @@ src/lance_etl/            Python package
     prewarm.py            Local executor-owned exact-version verification
     retention.py          Publication and audit cleanup
   state/                  PostgreSQL control plane
-    tables.py             SQLAlchemy Core metadata for the exact 14-table control plane
+    tables.py             SQLAlchemy Core metadata for the exact 9-table control plane
     specs.py              Immutable field, ingestion, compaction, index, and publication policy
-    settings.py           PostgreSQL-owned local loop limits and retention bounds
+    settings.py           Environment-sourced local loop limits and retention bounds
     types.py              Validated routing, source, plan, claim, status, and serving values
     repository.py         Visible transactions, leases, cursors, and catalog publication
   source/                 Iceberg source contract and side-effect-free planning
@@ -41,17 +41,16 @@ src/lance_etl/            Python package
     manifests.py          Physical-change classification and touched-target discovery
     planner.py            Pinned baseline and incremental window planning
     scans.py              Exact Spark snapshot scan construction
-  etl/                    Reusable mutation and ingestion libraries
+  etl/                    Shared ETL primitives composed by the reconciler
     replay_sink.py        Source-sequenced replay-safe Lance merge
     completion.py         Monotonic Lance completion marker
     digest.py             Canonical mutation and source digests
     mutation.py           Operation normalization and terminal mutation collapse
-    job.py                Legacy adaptive Spark ETL library
     pivot.py              Map projection, schema alignment, and Arrow casts
+    sink.py               Executor-side content-routed idempotent Lance merge sink
   indexing/               Segment-API index planning, build, commit, and maintenance libraries
-  maintenance/            TTL, compaction, cleanup, and tag libraries
+  maintenance/            Retention, compaction, cleanup, and tag libraries
   publication/            Exact candidate manifests and publication workflow helpers
-  pipeline/               Legacy unified pipeline library retained for tests and reuse
   recall/                 Offline recall audit libraries
   tools/                  Uninstalled operator library CLI
   cliutil.py              Shared local Spark and CLI helpers
@@ -68,17 +67,17 @@ oracle in `tests/conftest.py`. Production streaming routing uses `stream_routing
 
 ```
 bench/                  Benchmark package (python -m bench). See bench/README.md for the full guide.
-  cli.py                Subcommand dispatch: download / prepare / ingest / index / compact / search / report / e2e / experiment / all
+  cli.py                Subcommand dispatch: download / prepare / search / report / e2e / experiment / qualify
+  e2e.py                Reconciler-driven end-to-end run over the PostgreSQL control plane
+  reconcile.py          Source and spec registration plus reconciler invocation for the e2e run
   experiment.py         Agent loop iteration: prepare + spawn server + e2e + sizes + sweep -> metrics.json + experiments.jsonl
+  qualification.py      Deterministic mutation-collapse, shuffle-width, and external scale-gate evidence
   server.py             ServerHandle: build/spawn/health-check/restart/stop the search-api binary
   sizes.py              On-disk data/index/meta byte measurement across the Lance fleet
   config.py             BenchConfig dataclass + full flag set
   datasets.py           DatasetAdapter registry: Sift1mAdapter, BigannAdapter
   download.py           Corpus acquisition + checksum verification
   prepare.py            Iceberg table + prepared artifacts (queries, ground truth, vocab)
-  ingest.py             Real ETL run via LanceIndexer / IcebergToLanceETL
-  indexes.py            Index build phase
-  compaction.py         Compaction phase
   search.py             Recall / FTS / hybrid / load / clusters / prewarm search legs
   report.py             summary.md, recall.csv, results.csv, pareto.png aggregation
   grpc_client.py        gRPC stub helpers for the search legs
@@ -95,10 +94,12 @@ machine.
 
 Author configuration through the repository lifecycle APIs. A complete typed graph is inserted as
 DRAFT in one transaction, its digest is recomputed, and activation retires the former ACTIVE
-revision. Database triggers freeze ACTIVE and RETIRED parent, field, index, and option rows. Source
-defaults and dataset desired revisions must resolve to ACTIVE revisions. Assigning a different
-revision to materialized data creates deterministic REBUILD work. Optional Airflow environment
-context is copied to the claimed `dataset_work` row for audit only.
+revision. Database triggers freeze ACTIVE and RETIRED parent, field, and index rows. IVF_RQ and
+INVERTED options are nullable columns on `index_definitions`, frozen by the same index trigger and
+gated by per-index-type CHECK constraints. Source defaults and dataset desired revisions must
+resolve to ACTIVE revisions. Assigning a different revision to materialized data creates
+deterministic REBUILD work. The claimed `dataset_work` row records a `launcher_kind` audit label
+only.
 
 ---
 
@@ -122,14 +123,23 @@ you are unsure whether an API exists or what its signature is, read that checkou
   Resolve it with `lance_field_id(dataset, column)` from `indexing/segments.py` — the single
   documented helper for that internal access, per hard rule 1. Never inline the underlying
   `_ds.lance_schema` lookup at call sites.
-- Iceberg 1.10 rejects `start-timestamp` / `end-timestamp` outside changelog scans. Use
-  `snapshot_id_bounds` in `etl/` to resolve wall-clock windows to `start-snapshot-id` /
-  `end-snapshot-id` from the `{table}.snapshots` metadata table before reading.
+- Iceberg 1.10 rejects `start-timestamp` / `end-timestamp` outside changelog scans. The
+  `reconciler/iceberg.py` snapshot ledger and `source/scans.py` resolve windows to
+  `start-snapshot-id` / `end-snapshot-id` from the `{table}.snapshots` metadata table before
+  reading.
 - KNOWN pylance 8.0.0 REGRESSION: concurrent `merge_insert` against a dataset carrying BTREE
   index deltas can raise the internal error `RowAddrTreeMap::from_sorted_iter called with
   non-sorted input`. The failure is loud (the merge errors and retries surface it, no silent
   corruption), and the coexistence stress test is marked xfail with this reason. Re-test and
   drop the marker when an upstream fix ships.
+- KNOWN pylance 8.0.0 BEHAVIOR: `describe_indices()` reports `index_type` as `Unknown` for an
+  INVERTED index published through the FTS atomic `CreateIndex` swap, because that hand-built
+  `Index` record carries no index details. `stats.index_stats(name)["index_type"]` still reports
+  the true `Inverted` type on the same version. The publication qualification gate
+  (`reconciler/workers.py`) therefore resolves the effective kind through `resolved_actual_index_kind`,
+  which falls back to the stats type only when `describe_indices` reports `Unknown` and only on
+  pylance majors below 9, gated on `lance.__version__`. Scalar and vector segments committed with
+  `commit_existing_index_segments` are not affected. Re-check the version gate when the pin advances.
 - V2 manifest paths default on (`enable_v2_manifest_paths=True` at dataset creation). New datasets
   use V2. Existing datasets migrate via `migrate_manifest_paths_v2`. V2 makes every dataset open
   a single object-store request regardless of version-history depth.

@@ -2,7 +2,7 @@
 
 The base vectors are written into a local Iceberg table with exactly the schema the project's ETL
 expects: the routing columns (``org_id``, ``tenant_id``, ``namespace``), the merge key
-``vector_id``, the operation column ``op``, the timestamp column ``updated_at`` (used as both the
+``record_id``, the operation column ``op``, the timestamp column ``updated_at`` (used as both the
 last-write-wins collapse column and the window-pushdown column), the low-cardinality concrete
 ``category`` column (the bitmap index target, flows through the ETL untouched), and the three map
 columns ``vectors`` / ``texts`` / ``metadata``. The embedding rides in the ``vectors`` map under
@@ -60,13 +60,13 @@ MICROS_PER_MINUTE: int = 60_000_000
 CATEGORY_CARDINALITY: int = 16
 KMEANS_SAMPLE_ROWS: int = 100_000
 SPARK_ROW_DDL: str = (
-    "org_id string, tenant_id string, namespace string, vector_id string, op string, updated_at_us long, "
+    "org_id string, tenant_id string, namespace string, record_id string, op string, updated_at_us long, "
     "category string, vectors map<string,array<float>>, texts map<string,string>, "
     "metadata map<string,string>"
 )
 
 SPARK_ROW_DDL_NO_TEXT: str = (
-    "org_id string, tenant_id string, namespace string, vector_id string, op string, updated_at_us long, "
+    "org_id string, tenant_id string, namespace string, record_id string, op string, updated_at_us long, "
     "category string, vectors map<string,array<float>>, "
     "metadata map<string,string>"
 )
@@ -85,7 +85,7 @@ def arrow_row_schema(no_text: bool = False) -> pa.Schema:
         ("org_id", pa.string()),
         ("tenant_id", pa.string()),
         ("namespace", pa.string()),
-        ("vector_id", pa.string()),
+        ("record_id", pa.string()),
         ("op", pa.string()),
         ("updated_at_us", pa.int64()),
         ("category", pa.string()),
@@ -333,7 +333,7 @@ def fan_out_prepare_artifacts(
         queries: The query matrix, or ``None`` to skip ground-truth computation.
 
     Returns:
-        The int32 cluster ids indexed by global vector id, and one ``(num_queries, depth)`` int64 array per org id
+        The int32 cluster ids indexed by global record id, and one ``(num_queries, depth)`` int64 array per org id
         (empty when ``queries`` is ``None``).
     """
     corpus_root: Path = config.corpus_root

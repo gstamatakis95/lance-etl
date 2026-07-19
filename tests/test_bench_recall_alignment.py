@@ -68,7 +68,7 @@ class TestOrgRecallAlignment:
 
         fake_search.calls = 0
         monkeypatch.setattr(bench_e2e, "vector_search", fake_search)
-        monkeypatch.setattr(bench_e2e, "result_vector_ids", lambda results: np.asarray(results, dtype=np.int64))
+        monkeypatch.setattr(bench_e2e, "result_record_ids", lambda results: np.asarray(results, dtype=np.int64))
 
         point = bench_e2e.org_catalog_recall(
             object(), object(), alignment_config(str(tmp_path)), "org0", queries, ground_truth, 1

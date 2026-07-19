@@ -31,8 +31,7 @@ Because the remap problem is otherwise handled (the orphan-race guard, see
 release builds, the trade is not worth it. Do not add `enable_stable_row_ids=True` to any
 dataset creation or compaction path, and do not offer it as an option. If the upstream
 `RowIdIndex` defect is ever fixed, revisiting this requires a fresh decision record, not a
-revival of this one. The evaluation evidence is preserved in
-`market-research/stable-row-ids-plan.md` and `market-research/stable-row-version-columns.md`.
+revival of this one.
 
 ## ADR 0012 — V2 manifest paths fleet-wide
 

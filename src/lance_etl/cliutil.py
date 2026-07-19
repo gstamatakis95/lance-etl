@@ -251,12 +251,12 @@ def add_dataset_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def add_ttl_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add the per-row TTL flags shared by the maintenance and pipeline ``run`` subcommands.
+def add_retention_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the retention-window flags shared by the maintenance ``run`` subcommand.
 
-    Both subcommands expire rows the same way: ``--ttl-column`` turns per-row TTL on and names the
-    Arrow ``Duration`` column holding each row's lifetime, and ``--ts-column`` names the event
-    timestamp column used as the TTL clock. The ``--ts-column`` default mirrors
+    Rows are expired by ``--retention-seconds``, which turns record retention on and names the
+    window past which a row's ``ts`` is considered expired, and ``--ts-column`` names the ``ts``
+    column used as the retention clock. The ``--ts-column`` default mirrors
     :attr:`~lance_etl.maintenance.job.MaintenanceConfig.ts_column` directly rather than
     duplicating the literal, so the two can never drift apart.
 
@@ -264,19 +264,21 @@ def add_ttl_arguments(parser: argparse.ArgumentParser) -> None:
         parser: The subcommand parser to extend.
     """
     parser.add_argument(
-        "--ttl-column",
+        "--retention-seconds",
+        type=int,
         default=None,
         help=(
-            "Per-row TTL column holding each row's lifetime as an Arrow Duration. When set, rows are expired before "
-            "compaction by the predicate ts-column + ttl-column < now. Absent (the default) turns TTL off."
+            "Retention window in seconds. When set, rows whose ts is older than now minus this window are expired "
+            "before compaction by the predicate ts-column < now - retention-seconds. Absent (the default) turns "
+            "retention off."
         ),
     )
     parser.add_argument(
         "--ts-column",
         default=MaintenanceConfig.ts_column,
         help=(
-            "Event timestamp column used as the TTL clock. Must match ETLConfig.ts_col. Only used when --ttl-column "
-            "is set. Default: event_timestamp."
+            "The ts column used as the retention clock. Must match ETLConfig.ts_col. Only used when "
+            "--retention-seconds is set. Default: ts."
         ),
     )
 
@@ -316,14 +318,10 @@ def index_config_from_args(
 ) -> IndexJobConfig:
     """Build an :class:`~lance_etl.indexing.config.IndexJobConfig` from the shared index-column flags.
 
-    Every caller that exposes :func:`add_index_column_arguments` (the indexing CLI, the
-    ``migrate-namespace`` subcommand, and the pipeline CLI) constructs the same column-selection
-    fields from the same flags; only the identity/storage wiring and the rebuild flag differ per
-    caller, so those three are left to the caller instead of defaulted here. The pipeline CLI
-    passes a placeholder ``telemetry`` and omits ``storage_options`` because
-    :meth:`~lance_etl.pipeline.job.PipelineConfig.__post_init__` overwrites both cross-cutting
-    fields on the composed sub-config unconditionally once the ``PipelineConfig`` is built, so
-    resolving the "real" values here would be wasted work.
+    Every caller that exposes :func:`add_index_column_arguments` (the indexing CLI and the
+    ``migrate-namespace`` subcommand) constructs the same column-selection fields from the same
+    flags. Only the identity and storage wiring and the rebuild flag differ per caller, so those
+    are left to the caller instead of defaulted here.
 
     Args:
         args: Parsed command-line arguments carrying the :func:`add_index_column_arguments` flags.

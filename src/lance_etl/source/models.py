@@ -87,7 +87,7 @@ class PartitionValues:
     tenant_id: str
     namespace: str
     org_id: str
-    processing_timestamp_hour: int
+    ts_hour: int
 
     def target_key(self) -> TargetKey:
         """Return the target identity without the pruning-only hour.

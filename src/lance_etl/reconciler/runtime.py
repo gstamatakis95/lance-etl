@@ -129,7 +129,7 @@ def build_runtime_application() -> ReconcilerApplication:
     )
     if source.lifecycle_state is not SourceLifecycleState.ACTIVE:
         raise RuntimeError("the local Iceberg source registration is not active")
-    reconciler_settings: ReconcilerSettings = repository.reconciler_settings()
+    reconciler_settings: ReconcilerSettings = ReconcilerSettings.from_environment()
     catalog: SparkIcebergCatalog = SparkIcebergCatalog(
         spark,
         source.canonical_baseline_snapshot_id,
@@ -149,7 +149,7 @@ def build_runtime_application() -> ReconcilerApplication:
     publisher: ConfiguredPublicationRunner = ConfiguredPublicationRunner(spark, telemetry_config, prewarmer)
     executor: FencedWorkExecutor = FencedWorkExecutor(repository, ingest, publisher, reconciler_settings)
     result_reconciler: ResultReconciler = ResultReconciler(repository, reconciler_settings)
-    work_provenance: WorkProvenance = WorkProvenance.from_environment(os.environ)
+    work_provenance: WorkProvenance = WorkProvenance()
     dispatcher: BoundedDispatcher = BoundedDispatcher(
         repository,
         executor,
@@ -194,5 +194,5 @@ def build_runtime_operator() -> ReconcilerOperator:
     )
     engine: Engine = build_control_plane_engine(settings.database_url)
     repository: ControlPlaneRepository = ControlPlaneRepository(engine)
-    reconciler_settings: ReconcilerSettings = repository.reconciler_settings()
+    reconciler_settings: ReconcilerSettings = ReconcilerSettings.from_environment()
     return ReconcilerOperator(repository, TelemetrySloEmitter(telemetry), reconciler_settings, engine.dispose)

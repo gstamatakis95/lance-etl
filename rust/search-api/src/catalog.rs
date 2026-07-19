@@ -156,9 +156,8 @@ fn local_catalog_config(database_url: &str) -> Result<Config, String> {
 async fn resolve_row(pool: &CatalogPool, target: &DatasetTarget) -> Result<Option<Row>, SearchError> {
     const QUERY: &str = "SELECT p.lance_uri, p.lance_version \
          FROM datasets AS d \
-         JOIN dataset_state AS s ON s.dataset_id = d.dataset_id \
          JOIN dataset_publications AS p \
-           ON p.publication_id = s.active_publication_id \
+           ON p.publication_id = d.active_publication_id \
           AND p.dataset_id = d.dataset_id \
          WHERE d.tenant_id = $1 \
            AND d.namespace = $2 \

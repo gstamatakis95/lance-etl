@@ -20,7 +20,7 @@ from lance_etl.recall import (
     parse_samples,
 )
 
-COLUMNS: frozenset[str] = frozenset({"category", "value", "score", "flag", "vector_id"})
+COLUMNS: frozenset[str] = frozenset({"category", "value", "score", "flag", "record_id"})
 
 
 def make_attrs(**overrides: Any) -> dict[str, Any]:
@@ -215,7 +215,7 @@ class TestFilterTranslation:
 
     @pytest.mark.parametrize(
         "column",
-        ["vector_id; DROP TABLE t", "1abc", "a-b", "a b", "", "col'umn", None, 42],
+        ["record_id; DROP TABLE t", "1abc", "a-b", "a b", "", "col'umn", None, 42],
     )
     def test_malicious_or_invalid_columns_rejected(self, column: Any) -> None:
         """Identifiers outside the allowlist are rejected before schema lookup."""

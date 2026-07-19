@@ -342,7 +342,7 @@ message VectorSearchResult {
   // Vector distance.
   float distance = 2;
   // Stable logical identifier.
-  string vector_id = 3;
+  string record_id = 3;
   // Requested scalar projection.
   repeated ProjectedField projection = 4;
 }
@@ -384,7 +384,7 @@ message TextSearchResult {
   // BM25 score.
   float score = 2;
   // Stable logical identifier.
-  string vector_id = 3;
+  string record_id = 3;
   // Requested scalar projection.
   repeated ProjectedField projection = 4;
 }
@@ -430,7 +430,7 @@ message HybridSearchResult {
   // Fused score.
   double fused_score = 2;
   // Stable logical identifier.
-  string vector_id = 3;
+  string record_id = 3;
   // Requested scalar projection.
   repeated ProjectedField projection = 4;
 }

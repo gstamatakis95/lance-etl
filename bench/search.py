@@ -33,7 +33,7 @@ from bench.grpc_client import (
     load_expected_versions,
     load_stubs,
     open_stub,
-    result_vector_ids,
+    result_record_ids,
     text_query,
     timed_call,
     validate_served_version,
@@ -176,7 +176,7 @@ def sweep_point(
             response, elapsed_ms = timed_call(stub.VectorSearch, request, authorization_metadata(config, org))
             validate_served_version(response, org, expected_versions[org])
             latencies.append(elapsed_ms)
-            retrieved.append(result_vector_ids(response.results))
+            retrieved.append(result_record_ids(response.results))
         expected: np.ndarray = ground_truth[org][: len(queries)]
         cutoff: Any
         for cutoff in RECALL_CUTOFFS:
@@ -249,7 +249,7 @@ def run_fts_leg(
         response, elapsed_ms = timed_call(stub.TextSearch, request, authorization_metadata(config, org))
         validate_served_version(response, org, expected_versions[org])
         latencies.append(elapsed_ms)
-        hit_ids: np.ndarray = result_vector_ids(response.results)
+        hit_ids: np.ndarray = result_record_ids(response.results)
         if len(hit_ids):
             hit_rates.append(float(np.mean(clusters[hit_ids] == cluster)))
         else:
@@ -308,7 +308,7 @@ def run_hybrid_leg(
         response, elapsed_ms = timed_call(stub.HybridSearch, request, authorization_metadata(config, org))
         validate_served_version(response, org, expected_versions[org])
         latencies.append(elapsed_ms)
-        recalls.append(recall_at(expected[None, :], [result_vector_ids(response.results)], 10))
+        recalls.append(recall_at(expected[None, :], [result_record_ids(response.results)], 10))
     return {
         "queries": count,
         "served_versions": expected_versions,

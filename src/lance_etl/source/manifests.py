@@ -131,7 +131,7 @@ def discover_added_targets(
             continue
         validate_entry_spec(snapshot, entry)
         target = entry.partition.target_key()
-        target_hours.setdefault(target, set()).add(entry.partition.processing_timestamp_hour)
+        target_hours.setdefault(target, set()).add(entry.partition.ts_hour)
     return touched_targets(target_hours)
 
 
@@ -154,7 +154,7 @@ def discover_baseline_targets(
             continue
         validate_entry_spec(snapshot, entry)
         target = entry.partition.target_key()
-        target_hours.setdefault(target, set()).add(entry.partition.processing_timestamp_hour)
+        target_hours.setdefault(target, set()).add(entry.partition.ts_hour)
     return touched_targets(target_hours)
 
 

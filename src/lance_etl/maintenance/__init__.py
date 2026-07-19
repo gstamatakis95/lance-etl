@@ -1,4 +1,4 @@
-"""Maintenance job package: per-dataset TTL expiration, unified compaction, version cleanup, and fleet tools.
+"""Maintenance job package: per-dataset retention expiry, unified compaction, version cleanup, and fleet tools.
 
 Re-exports the consumer API from the sub-modules so callers can write
 ``from lance_etl.maintenance import MaintenanceJob, MaintenanceConfig, plan_one_dataset``.
@@ -11,13 +11,13 @@ from lance_etl.maintenance.cluster import plan_cluster_rewrite
 from lance_etl.maintenance.job import (
     MaintenanceConfig,
     MaintenanceJob,
-    build_ttl_predicate,
+    build_retention_predicate,
     cleanup_dataset,
     commit_one_dataset,
     compaction_metrics_dict,
     compute_cutoff,
     plan_one_dataset,
-    run_ttl_on_open_dataset,
+    run_retention_on_open_dataset,
     validate_column_name,
 )
 from lance_etl.maintenance.tools import migrate_dataset_manifest_paths, update_serving_tag
@@ -25,7 +25,7 @@ from lance_etl.maintenance.tools import migrate_dataset_manifest_paths, update_s
 __all__ = [
     "MaintenanceConfig",
     "MaintenanceJob",
-    "build_ttl_predicate",
+    "build_retention_predicate",
     "cleanup_dataset",
     "commit_one_dataset",
     "compaction_metrics_dict",
@@ -34,7 +34,7 @@ __all__ = [
     "migrate_dataset_manifest_paths",
     "plan_cluster_rewrite",
     "plan_one_dataset",
-    "run_ttl_on_open_dataset",
+    "run_retention_on_open_dataset",
     "update_serving_tag",
     "validate_column_name",
 ]

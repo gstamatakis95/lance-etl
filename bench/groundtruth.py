@@ -1,7 +1,7 @@
 """Brute-force ground truth and recall computation for the ANN benchmark.
 
 Ground truth is computed with exact batched L2 distances in numpy so subset runs (``--limit``) and multi-tenant splits
-stay self-consistent: each tenant's ground truth ranks only that tenant's base vectors and stores global vector ids.
+stay self-consistent: each tenant's ground truth ranks only that tenant's base vectors and stores global record ids.
 """
 
 from __future__ import annotations

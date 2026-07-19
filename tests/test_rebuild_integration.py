@@ -127,12 +127,11 @@ def terminal_table(rows: list[dict[str, object]]) -> pa.Table:
     """
     schema: pa.Schema = pa.schema(
         [
-            pa.field("vector_id", pa.string(), nullable=False),
-            pa.field("event_timestamp", pa.timestamp("us", tz="UTC")),
+            pa.field("record_id", pa.string(), nullable=False),
+            pa.field("ts", pa.timestamp("us", tz="UTC")),
             pa.field("vector", pa.list_(pa.float32(), DIMENSION)),
             pa.field("text", pa.string()),
             pa.field("cluster", pa.string()),
-            pa.field("ttl", pa.int64()),
             pa.field("lance_etl_window_seq", pa.int64(), nullable=False),
             pa.field("lance_etl_source_sequence", pa.int64(), nullable=False),
             pa.field("lance_etl_event_digest", pa.binary(32), nullable=False),
@@ -143,7 +142,7 @@ def terminal_table(rows: list[dict[str, object]]) -> pa.Table:
 
 
 def terminal_row(
-    vector_id: str,
+    record_id: str,
     sequence: int,
     digest_byte: bytes,
     *,
@@ -153,7 +152,7 @@ def terminal_row(
     """Build one persisted terminal mutation fixture.
 
     Args:
-        vector_id: Logical vector key.
+        record_id: Logical vector key.
         sequence: Internal Iceberg arrival sequence.
         digest_byte: Single byte repeated into the canonical digest.
         deleted: Tombstone state.
@@ -163,12 +162,11 @@ def terminal_row(
         Complete terminal row.
     """
     return {
-        "vector_id": vector_id,
-        "event_timestamp": None if deleted else TIMESTAMP,
+        "record_id": record_id,
+        "ts": None if deleted else TIMESTAMP,
         "vector": None if deleted else vector(value),
         "text": None if deleted else f"payload-{value}",
         "cluster": None if deleted else "cluster-a",
-        "ttl": None if deleted else 0,
         "lance_etl_window_seq": sequence,
         "lance_etl_source_sequence": sequence,
         "lance_etl_event_digest": digest_byte * 32,
@@ -224,7 +222,7 @@ def test_canonical_rebuild_collapses_duplicates_and_preserves_newest_tombstone(
     spark: SparkSession,
     tmp_path: Path,
 ) -> None:
-    """Recovery emits exactly one maximum-sequence terminal row per vector ID.
+    """Recovery emits exactly one maximum-sequence terminal row per record ID.
 
     Args:
         spark: Local Spark session.
@@ -253,7 +251,7 @@ def test_canonical_rebuild_collapses_duplicates_and_preserves_newest_tombstone(
     assert runner.canonical_rebuild(context) == candidate_uri
     candidate: lance.LanceDataset = lance.dataset(candidate_uri)
     assert candidate.version == first_version
-    rows: dict[str, dict[str, object]] = {row["vector_id"]: row for row in candidate.to_table().to_pylist()}
+    rows: dict[str, dict[str, object]] = {row["record_id"]: row for row in candidate.to_table().to_pylist()}
     assert set(rows) == {"a", "b", "c"}
     assert rows["a"]["is_deleted"] is True
     assert rows["a"]["lance_etl_source_sequence"] == 2

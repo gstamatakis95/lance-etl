@@ -95,7 +95,7 @@ impl RequestAuthorizer for DenyTestAuthorizer {
 /// Writes a dataset containing duplicate logical IDs and one deleted nearest neighbor.
 async fn build_duplicate_dataset(uri: &str) -> u64 {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("vector_id", DataType::Utf8, false),
+        Field::new("record_id", DataType::Utf8, false),
         Field::new("is_deleted", DataType::Boolean, false),
         Field::new("id", DataType::Int32, false),
         Field::new("text", DataType::Utf8, false),
@@ -167,7 +167,7 @@ async fn all_public_searches_return_typed_ids_and_exact_served_version() {
         .unwrap()
         .into_inner();
     assert_eq!(vector.served_version, version);
-    assert_eq!(vector.results[0].vector_id, "v1");
+    assert_eq!(vector.results[0].record_id, "v1");
     assert_eq!(vector.results[0].projection[0].name, "id");
 
     let text = client
@@ -186,7 +186,7 @@ async fn all_public_searches_return_typed_ids_and_exact_served_version() {
         .unwrap()
         .into_inner();
     assert_eq!(text.served_version, version);
-    assert_eq!(text.results[0].vector_id, "v4");
+    assert_eq!(text.results[0].record_id, "v4");
 
     let hybrid = client
         .hybrid_search(HybridSearchRequest {
@@ -208,7 +208,7 @@ async fn all_public_searches_return_typed_ids_and_exact_served_version() {
         .unwrap()
         .into_inner();
     assert_eq!(hybrid.served_version, version);
-    assert_eq!(hybrid.results[0].vector_id, "v2");
+    assert_eq!(hybrid.results[0].record_id, "v2");
 }
 
 #[tokio::test]
@@ -287,7 +287,7 @@ async fn duplicate_rows_are_deduplicated_and_deleted_rows_never_surface() {
     let ids: Vec<&str> = response
         .results
         .iter()
-        .map(|result| result.vector_id.as_str())
+        .map(|result| result.record_id.as_str())
         .collect();
     assert_eq!(ids, vec!["dup", "unique"]);
     assert!(!ids.contains(&"deleted"));
@@ -321,7 +321,7 @@ async fn request_filter_is_applied_with_the_mandatory_live_row_filter() {
         .into_inner();
     assert!(!response.partial);
     assert_eq!(response.results.len(), 1);
-    assert_eq!(response.results[0].vector_id, "v3");
+    assert_eq!(response.results[0].record_id, "v3");
 }
 
 #[tokio::test]

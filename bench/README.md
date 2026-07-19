@@ -1,8 +1,8 @@
 # Local BIGANN and SIFT1M benchmark
 
-The `bench` package qualifies the Iceberg, Lance ingestion, compaction, indexing, search, and report
-libraries on one machine. It is an experimental harness. The PostgreSQL reconciler remains the
-normal write path.
+The `bench` package qualifies the production PostgreSQL reconciler path end to end on one machine:
+Iceberg ingestion, Lance indexing, compaction, publication, search, and report. It is an
+experimental harness. The reconciler it drives is the normal write path.
 
 ## Install
 
@@ -22,14 +22,11 @@ export LANCE_MEM_POOL_SIZE=4294967296
 |---|---|
 | `download` | Download and checksum a corpus |
 | `prepare` | Create local Iceberg input and query artifacts |
-| `ingest` | Run the reusable ETL library |
-| `index` | Build configured Lance indexes |
-| `compact` | Run Lance compaction |
 | `search` | Measure vector, text, hybrid, load, cluster, and prewarm behavior |
 | `report` | Aggregate phase artifacts into tables and plots |
-| `e2e` | Run the interleaved end-to-end qualification path |
+| `e2e` | Run the reconciler-driven end-to-end qualification path |
 | `experiment` | Run one local build, search, size, and parameter-sweep iteration |
-| `all` | Run the phase-major local pipeline |
+| `qualify` | Emit deterministic mutation-collapse, shuffle-width, and external scale-gate evidence |
 
 Use `python -m bench COMMAND --help` for the complete current flag set.
 
@@ -55,10 +52,9 @@ depends on row limit, route count, seed, and text settings.
 SIFT1M is the smallest real corpus and includes published nearest-neighbor ground truth.
 
 ```bash
-python -m bench all \
+python -m bench e2e \
   --dataset sift1m \
   --batches 2 \
-  --etl-partitions 4 \
   --num-partitions 128 \
   --workspace bench/workspace \
   --results-root bench/results
@@ -67,10 +63,10 @@ python -m bench all \
 For a download-free integration fixture:
 
 ```bash
-.venv/bin/pytest tests/test_bench_e2e.py tests/test_bench_e2e_tagged.py -x -q -m integration
+.venv/bin/pytest tests/test_bench_e2e_tagged.py -x -q -m integration
 ```
 
-The tests create tiny local BIGANN-format files, run Spark locally, and use real adapter IO.
+The test creates tiny local BIGANN-format files, runs Spark locally, and uses real adapter IO.
 
 ## BIGANN qualification
 

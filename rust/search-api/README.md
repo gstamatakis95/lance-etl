@@ -5,7 +5,7 @@ a tonic gRPC service. It never writes source rows, runs Spark, builds indexes, o
 Lance version.
 
 Every request carries one logical `DatasetTarget` with `tenant_id`, `namespace`, and `org_id`. The
-service joins `datasets`, `dataset_state`, and `dataset_publications` in PostgreSQL and opens the
+service joins `datasets` and `dataset_publications` in PostgreSQL and opens the
 active publication's allowlisted URI at its exact committed version. Clients cannot supply a URI,
 version, tag, index name, raw SQL predicate, ANN execution knob, or fusion weight.
 
@@ -25,7 +25,7 @@ The PostgreSQL read is:
 
 ```text
 datasets
-  -> dataset_state.active_publication_id
+  -> datasets.active_publication_id
   -> dataset_publications.lance_uri + lance_version
 ```
 

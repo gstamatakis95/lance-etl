@@ -8,6 +8,7 @@ from dataclasses import FrozenInstanceError, dataclass, replace
 import pytest
 
 from lance_etl.state.specs import (
+    DEFAULT_CONFIGURATION_DIGEST_HEX,
     DEFAULT_FIELD_IDS,
     DEFAULT_INDEX_IDS,
     DEFAULT_SPEC_ID,
@@ -33,12 +34,9 @@ from lance_etl.state.specs import (
 class SpecRows:
     """Normalized PostgreSQL rows for one complete specification graph."""
 
-    spec: dict[str, object]
     revision: dict[str, object]
     fields: tuple[dict[str, object], ...]
     indexes: tuple[dict[str, object], ...]
-    vector_options: tuple[dict[str, object], ...]
-    fts_options: tuple[dict[str, object], ...]
 
 
 def redigest(revision: DatasetSpecRevision) -> DatasetSpecRevision:
@@ -98,14 +96,11 @@ def normalized_rows(revision: DatasetSpecRevision) -> SpecRows:
     Returns:
         Parent, field, index, and subtype rows.
     """
-    spec_row: dict[str, object] = {
-        "spec_id": revision.spec_id,
-        "name": "production",
-        "description": "Default local processing contract",
-    }
     revision_row: dict[str, object] = {
         "spec_revision_id": revision.spec_revision_id,
         "spec_id": revision.spec_id,
+        "name": "production",
+        "description": "Default local processing contract",
         "revision_number": revision.revision_number,
         "state": revision.state.value,
         "supersedes_revision_id": revision.supersedes_revision_id,
@@ -130,6 +125,7 @@ def normalized_rows(revision: DatasetSpecRevision) -> SpecRows:
         "prewarm_required": revision.prewarm_required,
         "retained_publications": revision.retained_publications,
         "artifact_retention_seconds": revision.artifact_retention_seconds,
+        "record_retention_seconds": revision.record_retention_seconds,
     }
     field_rows: tuple[dict[str, object], ...] = tuple(
         {
@@ -148,48 +144,66 @@ def normalized_rows(revision: DatasetSpecRevision) -> SpecRows:
         }
         for field_value in revision.fields
     )
-    index_rows: tuple[dict[str, object], ...] = tuple(
-        {
-            "index_definition_id": index.index_definition_id,
-            "spec_revision_id": index.spec_revision_id,
-            "field_id": index.field_id,
-            "ordinal": index.ordinal,
-            "index_name": index.index_name,
-            "index_type": index.index_type.value,
-        }
-        for index in revision.indexes
-    )
-    vector_rows: tuple[dict[str, object], ...] = tuple(
-        {
-            "index_definition_id": index.index_definition_id,
-            "index_type": index.index_type.value,
-            "metric": index.vector_options.metric.value,
-            "num_partitions": index.vector_options.num_partitions,
-            "minimum_partitions": index.vector_options.minimum_partitions,
-            "maximum_partitions": index.vector_options.maximum_partitions,
-            "target_rows_per_partition": index.vector_options.target_rows_per_partition,
-            "minimum_rows": index.vector_options.minimum_rows,
-            "num_bits": index.vector_options.num_bits,
-            "streaming_sample_rate": index.vector_options.streaming_sample_rate,
-            "streaming_refine_passes": index.vector_options.streaming_refine_passes,
-            "retrain_growth_factor": index.vector_options.retrain_growth_factor,
-        }
-        for index in revision.indexes
-        if index.vector_options is not None
-    )
-    fts_rows: tuple[dict[str, object], ...] = tuple(
-        {
-            "index_definition_id": index.index_definition_id,
-            "index_type": index.index_type.value,
-            "with_position": index.fts_options.with_position,
-            "base_tokenizer": index.fts_options.base_tokenizer,
-            "language": index.fts_options.language,
-            "max_unindexed_fragments": index.fts_options.max_unindexed_fragments,
-        }
-        for index in revision.indexes
-        if index.fts_options is not None
-    )
-    return SpecRows(spec_row, revision_row, field_rows, index_rows, vector_rows, fts_rows)
+    index_rows: tuple[dict[str, object], ...] = tuple(normalized_index_row(index) for index in revision.indexes)
+    return SpecRows(revision_row, field_rows, index_rows)
+
+
+def normalized_index_row(index: IndexDefinition) -> dict[str, object]:
+    """Build one ``index_definitions`` row carrying inline subtype option columns.
+
+    Args:
+        index: Typed index definition.
+
+    Returns:
+        PostgreSQL-shaped index row with every option column populated or null.
+    """
+    row: dict[str, object] = {
+        "index_definition_id": index.index_definition_id,
+        "spec_revision_id": index.spec_revision_id,
+        "field_id": index.field_id,
+        "ordinal": index.ordinal,
+        "index_name": index.index_name,
+        "index_type": index.index_type.value,
+        "metric": None,
+        "num_partitions": None,
+        "minimum_partitions": None,
+        "maximum_partitions": None,
+        "target_rows_per_partition": None,
+        "minimum_rows": None,
+        "num_bits": None,
+        "streaming_sample_rate": None,
+        "streaming_refine_passes": None,
+        "retrain_growth_factor": None,
+        "with_position": None,
+        "base_tokenizer": None,
+        "language": None,
+        "max_unindexed_fragments": None,
+    }
+    if index.vector_options is not None:
+        row.update(
+            {
+                "metric": index.vector_options.metric.value,
+                "num_partitions": index.vector_options.num_partitions,
+                "minimum_partitions": index.vector_options.minimum_partitions,
+                "maximum_partitions": index.vector_options.maximum_partitions,
+                "target_rows_per_partition": index.vector_options.target_rows_per_partition,
+                "minimum_rows": index.vector_options.minimum_rows,
+                "num_bits": index.vector_options.num_bits,
+                "streaming_sample_rate": index.vector_options.streaming_sample_rate,
+                "streaming_refine_passes": index.vector_options.streaming_refine_passes,
+                "retrain_growth_factor": index.vector_options.retrain_growth_factor,
+            }
+        )
+    if index.fts_options is not None:
+        row.update(
+            {
+                "with_position": index.fts_options.with_position,
+                "base_tokenizer": index.fts_options.base_tokenizer,
+                "language": index.fts_options.language,
+                "max_unindexed_fragments": index.fts_options.max_unindexed_fragments,
+            }
+        )
+    return row
 
 
 def decode_rows(rows: SpecRows) -> DatasetSpecRevision:
@@ -202,12 +216,9 @@ def decode_rows(rows: SpecRows) -> DatasetSpecRevision:
         Validated typed revision.
     """
     return decode_dataset_spec_revision(
-        rows.spec,
         rows.revision,
         rows.fields,
         rows.indexes,
-        rows.vector_options,
-        rows.fts_options,
     )
 
 
@@ -223,18 +234,17 @@ def test_production_default_is_deterministic_complete_and_valid() -> None:
     assert first.revision_number == 1
     assert first.state is SpecRevisionState.ACTIVE
     assert first.configuration_digest == first.expected_configuration_digest()
-    assert first.configuration_digest.hex() == "7f22b7fd26dac4aa832138372f9a6ea1e7c0d751d2509f463d6b7aaca0224bbe"
+    assert first.configuration_digest.hex() == DEFAULT_CONFIGURATION_DIGEST_HEX
     assert first.vector_fields == (("vector", 128),)
     assert first.text_fields == ("text",)
     assert first.metadata_fields == ("cluster",)
-    assert first.ttl_field is not None and first.ttl_field.target_name == "ttl"
-    assert first.include_ttl
+    assert first.record_retention_seconds is None
     assert first.ingest_shuffle_partitions == 256
     assert first.merge_rows_per_chunk == 250_000
     assert first.merge_batch_bytes == 268_435_456
     assert first.compaction_mode is CompactionMode.TRY_BINARY_COPY
     assert first.materialize_deletions
-    assert first.field_names_for_index_type(IndexType.BTREE) == ("cluster", "event_timestamp")
+    assert first.field_names_for_index_type(IndexType.BTREE) == ("cluster", "ts")
     assert tuple(index.index_type for index in first.index_definitions) == (
         IndexType.IVF_RQ,
         IndexType.INVERTED,
@@ -369,7 +379,7 @@ def test_revision_identity_lifecycle_and_supersession_are_validated() -> None:
     (
         ("vector", {"source_kind": SourceKind.DIRECT, "source_column": "vector", "source_key": None}, "MAP_KEY"),
         ("vector", {"source_column": "metadata"}, "vectors"),
-        ("vector_id", {"source_key": "id"}, "only MAP_KEY"),
+        ("record_id", {"source_key": "id"}, "only MAP_KEY"),
         ("is_deleted", {"source_kind": SourceKind.DIRECT}, "DERIVED"),
         (
             "cluster",
@@ -422,39 +432,29 @@ def test_vector_physical_type_must_encode_its_dimension() -> None:
     with pytest.raises(ValueError, match="TEXT fields require string"):
         replace_field(revision, "text", data_type="fixed_size_list<float32,128>").validate()
     with pytest.raises(ValueError, match="KEY fields require string"):
-        replace_field(revision, "vector_id", data_type="int64").validate()
+        replace_field(revision, "record_id", data_type="int64").validate()
 
 
-def test_revision_requires_singleton_key_event_time_and_optional_ttl() -> None:
-    """KEY and EVENT_TIME are required singletons while TTL may be absent but not duplicated."""
+def test_revision_requires_singleton_key_and_event_time() -> None:
+    """KEY and EVENT_TIME are required singletons in the record contract."""
     revision: DatasetSpecRevision = production_default_spec_revision()
     without_key: DatasetSpecRevision = replace(
         revision, fields=tuple(item for item in revision.fields if item.role is not FieldRole.KEY)
     )
-    duplicate_ttl: DatasetSpecRevision = replace_field(
+    duplicate_event_time: DatasetSpecRevision = replace_field(
         revision,
         "cluster",
-        role=FieldRole.TTL,
+        role=FieldRole.EVENT_TIME,
         source_kind=SourceKind.DIRECT,
-        source_column="secondary_ttl",
+        source_column="secondary_ts",
         source_key=None,
-        data_type="duration[s]",
+        data_type="timestamp[us,UTC]",
     )
 
     with pytest.raises(ValueError, match="exactly one KEY"):
         without_key.validate()
     with pytest.raises(ValueError, match="canonical name"):
-        duplicate_ttl.validate()
-
-    ttl_id: uuid.UUID = revision.ttl_field.field_id if revision.ttl_field is not None else EMPTY_UUID
-    retained_fields: tuple[DatasetField, ...] = tuple(item for item in revision.fields if item.field_id != ttl_id)
-    without_ttl: DatasetSpecRevision = replace(
-        revision,
-        fields=tuple(replace(item, ordinal=ordinal) for ordinal, item in enumerate(retained_fields)),
-        indexes=tuple(index for index in revision.indexes if index.field_id != ttl_id),
-    )
-    validated: DatasetSpecRevision = redigest(without_ttl).validate()
-    assert not validated.include_ttl
+        duplicate_event_time.validate()
 
 
 def test_revision_requires_canonical_derived_fields_and_execution_order() -> None:
@@ -571,8 +571,8 @@ def test_fts_options_allow_zero_backlog_but_reject_bad_strings() -> None:
         replace_index(revision, "text_fts_idx", fts_options=replace(options, base_tokenizer=" ")).validate()
 
 
-def test_decoder_rejects_cross_revision_children_and_orphan_options() -> None:
-    """A normalized row graph cannot cross revision or index identity boundaries."""
+def test_decoder_rejects_cross_revision_children() -> None:
+    """A normalized row graph cannot cross revision boundaries between parent and children."""
     rows: SpecRows = normalized_rows(production_default_spec_revision())
     bad_field: dict[str, object] = dict(rows.fields[0])
     bad_field["spec_revision_id"] = uuid.uuid4()
@@ -581,10 +581,10 @@ def test_decoder_rejects_cross_revision_children_and_orphan_options() -> None:
     with pytest.raises(ValueError, match="another spec revision"):
         decode_rows(mismatched)
 
-    orphan: dict[str, object] = dict(rows.vector_options[0])
-    orphan["index_definition_id"] = uuid.uuid4()
-    with pytest.raises(ValueError, match="outside the spec revision"):
-        decode_rows(replace(rows, vector_options=(orphan,)))
+    bad_index: dict[str, object] = dict(rows.indexes[0])
+    bad_index["spec_revision_id"] = uuid.uuid4()
+    with pytest.raises(ValueError, match="another spec revision"):
+        decode_rows(replace(rows, indexes=(bad_index, *rows.indexes[1:])))
 
 
 def test_lookup_helpers_fail_closed_for_unknown_names() -> None:

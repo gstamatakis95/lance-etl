@@ -2,12 +2,13 @@
 
 Composes the existing phases into a single command an agent can loop on. Each run: chain
 download and prepare when the prepared shape is missing (cached across iterations), wipe the
-Lance root so every iteration is a clean build of the configured knobs, run the batch-major
-e2e body (real ETL, pipeline compaction, indexing, and hour tags), measure the on-disk
-data/index/metadata footprint (:mod:`bench.sizes`), optionally measure an externally managed
-authenticated production service, and write one machine-readable ``metrics.json``
-plus a one-line summary appended to ``{results_root}/experiments.jsonl``. With ``--baseline
-RUN_ID`` the headline delta against a previous iteration is computed and logged.
+Lance root so every iteration is a clean build of the configured knobs, run the reconciler-driven
+e2e body (real Iceberg ingest, indexing, validation, prewarm, and publication through the local
+PostgreSQL control plane), measure the on-disk data/index/metadata footprint (:mod:`bench.sizes`),
+optionally measure an externally managed authenticated production service, and write one
+machine-readable ``metrics.json`` plus a one-line summary appended to
+``{results_root}/experiments.jsonl``. With ``--baseline RUN_ID`` the headline delta against a
+previous iteration is computed and logged.
 """
 
 from __future__ import annotations
@@ -105,7 +106,7 @@ def headline_numbers(sweep: dict[str, Any], sizes: dict[str, Any], build_seconds
     Args:
         sweep: The sweep record from :func:`run_sweep_and_first_queries`.
         sizes: The fleet size record from :func:`bench.sizes.measure_dataset_sizes`.
-        build_seconds: Total wall seconds across ETL and pipeline batches.
+        build_seconds: Total wall seconds across every reconciled batch.
 
     Returns:
         The headline record for ``experiments.jsonl`` and baseline deltas.
@@ -213,7 +214,7 @@ def run_experiment(config: BenchConfig) -> dict[str, Any]:
         "reason": "run the standalone search command after publishing the qualified build",
     }
     e2e_doc: dict[str, Any] = run_e2e(config)
-    build_seconds: float = sum(batch["etl_seconds"] + batch["pipeline"]["seconds"] for batch in e2e_doc["batches"])
+    build_seconds: float = sum(batch["seconds"] for batch in e2e_doc["batches"])
     sizes: dict[str, Any] = measure_dataset_sizes(lance_root)
     sweep: dict[str, Any] = {"status": "NOT_RUN", "reason": service_record["reason"]}
 
@@ -232,18 +233,17 @@ def run_experiment(config: BenchConfig) -> dict[str, Any]:
             "batches": [
                 {
                     "batch": batch["batch"],
-                    "tag": batch["tag"],
-                    "etl_seconds": batch["etl_seconds"],
-                    "pipeline_seconds": batch["pipeline"]["seconds"],
+                    "seconds": batch["seconds"],
+                    "reconcile": batch["reconcile"],
                 }
                 for batch in e2e_doc["batches"]
             ],
         },
         "sizes": sizes,
         "sweep": sweep,
-        "tags": {
-            "created": e2e_doc["tags_created"],
-            "verified": e2e_doc["historical_tag_verification"]["ok"],
+        "publications": {
+            "verified": e2e_doc["publication_verification"]["ok"],
+            "published": sum(1 for check in e2e_doc["publications"] if check.get("published")),
         },
         "headline": headline,
         "baseline_delta": delta,

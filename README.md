@@ -34,9 +34,8 @@ revision to existing datasets. Activation retires the former active revision. Po
 changes to every parent, field, index, and option row after activation. Assigning a revision to an
 already materialized dataset creates one deterministic replay-safe `REBUILD` work item.
 
-Airflow is optional and is not a scheduler dependency. When the local process is launched with
-standard `AIRFLOW_CTX_*` values, the claim records those values as audit provenance on
-`dataset_work`. They do not affect ordering, eligibility, retries, or fencing.
+The claim records a `launcher_kind` audit label on `dataset_work`. It does not affect ordering,
+eligibility, retries, or fencing.
 
 ## Repository layout
 
@@ -48,7 +47,6 @@ lance-etl/
   tests/             Python unit and integration tests
   bench/             Local end-to-end benchmark package
   docs/adr/          Architecture decisions
-  market-research/   Design evaluation notes
   compose.yaml       Disposable local PostgreSQL service
 ```
 
@@ -85,7 +83,7 @@ export LANCE_ETL_SOURCE_TABLE='local.vectors.events'
 export LANCE_ETL_SPARK_WAREHOUSE="${PWD}/var/iceberg"
 ```
 
-The Iceberg table must already exist with the route, mutation, payload-map, TTL, and partition
+The Iceberg table must already exist with the route, mutation, payload-map, `ts`, and partition
 contract shown in [the local runbook](docs/production-release.md#prepare-the-iceberg-source).
 
 The defaults use a Hadoop Iceberg catalog named `local`, a warehouse under `.lance-etl/iceberg`,
@@ -106,8 +104,8 @@ Run the same pass continuously with a local polling interval:
 uv run lance-etl-reconcile run
 ```
 
-The process loads `reconciler_settings` once at startup. Restart it after changing loop, lease,
-retry, SLO, or cleanup bounds in PostgreSQL.
+The process reads loop, lease, retry, SLO, and cleanup bounds from environment variables into
+`ReconcilerSettings` once at startup. Restart it after changing any of those environment values.
 
 Inspect the durable queue and retention state:
 
@@ -115,7 +113,7 @@ Inspect the durable queue and retention state:
 uv run lance-etl-reconcile status
 ```
 
-The single Alembic baseline creates exactly 14 application tables. Their responsibilities and
+The single Alembic baseline creates exactly 9 application tables. Their responsibilities and
 every stored option are documented in
 [docs/adr/postgresql-dataset-control-plane.md](docs/adr/postgresql-dataset-control-plane.md).
 See [docs/production-release.md](docs/production-release.md) for the local runbook.

@@ -52,7 +52,7 @@ class RecallJobConfig:
     base_uri: str
     telemetry: TelemetryConfig
     storage_options: dict[str, Any] | None = None
-    id_column: str = "vector_id"
+    id_column: str = "record_id"
     vector_column: str = "vector"
     max_samples: int = 10_000
     large_group_fragment_threshold: int = 32

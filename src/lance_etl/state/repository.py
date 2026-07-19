@@ -15,14 +15,12 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import Connection, Engine, RowMapping
 
 from lance_etl.publication.manifest import candidate_pin_name
-from lance_etl.state.settings import ReconcilerSettings
 from lance_etl.state.specs import (
     DEFAULT_SPEC_ID,
     DatasetField,
     DatasetSpecRevision,
     FtsIndexOptions,
     IndexDefinition,
-    IndexType,
     SpecRevisionState,
     VectorIndexOptions,
     decode_dataset_spec_revision,
@@ -31,17 +29,12 @@ from lance_etl.state.tables import (
     dataset_fields,
     dataset_publications,
     dataset_spec_revisions,
-    dataset_specs,
-    dataset_state,
     dataset_work,
     datasets,
-    fts_index_options,
     iceberg_sources,
     index_definitions,
     publication_indexes,
-    reconciler_settings,
     source_snapshots,
-    vector_index_options,
 )
 from lance_etl.state.types import (
     ControlPlaneStatus,
@@ -180,11 +173,10 @@ def source_from_row(row: Mapping[str, Any]) -> IcebergSource:
         org_column=str(row["org_column"]),
         record_id_column=str(row["record_id_column"]),
         operation_column=str(row["operation_column"]),
-        event_time_column=str(row["event_time_column"]),
+        ts_column=str(row["ts_column"]),
         vectors_column=str(row["vectors_column"]),
         texts_column=str(row["texts_column"]),
         metadata_column=str(row["metadata_column"]),
-        ttl_column=row["ttl_column"],
     ).validate()
 
 
@@ -310,11 +302,13 @@ def prepared_draft_revision(revision: DatasetSpecRevision) -> DatasetSpecRevisio
     return candidate.validate()
 
 
-def revision_row_values(revision: DatasetSpecRevision) -> dict[str, object]:
-    """Encode one validated revision parent row.
+def revision_row_values(revision: DatasetSpecRevision, name: str, description: str | None) -> dict[str, object]:
+    """Encode one validated revision parent row with its denormalized name.
 
     Args:
         revision: Complete validated revision.
+        name: Bounded specification name denormalized onto the revision row.
+        description: Optional description denormalized onto the revision row.
 
     Returns:
         SQLAlchemy insert values for ``dataset_spec_revisions``.
@@ -322,6 +316,8 @@ def revision_row_values(revision: DatasetSpecRevision) -> dict[str, object]:
     return {
         "spec_revision_id": revision.spec_revision_id,
         "spec_id": revision.spec_id,
+        "name": name,
+        "description": description,
         "revision_number": revision.revision_number,
         "state": revision.state.value,
         "supersedes_revision_id": revision.supersedes_revision_id,
@@ -346,6 +342,7 @@ def revision_row_values(revision: DatasetSpecRevision) -> dict[str, object]:
         "prewarm_required": revision.prewarm_required,
         "retained_publications": revision.retained_publications,
         "artifact_retention_seconds": revision.artifact_retention_seconds,
+        "record_retention_seconds": revision.record_retention_seconds,
     }
 
 
@@ -375,78 +372,64 @@ def field_row_values(field_value: DatasetField) -> dict[str, object]:
 
 
 def index_row_values(index: IndexDefinition) -> dict[str, object]:
-    """Encode one normalized index definition.
+    """Encode one normalized index definition and its inline subtype option columns.
 
     Args:
         index: Validated index owned by the draft.
 
     Returns:
-        SQLAlchemy insert values for ``index_definitions``.
+        SQLAlchemy insert values for ``index_definitions`` with every option column populated
+        or null according to the index family.
     """
-    return {
+    row: dict[str, object] = {
         "index_definition_id": index.index_definition_id,
         "spec_revision_id": index.spec_revision_id,
         "field_id": index.field_id,
         "ordinal": index.ordinal,
         "index_name": index.index_name,
         "index_type": index.index_type.value,
+        "metric": None,
+        "num_partitions": None,
+        "minimum_partitions": None,
+        "maximum_partitions": None,
+        "target_rows_per_partition": None,
+        "minimum_rows": None,
+        "num_bits": None,
+        "streaming_sample_rate": None,
+        "streaming_refine_passes": None,
+        "retrain_growth_factor": None,
+        "with_position": None,
+        "base_tokenizer": None,
+        "language": None,
+        "max_unindexed_fragments": None,
     }
-
-
-def vector_option_row_values(index: IndexDefinition) -> dict[str, object]:
-    """Encode IVF_RQ options from one validated index.
-
-    Args:
-        index: IVF_RQ index carrying vector options.
-
-    Returns:
-        SQLAlchemy insert values for ``vector_index_options``.
-
-    Raises:
-        ValueError: If the index lacks vector options.
-    """
-    options: VectorIndexOptions | None = index.vector_options
-    if options is None:
-        raise ValueError("IVF_RQ index lacks vector options")
-    return {
-        "index_definition_id": index.index_definition_id,
-        "index_type": index.index_type.value,
-        "metric": options.metric.value,
-        "num_partitions": options.num_partitions,
-        "minimum_partitions": options.minimum_partitions,
-        "maximum_partitions": options.maximum_partitions,
-        "target_rows_per_partition": options.target_rows_per_partition,
-        "minimum_rows": options.minimum_rows,
-        "num_bits": options.num_bits,
-        "streaming_sample_rate": options.streaming_sample_rate,
-        "streaming_refine_passes": options.streaming_refine_passes,
-        "retrain_growth_factor": options.retrain_growth_factor,
-    }
-
-
-def fts_option_row_values(index: IndexDefinition) -> dict[str, object]:
-    """Encode INVERTED options from one validated index.
-
-    Args:
-        index: INVERTED index carrying full-text options.
-
-    Returns:
-        SQLAlchemy insert values for ``fts_index_options``.
-
-    Raises:
-        ValueError: If the index lacks full-text options.
-    """
-    options: FtsIndexOptions | None = index.fts_options
-    if options is None:
-        raise ValueError("INVERTED index lacks full-text options")
-    return {
-        "index_definition_id": index.index_definition_id,
-        "index_type": index.index_type.value,
-        "with_position": options.with_position,
-        "base_tokenizer": options.base_tokenizer,
-        "language": options.language,
-        "max_unindexed_fragments": options.max_unindexed_fragments,
-    }
+    vector_options: VectorIndexOptions | None = index.vector_options
+    if vector_options is not None:
+        row.update(
+            {
+                "metric": vector_options.metric.value,
+                "num_partitions": vector_options.num_partitions,
+                "minimum_partitions": vector_options.minimum_partitions,
+                "maximum_partitions": vector_options.maximum_partitions,
+                "target_rows_per_partition": vector_options.target_rows_per_partition,
+                "minimum_rows": vector_options.minimum_rows,
+                "num_bits": vector_options.num_bits,
+                "streaming_sample_rate": vector_options.streaming_sample_rate,
+                "streaming_refine_passes": vector_options.streaming_refine_passes,
+                "retrain_growth_factor": vector_options.retrain_growth_factor,
+            }
+        )
+    fts_options: FtsIndexOptions | None = index.fts_options
+    if fts_options is not None:
+        row.update(
+            {
+                "with_position": fts_options.with_position,
+                "base_tokenizer": fts_options.base_tokenizer,
+                "language": fts_options.language,
+                "max_unindexed_fragments": fts_options.max_unindexed_fragments,
+            }
+        )
+    return row
 
 
 @dataclass(frozen=True)
@@ -454,40 +437,6 @@ class ControlPlaneRepository:
     """Own visible transactions and fenced dataset-work transitions."""
 
     engine: Engine
-
-    def reconciler_settings(self) -> ReconcilerSettings:
-        """Load the singleton operational settings.
-
-        Returns:
-            Validated local reconciler settings.
-
-        Raises:
-            StateTransitionError: If the singleton is missing.
-        """
-        with self.engine.connect() as connection:
-            row: RowMapping | None = (
-                connection.execute(sa.select(reconciler_settings).where(reconciler_settings.c.singleton_id == 1))
-                .mappings()
-                .one_or_none()
-            )
-        if row is None:
-            raise StateTransitionError("reconciler settings singleton is missing")
-        return ReconcilerSettings(
-            poll_interval=timedelta(seconds=int(row["poll_interval_seconds"])),
-            claim_batch_size=int(row["claim_batch_size"]),
-            max_drain_batches=int(row["max_drain_batches"]),
-            max_snapshots_per_plan=int(row["max_snapshots_per_plan"]),
-            lease_duration=timedelta(seconds=int(row["lease_duration_seconds"])),
-            lease_heartbeat_interval=timedelta(seconds=int(row["lease_heartbeat_seconds"])),
-            retry_base_delay=timedelta(seconds=int(row["retry_base_delay_seconds"])),
-            retry_max_delay=timedelta(seconds=int(row["retry_max_delay_seconds"])),
-            max_attempts=int(row["max_attempts"]),
-            max_due_work=int(row["max_due_work"]),
-            max_open_work_age=timedelta(seconds=int(row["max_open_work_age_seconds"])),
-            max_retention_age=timedelta(seconds=int(row["max_retention_age_seconds"])),
-            audit_retention=timedelta(seconds=int(row["audit_retention_seconds"])),
-            cleanup_batch_size=int(row["cleanup_batch_size"]),
-        ).validate()
 
     def source_by_name(self, source_name: str) -> IcebergSource | None:
         """Resolve one registered source by its stable name.
@@ -581,68 +530,35 @@ class ControlPlaneRepository:
                 raise StateTransitionError("source bootstrap values differ from PostgreSQL truth")
             return source
 
-    def create_spec(self, name: str, description: str | None = None, spec_id: uuid.UUID | None = None) -> uuid.UUID:
-        """Create one named dataset specification identity.
-
-        Args:
-            name: Unique bounded specification name.
-            description: Optional operator-facing description.
-            spec_id: Optional caller-owned identity for deterministic imports.
-
-        Returns:
-            Existing or newly created specification identity.
-
-        Raises:
-            ValueError: If the values cannot satisfy the database contract.
-            StateTransitionError: If a replayed name carries different immutable values.
-        """
-        if SPEC_NAME_PATTERN.fullmatch(name) is None:
-            raise ValueError("specification name must match [A-Za-z][A-Za-z0-9_-]{0,127}")
-        if description is not None and not description.strip():
-            raise ValueError("specification description must be nonblank when present")
-        identity: uuid.UUID = spec_id or uuid.uuid5(uuid.NAMESPACE_URL, f"lance-etl:dataset-spec:{name}")
-        if identity.int == 0:
-            raise ValueError("specification identity must be non-nil")
-        with self.engine.begin() as connection:
-            connection.execute(
-                postgresql.insert(dataset_specs)
-                .values(spec_id=identity, name=name, description=description)
-                .on_conflict_do_nothing(index_elements=[dataset_specs.c.name])
-            )
-            row: RowMapping = (
-                connection.execute(sa.select(dataset_specs).where(dataset_specs.c.name == name).with_for_update())
-                .mappings()
-                .one()
-            )
-            actual: tuple[uuid.UUID, str | None] = (row["spec_id"], row["description"])
-            expected: tuple[uuid.UUID, str | None] = (identity, description)
-            if actual != expected:
-                raise StateTransitionError("specification name was replayed with different immutable values")
-            return identity
-
-    def create_draft_spec_revision(self, revision: DatasetSpecRevision) -> DatasetSpecRevision:
+    def create_draft_spec_revision(
+        self,
+        revision: DatasetSpecRevision,
+        name: str,
+        description: str | None = None,
+    ) -> DatasetSpecRevision:
         """Atomically persist a complete normalized DRAFT specification graph.
+
+        A specification exists only as its revisions. The stable ``name`` and optional
+        ``description`` are denormalized onto every revision row for audit.
 
         Args:
             revision: Typed parent, fields, indexes, and options whose digest is recomputed.
+            name: Bounded human-readable specification name carried on the revision row.
+            description: Optional operator-facing description carried on the revision row.
 
         Returns:
             Persisted validated draft revision.
 
         Raises:
+            ValueError: If the name or description violates the database contract.
             StateTransitionError: If the identity already carries different content.
         """
+        if SPEC_NAME_PATTERN.fullmatch(name) is None:
+            raise ValueError("specification name must match [A-Za-z][A-Za-z0-9_-]{0,127}")
+        if description is not None and not description.strip():
+            raise ValueError("specification description must be nonblank when present")
         candidate: DatasetSpecRevision = prepared_draft_revision(revision)
         with self.engine.begin() as connection:
-            spec_row: RowMapping | None = (
-                connection.execute(
-                    sa.select(dataset_specs).where(dataset_specs.c.spec_id == candidate.spec_id).with_for_update()
-                )
-                .mappings()
-                .one_or_none()
-            )
-            if spec_row is None:
-                raise StateTransitionError("parent dataset specification is missing")
             existing_id: uuid.UUID | None = connection.scalar(
                 sa.select(dataset_spec_revisions.c.spec_revision_id).where(
                     dataset_spec_revisions.c.spec_revision_id == candidate.spec_revision_id
@@ -653,23 +569,15 @@ class ControlPlaneRepository:
                 if existing != candidate:
                     raise StateTransitionError("specification revision identity carries different content")
                 return existing
-            connection.execute(sa.insert(dataset_spec_revisions).values(**revision_row_values(candidate)))
+            connection.execute(
+                sa.insert(dataset_spec_revisions).values(**revision_row_values(candidate, name, description))
+            )
             field_rows: list[dict[str, object]] = [field_row_values(field_value) for field_value in candidate.fields]
             if field_rows:
                 connection.execute(sa.insert(dataset_fields), field_rows)
             index_rows: list[dict[str, object]] = [index_row_values(index) for index in candidate.indexes]
             if index_rows:
                 connection.execute(sa.insert(index_definitions), index_rows)
-            vector_rows: list[dict[str, object]] = [
-                vector_option_row_values(index) for index in candidate.indexes if index.index_type is IndexType.IVF_RQ
-            ]
-            if vector_rows:
-                connection.execute(sa.insert(vector_index_options), vector_rows)
-            fts_rows: list[dict[str, object]] = [
-                fts_option_row_values(index) for index in candidate.indexes if index.index_type is IndexType.INVERTED
-            ]
-            if fts_rows:
-                connection.execute(sa.insert(fts_index_options), fts_rows)
             persisted: DatasetSpecRevision = self.load_spec_revision(connection, candidate.spec_revision_id)
             if persisted != candidate:
                 raise StateTransitionError("persisted draft does not round-trip through normalized storage")
@@ -806,9 +714,7 @@ class ControlPlaneRepository:
             if revision_row is None or revision_row["state"] != SpecRevisionState.ACTIVE.value:
                 raise StateTransitionError("desired dataset specification revision must be ACTIVE")
             state_row: RowMapping = (
-                connection.execute(
-                    sa.select(dataset_state).where(dataset_state.c.dataset_id == dataset_id).with_for_update()
-                )
+                connection.execute(sa.select(datasets).where(datasets.c.dataset_id == dataset_id).with_for_update())
                 .mappings()
                 .one()
             )
@@ -896,11 +802,6 @@ class ControlPlaneRepository:
         )
         if revision_row is None:
             raise StateTransitionError("dataset specification revision is missing")
-        spec_row: RowMapping = (
-            connection.execute(sa.select(dataset_specs).where(dataset_specs.c.spec_id == revision_row["spec_id"]))
-            .mappings()
-            .one()
-        )
         field_rows: list[RowMapping] = list(
             connection.execute(
                 sa.select(dataset_fields)
@@ -915,27 +816,10 @@ class ControlPlaneRepository:
                 .order_by(index_definitions.c.ordinal)
             ).mappings()
         )
-        index_ids: list[uuid.UUID] = [row["index_definition_id"] for row in index_rows]
-        vector_rows: list[RowMapping] = []
-        fts_rows: list[RowMapping] = []
-        if index_ids:
-            vector_rows = list(
-                connection.execute(
-                    sa.select(vector_index_options).where(vector_index_options.c.index_definition_id.in_(index_ids))
-                ).mappings()
-            )
-            fts_rows = list(
-                connection.execute(
-                    sa.select(fts_index_options).where(fts_index_options.c.index_definition_id.in_(index_ids))
-                ).mappings()
-            )
         return decode_dataset_spec_revision(
-            spec_row,
             revision_row,
             field_rows,
             index_rows,
-            vector_rows,
-            fts_rows,
         )
 
     def active_spec_revision_id(self, connection: Connection, spec_id: uuid.UUID) -> uuid.UUID:
@@ -1175,13 +1059,9 @@ class ControlPlaneRepository:
                 org_id=plan.identity.org_id,
                 lifecycle_state=DatasetLifecycleState.ACTIVE.value,
                 desired_spec_revision_id=default_revision_id,
+                ingest_lance_uri=initial_ingest_uri,
             )
             .on_conflict_do_nothing(index_elements=[datasets.c.dataset_id])
-        )
-        connection.execute(
-            postgresql.insert(dataset_state)
-            .values(dataset_id=dataset_id, ingest_lance_uri=initial_ingest_uri)
-            .on_conflict_do_nothing(index_elements=[dataset_state.c.dataset_id])
         )
         row: RowMapping = (
             connection.execute(sa.select(datasets).where(datasets.c.dataset_id == dataset_id).with_for_update())
@@ -1206,18 +1086,10 @@ class ControlPlaneRepository:
 
         Args:
             connection: Current transaction.
-            dataset_row: Locked owning dataset.
+            dataset_row: Locked owning dataset carrying materialization state.
             snapshot_seq: Durable source-snapshot sequence.
         """
-        state_row: RowMapping = (
-            connection.execute(
-                sa.select(dataset_state)
-                .where(dataset_state.c.dataset_id == dataset_row["dataset_id"])
-                .with_for_update()
-            )
-            .mappings()
-            .one()
-        )
+        state_row: RowMapping = dataset_row
         work_id: uuid.UUID = deterministic_ingest_work_id(dataset_row["dataset_id"], snapshot_seq)
         values: dict[str, Any] = {
             "work_id": work_id,
@@ -1414,9 +1286,9 @@ class ControlPlaneRepository:
             SQL expression protecting claims from stale generations.
         """
         exact_state: Any = sa.and_(
-            dataset_work.c.expected_ingest_lance_uri == dataset_state.c.ingest_lance_uri,
-            dataset_work.c.expected_ingest_lance_version.is_not_distinct_from(dataset_state.c.ingest_lance_version),
-            dataset_work.c.expected_active_publication_id.is_not_distinct_from(dataset_state.c.active_publication_id),
+            dataset_work.c.expected_ingest_lance_uri == datasets.c.ingest_lance_uri,
+            dataset_work.c.expected_ingest_lance_version.is_not_distinct_from(datasets.c.ingest_lance_version),
+            dataset_work.c.expected_active_publication_id.is_not_distinct_from(datasets.c.active_publication_id),
         )
         return sa.or_(dataset_work.c.kind == WorkKind.INGEST.value, exact_state)
 
@@ -1448,7 +1320,6 @@ class ControlPlaneRepository:
             rows: list[RowMapping] = list(
                 connection.execute(
                     sa.select(dataset_work)
-                    .join(dataset_state, dataset_state.c.dataset_id == dataset_work.c.dataset_id)
                     .join(datasets, datasets.c.dataset_id == dataset_work.c.dataset_id)
                     .where(
                         self.due_predicate(current),
@@ -1475,9 +1346,7 @@ class ControlPlaneRepository:
                     continue
                 state_row: RowMapping | None = (
                     connection.execute(
-                        sa.select(dataset_state)
-                        .where(dataset_state.c.dataset_id == dataset_id)
-                        .with_for_update(skip_locked=True)
+                        sa.select(datasets).where(datasets.c.dataset_id == dataset_id).with_for_update(skip_locked=True)
                     )
                     .mappings()
                     .one_or_none()
@@ -1557,8 +1426,8 @@ class ControlPlaneRepository:
                 "expected_active_publication_id": state_row["active_publication_id"],
             }
         connection.execute(
-            sa.update(dataset_state)
-            .where(dataset_state.c.dataset_id == work_row["dataset_id"])
+            sa.update(datasets)
+            .where(datasets.c.dataset_id == work_row["dataset_id"])
             .values(fence_epoch=fence_epoch, updated_at=current)
         )
         result: sa.CursorResult[Any] = connection.execute(
@@ -1575,11 +1444,6 @@ class ControlPlaneRepository:
                 error_code=None,
                 error_message=None,
                 launcher_kind=provenance.launcher_kind.value,
-                airflow_ctx_dag_id=provenance.airflow_ctx_dag_id,
-                airflow_ctx_dag_run_id=provenance.airflow_ctx_dag_run_id,
-                airflow_ctx_task_id=provenance.airflow_ctx_task_id,
-                airflow_ctx_map_index=provenance.airflow_ctx_map_index,
-                airflow_ctx_try_number=provenance.airflow_ctx_try_number,
                 updated_at=current,
                 **refreshed_expectations,
             )
@@ -1611,6 +1475,7 @@ class ControlPlaneRepository:
         Returns:
             SQL expression requiring state, token, expiry, and dataset fence.
         """
+        fence_dataset: Any = datasets.alias("fence_dataset")
         return sa.and_(
             dataset_work.c.work_id == claim.work_id,
             dataset_work.c.dataset_id == claim.dataset_id,
@@ -1619,8 +1484,8 @@ class ControlPlaneRepository:
             dataset_work.c.lease_expires_at > current,
             sa.exists(
                 sa.select(sa.literal(1)).where(
-                    dataset_state.c.dataset_id == claim.dataset_id,
-                    dataset_state.c.fence_epoch == claim.fence_epoch,
+                    fence_dataset.c.dataset_id == claim.dataset_id,
+                    fence_dataset.c.fence_epoch == claim.fence_epoch,
                 )
             ),
         )
@@ -1648,9 +1513,7 @@ class ControlPlaneRepository:
                 source_snapshots.c.source_id == datasets.c.source_id,
             ),
         )
-        joined: Any = snapshot_join.join(dataset_state, dataset_state.c.dataset_id == dataset_work.c.dataset_id).join(
-            iceberg_sources, iceberg_sources.c.source_id == datasets.c.source_id
-        )
+        joined: Any = snapshot_join.join(iceberg_sources, iceberg_sources.c.source_id == datasets.c.source_id)
         with self.engine.connect() as connection:
             row: RowMapping | None = (
                 connection.execute(
@@ -1789,6 +1652,7 @@ class ControlPlaneRepository:
         delay: timedelta,
         error_code: str,
         error_message: str,
+        max_attempts: int,
         now: datetime | None = None,
     ) -> bool:
         """Return transient failure to retry or block it at the attempt bound.
@@ -1798,6 +1662,7 @@ class ControlPlaneRepository:
             delay: Non-negative retry delay.
             error_code: Bounded failure classification.
             error_message: Bounded diagnostic.
+            max_attempts: Bootstrap-configured maximum durable attempts before blocking.
             now: Optional deterministic clock.
 
         Returns:
@@ -1807,12 +1672,6 @@ class ControlPlaneRepository:
             raise ValueError("retry delay must be non-negative")
         current: datetime = now or utc_now()
         with self.engine.begin() as connection:
-            max_attempts: int = int(
-                connection.scalar(
-                    sa.select(reconciler_settings.c.max_attempts).where(reconciler_settings.c.singleton_id == 1)
-                )
-                or 0
-            )
             exhausted: bool = claim.attempt_count >= max_attempts
             state: WorkState = WorkState.BLOCKED if exhausted else WorkState.RETRY_WAIT
             persisted_code: str = "MAX_ATTEMPTS_EXHAUSTED" if exhausted else error_code
@@ -1931,7 +1790,7 @@ class ControlPlaneRepository:
             )
             state_row: RowMapping | None = (
                 connection.execute(
-                    sa.select(dataset_state).where(dataset_state.c.dataset_id == claim.dataset_id).with_for_update()
+                    sa.select(datasets).where(datasets.c.dataset_id == claim.dataset_id).with_for_update()
                 )
                 .mappings()
                 .one_or_none()
@@ -1961,8 +1820,8 @@ class ControlPlaneRepository:
             if expected != actual:
                 raise StateTransitionError("INGEST work expectations no longer match dataset state")
             connection.execute(
-                sa.update(dataset_state)
-                .where(dataset_state.c.dataset_id == claim.dataset_id)
+                sa.update(datasets)
+                .where(datasets.c.dataset_id == claim.dataset_id)
                 .values(
                     materialized_spec_revision_id=work_row["spec_revision_id"],
                     last_applied_source_snapshot_seq=work_row["source_snapshot_seq"],
@@ -2205,7 +2064,7 @@ class ControlPlaneRepository:
             )
             state_row: RowMapping | None = (
                 connection.execute(
-                    sa.select(dataset_state).where(dataset_state.c.dataset_id == claim.dataset_id).with_for_update()
+                    sa.select(datasets).where(datasets.c.dataset_id == claim.dataset_id).with_for_update()
                 )
                 .mappings()
                 .one_or_none()
@@ -2293,7 +2152,7 @@ class ControlPlaneRepository:
                     materialized_spec_revision_id=work_row["spec_revision_id"],
                 )
             connection.execute(
-                sa.update(dataset_state).where(dataset_state.c.dataset_id == claim.dataset_id).values(**state_values)
+                sa.update(datasets).where(datasets.c.dataset_id == claim.dataset_id).values(**state_values)
             )
             connection.execute(
                 sa.update(dataset_work)
@@ -2502,17 +2361,13 @@ class ControlPlaneRepository:
             StateTransitionError: If multiple active sources expose the same route.
         """
         identity.validate()
-        joined: Any = (
-            datasets.join(dataset_state, dataset_state.c.dataset_id == datasets.c.dataset_id)
-            .join(
-                dataset_publications,
-                sa.and_(
-                    dataset_publications.c.dataset_id == dataset_state.c.dataset_id,
-                    dataset_publications.c.publication_id == dataset_state.c.active_publication_id,
-                ),
-            )
-            .join(iceberg_sources, iceberg_sources.c.source_id == datasets.c.source_id)
-        )
+        joined: Any = datasets.join(
+            dataset_publications,
+            sa.and_(
+                dataset_publications.c.dataset_id == datasets.c.dataset_id,
+                dataset_publications.c.publication_id == datasets.c.active_publication_id,
+            ),
+        ).join(iceberg_sources, iceberg_sources.c.source_id == datasets.c.source_id)
         with self.engine.connect() as connection:
             rows: list[RowMapping] = list(
                 connection.execute(
@@ -2550,15 +2405,15 @@ class ControlPlaneRepository:
         self,
         connection: Connection,
         identity: RoutingIdentity,
-    ) -> tuple[RowMapping, RowMapping]:
-        """Lock the sole active dataset and mutable state for a route.
+    ) -> RowMapping:
+        """Lock the sole active dataset carrying its materialization state for a route.
 
         Args:
             connection: Current transaction.
             identity: Validated logical route.
 
         Returns:
-            Locked dataset and state rows.
+            Locked dataset row carrying materialization state.
 
         Raises:
             StateTransitionError: If the route is absent or ambiguous.
@@ -2580,17 +2435,7 @@ class ControlPlaneRepository:
         )
         if len(rows) != 1:
             raise StateTransitionError("dataset route is absent or ambiguous")
-        dataset_row: RowMapping = rows[0]
-        state_row: RowMapping = (
-            connection.execute(
-                sa.select(dataset_state)
-                .where(dataset_state.c.dataset_id == dataset_row["dataset_id"])
-                .with_for_update()
-            )
-            .mappings()
-            .one()
-        )
-        return dataset_row, state_row
+        return rows[0]
 
     def enqueue_rebuild(self, identity: RoutingIdentity, request_id: uuid.UUID) -> uuid.UUID:
         """Enqueue one idempotent isolated rebuild of the current source state.
@@ -2605,9 +2450,8 @@ class ControlPlaneRepository:
         identity.validate()
         current: datetime = utc_now()
         with self.engine.begin() as connection:
-            dataset_row: RowMapping
-            state_row: RowMapping
-            dataset_row, state_row = self.dataset_and_state_for_identity(connection, identity)
+            dataset_row: RowMapping = self.dataset_and_state_for_identity(connection, identity)
+            state_row: RowMapping = dataset_row
             if state_row["last_applied_source_snapshot_seq"] is None or state_row["ingest_lance_version"] is None:
                 raise StateTransitionError("dataset has no materialized source state to rebuild")
             work_id: uuid.UUID = deterministic_rebuild_work_id(dataset_row["dataset_id"], request_id)
@@ -2786,9 +2630,7 @@ class ControlPlaneRepository:
                         <= current,
                         ranked.c.publication_rank > ranked.c.retained_publications,
                         ~sa.exists(
-                            sa.select(sa.literal(1)).where(
-                                dataset_state.c.active_publication_id == ranked.c.publication_id
-                            )
+                            sa.select(sa.literal(1)).where(datasets.c.active_publication_id == ranked.c.publication_id)
                         ),
                     )
                     .order_by(ranked.c.retired_at, ranked.c.publication_id)
@@ -2819,7 +2661,7 @@ class ControlPlaneRepository:
         """
         with self.engine.begin() as connection:
             active: Any = sa.exists(
-                sa.select(sa.literal(1)).where(dataset_state.c.active_publication_id == cleanup.publication_id)
+                sa.select(sa.literal(1)).where(datasets.c.active_publication_id == cleanup.publication_id)
             )
             row: RowMapping | None = (
                 connection.execute(
@@ -2908,7 +2750,7 @@ class ControlPlaneRepository:
                     ),
                     ~sa.exists(
                         sa.select(sa.literal(1)).where(
-                            dataset_state.c.last_applied_source_snapshot_seq == source_snapshots.c.source_snapshot_seq
+                            datasets.c.last_applied_source_snapshot_seq == source_snapshots.c.source_snapshot_seq
                         )
                     ),
                 )

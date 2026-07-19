@@ -172,8 +172,8 @@ def cluster_generation_skip_reason(dataset: lance.LanceDataset) -> str | None:
     kinds of write: a fragment-replacing write (append, merge rewrite, compaction) mints new
     fragment ids so the id list diverges even when the count is unchanged, while a pure delete
     lowers the row count without touching the ids. Both reads come from the already-open manifest,
-    so the check costs no object-store I/O. TTL is deliberately not run before this check, so on a
-    clustered fleet with TTL active an idle already-clustered dataset defers time-based expiry
+    so the check costs no object-store I/O. Retention is deliberately not run before this check, so on a
+    clustered fleet with retention active an idle already-clustered dataset defers time-based expiry
     until a write re-enables it.
 
     Args:
@@ -577,8 +577,8 @@ def plan_cluster_rewrite(
 ) -> dict[str, Any]:
     """Plan one dataset's clustered rewrite on an executor (phase ``cluster-plan``).
 
-    Resolves the vector column and guards eligibility, runs TTL now so expired rows are never
-    rewritten, resolves the reusable centroids sidecar-first, and pins the post-TTL read version
+    Resolves the vector column and guards eligibility, runs retention now so expired rows are never
+    rewritten, resolves the reusable centroids sidecar-first, and pins the post-retention read version
     with its schema, row count, and fragment shards. A dataset already clustered and unwritten
     since (:func:`cluster_generation_skip_reason`) returns a terminal ``cluster_current`` dict so
     it is neither re-clustered nor routed into normal compaction, which would undo its centroid
@@ -591,7 +591,7 @@ def plan_cluster_rewrite(
     Args:
         uri: Dataset URI.
         config: Maintenance configuration.
-        cutoff: TTL cutoff instant, or ``None`` to skip the TTL step.
+        cutoff: retention cutoff instant, or ``None`` to skip the retention step.
         telemetry: Telemetry facade for the current executor process.
         cleanup_slot: The active fleet-wide rotation slot for this run, threaded into the
             already-clustered idle cleanup, or ``None`` to always clean (the pre-rotation behavior
@@ -620,11 +620,13 @@ def plan_cluster_rewrite(
     if cfg is None:
         return {"uri": uri, "cluster_skipped": "vector config vanished after the guard check"}
 
-    ttl_rows_deleted: int = 0
-    if config.ttl_active() and cutoff is not None:
-        ttl_result: dict[str, Any] = maintenance_job.run_ttl_on_open_dataset(dataset, uri, config, cutoff, telemetry)
-        ttl_rows_deleted = int(ttl_result.get("ttl_rows_deleted", 0))
-        if ttl_rows_deleted > 0:
+    retention_rows_deleted: int = 0
+    if config.retention_active() and cutoff is not None:
+        retention_result: dict[str, Any] = maintenance_job.run_retention_on_open_dataset(
+            dataset, uri, config, cutoff, telemetry
+        )
+        retention_rows_deleted = int(retention_result.get("retention_rows_deleted", 0))
+        if retention_rows_deleted > 0:
             dataset = lance.dataset(uri, storage_options=config.storage_options)
 
     rows_at_train: int = int(cfg["rows_at_train"])
@@ -648,7 +650,7 @@ def plan_cluster_rewrite(
         "schema": dataset.schema,
         "shards": split_evenly(fragment_ids, CLUSTER_READ_SHARDS),
         "centroids_ipc": encode_centroids(centroids),
-        "ttl_rows_deleted": ttl_rows_deleted,
+        "retention_rows_deleted": retention_rows_deleted,
     }
 
 
@@ -1035,7 +1037,7 @@ def run_cluster_rewrites(
         spark: Active Spark session.
         uris: Datasets to consider for a clustered rewrite.
         config: Maintenance configuration.
-        cutoff: TTL cutoff instant, or ``None`` when TTL is inactive.
+        cutoff: retention cutoff instant, or ``None`` when retention is inactive.
         driver_telemetry: The driver's telemetry facade.
         cleanup_slot: The active fleet-wide rotation slot for this run, threaded into the
             already-clustered idle cleanup, or ``None`` to always clean.
@@ -1124,7 +1126,7 @@ class ClusterRunState:
 
         Args:
             uris: Datasets to consider.
-            cutoff: TTL cutoff instant, or ``None``.
+            cutoff: retention cutoff instant, or ``None``.
 
         Returns:
             The eligible plan dicts. Passthrough, already-clustered, and errored datasets are
@@ -1636,7 +1638,7 @@ def mark_rebuild_failure(plan: dict[str, Any], error: str) -> dict[str, Any]:
         "uri": plan["uri"],
         "clustered": True,
         "fragments_added": plan.get("fragments_added", 0),
-        "ttl_rows_deleted": plan.get("ttl_rows_deleted", 0),
+        "retention_rows_deleted": plan.get("retention_rows_deleted", 0),
         "error": error,
         "phase": "cluster_index",
         "bytes_removed": 0,
@@ -1709,6 +1711,6 @@ def finalise_cluster_dataset(
         "uri": uri,
         "clustered": True,
         "fragments_added": plan.get("fragments_added", 0),
-        "ttl_rows_deleted": plan.get("ttl_rows_deleted", 0),
+        "retention_rows_deleted": plan.get("retention_rows_deleted", 0),
         "bytes_removed": bytes_removed,
     }

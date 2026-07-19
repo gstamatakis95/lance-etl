@@ -1,8 +1,8 @@
 """Benchmark configuration and command-line parsing.
 
 Defines :class:`BenchConfig`, the single dataclass shared by every benchmark phase, and the argparse parser for the
-``python -m bench`` entry point. Every subcommand accepts the full flag set so one flag vector can drive the whole
-``all`` chain. Each phase simply reads the fields it needs.
+``python -m bench`` entry point. Every subcommand accepts the full flag set so one flag vector can drive any phase.
+Each phase simply reads the fields it needs.
 """
 
 from __future__ import annotations
@@ -30,17 +30,13 @@ SIFT_FILE_NAMES: tuple[str, str, str] = ("sift_base.fvecs", "sift_query.fvecs", 
 SUBCOMMANDS: tuple[str, ...] = (
     "download",
     "prepare",
-    "ingest",
-    "index",
-    "compact",
     "search",
     "report",
-    "all",
     "e2e",
     "experiment",
     "qualify",
 )
-PHASE_NAMES: tuple[str, ...] = ("download", "prepare", "ingest", "index", "compact", "search", "report")
+PHASE_NAMES: tuple[str, ...] = ("download", "prepare", "e2e", "search", "report")
 RECALL_CUTOFFS: tuple[int, ...] = (1, 10, 100)
 """Recall cut-off depths scored by the search and e2e legs; ``search_k`` must cover the deepest one."""
 
@@ -74,7 +70,7 @@ class BenchConfig:
         words_per_text: Cluster-specific words per document.
         rows_per_slice: Base vectors generated per Spark task during prepare.
         batches: Sequential ETL merge batches during ingest. Values above 1 create extra fragments for compaction.
-        etl_partitions: Shuffle partition count handed to the ETL job.
+        etl_partitions: Shuffle partition count handed to the reconciler ingest run.
         ivf_partitions: Explicit IVF partition count. ``None`` uses the indexer's size-aware policy.
         num_shards: Fragments covered by one segment-build task during indexing.
         vector_row_floor: Row floor below which the vector index is skipped. Lowered from the production default so
@@ -460,7 +456,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the top-level benchmark argument parser.
 
     Returns:
-        The parser with one subcommand per benchmark phase plus ``all``.
+        The parser with one subcommand per surviving benchmark phase.
     """
     parser: argparse.ArgumentParser = argparse.ArgumentParser(prog="python -m bench", description=__doc__)
     parser.add_argument("--log-level", default="INFO")
@@ -468,13 +464,9 @@ def build_parser() -> argparse.ArgumentParser:
     help_texts: dict[str, str] = {
         "download": "Fetch and verify the SIFT1M corpus",
         "prepare": "Write the Iceberg source table, cluster-seeded text corpus, and ground truth",
-        "ingest": "Run the real Iceberg-to-Lance ETL into per-tenant datasets",
-        "index": "Build IVF_RQ, BTREE, BITMAP, and INVERTED indices with LanceIndexer",
-        "compact": "Compact the datasets with MaintenanceJob and record fragment counts",
         "search": "Run recall, FTS, hybrid, and the fixed authenticated load profile against the gRPC server",
         "report": "Aggregate run artifacts into summary.md, results.csv, and pareto.png",
-        "all": "Run the full chain: download, prepare, ingest, index, compact, search, report",
-        "e2e": "Batch-major e2e: per-batch ETL+index+compact+tag, historical-tag verification, optional gRPC legs",
+        "e2e": "Reconciler-driven e2e: per-batch ingest via the control plane, historical-tag verification, gRPC legs",
         "experiment": "One offline build iteration: prepare if needed, e2e, sizes, and metrics.json",
         "qualify": "Measure deterministic mutation collapse, skew, shuffle width, capacity, and external scale gates",
     }

@@ -287,7 +287,7 @@ def normalize_leg(ids: list[Any], scores: list[float], lower_is_better: bool) ->
 
 def fuse_legs(
     fusion_ast: dict[str, Any],
-    vector_ids: list[Any],
+    record_ids: list[Any],
     vector_scores: list[float],
     text_ids: list[Any],
     text_scores: list[float],
@@ -302,8 +302,8 @@ def fuse_legs(
 
     Args:
         fusion_ast: The single-key fusion specification, ``{"rrf": {"k": ...}}`` or ``{"weighted": {...}}``.
-        vector_ids: The exact vector leg ids in best-first order.
-        vector_scores: The exact vector leg distances aligned with ``vector_ids``.
+        record_ids: The exact vector leg ids in best-first order.
+        vector_scores: The exact vector leg distances aligned with ``record_ids``.
         text_ids: The exact BM25 leg ids in best-first order.
         text_scores: The exact BM25 leg scores aligned with ``text_ids``.
         k: The number of fused results to return.
@@ -324,7 +324,7 @@ def fuse_legs(
         if isinstance(rrf_k, bool) or not isinstance(rrf_k, (int, float)) or rrf_k <= 0:
             raise FusionReplayError(f"rrf k must be a positive number: {rrf_k!r}")
         fused: dict[Any, float] = {}
-        for leg in (vector_ids, text_ids):
+        for leg in (record_ids, text_ids):
             for rank, rid in enumerate(leg):
                 fused[rid] = fused.get(rid, 0.0) + 1.0 / (float(rrf_k) + rank + 1.0)
         return sorted(fused, key=lambda rid: (-fused[rid], rid))[:k]
@@ -332,7 +332,7 @@ def fuse_legs(
         weight: Any = body.get("vector_weight")
         if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not 0.0 <= float(weight) <= 1.0:
             raise FusionReplayError(f"weighted vector_weight must be in [0, 1]: {weight!r}")
-        vector_norm: dict[Any, float] = normalize_leg(vector_ids, vector_scores, lower_is_better=True)
+        vector_norm: dict[Any, float] = normalize_leg(record_ids, vector_scores, lower_is_better=True)
         text_norm: dict[Any, float] = normalize_leg(text_ids, text_scores, lower_is_better=False)
         weight_value: float = float(weight)
         union: set[Any] = set(vector_norm) | set(text_norm)

@@ -263,7 +263,6 @@ def test_runtime_bootstraps_source_then_uses_postgres_truth(
     repository: MagicMock = MagicMock()
     repository.source_by_name.return_value = None
     repository.ensure_source_registration.return_value = source
-    repository.reconciler_settings.return_value = reconciler_settings
     bootstrap_catalog: MagicMock = MagicMock()
     bootstrap_catalog.table_metadata.return_value = SimpleNamespace(table_uuid=str(table_uuid))
     runtime_catalog: MagicMock = MagicMock()
@@ -274,6 +273,9 @@ def test_runtime_bootstraps_source_then_uses_postgres_truth(
     engine: MagicMock = MagicMock()
     monkeypatch.setattr(
         reconciler_runtime.RuntimeSettings, "from_environment", MagicMock(return_value=runtime_settings)
+    )
+    monkeypatch.setattr(
+        reconciler_runtime.ReconcilerSettings, "from_environment", MagicMock(return_value=reconciler_settings)
     )
     monkeypatch.setattr(reconciler_runtime, "build_runtime_spark", MagicMock(return_value=spark))
     monkeypatch.setattr(reconciler_runtime.Telemetry, "create", MagicMock(return_value=telemetry))

@@ -147,6 +147,69 @@ def plot_pareto(path: Path, sweep: list[dict[str, Any]], title: str) -> bool:
     return True
 
 
+RECONCILE_COUNTERS: tuple[str, ...] = (
+    "cycles",
+    "enqueued",
+    "claimed",
+    "succeeded",
+    "advanced",
+    "retried",
+    "blocked",
+)
+
+
+def e2e_sections(e2e: dict[str, Any] | None) -> list[str]:
+    """Build the markdown sections summarizing a reconciler-driven ``e2e`` run.
+
+    Aggregates the per-batch reconciliation counters and renders the terminal per-organization
+    publication verification so a ``report`` following an ``e2e`` run reflects the reconcile counts
+    and whether every declared index converged.
+
+    Args:
+        e2e: The saved ``e2e`` phase document, or ``None`` when no such artifact exists.
+
+    Returns:
+        The markdown section strings, empty when no ``e2e`` artifact exists.
+    """
+    if not e2e:
+        return []
+    batches: list[dict[str, Any]] = e2e.get("batches", [])
+    totals: dict[str, int] = dict.fromkeys(RECONCILE_COUNTERS, 0)
+    counter: str
+    for record in batches:
+        reconcile: dict[str, Any] = record.get("reconcile", {})
+        for counter in RECONCILE_COUNTERS:
+            totals[counter] += int(reconcile.get(counter, 0))
+    verification: dict[str, Any] = e2e.get("publication_verification", {})
+    ok: bool = bool(verification.get("ok"))
+    sections: list[str] = [
+        "## Reconciler end-to-end",
+        f"Batches: {len(batches)} | publication verification: `{'OK' if ok else 'FAILED'}`",
+        markdown_table(
+            ["batches", *RECONCILE_COUNTERS],
+            [[len(batches), *[totals[counter] for counter in RECONCILE_COUNTERS]]],
+        ),
+    ]
+    checks: list[dict[str, Any]] = verification.get("checks", e2e.get("publications", []))
+    if checks:
+        sections.append("## Publication verification")
+        rows: list[list[Any]] = [
+            [
+                check.get("org"),
+                check.get("published"),
+                check.get("expected_rows"),
+                check.get("row_count"),
+                "OK" if check.get("ok") else "FAILED",
+                ",".join(check.get("missing_indexes", [])) or "-",
+            ]
+            for check in checks
+        ]
+        sections.append(
+            markdown_table(["org", "published", "expected rows", "rows", "status", "missing indexes"], rows)
+        )
+    return sections
+
+
 def summary_sections(config: BenchConfig, phases: dict[str, dict[str, Any] | None]) -> list[str]:
     """Build the markdown sections of the run summary.
 
@@ -162,30 +225,7 @@ def summary_sections(config: BenchConfig, phases: dict[str, dict[str, Any] | Non
         f"Generated {utc_now()} | limit={config.limit} tenants={config.tenants} seed={config.seed} "
         f"batches={config.batches}",
     ]
-    ingest: dict[str, Any] | None = phases.get("ingest")
-    if ingest:
-        sections.append("## Ingest (real ETL)")
-        sections.append(
-            markdown_table(
-                ["total rows", "wall (s)", "rows/sec", "batches"],
-                [[ingest["total_rows"], ingest["total_seconds"], ingest["rows_per_second"], len(ingest["batches"])]],
-            )
-        )
-    index: dict[str, Any] | None = phases.get("index")
-    if index:
-        sections.append("## Index builds (LanceIndexer)")
-        sections.append(
-            markdown_table(["stage", "wall (s)"], [[stage["stage"], stage["seconds"]] for stage in index["stages"]])
-        )
-    compact: dict[str, Any] | None = phases.get("compact")
-    if compact:
-        sections.append("## Compaction (MaintenanceJob)")
-        rows: list[list[Any]] = [
-            [uri.rsplit("/", 3)[-3], compact["fragments_before"][uri], compact["fragments_after"][uri]]
-            for uri in compact["fragments_before"]
-        ]
-        sections.append(markdown_table(["dataset", "fragments before", "fragments after"], rows))
-        sections.append(f"Total wall: {compact['total_seconds']}s")
+    sections.extend(e2e_sections(phases.get("e2e")))
     search: dict[str, Any] | None = phases.get("search")
     sections.append("## Search qualification")
     if search:

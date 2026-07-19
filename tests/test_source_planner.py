@@ -233,7 +233,7 @@ def trusted_rewrite() -> MaintenanceTrust:
 
 def test_partition_contract_is_exact() -> None:
     """A renamed hour partition field is rejected even when its source and transform match."""
-    renamed_fields = (*REQUIRED_PARTITION_FIELDS[:3], PartitionField("hour", "processing_timestamp", "hour"))
+    renamed_fields = (*REQUIRED_PARTITION_FIELDS[:3], PartitionField("hour", "ts", "hour"))
     catalog = FakeCatalog(TableMetadata("table-a", 1, PartitionSpec(7, renamed_fields)), (snapshot(1, None, 1),))
     with pytest.raises(SourceContractError, match="active partition spec"):
         SourcePlanner(catalog).plan("catalog.db.events", None, canonical_baseline())

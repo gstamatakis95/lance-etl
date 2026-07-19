@@ -1,7 +1,7 @@
 """The Lance sink: content-routed, idempotent merge of pivoted change rows into per-tenant datasets.
 
-This module is the write seam of the ETL, the counterpart of the Iceberg source seam in
-:meth:`lance_etl.etl.job.IcebergToLanceETL.read_increment`. It deliberately is not a Spark
+This module is the write seam of the ingestion path, the counterpart of the Iceberg source scan in
+:mod:`lance_etl.source`. It deliberately is not a Spark
 DataSourceV2 connector: a DSv2 write targets one table per write, while this sink routes each
 row group to one of thousands of per-tenant datasets chosen by content, evolves each dataset's
 schema independently, and applies last-write-wins merge conditions. Executor closures calling
@@ -39,9 +39,7 @@ from lance_etl.etl.pivot import (
     DELETE_OP_VALUES,
     KEY_COL,
     OP_COL,
-    TTL_COL,
     ETLConfig,
-    apply_ttl_cast,
     pivot_map_columns,
 )
 from lance_etl.telemetry import DEFAULT_RETRY_TIMEOUT, Telemetry, commit_with_retries
@@ -172,7 +170,7 @@ def build_update_condition(ts_col: str) -> str:
 def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], group: pa.Table) -> tuple[int, int]:
     """Pivot, cast, and merge one dataset group via upsert and physical delete.
 
-    Pivots map columns, casts TTL, bootstraps a new dataset with V2 manifest paths and the
+    Pivots map columns, bootstraps a new dataset with V2 manifest paths and the
     configured Lance file format when absent (concurrent-bootstrap race caught with OSError
     fallback), evolves schema via ``add_columns`` when new keys appear (idempotent on retry),
     then runs ``merge_insert`` with ``when_matched_update_all(condition)``. Physical deletes use
@@ -201,8 +199,8 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
     When ``config.merge_batch_bytes`` is set, the upsert and delete tables are sliced into
     zero-copy chunks via :func:`table_chunks` using the table's actual mean row width to derive a
     rows-per-chunk value, and each chunk is committed independently. Chunking is order-safe because
-    :meth:`lance_etl.etl.job.IcebergToLanceETL.collapse` guarantees at most one row per vector id
-    reaches this function, so no key appears in more than one chunk.
+    the upstream terminal-mutation collapse guarantees at most one row per record id reaches this
+    function, so no key appears in more than one chunk.
 
     Args:
         config: ETL configuration.
@@ -237,7 +235,7 @@ def apply_merge(config: ETLConfig, telemetry: Telemetry, key: tuple[str, ...], g
             pivot_counts["invalid_vector_rows"],
         )
 
-    upserts: pa.Table = apply_ttl_cast(upserts_pivoted, TTL_COL)
+    upserts: pa.Table = upserts_pivoted
 
     deletes: pa.Table = group.filter(is_delete).select([KEY_COL])
 

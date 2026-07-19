@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -46,7 +45,7 @@ def make_group(keys: list[str], op: str = "insert", value: float = 1.0) -> pa.Ta
     """Build one routing key's change rows.
 
     Args:
-        keys: Vector ids for the rows.
+        keys: Record ids for the rows.
         op: Operation value for every row.
         value: Payload value for every row.
 
@@ -56,7 +55,7 @@ def make_group(keys: list[str], op: str = "insert", value: float = 1.0) -> pa.Ta
     count: int = len(keys)
     return pa.table(
         {
-            "vector_id": pa.array(keys, pa.string()),
+            "record_id": pa.array(keys, pa.string()),
             "org_id": pa.array([ROUTING_KEY[0]] * count),
             "tenant_id": pa.array([ROUTING_KEY[1]] * count),
             "namespace": pa.array([ROUTING_KEY[2]] * count),
@@ -81,45 +80,10 @@ def test_apply_merge_reupsert_updates_in_place(etl_config: ETLConfig, telemetry:
     upserted, deleted = apply_merge(etl_config, telemetry, ROUTING_KEY, make_group(["a", "b"], value=2.0))
     assert (upserted, deleted) == (2, 0)
     uri: str = dataset_uri(etl_config, *ROUTING_KEY)
-    table: pa.Table = lance.dataset(uri).to_table().sort_by("vector_id")
+    table: pa.Table = lance.dataset(uri).to_table().sort_by("record_id")
     assert table.num_rows == 3
-    assert table["vector_id"].to_pylist() == ["a", "b", "c"]
+    assert table["record_id"].to_pylist() == ["a", "b", "c"]
     assert table["value"].to_pylist() == [2.0, 2.0, 1.0]
-
-
-def make_ttl_group(keys: list[str], op: str = "insert", lifetime_days: int = 30) -> pa.Table:
-    """Build one routing key's change rows carrying a per-row Duration TTL column.
-
-    Args:
-        keys: Vector ids for the rows.
-        op: Operation value for every row.
-        lifetime_days: The per-row lifetime stored in the ``ttl`` Duration column.
-
-    Returns:
-        A routed ETL group with an extra ``ttl`` duration column.
-    """
-    count: int = len(keys)
-    return pa.table(
-        {
-            "vector_id": pa.array(keys, pa.string()),
-            "org_id": pa.array([ROUTING_KEY[0]] * count),
-            "tenant_id": pa.array([ROUTING_KEY[1]] * count),
-            "namespace": pa.array([ROUTING_KEY[2]] * count),
-            "timestamp": pa.array([1] * count, pa.int64()),
-            "op": pa.array([op] * count),
-            "ttl": pa.array([timedelta(days=lifetime_days)] * count, pa.duration("us")),
-        }
-    )
-
-
-def test_apply_merge_passes_ttl_column_through(etl_config: ETLConfig, telemetry: Telemetry) -> None:
-    """A per-row Duration TTL column flows through merge_insert and is refreshed on re-upsert."""
-    apply_merge(etl_config, telemetry, ROUTING_KEY, make_ttl_group(["a", "b"], lifetime_days=30))
-    apply_merge(etl_config, telemetry, ROUTING_KEY, make_ttl_group(["a"], lifetime_days=90))
-    uri: str = dataset_uri(etl_config, *ROUTING_KEY)
-    table: pa.Table = lance.dataset(uri).to_table().sort_by("vector_id")
-    assert "ttl" in table.column_names
-    assert table["ttl"].to_pylist() == [timedelta(days=90), timedelta(days=30)]
 
 
 def test_apply_merge_delete_path(etl_config: ETLConfig, telemetry: Telemetry) -> None:
@@ -129,7 +93,7 @@ def test_apply_merge_delete_path(etl_config: ETLConfig, telemetry: Telemetry) ->
     assert (upserted, deleted) == (0, 2)
     uri: str = dataset_uri(etl_config, *ROUTING_KEY)
     table: pa.Table = lance.dataset(uri).to_table()
-    assert table["vector_id"].to_pylist() == ["b"]
+    assert table["record_id"].to_pylist() == ["b"]
 
 
 def test_apply_merge_delete_on_missing_dataset(etl_config: ETLConfig, telemetry: Telemetry) -> None:
@@ -192,9 +156,9 @@ def test_concurrent_merges_and_compaction(
     assert failures == []
     assert len(compactions) >= 2
     assert all(int(item["tasks"]) >= 1 for item in compactions)
-    table: pa.Table = lance.dataset(uri).to_table().sort_by("vector_id")
+    table: pa.Table = lance.dataset(uri).to_table().sort_by("record_id")
     assert table.num_rows == 400
-    assert table["vector_id"].to_pylist() == sorted(keys_one + keys_two)
+    assert table["record_id"].to_pylist() == sorted(keys_one + keys_two)
     assert table["value"].to_pylist() == [float(iterations)] * 400
 
 
@@ -202,17 +166,17 @@ def make_large_group(keys: list[str], op: str = "insert", value: float = 1.0) ->
     """Build a routing-key group table for chunked-merge tests.
 
     Args:
-        keys: Vector ids for the rows.
+        keys: Record ids for the rows.
         op: Operation value for every row.
         value: Payload float for every row.
 
     Returns:
-        A table shaped like one routed ETL group with vector_id, routing, timestamp, op, and value.
+        A table shaped like one routed ETL group with record_id, routing, timestamp, op, and value.
     """
     count: int = len(keys)
     return pa.table(
         {
-            "vector_id": pa.array(keys, pa.string()),
+            "record_id": pa.array(keys, pa.string()),
             "org_id": pa.array([ROUTING_KEY[0]] * count),
             "tenant_id": pa.array([ROUTING_KEY[1]] * count),
             "namespace": pa.array([ROUTING_KEY[2]] * count),
@@ -263,13 +227,13 @@ def test_chunked_upsert_matches_unchunked(
     assert chunked_upserted == unchunked_upserted == 30
     assert chunked_deleted == unchunked_deleted == 0
 
-    chunked_table: pa.Table = lance.dataset(dataset_uri(chunked_config, *ROUTING_KEY)).to_table().sort_by("vector_id")
+    chunked_table: pa.Table = lance.dataset(dataset_uri(chunked_config, *ROUTING_KEY)).to_table().sort_by("record_id")
     unchunked_table: pa.Table = (
-        lance.dataset(dataset_uri(unchunked_config, *ROUTING_KEY)).to_table().sort_by("vector_id")
+        lance.dataset(dataset_uri(unchunked_config, *ROUTING_KEY)).to_table().sort_by("record_id")
     )
 
     assert chunked_table.num_rows == unchunked_table.num_rows == 30
-    assert chunked_table["vector_id"].to_pylist() == unchunked_table["vector_id"].to_pylist()
+    assert chunked_table["record_id"].to_pylist() == unchunked_table["record_id"].to_pylist()
     assert chunked_table["value"].to_pylist() == unchunked_table["value"].to_pylist()
 
 
@@ -414,7 +378,7 @@ def make_wide_float32_group(num_rows: int, dim: int = 128) -> pa.Table:
     )
     return pa.table(
         {
-            "vector_id": pa.array([f"f32_{i}" for i in range(num_rows)], pa.string()),
+            "record_id": pa.array([f"f32_{i}" for i in range(num_rows)], pa.string()),
             "org_id": pa.array([ROUTING_KEY[0]] * num_rows),
             "tenant_id": pa.array([ROUTING_KEY[1]] * num_rows),
             "namespace": pa.array([ROUTING_KEY[2]] * num_rows),
@@ -438,7 +402,7 @@ def test_float32_wide_row_chunks_more_than_uint8_under_same_budget() -> None:
     float32_table: pa.Table = make_wide_float32_group(num_rows, dim)
     uint8_table: pa.Table = pa.table(
         {
-            "vector_id": pa.array([f"u8_{i}" for i in range(num_rows)], pa.string()),
+            "record_id": pa.array([f"u8_{i}" for i in range(num_rows)], pa.string()),
             "org_id": pa.array([ROUTING_KEY[0]] * num_rows),
             "tenant_id": pa.array([ROUTING_KEY[1]] * num_rows),
             "namespace": pa.array([ROUTING_KEY[2]] * num_rows),
@@ -467,7 +431,7 @@ def test_float32_wide_row_chunks_more_than_uint8_under_same_budget() -> None:
 
 
 TS_TYPE: pa.DataType = pa.timestamp("us", tz=None)
-TS_COL: str = "event_timestamp"
+TS_COL: str = "ts"
 
 
 def make_ts_group(
@@ -476,21 +440,21 @@ def make_ts_group(
     op: str = "insert",
     value: float = 1.0,
 ) -> pa.Table:
-    """Build one routing-key group with an ``event_timestamp`` column for the cross-window guard tests.
+    """Build one routing-key group with an ``ts`` column for the cross-window guard tests.
 
     Args:
-        keys: Vector ids for the rows.
+        keys: Record ids for the rows.
         ts_values: Microsecond-epoch timestamp values, one per row.
         op: Operation value for every row.
         value: Payload float for every row.
 
     Returns:
-        A table shaped like one routed ETL group carrying ``event_timestamp`` as a us-precision timestamp.
+        A table shaped like one routed ETL group carrying ``ts`` as a us-precision timestamp.
     """
     count: int = len(keys)
     return pa.table(
         {
-            "vector_id": pa.array(keys, pa.string()),
+            "record_id": pa.array(keys, pa.string()),
             "org_id": pa.array([ROUTING_KEY[0]] * count),
             "tenant_id": pa.array([ROUTING_KEY[1]] * count),
             "namespace": pa.array([ROUTING_KEY[2]] * count),
@@ -503,7 +467,7 @@ def make_ts_group(
 
 @pytest.fixture
 def ts_config(tmp_path: Path, telemetry_config: TelemetryConfig) -> ETLConfig:
-    """ETLConfig using the default ts_col (``event_timestamp``) for cross-window guard tests.
+    """ETLConfig using the default ts_col (``ts``) for cross-window guard tests.
 
     Args:
         tmp_path: Pytest-provided temporary directory.
@@ -568,7 +532,7 @@ def test_newer_update_overwrites_older_stored_row(ts_config: ETLConfig, telemetr
 
 
 def test_null_target_ts_is_not_overwritten(ts_config: ETLConfig, telemetry: Telemetry) -> None:
-    """A row stored with NULL event_timestamp is not overwritten by the cross-window guard.
+    """A row stored with NULL ts is not overwritten by the cross-window guard.
 
     The condition ``source.ts >= target.ts`` evaluates to NULL (treated as FALSE) when target.ts
     is NULL, so NULL-timestamp target rows are skipped by the guard. This is the documented
@@ -586,7 +550,7 @@ def test_null_target_ts_is_not_overwritten(ts_config: ETLConfig, telemetry: Tele
     """
     null_ts_group: pa.Table = pa.table(
         {
-            "vector_id": pa.array(["k1"], pa.string()),
+            "record_id": pa.array(["k1"], pa.string()),
             "org_id": pa.array([ROUTING_KEY[0]]),
             "tenant_id": pa.array([ROUTING_KEY[1]]),
             "namespace": pa.array([ROUTING_KEY[2]]),
@@ -641,7 +605,7 @@ def test_dataset_absent_classifies_only_genuine_absence() -> None:
 def test_delete_chunk_absent_dataset_is_noop(etl_config: ETLConfig) -> None:
     """A delete against a dataset that never existed returns empty stats without raising."""
     uri: str = dataset_uri(etl_config, *ROUTING_KEY)
-    chunk: pa.Table = pa.table({"vector_id": pa.array(["a"], pa.string())})
+    chunk: pa.Table = pa.table({"record_id": pa.array(["a"], pa.string())})
     stats = run_delete_chunk(etl_config, MagicMock(), uri, chunk, 0, 1)
     assert stats == {}
 
@@ -664,7 +628,7 @@ def test_delete_chunk_transient_open_error_reraises(
         raise ValueError("Generic S3 error: 503 Slow Down")
 
     monkeypatch.setattr(lance, "dataset", raise_transient)
-    chunk: pa.Table = pa.table({"vector_id": pa.array(["a"], pa.string())})
+    chunk: pa.Table = pa.table({"record_id": pa.array(["a"], pa.string())})
     telemetry_mock: MagicMock = MagicMock()
     with pytest.raises(ValueError, match="503 Slow Down"):
         run_delete_chunk(etl_config, telemetry_mock, uri, chunk, 0, 1)
@@ -684,6 +648,6 @@ def test_open_or_bootstrap_transient_error_reraises(
         raise ValueError("Generic S3 error: 503 Slow Down")
 
     monkeypatch.setattr(lance, "dataset", raise_transient)
-    schema: pa.Schema = pa.schema([("vector_id", pa.string())])
+    schema: pa.Schema = pa.schema([("record_id", pa.string())])
     with pytest.raises(ValueError, match="503 Slow Down"):
         open_or_bootstrap(uri, schema, etl_config)

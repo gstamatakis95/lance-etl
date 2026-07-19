@@ -20,8 +20,6 @@ from lance_etl.state.types import (
     SourceLifecycleState,
     SourceSnapshotKind,
     SourceSnapshotPlan,
-    WorkLauncherKind,
-    WorkProvenance,
     deterministic_dataset_id,
     deterministic_ingest_work_id,
     deterministic_publication_id,
@@ -33,20 +31,15 @@ from lance_etl.state.types import (
 )
 
 APPLICATION_TABLES: set[str] = {
-    "reconciler_settings",
-    "dataset_specs",
     "dataset_spec_revisions",
     "dataset_fields",
     "index_definitions",
-    "vector_index_options",
-    "fts_index_options",
     "iceberg_sources",
     "datasets",
     "source_snapshots",
     "dataset_work",
     "dataset_publications",
     "publication_indexes",
-    "dataset_state",
 }
 """Exact normalized PostgreSQL application entity set."""
 
@@ -73,28 +66,8 @@ def source_registration() -> IcebergSource:
 
 
 def test_metadata_contains_exact_normalized_entities() -> None:
-    """SQLAlchemy metadata contains only the fourteen approved entities."""
+    """SQLAlchemy metadata contains only the nine approved entities."""
     assert set(metadata.tables) == APPLICATION_TABLES
-
-
-def test_work_provenance_parses_local_and_airflow_process_context() -> None:
-    """Launch provenance remains local unless valid Airflow context is present."""
-    local: WorkProvenance = WorkProvenance.from_environment({})
-    assert local == WorkProvenance()
-    airflow: WorkProvenance = WorkProvenance.from_environment(
-        {
-            "AIRFLOW_CTX_DAG_ID": "local-reconcile",
-            "AIRFLOW_CTX_DAG_RUN_ID": "manual__2026-07-18",
-            "AIRFLOW_CTX_TASK_ID": "reconcile",
-            "AIRFLOW_CTX_MAP_INDEX": "-1",
-            "AIRFLOW_CTX_TRY_NUMBER": "3",
-        }
-    )
-    assert airflow.launcher_kind is WorkLauncherKind.AIRFLOW
-    assert airflow.airflow_ctx_map_index == -1
-    assert airflow.airflow_ctx_try_number == 3
-    with pytest.raises(ValueError, match="requires DAG, run, and task"):
-        WorkProvenance.from_environment({"AIRFLOW_CTX_DAG_ID": "partial"})
 
 
 @pytest.mark.parametrize(
@@ -213,7 +186,7 @@ def test_default_spec_exposes_typed_ingest_compaction_and_index_options() -> Non
     assert revision.target_rows_per_fragment > 0
     assert revision.fragments_per_index_task > 0
     assert revision.retained_publications > 0
-    assert len(revision.fields) == 10
+    assert len(revision.fields) == 9
     assert len(revision.indexes) == 6
     assert revision.vector_options_for_field("vector").maximum_partitions >= 1
     assert revision.fts_options_for_field("text").max_unindexed_fragments >= 0

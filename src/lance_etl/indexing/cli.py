@@ -1,7 +1,8 @@
 """Indexing job CLI: build IVF_RQ, BTREE, BITMAP, and FTS indices on Lance datasets.
 
-Exposes the ``index`` argument parser and the ``main()`` entry point consumed by the
-``lance-etl-index`` script and ``python -m lance_etl.indexing``.
+Uninstalled operator CLI, not registered as a console script in ``pyproject.toml``. Exposes the
+``index`` argument parser and the ``main()`` entry point reachable via
+``python -m lance_etl.indexing.cli``.
 """
 
 from __future__ import annotations

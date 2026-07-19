@@ -96,21 +96,21 @@ def test_run_replans_until_budget_then_defers(
     assert "fragments_removed" not in results[0]
 
 
-def test_hot_skip_cleans_versions_created_by_same_run_ttl(
+def test_hot_skip_cleans_versions_created_by_same_run_retention(
     dataset_uri: str, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A TTL-active hot dataset still cleans its same-run obsolete versions after deferral."""
-    config: MaintenanceConfig = replan_config(telemetry_config, ttl_column="ttl")
+    """A retention-active hot dataset still cleans its same-run obsolete versions after deferral."""
+    config: MaintenanceConfig = replan_config(telemetry_config, retention_seconds=10 * 24 * 3600)
     cleanup_calls: list[str] = []
 
-    def ttl_delete(
+    def retention_delete(
         dataset: lance.LanceDataset,
         uri: str,
         cfg: MaintenanceConfig,
         cutoff: object,
         telemetry: Telemetry,
     ) -> dict[str, object]:
-        """Report same-run TTL work without mutating the compaction fixture.
+        """Report same-run retention work without mutating the compaction fixture.
 
         Args:
             dataset: Open dataset handle.
@@ -120,10 +120,10 @@ def test_hot_skip_cleans_versions_created_by_same_run_ttl(
             telemetry: Executor telemetry facade.
 
         Returns:
-            TTL evidence showing that this run created an obsolete version.
+            Retention evidence showing that this run created an obsolete version.
         """
         del dataset, cfg, cutoff, telemetry
-        return {"uri": uri, "ttl_rows_deleted": 1, "skipped": ""}
+        return {"uri": uri, "retention_rows_deleted": 1, "skipped": ""}
 
     def conflicting_commit(
         uri: str, rewrite_jsons: list[str], cfg: MaintenanceConfig, telemetry: Telemetry
@@ -157,14 +157,14 @@ def test_hot_skip_cleans_versions_created_by_same_run_ttl(
         cleanup_calls.append(uri)
         return 321
 
-    monkeypatch.setattr(maintenance_job, "run_ttl_on_open_dataset", ttl_delete)
+    monkeypatch.setattr(maintenance_job, "run_retention_on_open_dataset", retention_delete)
     monkeypatch.setattr(maintenance_job, "commit_one_dataset", conflicting_commit)
     monkeypatch.setattr(maintenance_job, "cleanup_dataset", record_cleanup)
 
     results: list[dict[str, object]] = MaintenanceJob(config).run(FakeSpark(), [dataset_uri])
 
     assert cleanup_calls == [dataset_uri]
-    assert results[0]["ttl_rows_deleted"] == 1
+    assert results[0]["retention_rows_deleted"] == 1
     assert results[0]["bytes_removed"] == 321
     assert f"conflicted in all {maintenance_job.REPLAN_BUDGET}" in str(results[0]["skipped"])
 

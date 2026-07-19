@@ -1,6 +1,6 @@
 //! Event-time range search and object-store scan-stats capture.
 //!
-//! Builds a tiny dataset with an `event_timestamp` column (one row per day), then drives the Lance
+//! Builds a tiny dataset with a `ts` column (one row per day), then drives the Lance
 //! backend directly to assert that a request time range restricts results to the window on the
 //! event-timestamp column (start inclusive, end exclusive, either bound optional), that an absent
 //! range behaves as before, that the range ANDs with a caller filter, and that the scan-stats
@@ -41,11 +41,11 @@ fn event_ms(index: i64) -> i64 {
     BASE_MS + index * DAY_MS
 }
 
-/// Writes a four-row dataset (id, text, vector, event_timestamp) and creates an INVERTED index on
+/// Writes a four-row dataset (id, text, vector, ts) and creates an INVERTED index on
 /// `text` so the text and hybrid legs run, with one row per day on the timestamp column.
 async fn build_timestamped_dataset(uri: &str) {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("vector_id", DataType::Utf8, false),
+        Field::new("record_id", DataType::Utf8, false),
         Field::new("is_deleted", DataType::Boolean, false),
         Field::new("id", DataType::Int32, false),
         Field::new("text", DataType::Utf8, false),
@@ -55,7 +55,7 @@ async fn build_timestamped_dataset(uri: &str) {
             false,
         ),
         Field::new(
-            "event_timestamp",
+            "ts",
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
         ),
@@ -274,7 +274,7 @@ async fn time_range_against_a_missing_event_column_is_rejected() {
     build_timestamped_dataset(&uri).await;
     let backend = build_backend(data_tmp.path(), cache_tmp.path())
         .await
-        .with_event_timestamp_column("no_such_column");
+        .with_ts_column("no_such_column");
 
     let err = backend
         .vector_search(

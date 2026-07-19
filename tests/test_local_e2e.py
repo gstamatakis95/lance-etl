@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,7 +20,6 @@ from pyspark.sql import Row, SparkSession
 from pyspark.sql.types import (
     ArrayType,
     FloatType,
-    LongType,
     MapType,
     StringType,
     StructField,
@@ -65,6 +64,7 @@ from lance_etl.state.tables import (
     dataset_publications,
     dataset_work,
     datasets,
+    publication_indexes,
     source_snapshots,
 )
 from lance_etl.telemetry import TelemetryConfig
@@ -89,14 +89,12 @@ SOURCE_SCHEMA: StructType = StructType(
         StructField("tenant_id", StringType(), False),
         StructField("namespace", StringType(), False),
         StructField("org_id", StringType(), False),
-        StructField("vector_id", StringType(), False),
+        StructField("record_id", StringType(), False),
         StructField("op", StringType(), False),
-        StructField("event_timestamp", TimestampType(), False),
-        StructField("processing_timestamp", TimestampType(), False),
+        StructField("ts", TimestampType(), False),
         StructField("vectors", MapType(StringType(), ArrayType(FloatType(), False), False), False),
         StructField("texts", MapType(StringType(), StringType(), False), False),
         StructField("metadata", MapType(StringType(), StringType(), False), False),
-        StructField("ttl", LongType(), True),
     ]
 )
 """Exact source shape accepted by the database-configured ingestion worker."""
@@ -130,17 +128,17 @@ def schema_url(base_url: URL, schema_name: str) -> URL:
     return base_url.update_query_dict({"options": f"-csearch_path={schema_name}"})
 
 
-@pytest.fixture
-def postgres_control_plane(tmp_path: Path) -> Iterator[tuple[ControlPlaneRepository, Engine]]:
-    """Migrate and expose an isolated local PostgreSQL control plane.
+def provision_isolated_plane(
+    configure: Callable[[ControlPlaneRepository], None],
+) -> Iterator[tuple[ControlPlaneRepository, Engine]]:
+    """Migrate an isolated PostgreSQL schema and install one configured specification.
 
     Args:
-        tmp_path: Isolated filesystem root used by the test.
+        configure: Callback that installs and activates the specification under test.
 
     Yields:
-        Migrated repository and SQLAlchemy engine.
+        Migrated repository and SQLAlchemy engine bound to the isolated schema.
     """
-    del tmp_path
     raw_url: str | None = os.environ.get(POSTGRES_URL_ENV)
     if raw_url is None:
         pytest.skip(f"set {POSTGRES_URL_ENV} to run the local end-to-end integration test")
@@ -159,7 +157,7 @@ def postgres_control_plane(tmp_path: Path) -> Iterator[tuple[ControlPlaneReposit
         command.upgrade(alembic_config, "head")
         engine = build_control_plane_engine(isolated_url_string)
         repository: ControlPlaneRepository = ControlPlaneRepository(engine)
-        configure_local_spec(repository)
+        configure(repository)
         yield repository, engine
     finally:
         if engine is not None:
@@ -167,6 +165,26 @@ def postgres_control_plane(tmp_path: Path) -> Iterator[tuple[ControlPlaneReposit
         with admin_engine.begin() as connection:
             connection.execute(DropSchema(schema_name, cascade=True))
         admin_engine.dispose()
+
+
+@pytest.fixture
+def postgres_control_plane() -> Iterator[tuple[ControlPlaneRepository, Engine]]:
+    """Migrate and expose an isolated local PostgreSQL control plane.
+
+    Yields:
+        Migrated repository and SQLAlchemy engine.
+    """
+    yield from provision_isolated_plane(configure_local_spec)
+
+
+@pytest.fixture
+def postgres_production_plane() -> Iterator[tuple[ControlPlaneRepository, Engine]]:
+    """Migrate and expose an isolated plane carrying the bundled production default spec.
+
+    Yields:
+        Migrated repository and SQLAlchemy engine.
+    """
+    yield from provision_isolated_plane(configure_production_spec)
 
 
 @pytest.fixture
@@ -258,10 +276,82 @@ def configure_local_spec(repository: ControlPlaneRepository) -> None:
     Args:
         repository: Fresh migrated PostgreSQL repository.
     """
-    spec_id: uuid.UUID = repository.create_spec("local-e2e", "Small local end-to-end policy", LOCAL_SPEC_ID)
-    if spec_id != LOCAL_SPEC_ID:
-        raise RuntimeError("local specification identity drifted")
-    draft: DatasetSpecRevision = repository.create_draft_spec_revision(local_spec())
+    draft: DatasetSpecRevision = repository.create_draft_spec_revision(
+        local_spec(), "local-e2e", "Small local end-to-end policy"
+    )
+    repository.activate_spec_revision(draft.spec_revision_id)
+
+
+def production_local_spec() -> DatasetSpecRevision:
+    """Return the bundled production default spec re-scaled for the local E2E harness.
+
+    Keeps compaction enabled and every bundled index (vector, FTS, two BTREE, ZONEMAP, and
+    BITMAP), only shrinking the vector dimension and partition counts so the tiny local corpus
+    can bootstrap a real IVF_RQ index.
+
+    Returns:
+        A draft revision under the local identities carrying the full production index set.
+    """
+    base: DatasetSpecRevision = production_default_spec_revision()
+    field_ids: dict[uuid.UUID, uuid.UUID] = {
+        field.field_id: uuid.uuid5(LOCAL_SPEC_REVISION_ID, f"field:{field.target_name}") for field in base.fields
+    }
+    fields: tuple[DatasetField, ...] = tuple(
+        replace(
+            field,
+            field_id=field_ids[field.field_id],
+            spec_revision_id=LOCAL_SPEC_REVISION_ID,
+            data_type=f"fixed_size_list<float32,{VECTOR_DIMENSION}>"
+            if field.role is FieldRole.VECTOR
+            else field.data_type,
+            vector_dimension=VECTOR_DIMENSION if field.role is FieldRole.VECTOR else field.vector_dimension,
+        )
+        for field in base.fields
+    )
+    indexes: tuple[IndexDefinition, ...] = tuple(
+        replace(
+            definition,
+            index_definition_id=uuid.uuid5(LOCAL_SPEC_REVISION_ID, f"index:{definition.index_name}"),
+            spec_revision_id=LOCAL_SPEC_REVISION_ID,
+            field_id=field_ids[definition.field_id],
+            vector_options=replace(
+                definition.vector_options,
+                num_partitions=2,
+                minimum_partitions=1,
+                maximum_partitions=16,
+                target_rows_per_partition=4,
+            )
+            if definition.vector_options is not None
+            else None,
+        )
+        for definition in base.index_definitions
+    )
+    candidate: DatasetSpecRevision = replace(
+        base,
+        spec_id=LOCAL_SPEC_ID,
+        spec_revision_id=LOCAL_SPEC_REVISION_ID,
+        revision_number=1,
+        state=SpecRevisionState.DRAFT,
+        supersedes_revision_id=None,
+        fields=fields,
+        indexes=indexes,
+        ingest_shuffle_partitions=2,
+        write_rows_per_fragment=4,
+        target_rows_per_fragment=64,
+        configuration_digest=b"",
+    )
+    return candidate
+
+
+def configure_production_spec(repository: ControlPlaneRepository) -> None:
+    """Install and activate the full production default revision through lifecycle APIs.
+
+    Args:
+        repository: Fresh migrated PostgreSQL repository.
+    """
+    draft: DatasetSpecRevision = repository.create_draft_spec_revision(
+        production_local_spec(), "production-e2e", "Bundled production default policy"
+    )
     repository.activate_spec_revision(draft.spec_revision_id)
 
 
@@ -279,16 +369,14 @@ def create_source_table(spark: SparkSession, table: str) -> None:
             tenant_id STRING NOT NULL,
             namespace STRING NOT NULL,
             org_id STRING NOT NULL,
-            vector_id STRING NOT NULL,
+            record_id STRING NOT NULL,
             op STRING NOT NULL,
-            event_timestamp TIMESTAMP NOT NULL,
-            processing_timestamp TIMESTAMP NOT NULL,
+            ts TIMESTAMP NOT NULL,
             vectors MAP<STRING, ARRAY<FLOAT>> NOT NULL,
             texts MAP<STRING, STRING> NOT NULL,
-            metadata MAP<STRING, STRING> NOT NULL,
-            ttl BIGINT
+            metadata MAP<STRING, STRING> NOT NULL
         ) USING iceberg
-        PARTITIONED BY (tenant_id, namespace, org_id, hours(processing_timestamp))
+        PARTITIONED BY (tenant_id, namespace, org_id, hours(ts))
         TBLPROPERTIES ('format-version' = '2')
         """
     )
@@ -317,11 +405,9 @@ def source_rows(first: int, last: int) -> list[tuple[object, ...]]:
                 f"vector-{ordinal}",
                 "upsert",
                 timestamp,
-                timestamp,
                 {"vector": vector},
                 {"text": f"payload-{ordinal}"},
                 {"cluster": "cluster-a"},
-                0,
             )
         )
     return rows
@@ -378,7 +464,7 @@ def build_application(
         lance_base_uri=lance_base_uri,
     )
     source = repository.set_source_default_spec(source.source_id, LOCAL_SPEC_ID)
-    settings: ReconcilerSettings = repository.reconciler_settings()
+    settings: ReconcilerSettings = ReconcilerSettings.from_environment()
     catalog: SparkIcebergCatalog = SparkIcebergCatalog(
         spark,
         source.canonical_baseline_snapshot_id,
@@ -499,8 +585,8 @@ def test_local_reconciler_runs_baseline_increment_and_noop(
     assert second_serving.lance_uri == first_serving.lance_uri
     assert second_serving.lance_version > first_serving.lance_version
     dataset: Any = lance.dataset(second_serving.lance_uri, version=second_serving.lance_version)
-    rows: list[dict[str, object]] = dataset.to_table(columns=["vector_id", "is_deleted"]).to_pylist()
-    assert {row["vector_id"] for row in rows} == {f"vector-{ordinal}" for ordinal in range(9)}
+    rows: list[dict[str, object]] = dataset.to_table(columns=["record_id", "is_deleted"]).to_pylist()
+    assert {row["record_id"] for row in rows} == {f"vector-{ordinal}" for ordinal in range(9)}
     assert all(row["is_deleted"] is False for row in rows)
     assert {description.name for description in dataset.describe_indices()} == {"vector_idx"}
     assert int(dataset.stats.index_stats("vector_idx")["num_unindexed_fragments"]) == 0
@@ -517,3 +603,168 @@ def test_local_reconciler_runs_baseline_increment_and_noop(
         manifests: tuple[str, ...] = tuple(connection.scalars(sa.select(dataset_publications.c.manifest_uri)))
     assert len(manifests) == 2
     assert all(Path(uri).is_file() for uri in manifests)
+
+
+PRODUCTION_INDEX_NAMES: frozenset[str] = frozenset(
+    {
+        "vector_idx",
+        "text_fts_idx",
+        "cluster_idx",
+        "ts_idx",
+        "ts_zonemap_idx",
+        "is_deleted_bitmap_idx",
+    }
+)
+"""Every serving index the bundled production default specification declares."""
+
+
+def dump_work_diagnostics(engine: Engine) -> str:
+    """Render every work row and the candidate index inventory for a blocked publish.
+
+    Args:
+        engine: Isolated migrated PostgreSQL engine.
+
+    Returns:
+        Human-readable diagnostic block naming each work error and the candidate index types.
+    """
+    lines: list[str] = []
+    with engine.connect() as connection:
+        for row in connection.execute(
+            sa.select(
+                dataset_work.c.kind, dataset_work.c.state, dataset_work.c.error_code, dataset_work.c.error_message
+            )
+        ):
+            lines.append(f"work kind={row.kind} state={row.state} error={row.error_code}: {row.error_message}")
+        uris: list[tuple[str, int | None]] = [
+            (str(row.ingest_lance_uri), row.ingest_lance_version)
+            for row in connection.execute(sa.select(datasets.c.ingest_lance_uri, datasets.c.ingest_lance_version))
+        ]
+    for uri, version in uris:
+        if not Path(uri).exists():
+            lines.append(f"candidate {uri} absent")
+            continue
+        head: Any = lance.dataset(uri)
+        lines.append(
+            f"candidate {uri} ingest_version={version} head_version={head.version} "
+            f"rows={head.count_rows()} versions={[int(entry['version']) for entry in head.versions()]}"
+        )
+        for description in head.describe_indices():
+            stats: dict[str, Any] = head.stats.index_stats(description.name)
+            lines.append(
+                f"  index {description.name}: describe_type={description.index_type!r} "
+                f"stats_type={stats.get('index_type')!r} unindexed={stats.get('num_unindexed_fragments')}"
+            )
+    return "\n".join(lines)
+
+
+def ingest_candidate(engine: Engine) -> tuple[str, int | None]:
+    """Return the single dataset's ingest candidate URI and post-ingest Lance version.
+
+    The recorded ingest version is the state immediately after the ETL merge and before the
+    publish worker runs compaction and indexing, so it exposes the pre-compaction fragment layout.
+
+    Args:
+        engine: Isolated migrated PostgreSQL engine.
+
+    Returns:
+        The ingest Lance URI and its recorded pre-compaction version.
+    """
+    with engine.connect() as connection:
+        row: Any = connection.execute(sa.select(datasets.c.ingest_lance_uri, datasets.c.ingest_lance_version)).one()
+    return str(row.ingest_lance_uri), row.ingest_lance_version
+
+
+def assert_full_index_coverage(uri: str, version: int, expected_rows: int) -> int:
+    """Assert a served version carries every production index with full coverage.
+
+    Args:
+        uri: Served Lance URI.
+        version: Exact served Lance version.
+        expected_rows: Exact live row count the version must hold.
+
+    Returns:
+        The served version's fragment count.
+    """
+    dataset: Any = lance.dataset(uri, version=version)
+    assert dataset.count_rows() == expected_rows
+    assert {description.name for description in dataset.describe_indices()} == PRODUCTION_INDEX_NAMES
+    for name in PRODUCTION_INDEX_NAMES:
+        assert int(dataset.stats.index_stats(name)["num_unindexed_fragments"]) == 0
+    return len(dataset.get_fragments())
+
+
+@pytest.mark.integration
+def test_local_reconciler_publishes_production_default_spec(
+    postgres_production_plane: tuple[ControlPlaneRepository, Engine],
+    local_spark: SparkSession,
+    tmp_path: Path,
+) -> None:
+    """The bundled production default spec publishes end-to-end with real compaction and every index.
+
+    Proves the two publish-gate bugs the bench port surfaced are fixed. A compaction-enabled spec
+    must still qualify all six indexes, and a segment-committed INVERTED index must pass the
+    index-kind gate under pylance 8.0.0, where ``describe_indices`` reports its type as ``Unknown``.
+    The incremental round accumulates fragments across two ingests so the publish worker's
+    compaction actually rewrites the candidate before indexing, exercising the compaction-then-index
+    ordering rather than a compaction no-op.
+
+    Args:
+        postgres_production_plane: Fresh migrated repository seeded with the production spec.
+        local_spark: Local Iceberg-enabled Spark session.
+        tmp_path: Isolated local Lance root.
+    """
+    repository: ControlPlaneRepository
+    engine: Engine
+    repository, engine = postgres_production_plane
+    table: str = "local.db.events"
+    create_source_table(local_spark, table)
+    baseline_snapshot_id: int = append_source_rows(local_spark, table, 0, 8)
+    application: ReconcilerApplication = build_application(
+        local_spark,
+        repository,
+        table,
+        baseline_snapshot_id,
+        str(tmp_path / "lance"),
+    )
+
+    baseline: Any = application.run_once()
+    assert baseline.planning.enqueued_snapshots == 1
+    assert baseline.dispatch.claimed == 2
+    assert baseline.dispatch.blocked == 0, dump_work_diagnostics(engine)
+    assert baseline.dispatch.retried == 0, dump_work_diagnostics(engine)
+    assert baseline.dispatch.succeeded == 2, dump_work_diagnostics(engine)
+    assert durable_counts(engine) == (1, 1, 2, 1)
+
+    identity: RoutingIdentity = RoutingIdentity("tenant1", "namespace1", "org1")
+    baseline_serving: ServingDataset | None = repository.resolve_serving_dataset(identity)
+    assert baseline_serving is not None
+    assert_full_index_coverage(baseline_serving.lance_uri, baseline_serving.lance_version, 8)
+
+    incremental_snapshot_id: int = append_source_rows(local_spark, table, 8, 16)
+    assert incremental_snapshot_id != baseline_snapshot_id
+    incremental: Any = application.run_once()
+    assert incremental.planning.enqueued_snapshots == 1
+    assert incremental.dispatch.claimed == 2
+    assert incremental.dispatch.blocked == 0, dump_work_diagnostics(engine)
+    assert incremental.dispatch.retried == 0, dump_work_diagnostics(engine)
+    assert incremental.dispatch.succeeded == 2, dump_work_diagnostics(engine)
+
+    ingest_uri: str
+    ingest_version: int | None
+    ingest_uri, ingest_version = ingest_candidate(engine)
+    precompaction_fragments: int = len(lance.dataset(ingest_uri, version=ingest_version).get_fragments())
+
+    serving: ServingDataset | None = repository.resolve_serving_dataset(identity)
+    assert serving is not None
+    assert serving.lance_version > baseline_serving.lance_version
+    served_fragments: int = assert_full_index_coverage(serving.lance_uri, serving.lance_version, 16)
+
+    assert precompaction_fragments >= 2, dump_work_diagnostics(engine)
+    assert served_fragments < precompaction_fragments, dump_work_diagnostics(engine)
+
+    with engine.connect() as connection:
+        assert set(connection.scalars(sa.select(dataset_work.c.state))) == {WorkState.SUCCEEDED.value}
+        publication_index_count: int = int(
+            connection.scalar(sa.select(sa.func.count()).select_from(publication_indexes)) or 0
+        )
+    assert publication_index_count == 2 * len(PRODUCTION_INDEX_NAMES)

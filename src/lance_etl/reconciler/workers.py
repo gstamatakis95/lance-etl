@@ -51,7 +51,7 @@ from lance_etl.cloud_storage import resolve_filesystem
 from lance_etl.etl.completion import CompletionMarker, finalize_completion_marker
 from lance_etl.etl.digest import SOURCE_DIGEST_HEADER, canonical_event_digest, encode_bytes
 from lance_etl.etl.mutation import DELETE_OPERATIONS, UPSERT_OPERATIONS, normalize_operation
-from lance_etl.etl.pivot import apply_fsl_cast, apply_ttl_cast
+from lance_etl.etl.pivot import apply_fsl_cast
 from lance_etl.etl.replay_sink import (
     DELETED_COLUMN,
     EVENT_DIGEST_COLUMN,
@@ -183,10 +183,10 @@ class DistributedIngestRunner:
             selected: DataFrame = self.select_profile_fields(source, spec)
             terminal: DataFrame = self.normalize_terminal(selected, context).persist(StorageLevel.MEMORY_AND_DISK)
             try:
-                if terminal.where(col("vector_id").isNull()).limit(1).count():
-                    return blocked_result(context.claim, "NULL_VECTOR_ID", "source contains a null vector_id")
+                if terminal.where(col("record_id").isNull()).limit(1).count():
+                    return blocked_result(context.claim, "NULL_RECORD_ID", "source contains a null record_id")
                 conflict: int = (
-                    terminal.groupBy("vector_id")
+                    terminal.groupBy("record_id")
                     .agg(countDistinct(EVENT_DIGEST_COLUMN).alias("distinct_mutations"))
                     .where(col("distinct_mutations") > 1)
                     .limit(1)
@@ -196,10 +196,10 @@ class DistributedIngestRunner:
                     return blocked_result(
                         context.claim,
                         "SAME_SNAPSHOT_CONFLICT",
-                        "source snapshot contains distinct unordered mutations for one vector_id",
+                        "source snapshot contains distinct unordered mutations for one record_id",
                     )
-                collapsed: DataFrame = terminal.dropDuplicates(["vector_id", EVENT_DIGEST_COLUMN]).dropDuplicates(
-                    ["vector_id"]
+                collapsed: DataFrame = terminal.dropDuplicates(["record_id", EVENT_DIGEST_COLUMN]).dropDuplicates(
+                    ["record_id"]
                 )
                 source_digest: bytes
                 source_rows: int
@@ -235,17 +235,13 @@ class DistributedIngestRunner:
             col(registration.tenant_column).alias("tenant_id"),
             col(registration.namespace_column).alias("namespace"),
             col(registration.org_column).alias("org_id"),
-            col(registration.record_id_column).alias("vector_id"),
+            col(registration.record_id_column).alias("record_id"),
             col(registration.operation_column).alias("op"),
-            col(registration.event_time_column).alias("event_timestamp"),
+            col(registration.ts_column).alias("ts"),
             col(registration.vectors_column).alias("vectors"),
             col(registration.texts_column).alias("texts"),
             col(registration.metadata_column).alias("metadata"),
         ]
-        if context.spec_revision.include_ttl:
-            if registration.ttl_column is None:
-                raise ValueError("source registration omits ttl_column required by the dataset specification")
-            projections.append(col(registration.ttl_column).alias("ttl"))
         return source.select(*projections)
 
     def validate_source_profile(self, source: DataFrame, spec: DatasetSpecRevision) -> None:
@@ -258,9 +254,9 @@ class DistributedIngestRunner:
         Raises:
             ValueError: If source fields violate the frozen dataset specification.
         """
-        self.validate_source_schema(source, spec)
-        if source.where(col("event_timestamp").isNull()).limit(1).count():
-            raise ValueError("source contains a null event_timestamp")
+        self.validate_source_schema(source)
+        if source.where(col("ts").isNull()).limit(1).count():
+            raise ValueError("source contains a null ts")
         normalized_operation: Column = lower(trim(col("op")))
         supported: tuple[str, ...] = tuple(sorted(UPSERT_OPERATIONS | DELETE_OPERATIONS))
         if source.where(col("op").isNull() | ~normalized_operation.isin(*supported)).limit(1).count():
@@ -268,12 +264,11 @@ class DistributedIngestRunner:
         self.validate_map_keys(source, spec)
         self.validate_vector_dimensions(source, normalized_operation, spec)
 
-    def validate_source_schema(self, source: DataFrame, spec: DatasetSpecRevision) -> None:
+    def validate_source_schema(self, source: DataFrame) -> None:
         """Validate the fixed physical source types before distributed checks.
 
         Args:
             source: Exact target snapshot scan.
-            spec: Frozen dataset specification.
 
         Raises:
             ValueError: If a required column is absent or carries the wrong Spark type.
@@ -282,23 +277,21 @@ class DistributedIngestRunner:
             "tenant_id",
             "namespace",
             "org_id",
-            "vector_id",
+            "record_id",
             "op",
-            "event_timestamp",
+            "ts",
             "vectors",
             "texts",
             "metadata",
         }
-        if spec.include_ttl:
-            required_columns.add("ttl")
         missing_columns: list[str] = sorted(required_columns - set(source.columns))
         if missing_columns:
             raise ValueError(f"source is missing required columns {missing_columns}")
-        string_columns: tuple[str, ...] = ("tenant_id", "namespace", "org_id", "vector_id", "op")
+        string_columns: tuple[str, ...] = ("tenant_id", "namespace", "org_id", "record_id", "op")
         if any(not isinstance(source.schema[name].dataType, StringType) for name in string_columns):
-            raise ValueError("source routing, vector_id, and op columns must be strings")
-        if not isinstance(source.schema["event_timestamp"].dataType, TimestampType):
-            raise ValueError("source event_timestamp must be a timestamp")
+            raise ValueError("source routing, record_id, and op columns must be strings")
+        if not isinstance(source.schema["ts"].dataType, TimestampType):
+            raise ValueError("source ts must be a timestamp")
         vectors_type: DataType = source.schema["vectors"].dataType
         texts_type: DataType = source.schema["texts"].dataType
         metadata_type: DataType = source.schema["metadata"].dataType
@@ -318,8 +311,6 @@ class DistributedIngestRunner:
             )
         if not vectors_valid or not strings_valid:
             raise ValueError("source maps must match vectors<string,array<float>> and text metadata string maps")
-        if spec.include_ttl and not isinstance(source.schema["ttl"].dataType, LongType):
-            raise ValueError("source ttl must be bigint seconds")
 
     def validate_map_keys(self, source: DataFrame, spec: DatasetSpecRevision) -> None:
         """Reject dynamic map keys outside the frozen dataset specification.
@@ -385,9 +376,9 @@ class DistributedIngestRunner:
             Projected rows containing every allowed field.
         """
         fields: list[Column] = [
-            col("vector_id"),
+            col("record_id"),
             col("op"),
-            col("event_timestamp"),
+            col("ts"),
             *(
                 element_at(col("vectors"), lit(vector_field[0])).alias(vector_field[0])
                 for vector_field in spec.vector_fields
@@ -395,8 +386,6 @@ class DistributedIngestRunner:
             *(element_at(col("texts"), lit(name)).alias(name) for name in spec.text_fields),
             *(element_at(col("metadata"), lit(name)).alias(name) for name in spec.metadata_fields),
         ]
-        if spec.include_ttl:
-            fields.append(col("ttl"))
         return source.select(*fields)
 
     def normalize_terminal(self, source: DataFrame, context: WorkExecutionContext) -> DataFrame:
@@ -436,21 +425,21 @@ class DistributedIngestRunner:
                 row: dict[str, object]
                 for row in pa.Table.from_batches([batch]).to_pylist():
                     operation: str = normalize_operation(str(row["op"]))
-                    event_timestamp: datetime = row["event_timestamp"]
-                    if event_timestamp.tzinfo is None:
-                        event_timestamp = event_timestamp.replace(tzinfo=UTC)
+                    ts: datetime = row["ts"]
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=UTC)
                     payload: dict[str, object] = {name: row.get(name) for name in payload_names}
                     digest: bytes = canonical_event_digest(
                         target,
-                        str(row["vector_id"]),
+                        str(row["record_id"]),
                         operation,
-                        event_timestamp,
+                        ts,
                         payload,
                     )
                     deleted: bool = operation == "delete"
                     terminal_row: dict[str, object] = {
-                        "vector_id": row["vector_id"],
-                        "event_timestamp": None if deleted else event_timestamp,
+                        "record_id": row["record_id"],
+                        "ts": None if deleted else ts,
                         **{name: None if deleted else payload[name] for name in payload_names},
                         WINDOW_SEQUENCE_COLUMN: window_seq,
                         SOURCE_SEQUENCE_COLUMN: source_sequence,
@@ -473,9 +462,9 @@ class DistributedIngestRunner:
             Raw digest and terminal row count.
         """
         ordered: DataFrame = (
-            terminal.select("vector_id", SOURCE_SEQUENCE_COLUMN, EVENT_DIGEST_COLUMN)
+            terminal.select("record_id", SOURCE_SEQUENCE_COLUMN, EVENT_DIGEST_COLUMN)
             .repartition(1)
-            .sortWithinPartitions("vector_id")
+            .sortWithinPartitions("record_id")
         )
 
         def digest_batches(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
@@ -494,7 +483,7 @@ class DistributedIngestRunner:
             for batch in batches:
                 row: dict[str, object]
                 for row in pa.Table.from_batches([batch]).to_pylist():
-                    digest.update(encode_bytes(str(row["vector_id"]).encode("utf-8")))
+                    digest.update(encode_bytes(str(row["record_id"]).encode("utf-8")))
                     digest.update(struct.pack(">q", int(row[SOURCE_SEQUENCE_COLUMN])))
                     digest.update(bytes(row[EVENT_DIGEST_COLUMN]))
                     count += 1
@@ -520,8 +509,8 @@ class DistributedIngestRunner:
         uri: str = context.claim.ingest_lance_uri
         partitioned: DataFrame = terminal.repartition(
             profile.ingest_shuffle_partitions,
-            col("vector_id"),
-        ).sortWithinPartitions("vector_id")
+            col("record_id"),
+        ).sortWithinPartitions("record_id")
 
         def write_batches(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
             """Write bounded Arrow batches with unique keys per Spark partition.
@@ -545,8 +534,6 @@ class DistributedIngestRunner:
                     pa.field(EVENT_DIGEST_COLUMN, pa.binary(32)),
                     pc.cast(table[EVENT_DIGEST_COLUMN], pa.binary(32)),
                 )
-                if profile.include_ttl:
-                    table = apply_ttl_cast(table, "ttl")
                 name: str
                 dimension: int
                 for name, dimension in profile.vector_fields:
@@ -647,7 +634,8 @@ class ConfiguredPublicationRunner:
                 maintenance: dict[str, object] = MaintenanceJob(
                     MaintenanceConfig(
                         telemetry=self.telemetry_config,
-                        ttl_column=spec.ttl_field.target_name if spec.ttl_field is not None else None,
+                        ts_column="ts",
+                        retention_seconds=spec.record_retention_seconds,
                         target_rows_per_fragment=spec.target_rows_per_fragment,
                         materialize_deletions=spec.materialize_deletions,
                         materialize_deletions_threshold=spec.materialize_deletions_threshold,
@@ -756,13 +744,6 @@ class ConfiguredPublicationRunner:
                     batch: pa.RecordBatch
                     for batch in reader:
                         table: pa.Table = pa.Table.from_batches([batch])
-                        if profile.include_ttl:
-                            ttl_index: int = table.schema.get_field_index("ttl")
-                            table = table.set_column(
-                                ttl_index,
-                                pa.field("ttl", pa.int64()),
-                                pc.cast(table["ttl"], pa.int64()),
-                            )
                         name: str
                         dimension: int
                         for name, dimension in profile.vector_fields:
@@ -795,14 +776,14 @@ class ConfiguredPublicationRunner:
         )
         winners: DataFrame | None = None
         try:
-            maxima: DataFrame = rows.groupBy("vector_id").agg(
+            maxima: DataFrame = rows.groupBy("record_id").agg(
                 spark_max(SOURCE_SEQUENCE_COLUMN).alias("maximum_source_sequence")
             )
             winners = (
                 rows.alias("terminal_rows")
                 .join(
                     maxima.alias("sequence_maxima"),
-                    (col("terminal_rows.vector_id") == col("sequence_maxima.vector_id"))
+                    (col("terminal_rows.record_id") == col("sequence_maxima.record_id"))
                     & (
                         col(f"terminal_rows.{SOURCE_SEQUENCE_COLUMN}") == col("sequence_maxima.maximum_source_sequence")
                     ),
@@ -811,7 +792,7 @@ class ConfiguredPublicationRunner:
             )
             winners.persist(StorageLevel.MEMORY_AND_DISK)
             conflicts: int = (
-                winners.groupBy("vector_id")
+                winners.groupBy("record_id")
                 .agg(countDistinct(EVENT_DIGEST_COLUMN).alias("distinct_mutations"))
                 .where(col("distinct_mutations") > 1)
                 .limit(1)
@@ -824,7 +805,7 @@ class ConfiguredPublicationRunner:
                     "duplicate rows at the maximum source sequence carry different event digests",
                 )
             canonical: DataFrame = winners.drop("maximum_source_sequence").dropDuplicates(
-                ["vector_id", SOURCE_SEQUENCE_COLUMN, EVENT_DIGEST_COLUMN]
+                ["record_id", SOURCE_SEQUENCE_COLUMN, EVENT_DIGEST_COLUMN]
             )
             rebuild_error: ReplayConflict | ValueError
             try:
@@ -920,7 +901,7 @@ class ConfiguredPublicationRunner:
         """Converge key-disjoint canonical rows into an isolated rebuild candidate.
 
         Args:
-            canonical: One maximum-sequence terminal row per logical vector ID.
+            canonical: One maximum-sequence terminal row per logical record ID.
             candidate_uri: Deterministic work-derived destination.
             spec: Frozen dataset specification.
 
@@ -931,8 +912,8 @@ class ConfiguredPublicationRunner:
         telemetry_config: TelemetryConfig = self.telemetry_config
         partitioned: DataFrame = canonical.repartition(
             profile.ingest_shuffle_partitions,
-            col("vector_id"),
-        ).sortWithinPartitions("vector_id")
+            col("record_id"),
+        ).sortWithinPartitions("record_id")
 
         def write_batches(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
             """Write one key-disjoint canonical partition idempotently.
@@ -957,8 +938,6 @@ class ConfiguredPublicationRunner:
                     pa.field(EVENT_DIGEST_COLUMN, pa.binary(32)),
                     pc.cast(table[EVENT_DIGEST_COLUMN], pa.binary(32)),
                 )
-                if profile.include_ttl and pa.types.is_duration(candidate_schema.field("ttl").type):
-                    table = apply_ttl_cast(table, "ttl")
                 name: str
                 dimension: int
                 for name, dimension in profile.vector_fields:
@@ -1165,7 +1144,7 @@ class ConfiguredPublicationRunner:
             spec: Frozen dataset specification.
 
         Returns:
-            Total rows, distinct vector IDs, live rows, and distinct live vector IDs.
+            Total rows, distinct record IDs, live rows, and distinct live record IDs.
         """
 
         def inventory(item: tuple[str, int]) -> list[int]:
@@ -1192,13 +1171,13 @@ class ConfiguredPublicationRunner:
         shards: list[tuple[int, ...]] = shard_fragments(fragment_ids, spec.ingest_shuffle_partitions)
 
         def terminal_ids(item: tuple[str, int, tuple[int, ...]]) -> Iterator[tuple[str, bool]]:
-            """Stream vector IDs and deletion state from one exact fragment shard.
+            """Stream record IDs and deletion state from one exact fragment shard.
 
             Args:
                 item: Candidate URI, version, and fragment IDs.
 
             Yields:
-                Vector IDs and deletion state for distributed distinct counting.
+                Record IDs and deletion state for distributed distinct counting.
             """
             uri: str
             version: int
@@ -1209,19 +1188,19 @@ class ConfiguredPublicationRunner:
                 fragment for fragment in dataset.get_fragments() if fragment.fragment_id in set(wanted)
             ]
             reader: pa.RecordBatchReader = dataset.scanner(
-                columns=["vector_id", DELETED_COLUMN],
+                columns=["record_id", DELETED_COLUMN],
                 fragments=fragments,
             ).to_reader()
             batch: pa.RecordBatch
             for batch in reader:
-                vector_id: object
+                record_id: object
                 is_deleted: object
-                for vector_id, is_deleted in zip(
+                for record_id, is_deleted in zip(
                     batch.column(0).to_pylist(),
                     batch.column(1).to_pylist(),
                     strict=True,
                 ):
-                    yield str(vector_id), bool(is_deleted)
+                    yield str(record_id), bool(is_deleted)
 
         tasks: list[tuple[str, int, tuple[int, ...]]] = [(candidate_uri, lance_version, shard) for shard in shards]
         terminal_rows: Any = (
@@ -1310,7 +1289,9 @@ class ConfiguredPublicationRunner:
                     continue
                 stats: dict[str, Any] = dataset.stats.index_stats(name)
                 uncovered: int = int(stats.get("num_unindexed_fragments") or 0)
-                actual_kind: str = str(description.index_type).upper()
+                actual_kind: str = resolved_actual_index_kind(
+                    str(description.index_type).upper(), stats.get("index_type")
+                )
                 kind_matches: bool = index_kind_matches(kind, actual_kind)
                 columns_match: bool = tuple(description.field_names) == (column,)
                 generation_digest: str | None = None
@@ -1364,16 +1345,16 @@ class ConfiguredPublicationRunner:
                 }
             if total != distinct_all:
                 return {
-                    "error_code": "DUPLICATE_VECTOR_ID",
-                    "error_message": "candidate contains multiple terminal rows for one vector_id",
+                    "error_code": "DUPLICATE_RECORD_ID",
+                    "error_message": "candidate contains multiple terminal rows for one record_id",
                 }
             return {
                 "lance_version": int(dataset.version),
                 "fragment_count": len(dataset.get_fragments()),
                 "total_rows": total,
-                "distinct_vector_ids": distinct_all,
+                "distinct_record_ids": distinct_all,
                 "live_rows": live,
-                "distinct_live_vector_ids": distinct_live,
+                "distinct_live_record_ids": distinct_live,
                 "schema_fingerprint": schema_fingerprint(dataset.schema),
                 "indexes": outcomes,
                 "spec_revision_id": spec_revision_id,
@@ -1540,8 +1521,6 @@ def spec_payload_names(spec: DatasetSpecRevision) -> tuple[str, ...]:
         *spec.text_fields,
         *spec.metadata_fields,
     ]
-    if spec.include_ttl:
-        names.append("ttl")
     return tuple(names)
 
 
@@ -1611,12 +1590,57 @@ def publication_evidence(
     return PublicationEvidence(
         schema_digest=bytes.fromhex(str(qualification["schema_fingerprint"])),
         total_row_count=int(qualification["total_rows"]),
-        distinct_row_count=int(qualification["distinct_vector_ids"]),
+        distinct_row_count=int(qualification["distinct_record_ids"]),
         live_row_count=int(qualification["live_rows"]),
-        distinct_live_row_count=int(qualification["distinct_live_vector_ids"]),
+        distinct_live_row_count=int(qualification["distinct_live_record_ids"]),
         fragment_count=int(qualification["fragment_count"]),
         indexes=tuple(index_evidence),
     ).validate()
+
+
+def lance_major_version() -> int:
+    """Return the installed pylance major version.
+
+    Returns:
+        The integer major component of ``lance.__version__`` (for example ``8`` for ``8.0.0`` and
+        ``9`` for ``9.0.0-beta.17``).
+    """
+    return int(lance.__version__.split(".", 1)[0])
+
+
+def describe_indices_omits_inverted_type() -> bool:
+    """Report whether ``describe_indices`` mislabels a segment-committed INVERTED index.
+
+    pylance 8.0.0 reports ``index_type`` as ``Unknown`` for an inverted index published through
+    the atomic ``CreateIndex`` swap the FTS build path uses, because that hand-built ``Index``
+    record carries no index details. ``stats.index_stats`` still reports the true ``Inverted``
+    type on the same version, so the qualification gate falls back to it. This is version-gated on
+    ``lance.__version__`` alone, never on attribute probing, per the repo compatibility rule. The
+    assumption that pylance 9 reports the type correctly is untested here (both the checkout and
+    the pinned wheel are 8.0.0), so the fallback is scoped to majors below 9 and must be re-checked
+    when the pin advances.
+
+    Returns:
+        ``True`` on pylance majors below 9, where the fallback is required.
+    """
+    return lance_major_version() < 9
+
+
+def resolved_actual_index_kind(description_kind: str, stats_kind: object | None) -> str:
+    """Resolve the effective index kind for the coverage gate under known pylance quirks.
+
+    Args:
+        description_kind: Uppercased ``describe_indices`` index type for the index.
+        stats_kind: The ``index_type`` value from ``stats.index_stats`` for the same index.
+
+    Returns:
+        The uppercased describe kind, or the uppercased stats kind when the describe kind is the
+        placeholder ``UNKNOWN`` on a pylance major that mislabels segment-committed inverted
+        indexes. The stats kind carries the true type, so genuinely wrong types are still rejected.
+    """
+    if description_kind == "UNKNOWN" and describe_indices_omits_inverted_type() and stats_kind is not None:
+        return str(stats_kind).upper()
+    return description_kind
 
 
 def index_kind_matches(required: str, actual: str) -> bool:
@@ -1665,14 +1689,12 @@ def terminal_arrow_schema(spec: DatasetSpecRevision) -> pa.Schema:
         Arrow schema before fixed-size vector cast.
     """
     fields: list[pa.Field] = [
-        pa.field("vector_id", pa.string(), nullable=False),
-        pa.field("event_timestamp", pa.timestamp("us", "UTC")),
+        pa.field("record_id", pa.string(), nullable=False),
+        pa.field("ts", pa.timestamp("us", "UTC")),
     ]
     fields.extend(pa.field(vector_field[0], pa.list_(pa.float32())) for vector_field in spec.vector_fields)
     fields.extend(pa.field(name, pa.string()) for name in spec.text_fields)
     fields.extend(pa.field(name, pa.string()) for name in spec.metadata_fields)
-    if spec.include_ttl:
-        fields.append(pa.field("ttl", pa.int64()))
     fields.extend(
         (
             pa.field(WINDOW_SEQUENCE_COLUMN, pa.int64(), nullable=False),
@@ -1694,14 +1716,12 @@ def persisted_arrow_schema(spec: DatasetSpecRevision) -> pa.Schema:
         Exact field names, order, physical types, and nullability for storage.
     """
     fields: list[pa.Field] = [
-        pa.field("vector_id", pa.string(), nullable=False),
-        pa.field("event_timestamp", pa.timestamp("us", "UTC")),
+        pa.field("record_id", pa.string(), nullable=False),
+        pa.field("ts", pa.timestamp("us", "UTC")),
     ]
     fields.extend(pa.field(name, pa.list_(pa.float32(), dimension)) for name, dimension in spec.vector_fields)
     fields.extend(pa.field(name, pa.string()) for name in spec.text_fields)
     fields.extend(pa.field(name, pa.string()) for name in spec.metadata_fields)
-    if spec.include_ttl:
-        fields.append(pa.field("ttl", pa.duration("s")))
     fields.extend(
         (
             pa.field(WINDOW_SEQUENCE_COLUMN, pa.int64(), nullable=False),
@@ -1723,14 +1743,12 @@ def terminal_spark_schema(spec: DatasetSpecRevision) -> StructType:
         Spark schema matching ``terminal_arrow_schema``.
     """
     fields: list[StructField] = [
-        StructField("vector_id", StringType(), nullable=False),
-        StructField("event_timestamp", TimestampType()),
+        StructField("record_id", StringType(), nullable=False),
+        StructField("ts", TimestampType()),
     ]
     fields.extend(StructField(vector_field[0], ArrayType(FloatType())) for vector_field in spec.vector_fields)
     fields.extend(StructField(name, StringType()) for name in spec.text_fields)
     fields.extend(StructField(name, StringType()) for name in spec.metadata_fields)
-    if spec.include_ttl:
-        fields.append(StructField("ttl", LongType()))
     fields.extend(
         (
             StructField(WINDOW_SEQUENCE_COLUMN, LongType(), nullable=False),

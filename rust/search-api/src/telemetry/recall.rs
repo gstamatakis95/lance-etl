@@ -372,7 +372,7 @@ impl RecallCapture {
     /// Vector captures record the served scores as `recall.result_distances`; text and hybrid
     /// captures record them as `recall.result_scores`.
     pub fn finish(&self, pending: PendingRecall, dataset_version: Option<u64>, hits: &[Hit]) {
-        let ids: Vec<Value> = hits.iter().map(|hit| Value::from(hit.vector_id.clone())).collect();
+        let ids: Vec<Value> = hits.iter().map(|hit| Value::from(hit.record_id.clone())).collect();
         let scores: Vec<f64> = hits.iter().map(|hit| hit.score).collect();
         let scores_json = serde_json::to_string(&scores).unwrap_or_else(|_| "[]".to_string());
         let (result_distances_json, result_scores_json) = match pending.query_type {
@@ -506,9 +506,9 @@ mod tests {
         let (target, query) = fixture();
         let pending = capture.begin(&target, &query).expect("rate 1.0 must sample");
         let mut row = Map::new();
-        row.insert("vector_id".to_string(), Value::from(7));
+        row.insert("record_id".to_string(), Value::from(7));
         let hits = vec![Hit {
-            vector_id: "7".to_string(),
+            record_id: "7".to_string(),
             score: 0.25,
             row,
         }];
@@ -537,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn logical_vector_id_is_always_recorded() {
+    fn logical_record_id_is_always_recorded() {
         let captured: Arc<Mutex<Vec<RecallRecord>>> = Arc::new(Mutex::new(Vec::new()));
         let capture = capturing(captured.clone());
         let (target, mut query) = fixture();
@@ -546,7 +546,7 @@ mod tests {
         query.minimum_nprobes = Some(4);
         let pending = capture.begin(&target, &query).unwrap();
         let hits = vec![Hit {
-            vector_id: "9".to_string(),
+            record_id: "9".to_string(),
             score: 1.5,
             row: Map::new(),
         }];
@@ -567,9 +567,9 @@ mod tests {
         query.columns = vec!["text".to_string()];
         let pending = capture.begin_text(&target, &query).expect("rate 1.0 must sample");
         let mut row = Map::new();
-        row.insert("vector_id".to_string(), Value::from(4));
+        row.insert("record_id".to_string(), Value::from(4));
         let hits = vec![Hit {
-            vector_id: "4".to_string(),
+            record_id: "4".to_string(),
             score: 2.5,
             row,
         }];
@@ -614,9 +614,9 @@ mod tests {
         };
         let pending = capture.begin_hybrid(&target, &query).expect("rate 1.0 must sample");
         let mut row = Map::new();
-        row.insert("vector_id".to_string(), Value::from(2));
+        row.insert("record_id".to_string(), Value::from(2));
         let hits = vec![Hit {
-            vector_id: "2".to_string(),
+            record_id: "2".to_string(),
             score: 0.42,
             row,
         }];

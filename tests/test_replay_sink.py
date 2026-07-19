@@ -22,7 +22,7 @@ from lance_etl.telemetry import Telemetry
 
 
 def terminal_table(
-    vector_id: str,
+    record_id: str,
     source_sequence: int,
     digest_byte: bytes,
     text: str | None,
@@ -31,7 +31,7 @@ def terminal_table(
     """Build one release-shaped terminal mutation table.
 
     Args:
-        vector_id: Logical key.
+        record_id: Logical key.
         source_sequence: Iceberg source sequence.
         digest_byte: One byte repeated to create a test digest.
         text: Payload text or null.
@@ -42,7 +42,7 @@ def terminal_table(
     """
     return pa.table(
         {
-            "vector_id": pa.array([vector_id], type=pa.string()),
+            "record_id": pa.array([record_id], type=pa.string()),
             "text": pa.array([text], type=pa.string()),
             WINDOW_SEQUENCE_COLUMN: pa.array([source_sequence], type=pa.int64()),
             SOURCE_SEQUENCE_COLUMN: pa.array([source_sequence], type=pa.int64()),
@@ -69,7 +69,7 @@ def test_update_condition_matches_frozen_contract() -> None:
     condition: str = replay_update_condition()
     assert f"target.{SOURCE_SEQUENCE_COLUMN} < source.{SOURCE_SEQUENCE_COLUMN}" in condition
     assert EVENT_DIGEST_COLUMN not in condition
-    assert "event_timestamp" not in condition
+    assert "ts" not in condition
 
 
 def test_replay_table_chunks_applies_row_and_byte_limits() -> None:

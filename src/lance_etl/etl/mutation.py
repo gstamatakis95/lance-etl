@@ -25,18 +25,18 @@ class MutationInput:
         tenant_id: Tenant routing component.
         namespace: Namespace routing component.
         org_id: Organization routing component.
-        vector_id: Logical record identity.
+        record_id: Logical record identity.
         operation: Source operation spelling.
-        event_timestamp: Query and TTL timestamp.
+        ts: Query and retention timestamp.
         payload: Complete source payload excluding delivery metadata.
     """
 
     tenant_id: str
     namespace: str
     org_id: str
-    vector_id: str
+    record_id: str
     operation: str
-    event_timestamp: datetime
+    ts: datetime
     payload: Mapping[str, Any]
 
     @property
@@ -51,9 +51,9 @@ class TerminalMutation:
 
     Attributes:
         target: Canonical routing tuple.
-        vector_id: Logical record identity.
+        record_id: Logical record identity.
         operation: Normalized `upsert` or `delete` operation.
-        event_timestamp: Query and TTL timestamp.
+        ts: Query and retention timestamp.
         payload: Complete normalized payload.
         window_seq: Durable source-window sequence.
         source_sequence: Iceberg sequence number for the source snapshot.
@@ -61,9 +61,9 @@ class TerminalMutation:
     """
 
     target: tuple[str, str, str]
-    vector_id: str
+    record_id: str
     operation: str
-    event_timestamp: datetime
+    ts: datetime
     payload: Mapping[str, Any]
     window_seq: int
     source_sequence: int
@@ -138,23 +138,23 @@ def collapse_snapshot_mutations(
     row: Any
     for row in rows:
         operation: Any = normalize_operation(row.operation)
-        digest: Any = canonical_event_digest(row.target, row.vector_id, operation, row.event_timestamp, row.payload)
+        digest: Any = canonical_event_digest(row.target, row.record_id, operation, row.ts, row.payload)
         terminal: Any = TerminalMutation(
             target=row.target,
-            vector_id=row.vector_id,
+            record_id=row.record_id,
             operation=operation,
-            event_timestamp=row.event_timestamp,
+            ts=row.ts,
             payload=dict(row.payload),
             window_seq=window_seq,
             source_sequence=source_sequence,
             event_digest=digest,
         )
-        key: Any = row.target, row.vector_id
+        key: Any = row.target, row.record_id
         previous: Any = terminal_by_key.get(key)
         if previous is not None and previous.event_digest != digest:
             raise MutationConflict(
                 f"source snapshot has distinct unordered mutations for target={row.target!r}, "
-                f"vector_id={row.vector_id!r}"
+                f"record_id={row.record_id!r}"
             )
         terminal_by_key[key] = terminal
     return [terminal_by_key[key] for key in sorted(terminal_by_key)]
@@ -176,4 +176,4 @@ def terminal_source_digest(rows: Iterable[TerminalMutation]) -> bytes:
     targets: Any = {row.target for row in materialized}
     if len(targets) > 1:
         raise ValueError("source digest rows must belong to one target")
-    return canonical_source_digest((row.vector_id, row.source_sequence, row.event_digest) for row in materialized)
+    return canonical_source_digest((row.record_id, row.source_sequence, row.event_digest) for row in materialized)

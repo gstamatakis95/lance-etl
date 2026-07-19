@@ -1,10 +1,10 @@
-"""Tests for the maintenance job: per-row TTL expiration, compaction, and version cleanup.
+"""Tests for the maintenance job: retention-window expiry, compaction, and version cleanup.
 
-Covers the per-row TTL predicate (timestamp plus a Duration lifetime column), validation safety, the default-off
-no-op, an end-to-end run that deletes only expired rows and then compacts, and the delete-before-compact ordering of
-the run. The functional TTL tests use a tiny real Lance dataset with a ``Duration`` TTL column so the delete path
-exercises actual Lance timestamp-plus-duration arithmetic. Ordering is pinned with an in-process fake Spark so the
-fan-out callables run in the driver process and can be observed.
+Covers the retention predicate (a ``ts`` column compared against a ``now - retention_seconds`` cutoff), validation
+safety, the default-off no-op, an end-to-end run that deletes only expired rows and then compacts, and the
+delete-before-compact ordering of the run. The functional retention tests use a tiny real Lance dataset with a ``ts``
+timestamp column so the delete path exercises actual Lance timestamp arithmetic. Ordering is pinned with an in-process
+fake Spark so the fan-out callables run in the driver process and can be observed.
 """
 
 from __future__ import annotations
@@ -21,42 +21,40 @@ import lance_etl.maintenance.job as maintenance_job
 from lance_etl.maintenance import (
     MaintenanceConfig,
     MaintenanceJob,
-    build_ttl_predicate,
+    build_retention_predicate,
     compute_cutoff,
-    run_ttl_on_open_dataset,
+    run_retention_on_open_dataset,
     validate_column_name,
 )
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 TS_COLUMN: str = "ts"
-TTL_COLUMN: str = "ttl"
+RETENTION_SECONDS: int = 10 * 24 * 3600
 
 
-def make_ttl_table(rows: int, ts_base: datetime, step: timedelta, lifetime: timedelta) -> pa.Table:
-    """Build a table with id, an event timestamp column, and a per-row Duration TTL column.
+def make_retention_table(rows: int, ts_base: datetime, step: timedelta) -> pa.Table:
+    """Build a table with an id column and a ``ts`` timestamp column.
 
     Args:
         rows: Number of rows.
         ts_base: Timestamp of the first row.
         step: Time between consecutive rows.
-        lifetime: The per-row TTL lifetime stored in the Duration column.
 
     Returns:
-        A table with ``id`` (int64), ``ts`` (timestamp[us, UTC]), and ``ttl`` (duration[us]) columns.
+        A table with ``id`` (int64) and ``ts`` (timestamp[us, UTC]) columns.
     """
     ids: pa.Array = pa.array(range(rows), pa.int64())
     timestamps: pa.Array = pa.array([ts_base + step * i for i in range(rows)], pa.timestamp("us", tz="UTC"))
-    lifetimes: pa.Array = pa.array([lifetime for _ in range(rows)], pa.duration("us"))
-    return pa.table({"id": ids, TS_COLUMN: timestamps, TTL_COLUMN: lifetimes})
+    return pa.table({"id": ids, TS_COLUMN: timestamps})
 
 
 @pytest.fixture
-def ttl_dataset(tmp_path: Path) -> tuple[str, int, int]:
-    """Write a fragmented Lance dataset with expired and fresh rows by per-row TTL.
+def retention_dataset(tmp_path: Path) -> tuple[str, int, int]:
+    """Write a fragmented Lance dataset with expired and fresh rows by ``ts`` age.
 
-    Six rows have an event timestamp 100 days ago with a 1-day lifetime (expired), and four rows have an event
-    timestamp 1 day ago with a 100-day lifetime (still alive). The dataset is split into several fragments so
-    compaction has work to do.
+    Six rows have a ``ts`` 100 days ago (older than the ten-day retention window, so expired), and four rows have a
+    ``ts`` 1 day ago (inside the window, so still alive). The dataset is split into several fragments so compaction has
+    work to do.
 
     Args:
         tmp_path: Pytest-provided temporary directory.
@@ -65,62 +63,61 @@ def ttl_dataset(tmp_path: Path) -> tuple[str, int, int]:
         ``(uri, expired_count, alive_count)``.
     """
     now: datetime = datetime.now(tz=UTC)
-    expired: pa.Table = make_ttl_table(6, now - timedelta(days=100), timedelta(hours=1), timedelta(days=1))
-    alive: pa.Table = make_ttl_table(4, now - timedelta(days=1), timedelta(hours=1), timedelta(days=100))
-    uri: str = str(tmp_path / "ttl.lance")
+    expired: pa.Table = make_retention_table(6, now - timedelta(days=100), timedelta(hours=1))
+    alive: pa.Table = make_retention_table(4, now - timedelta(days=1), timedelta(hours=1))
+    uri: str = str(tmp_path / "retention.lance")
     lance.write_dataset(pa.concat_tables([expired, alive]), uri, max_rows_per_file=2)
     return uri, 6, 4
 
 
 class TestMaintenanceConfigDefaults:
-    """MaintenanceConfig carries the expected TTL defaults."""
+    """MaintenanceConfig carries the expected retention defaults."""
 
-    def test_ttl_off_by_default(self, telemetry_config: TelemetryConfig) -> None:
-        """ttl_column defaults to None so TTL is off."""
+    def test_retention_off_by_default(self, telemetry_config: TelemetryConfig) -> None:
+        """retention_seconds defaults to None so record expiry is off."""
         config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config)
-        assert config.ttl_column is None
-        assert config.ttl_active() is False
+        assert config.retention_seconds is None
+        assert config.retention_active() is False
 
-    def test_ttl_active_when_column_set(self, telemetry_config: TelemetryConfig) -> None:
-        """Naming a ttl_column turns TTL on."""
-        config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config, ttl_column="ttl")
-        assert config.ttl_active() is True
+    def test_retention_active_when_window_set(self, telemetry_config: TelemetryConfig) -> None:
+        """Setting a retention_seconds window turns record expiry on."""
+        config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config, retention_seconds=RETENTION_SECONDS)
+        assert config.retention_active() is True
 
     def test_ts_column_default(self, telemetry_config: TelemetryConfig) -> None:
-        """The default event timestamp column matches ETLConfig.ts_col."""
-        assert MaintenanceConfig(telemetry=telemetry_config).ts_column == "event_timestamp"
+        """The default ts column matches ETLConfig.ts_col."""
+        assert MaintenanceConfig(telemetry=telemetry_config).ts_column == "ts"
 
 
 class TestPredicateSafety:
-    """The per-row TTL delete predicate and its column validation are safe."""
+    """The retention delete predicate and its column validation are safe."""
 
     def test_build_predicate_format(self) -> None:
-        """build_ttl_predicate renders timestamp-plus-duration arithmetic against a typed literal."""
+        """build_retention_predicate renders a ts comparison against a typed literal."""
         cutoff: datetime = datetime(2025, 3, 15, 12, 30, 45, 123456, tzinfo=UTC)
-        predicate: str = build_ttl_predicate("ts", "ttl", cutoff)
+        predicate: str = build_retention_predicate("ts", cutoff)
         assert predicate == (
-            "arrow_cast(ts + ttl, 'Timestamp(Microsecond, \"UTC\")') < "
+            "arrow_cast(ts, 'Timestamp(Microsecond, \"UTC\")') < "
             "arrow_cast('2025-03-15T12:30:45.123456', 'Timestamp(Microsecond, \"UTC\")')"
         )
 
     def test_build_predicate_converts_to_utc(self) -> None:
-        """build_ttl_predicate converts a non-UTC cutoff to UTC."""
+        """build_retention_predicate converts a non-UTC cutoff to UTC."""
         eastern: datetime = datetime(2025, 3, 15, 8, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
-        predicate: str = build_ttl_predicate("event_time", "lifetime", eastern)
+        predicate: str = build_retention_predicate("event_time", eastern)
         assert "2025-03-15T13:00:00.000000" in predicate
 
     def test_build_predicate_is_explicitly_utc(self) -> None:
-        """build_ttl_predicate forces both comparison sides to an explicit UTC timestamp type.
+        """build_retention_predicate forces both comparison sides to an explicit UTC timestamp type.
 
-        A bare ``TIMESTAMP '...'`` literal is always timezone-naive, so the predicate wraps BOTH
-        the column-side arithmetic and the cutoff literal in
-        ``arrow_cast(..., 'Timestamp(Microsecond, "UTC")')``. The comparison is then a direct
-        UTC-instant comparison with no naive operand and no reliance on implicit coercion with
-        whatever timezone the column happens to carry.
+        A bare ``TIMESTAMP '...'`` literal is always timezone-naive, so the predicate wraps BOTH the ts column and the
+        cutoff literal in ``arrow_cast(..., 'Timestamp(Microsecond, "UTC")')``. The comparison is then a direct
+        UTC-instant comparison with no naive operand and no reliance on implicit coercion with whatever timezone the
+        column happens to carry.
         """
         cutoff: datetime = datetime(2025, 3, 15, 12, 30, 45, 123456, tzinfo=UTC)
-        predicate: str = build_ttl_predicate("ts", "ttl", cutoff)
-        assert "arrow_cast(ts + ttl, 'Timestamp(Microsecond, \"UTC\")')" in predicate
+        predicate: str = build_retention_predicate("ts", cutoff)
+        assert "arrow_cast(ts, 'Timestamp(Microsecond, \"UTC\")')" in predicate
         assert "arrow_cast('2025-03-15T12:30:45.123456', 'Timestamp(Microsecond, \"UTC\")')" in predicate
         assert "TIMESTAMP '" not in predicate
 
@@ -148,70 +145,85 @@ class TestPredicateSafety:
         validate_column_name("ts", ds.schema)
 
 
-class TestPerRowTtlDelete:
-    """run_ttl_on_open_dataset removes only rows whose lifetime has elapsed."""
+class TestRetentionDelete:
+    """run_retention_on_open_dataset removes only rows whose ts is outside the retention window."""
 
-    def test_deletes_only_expired_rows(self, ttl_dataset: tuple[str, int, int], telemetry: Telemetry) -> None:
-        """Rows whose event timestamp plus per-row lifetime is before now are deleted; the rest survive."""
-        uri, expired_count, alive_count = ttl_dataset
+    def test_deletes_only_expired_rows(self, retention_dataset: tuple[str, int, int], telemetry: Telemetry) -> None:
+        """Rows whose ts is before the retention cutoff are deleted; the rest survive."""
+        uri, expired_count, alive_count = retention_dataset
         config: MaintenanceConfig = MaintenanceConfig(
-            telemetry=TelemetryConfig(), ttl_column=TTL_COLUMN, ts_column=TS_COLUMN, commit_backoff_seconds=0.0
+            telemetry=TelemetryConfig(),
+            retention_seconds=RETENTION_SECONDS,
+            ts_column=TS_COLUMN,
+            commit_backoff_seconds=0.0,
         )
         dataset: lance.LanceDataset = lance.dataset(uri)
-        result: dict[str, object] = run_ttl_on_open_dataset(dataset, uri, config, compute_cutoff(), telemetry)
-        assert result["ttl_rows_deleted"] == expired_count
+        result: dict[str, object] = run_retention_on_open_dataset(
+            dataset, uri, config, compute_cutoff(RETENTION_SECONDS), telemetry
+        )
+        assert result["retention_rows_deleted"] == expired_count
         assert result["skipped"] == ""
         assert lance.dataset(uri).count_rows() == alive_count
 
-    def test_keeps_rows_with_long_lifetime(self, tmp_path: Path, telemetry: Telemetry) -> None:
-        """When every row's lifetime outlasts its age, nothing is deleted."""
+    def test_keeps_rows_inside_window(self, tmp_path: Path, telemetry: Telemetry) -> None:
+        """When every row's ts is inside the retention window, nothing is deleted."""
         now: datetime = datetime.now(tz=UTC)
-        table: pa.Table = make_ttl_table(8, now - timedelta(days=5), timedelta(hours=1), timedelta(days=365))
+        table: pa.Table = make_retention_table(8, now - timedelta(days=5), timedelta(hours=1))
         uri: str = str(tmp_path / "alive.lance")
         dataset: lance.LanceDataset = lance.write_dataset(table, uri)
         config: MaintenanceConfig = MaintenanceConfig(
-            telemetry=TelemetryConfig(), ttl_column=TTL_COLUMN, ts_column=TS_COLUMN, commit_backoff_seconds=0.0
+            telemetry=TelemetryConfig(),
+            retention_seconds=365 * 24 * 3600,
+            ts_column=TS_COLUMN,
+            commit_backoff_seconds=0.0,
         )
-        result: dict[str, object] = run_ttl_on_open_dataset(dataset, uri, config, compute_cutoff(), telemetry)
-        assert result["ttl_rows_deleted"] == 0
+        result: dict[str, object] = run_retention_on_open_dataset(
+            dataset, uri, config, compute_cutoff(config.retention_seconds), telemetry
+        )
+        assert result["retention_rows_deleted"] == 0
         assert lance.dataset(uri).count_rows() == 8
 
-    def test_skips_dataset_without_ttl_column(self, tmp_path: Path, telemetry: Telemetry) -> None:
-        """A dataset lacking the TTL column is skipped rather than failing."""
-        uri: str = str(tmp_path / "no_ttl.lance")
+    def test_skips_dataset_without_ts_column(self, tmp_path: Path, telemetry: Telemetry) -> None:
+        """A dataset lacking the ts column is skipped rather than failing."""
+        uri: str = str(tmp_path / "no_ts.lance")
         dataset: lance.LanceDataset = lance.write_dataset(pa.table({"id": pa.array([1, 2], pa.int64())}), uri)
         config: MaintenanceConfig = MaintenanceConfig(
-            telemetry=TelemetryConfig(), ttl_column=TTL_COLUMN, ts_column=TS_COLUMN, commit_backoff_seconds=0.0
+            telemetry=TelemetryConfig(),
+            retention_seconds=RETENTION_SECONDS,
+            ts_column=TS_COLUMN,
+            commit_backoff_seconds=0.0,
         )
-        result: dict[str, object] = run_ttl_on_open_dataset(dataset, uri, config, compute_cutoff(), telemetry)
-        assert result["ttl_rows_deleted"] == 0
+        result: dict[str, object] = run_retention_on_open_dataset(
+            dataset, uri, config, compute_cutoff(RETENTION_SECONDS), telemetry
+        )
+        assert result["retention_rows_deleted"] == 0
         assert result["skipped"] != ""
 
 
-class TestTtlOffIsNoop:
-    """With no TTL column configured the TTL step never runs."""
+class TestRetentionOffIsNoop:
+    """With no retention window configured the retention step never runs."""
 
-    def test_run_with_ttl_off_deletes_nothing(self, ttl_dataset: tuple[str, int, int]) -> None:
-        """A maintenance run without ttl_column compacts but deletes no rows."""
-        uri, _, _ = ttl_dataset
+    def test_run_with_retention_off_deletes_nothing(self, retention_dataset: tuple[str, int, int]) -> None:
+        """A maintenance run without retention_seconds compacts but deletes no rows."""
+        uri, _, _ = retention_dataset
         config: MaintenanceConfig = MaintenanceConfig(
             telemetry=TelemetryConfig(), target_rows_per_fragment=1000, commit_backoff_seconds=0.0
         )
         MaintenanceJob(config).run(FakeSpark(), [uri])
         assert lance.dataset(uri).count_rows() == 10
 
-    def test_run_with_ttl_off_never_calls_delete(
-        self, ttl_dataset: tuple[str, int, int], monkeypatch: pytest.MonkeyPatch
+    def test_run_with_retention_off_never_calls_delete(
+        self, retention_dataset: tuple[str, int, int], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The TTL pass is skipped entirely when ttl_column is None."""
-        uri, _, _ = ttl_dataset
+        """The retention pass is skipped entirely when retention_seconds is None."""
+        uri, _, _ = retention_dataset
 
         def fail_delete(*args: object, **kwargs: object) -> dict[str, object]:
-            """Fail if the TTL delete is ever invoked with TTL off."""
+            """Fail if the retention delete is ever invoked with retention off."""
             del args, kwargs
-            raise AssertionError("run_ttl_on_open_dataset must not run when ttl_column is None")
+            raise AssertionError("run_retention_on_open_dataset must not run when retention_seconds is None")
 
-        monkeypatch.setattr(maintenance_job, "run_ttl_on_open_dataset", fail_delete)
+        monkeypatch.setattr(maintenance_job, "run_retention_on_open_dataset", fail_delete)
         config: MaintenanceConfig = MaintenanceConfig(
             telemetry=TelemetryConfig(), target_rows_per_fragment=1000, commit_backoff_seconds=0.0
         )
@@ -219,16 +231,16 @@ class TestTtlOffIsNoop:
 
 
 class TestRunOrdering:
-    """A maintenance run uses a consolidated per-dataset pass for DQ, TTL, and compaction."""
+    """A maintenance run uses a consolidated per-dataset pass for DQ, retention, and compaction."""
 
     def test_plan_fan_out_covers_all_datasets(
         self, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The plan fan-out calls plan_one_dataset for every dataset in the fleet.
 
-        With the unified design, plan_one_dataset handles TTL, the skip check, and the
-        compaction plan in one executor task per dataset. Patching plan_one_dataset at the
-        module level lets the test observe that every URI is planned exactly once.
+        With the unified design, plan_one_dataset handles retention, the skip check, and the compaction plan in one
+        executor task per dataset. Patching plan_one_dataset at the module level lets the test observe that every URI
+        is planned exactly once.
 
         Args:
             telemetry_config: The test telemetry configuration.
@@ -249,16 +261,16 @@ class TestRunOrdering:
             return {"uri": uri, "tasks": 0, "bytes_removed": 0, "fragments_removed": 0}
 
         monkeypatch.setattr(maintenance_job, "plan_one_dataset", record_plan)
-        config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config, ttl_column="ttl")
+        config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config, retention_seconds=RETENTION_SECONDS)
         MaintenanceJob(config).run(FakeSpark(), ["a.lance", "b.lance"])
         assert processed == ["a.lance", "b.lance"]
 
-    def test_run_expires_then_compacts_real_dataset(self, ttl_dataset: tuple[str, int, int]) -> None:
+    def test_run_expires_then_compacts_real_dataset(self, retention_dataset: tuple[str, int, int]) -> None:
         """An end-to-end run deletes expired rows and compacts the survivors into one fragment."""
-        uri, _, alive_count = ttl_dataset
+        uri, _, alive_count = retention_dataset
         config: MaintenanceConfig = MaintenanceConfig(
             telemetry=TelemetryConfig(),
-            ttl_column=TTL_COLUMN,
+            retention_seconds=RETENTION_SECONDS,
             ts_column=TS_COLUMN,
             target_rows_per_fragment=1000,
             commit_backoff_seconds=0.0,
@@ -273,9 +285,9 @@ class TestRunOrdering:
 class TestPlanOpenCounts:
     """plan_one_dataset reuses one dataset handle instead of re-opening per step.
 
-    At long-tail fleet scale every extra ``lance.dataset`` open multiplies into millions of
-    object-store round trips per run, so these tests pin the exact open counts of the plan
-    phase's paths by wrapping ``lance.dataset`` with a counting delegate.
+    At long-tail fleet scale every extra ``lance.dataset`` open multiplies into millions of object-store round trips
+    per run, so these tests pin the exact open counts of the plan phase's paths by wrapping ``lance.dataset`` with a
+    counting delegate.
     """
 
     def counting_dataset(self, monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -310,7 +322,7 @@ class TestPlanOpenCounts:
     def test_idle_skip_path_opens_once(
         self, tmp_path: Path, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A single-fragment dataset with TTL off costs exactly one open on the skip path."""
+        """A single-fragment dataset with retention off costs exactly one open on the skip path."""
         uri: str = str(tmp_path / "idle.lance")
         lance.write_dataset(pa.table({"id": pa.array([1, 2], pa.int64())}), uri)
         opens: list[str] = self.counting_dataset(monkeypatch)
@@ -322,7 +334,7 @@ class TestPlanOpenCounts:
     def test_multi_fragment_plan_opens_once(
         self, tmp_path: Path, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A compactable dataset with TTL off plans its rewrite tasks from the single open."""
+        """A compactable dataset with retention off plans its rewrite tasks from the single open."""
         uri: str = str(tmp_path / "busy.lance")
         lance.write_dataset(pa.table({"id": pa.array(range(10), pa.int64())}), uri, max_rows_per_file=2)
         opens: list[str] = self.counting_dataset(monkeypatch)
@@ -331,17 +343,25 @@ class TestPlanOpenCounts:
         assert result["task_jsons"]
         assert opens == [uri]
 
-    def test_ttl_commit_refreshes_exactly_once(
-        self, ttl_dataset: tuple[str, int, int], telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
+    def test_retention_commit_refreshes_exactly_once(
+        self,
+        retention_dataset: tuple[str, int, int],
+        telemetry_config: TelemetryConfig,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A TTL delete costs the initial open, the retried delete's own open, and one refresh."""
-        uri, _, _ = ttl_dataset
+        """A retention delete costs the initial open, the retried delete's own open, and one refresh."""
+        uri, _, _ = retention_dataset
         opens: list[str] = self.counting_dataset(monkeypatch)
         config: MaintenanceConfig = MaintenanceConfig(
-            telemetry=telemetry_config, ttl_column=TTL_COLUMN, ts_column=TS_COLUMN, commit_backoff_seconds=0.0
+            telemetry=telemetry_config,
+            retention_seconds=RETENTION_SECONDS,
+            ts_column=TS_COLUMN,
+            commit_backoff_seconds=0.0,
         )
-        result = maintenance_job.plan_one_dataset(uri, config, compute_cutoff(), Telemetry.create(telemetry_config))
-        assert result["ttl_rows_deleted"] == 6
+        result = maintenance_job.plan_one_dataset(
+            uri, config, compute_cutoff(RETENTION_SECONDS), Telemetry.create(telemetry_config)
+        )
+        assert result["retention_rows_deleted"] == 6
         assert opens == [uri, uri, uri]
 
     def test_cleanup_with_handle_opens_nothing(

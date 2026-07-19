@@ -43,12 +43,11 @@ DEFAULT_SPEC_REVISION_ID: uuid.UUID = uuid.UUID("00000000-0000-0000-0000-0000000
 """Stable identity of revision one of the bundled default specification."""
 
 DEFAULT_FIELD_IDS: Mapping[str, uuid.UUID] = {
-    "vector_id": uuid.UUID("00000000-0000-0000-0000-000000001001"),
-    "event_timestamp": uuid.UUID("00000000-0000-0000-0000-000000001002"),
+    "record_id": uuid.UUID("00000000-0000-0000-0000-000000001001"),
+    "ts": uuid.UUID("00000000-0000-0000-0000-000000001002"),
     "vector": uuid.UUID("00000000-0000-0000-0000-000000001003"),
     "text": uuid.UUID("00000000-0000-0000-0000-000000001004"),
     "cluster": uuid.UUID("00000000-0000-0000-0000-000000001005"),
-    "ttl": uuid.UUID("00000000-0000-0000-0000-000000001006"),
     "lance_etl_window_seq": uuid.UUID("00000000-0000-0000-0000-000000001007"),
     "lance_etl_source_sequence": uuid.UUID("00000000-0000-0000-0000-000000001008"),
     "lance_etl_event_digest": uuid.UUID("00000000-0000-0000-0000-000000001009"),
@@ -60,8 +59,8 @@ DEFAULT_INDEX_IDS: Mapping[str, uuid.UUID] = {
     "vector_idx": uuid.UUID("00000000-0000-0000-0000-000000002001"),
     "text_fts_idx": uuid.UUID("00000000-0000-0000-0000-000000002002"),
     "cluster_idx": uuid.UUID("00000000-0000-0000-0000-000000002003"),
-    "event_timestamp_idx": uuid.UUID("00000000-0000-0000-0000-000000002004"),
-    "event_timestamp_zonemap_idx": uuid.UUID("00000000-0000-0000-0000-000000002005"),
+    "ts_idx": uuid.UUID("00000000-0000-0000-0000-000000002004"),
+    "ts_zonemap_idx": uuid.UUID("00000000-0000-0000-0000-000000002005"),
     "is_deleted_bitmap_idx": uuid.UUID("00000000-0000-0000-0000-000000002006"),
 }
 """Stable identities of indexes in the bundled default specification."""
@@ -83,7 +82,6 @@ class FieldRole(StrEnum):
     VECTOR = "VECTOR"
     TEXT = "TEXT"
     METADATA = "METADATA"
-    TTL = "TTL"
     TOMBSTONE = "TOMBSTONE"
     LINEAGE = "LINEAGE"
 
@@ -309,15 +307,11 @@ class DatasetField:
             raise ValueError("MAP_KEY source_key must equal the persisted target_name")
         if self.role in (FieldRole.TOMBSTONE, FieldRole.LINEAGE) and self.source_kind is not SourceKind.DERIVED:
             raise ValueError(f"{self.role.value} fields must be DERIVED")
-        if (
-            self.role in (FieldRole.KEY, FieldRole.EVENT_TIME, FieldRole.TTL)
-            and self.source_kind is not SourceKind.DIRECT
-        ):
+        if self.role in (FieldRole.KEY, FieldRole.EVENT_TIME) and self.source_kind is not SourceKind.DIRECT:
             raise ValueError(f"{self.role.value} fields must be DIRECT")
         canonical_direct_columns: dict[FieldRole, str] = {
-            FieldRole.KEY: "vector_id",
-            FieldRole.EVENT_TIME: "event_timestamp",
-            FieldRole.TTL: "ttl",
+            FieldRole.KEY: "record_id",
+            FieldRole.EVENT_TIME: "ts",
         }
         expected_direct: str | None = canonical_direct_columns.get(self.role)
         if expected_direct is not None and (
@@ -338,7 +332,6 @@ class DatasetField:
             FieldRole.EVENT_TIME: "timestamp[us,UTC]",
             FieldRole.TEXT: "string",
             FieldRole.METADATA: "string",
-            FieldRole.TTL: "duration[s]",
             FieldRole.TOMBSTONE: "bool",
         }
         required_type: str | None = required_types.get(self.role)
@@ -368,7 +361,6 @@ class DatasetField:
             FieldRole.VECTOR: (True, True),
             FieldRole.TEXT: (True, False),
             FieldRole.METADATA: (True, False),
-            FieldRole.TTL: (True, False),
             FieldRole.TOMBSTONE: (False, False),
             FieldRole.LINEAGE: (False, False),
         }
@@ -490,6 +482,7 @@ class DatasetSpecRevision:
     prewarm_required: bool
     retained_publications: int
     artifact_retention_seconds: int
+    record_retention_seconds: int | None
 
     @property
     def vector_fields(self) -> tuple[tuple[str, int], ...]:
@@ -518,24 +511,6 @@ class DatasetSpecRevision:
             Ordered metadata fields.
         """
         return tuple(field_value.target_name for field_value in self.fields_for_role(FieldRole.METADATA))
-
-    @property
-    def ttl_field(self) -> DatasetField | None:
-        """Return the optional TTL field.
-
-        Returns:
-            The sole TTL field, or ``None`` when TTL expiration is disabled.
-        """
-        return next(iter(self.fields_for_role(FieldRole.TTL)), None)
-
-    @property
-    def include_ttl(self) -> bool:
-        """Report whether the target schema persists a TTL field.
-
-        Returns:
-            ``True`` when the revision includes TTL.
-        """
-        return self.ttl_field is not None
 
     @property
     def index_definitions(self) -> tuple[IndexDefinition, ...]:
@@ -705,6 +680,7 @@ class DatasetSpecRevision:
         validate_optional_positive(self.max_source_fragments, "max_source_fragments")
         validate_optional_positive(self.compaction_threads, "compaction_threads")
         validate_optional_positive(self.retain_versions, "retain_versions")
+        validate_optional_positive(self.record_retention_seconds, "record_retention_seconds")
         if self.cleanup_older_than_seconds is not None and (
             type(self.cleanup_older_than_seconds) is not int or self.cleanup_older_than_seconds < 21_600
         ):
@@ -757,8 +733,6 @@ class DatasetSpecRevision:
             raise ValueError("a dataset specification requires exactly one KEY field")
         if role_counts[FieldRole.EVENT_TIME] != 1:
             raise ValueError("a dataset specification requires exactly one EVENT_TIME field")
-        if role_counts[FieldRole.TTL] > 1:
-            raise ValueError("a dataset specification permits at most one TTL field")
         if role_counts[FieldRole.TOMBSTONE] != 1:
             raise ValueError("a dataset specification requires exactly one TOMBSTONE field")
         expected_lineage: dict[str, str] = {
@@ -778,12 +752,11 @@ class DatasetSpecRevision:
             field_value.target_name for field_value in sorted(self.fields, key=lambda item: item.ordinal)
         )
         expected_order: tuple[str, ...] = (
-            "vector_id",
-            "event_timestamp",
+            "record_id",
+            "ts",
             *(field_value.target_name for field_value in self.fields_for_role(FieldRole.VECTOR)),
             *(field_value.target_name for field_value in self.fields_for_role(FieldRole.TEXT)),
             *(field_value.target_name for field_value in self.fields_for_role(FieldRole.METADATA)),
-            *(("ttl",) if self.include_ttl else ()),
             "lance_etl_window_seq",
             "lance_etl_source_sequence",
             "lance_etl_event_digest",
@@ -852,6 +825,7 @@ class DatasetSpecRevision:
                 "materialize_deletions_threshold": self.materialize_deletions_threshold,
                 "cleanup_older_than_seconds": self.cleanup_older_than_seconds,
                 "retain_versions": self.retain_versions,
+                "record_retention_seconds": self.record_retention_seconds,
             },
             "indexing": {
                 "fragments_per_index_task": self.fragments_per_index_task,
@@ -986,12 +960,11 @@ def validate_index_field_compatibility(index: IndexDefinition, field_value: Data
                 FieldRole.KEY,
                 FieldRole.EVENT_TIME,
                 FieldRole.METADATA,
-                FieldRole.TTL,
                 FieldRole.LINEAGE,
             }
         ),
         IndexType.BITMAP: frozenset({FieldRole.KEY, FieldRole.METADATA, FieldRole.TOMBSTONE}),
-        IndexType.ZONEMAP: frozenset({FieldRole.EVENT_TIME, FieldRole.TTL, FieldRole.LINEAGE}),
+        IndexType.ZONEMAP: frozenset({FieldRole.EVENT_TIME, FieldRole.LINEAGE}),
     }
     if field_value.role not in allowed_roles[index.index_type]:
         raise ValueError(f"{index.index_type.value} cannot index a {field_value.role.value} field")
@@ -1024,8 +997,8 @@ def production_default_spec_revision() -> DatasetSpecRevision:
         production_index(fields_by_name, "cluster_idx", "cluster", 2, IndexType.BTREE, None, None),
         production_index(
             fields_by_name,
-            "event_timestamp_idx",
-            "event_timestamp",
+            "ts_idx",
+            "ts",
             3,
             IndexType.BTREE,
             None,
@@ -1033,8 +1006,8 @@ def production_default_spec_revision() -> DatasetSpecRevision:
         ),
         production_index(
             fields_by_name,
-            "event_timestamp_zonemap_idx",
-            "event_timestamp",
+            "ts_zonemap_idx",
+            "ts",
             4,
             IndexType.ZONEMAP,
             None,
@@ -1079,6 +1052,7 @@ def production_default_spec_revision() -> DatasetSpecRevision:
         prewarm_required=True,
         retained_publications=2,
         artifact_retention_seconds=2_592_000,
+        record_retention_seconds=None,
     )
     return replace(candidate, configuration_digest=candidate.expected_configuration_digest()).validate()
 
@@ -1090,12 +1064,12 @@ def production_default_fields() -> tuple[DatasetField, ...]:
         Ordered immutable field definitions.
     """
     definitions: tuple[tuple[object, ...], ...] = (
-        ("vector_id", FieldRole.KEY, SourceKind.DIRECT, "vector_id", None, "string", False, True, None),
+        ("record_id", FieldRole.KEY, SourceKind.DIRECT, "record_id", None, "string", False, True, None),
         (
-            "event_timestamp",
+            "ts",
             FieldRole.EVENT_TIME,
             SourceKind.DIRECT,
-            "event_timestamp",
+            "ts",
             None,
             "timestamp[us,UTC]",
             True,
@@ -1125,7 +1099,6 @@ def production_default_fields() -> tuple[DatasetField, ...]:
             False,
             None,
         ),
-        ("ttl", FieldRole.TTL, SourceKind.DIRECT, "ttl", None, "duration[s]", True, False, None),
         (
             "lance_etl_window_seq",
             FieldRole.LINEAGE,
@@ -1236,22 +1209,16 @@ def production_index(
 
 
 def decode_dataset_spec_revision(
-    spec_row: Mapping[str, object],
     revision_row: Mapping[str, object],
     field_rows: Sequence[Mapping[str, object]],
     index_rows: Sequence[Mapping[str, object]],
-    vector_option_rows: Sequence[Mapping[str, object]],
-    fts_option_rows: Sequence[Mapping[str, object]],
 ) -> DatasetSpecRevision:
     """Decode one normalized PostgreSQL specification graph.
 
     Args:
-        spec_row: One ``dataset_specs`` row.
-        revision_row: One ``dataset_spec_revisions`` row.
+        revision_row: One ``dataset_spec_revisions`` row carrying its own ``spec_id``.
         field_rows: Child ``dataset_fields`` rows in any order.
-        index_rows: Child ``index_definitions`` rows in any order.
-        vector_option_rows: ``vector_index_options`` rows keyed by index identity.
-        fts_option_rows: ``fts_index_options`` rows keyed by index identity.
+        index_rows: Child ``index_definitions`` rows carrying inline option columns in any order.
 
     Returns:
         Fully decoded and validated immutable revision.
@@ -1259,32 +1226,19 @@ def decode_dataset_spec_revision(
     Raises:
         ValueError: If rows are incomplete, cross revision boundaries, or violate the domain contract.
     """
-    spec_id: uuid.UUID = row_uuid(spec_row, "spec_id")
-    if spec_id != row_uuid(revision_row, "spec_id"):
-        raise ValueError("spec and revision rows reference different specifications")
+    spec_id: uuid.UUID = row_uuid(revision_row, "spec_id")
     spec_revision_id: uuid.UUID = row_uuid(revision_row, "spec_revision_id")
     row: Mapping[str, object]
     for row in field_rows:
         validate_child_revision(row, spec_revision_id, "dataset field")
     for row in index_rows:
         validate_child_revision(row, spec_revision_id, "index definition")
-    vector_rows: dict[uuid.UUID, Mapping[str, object]] = option_rows_by_index(
-        vector_option_rows,
-        IndexType.IVF_RQ,
-    )
-    fts_rows: dict[uuid.UUID, Mapping[str, object]] = option_rows_by_index(fts_option_rows, IndexType.INVERTED)
     fields: tuple[DatasetField, ...] = tuple(
         sorted((decode_dataset_field(row) for row in field_rows), key=lambda item: item.ordinal)
     )
     indexes: tuple[IndexDefinition, ...] = tuple(
-        sorted(
-            (decode_index_definition(row, vector_rows, fts_rows) for row in index_rows),
-            key=lambda item: item.ordinal,
-        )
+        sorted((decode_index_definition(row) for row in index_rows), key=lambda item: item.ordinal)
     )
-    consumed_index_ids: set[uuid.UUID] = {index.index_definition_id for index in indexes}
-    if not (set(vector_rows) | set(fts_rows)).issubset(consumed_index_ids):
-        raise ValueError("index option row references an index outside the spec revision")
     revision: DatasetSpecRevision = DatasetSpecRevision(
         spec_id=spec_id,
         spec_revision_id=spec_revision_id,
@@ -1314,6 +1268,7 @@ def decode_dataset_spec_revision(
         prewarm_required=row_bool(revision_row, "prewarm_required"),
         retained_publications=row_int(revision_row, "retained_publications"),
         artifact_retention_seconds=row_int(revision_row, "artifact_retention_seconds"),
+        record_retention_seconds=row_optional_int(revision_row, "record_retention_seconds"),
     )
     return revision.validate()
 
@@ -1343,39 +1298,33 @@ def decode_dataset_field(row: Mapping[str, object]) -> DatasetField:
     )
 
 
-def decode_index_definition(
-    row: Mapping[str, object],
-    vector_rows: Mapping[uuid.UUID, Mapping[str, object]],
-    fts_rows: Mapping[uuid.UUID, Mapping[str, object]],
-) -> IndexDefinition:
-    """Decode one index definition and its optional subtype row.
+def decode_index_definition(row: Mapping[str, object]) -> IndexDefinition:
+    """Decode one ``index_definitions`` row and its inline subtype option columns.
 
     Args:
-        row: PostgreSQL index-definition row.
-        vector_rows: IVF_RQ option rows keyed by index identity.
-        fts_rows: INVERTED option rows keyed by index identity.
+        row: PostgreSQL index-definition row carrying inline vector and full-text columns.
 
     Returns:
         Typed immutable index definition.
     """
-    index_id: uuid.UUID = row_uuid(row, "index_definition_id")
+    index_type: IndexType = IndexType(row_enum(row, "index_type", IndexType))
     return IndexDefinition(
-        index_definition_id=index_id,
+        index_definition_id=row_uuid(row, "index_definition_id"),
         spec_revision_id=row_uuid(row, "spec_revision_id"),
         field_id=row_uuid(row, "field_id"),
         ordinal=row_int(row, "ordinal"),
         index_name=row_string(row, "index_name"),
-        index_type=row_enum(row, "index_type", IndexType),
-        vector_options=decode_vector_options(vector_rows[index_id]) if index_id in vector_rows else None,
-        fts_options=decode_fts_options(fts_rows[index_id]) if index_id in fts_rows else None,
+        index_type=index_type,
+        vector_options=decode_vector_options(row) if index_type is IndexType.IVF_RQ else None,
+        fts_options=decode_fts_options(row) if index_type is IndexType.INVERTED else None,
     )
 
 
 def decode_vector_options(row: Mapping[str, object]) -> VectorIndexOptions:
-    """Decode one ``vector_index_options`` row.
+    """Decode the inline IVF_RQ option columns from one ``index_definitions`` row.
 
     Args:
-        row: PostgreSQL vector option row.
+        row: PostgreSQL index-definition row of an IVF_RQ index.
 
     Returns:
         Typed IVF_RQ options.
@@ -1395,10 +1344,10 @@ def decode_vector_options(row: Mapping[str, object]) -> VectorIndexOptions:
 
 
 def decode_fts_options(row: Mapping[str, object]) -> FtsIndexOptions:
-    """Decode one ``fts_index_options`` row.
+    """Decode the inline INVERTED option columns from one ``index_definitions`` row.
 
     Args:
-        row: PostgreSQL full-text option row.
+        row: PostgreSQL index-definition row of an INVERTED index.
 
     Returns:
         Typed full-text options.
@@ -1409,33 +1358,6 @@ def decode_fts_options(row: Mapping[str, object]) -> FtsIndexOptions:
         language=row_optional_string(row, "language"),
         max_unindexed_fragments=row_int(row, "max_unindexed_fragments"),
     )
-
-
-def option_rows_by_index(
-    rows: Sequence[Mapping[str, object]], expected_type: IndexType
-) -> dict[uuid.UUID, Mapping[str, object]]:
-    """Key subtype rows by index and validate their discriminator.
-
-    Args:
-        rows: Subtype rows.
-        expected_type: Required index-family discriminator.
-
-    Returns:
-        Rows keyed by unique index identity.
-
-    Raises:
-        ValueError: If an identity repeats or a discriminator is wrong.
-    """
-    keyed: dict[uuid.UUID, Mapping[str, object]] = {}
-    row: Mapping[str, object]
-    for row in rows:
-        index_id: uuid.UUID = row_uuid(row, "index_definition_id")
-        if row_enum(row, "index_type", IndexType) is not expected_type:
-            raise ValueError(f"index option row must use {expected_type.value}")
-        if index_id in keyed:
-            raise ValueError("index option identities must be unique")
-        keyed[index_id] = row
-    return keyed
 
 
 def validate_child_revision(row: Mapping[str, object], revision_id: uuid.UUID, description: str) -> None:
@@ -1661,3 +1583,7 @@ def row_enum(row: Mapping[str, object], key: str, enum_type: type[StrEnum]) -> S
         return enum_type(value)
     except ValueError as error:
         raise ValueError(f"database column {key!r} has unsupported value {value!r}") from error
+
+
+DEFAULT_CONFIGURATION_DIGEST_HEX: str = production_default_spec_revision().configuration_digest.hex()
+"""Single source of truth for the seeded default-revision configuration digest, in lowercase hex."""

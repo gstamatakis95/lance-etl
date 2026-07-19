@@ -259,8 +259,8 @@ def text_query(pb2: ModuleType, terms: str, columns: tuple[str, ...] = ("text",)
     return query
 
 
-def result_vector_ids(results: Any) -> np.ndarray:
-    """Extract the ``vector_id`` column from search results as global int ids.
+def result_record_ids(results: Any) -> np.ndarray:
+    """Extract the ``record_id`` column from search results as global int ids.
 
     The release API carries the stable logical identifier as a required typed string rather than a
     generic row struct. An empty or non-numeric identifier is contract drift for these integer-id
@@ -270,10 +270,10 @@ def result_vector_ids(results: Any) -> np.ndarray:
         results: Repeated typed result messages.
 
     Returns:
-        An int64 array of global vector ids in result order, one entry per input result.
+        An int64 array of global record ids in result order, one entry per input result.
 
     Raises:
-        ValueError: If any result has an empty or non-numeric ``vector_id``.
+        ValueError: If any result has an empty or non-numeric ``record_id``.
     """
     ids: list[int] = []
     malformed: list[str] = []
@@ -281,13 +281,13 @@ def result_vector_ids(results: Any) -> np.ndarray:
     result: Any
     for result in results:
         try:
-            ids.append(int(result.vector_id))
+            ids.append(int(result.record_id))
         except (TypeError, ValueError):
-            malformed.append(f"result[{total}] vector_id={result.vector_id!r}")
+            malformed.append(f"result[{total}] record_id={result.record_id!r}")
         total += 1
     if malformed:
         raise ValueError(
-            f"{len(malformed)} of {total} results carried an empty or non-numeric vector_id. Offenders: {malformed[:5]}"
+            f"{len(malformed)} of {total} results carried an empty or non-numeric record_id. Offenders: {malformed[:5]}"
         )
     return np.asarray(ids, dtype=np.int64)
 

@@ -532,7 +532,7 @@ def grade_against_reference(
 
 def grade_hybrid_reference(
     sample: RecallSample,
-    vector_ids: list[Any],
+    record_ids: list[Any],
     vector_scores: list[float],
     vector_count: int,
     text_ids: list[Any],
@@ -547,8 +547,8 @@ def grade_hybrid_reference(
 
     Args:
         sample: The hybrid sample to grade.
-        vector_ids: The exact vector leg ids in best-first order.
-        vector_scores: The exact vector leg distances aligned with ``vector_ids``.
+        record_ids: The exact vector leg ids in best-first order.
+        vector_scores: The exact vector leg distances aligned with ``record_ids``.
         vector_count: The vector leg candidate count.
         text_ids: The exact BM25 leg ids in best-first order.
         text_scores: The exact BM25 leg scores aligned with ``text_ids``.
@@ -562,7 +562,7 @@ def grade_hybrid_reference(
         return skipped_score(sample, "empty_candidate_set", version_drift)
     try:
         fused_ids: list[Any] = fuse_legs(
-            sample.fusion or {}, vector_ids, vector_scores, text_ids, text_scores, sample.k
+            sample.fusion or {}, record_ids, vector_scores, text_ids, text_scores, sample.k
         )
     except FusionReplayError:
         return skipped_score(sample, "fusion_replay", version_drift)

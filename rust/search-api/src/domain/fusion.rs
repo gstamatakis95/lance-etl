@@ -9,9 +9,6 @@ use crate::domain::query::{FusedHit, Hit};
 /// Default rank-smoothing constant for reciprocal-rank fusion.
 pub const DEFAULT_RRF_K: f64 = 60.0;
 
-/// Default vector-leg weight for weighted fusion. The text leg takes the complement.
-pub const DEFAULT_WEIGHTED_VECTOR_WEIGHT: f64 = 0.7;
-
 /// Declarative fusion configuration carried by hybrid requests. New strategies slot in as
 /// variants with their own `fuse` arm.
 #[derive(Debug, Clone, PartialEq)]
@@ -71,11 +68,11 @@ fn rrf_fuse(rrf_k: f64, legs: Vec<Vec<Hit>>, k: usize) -> Vec<FusedHit> {
     for leg in legs {
         for (rank, hit) in leg.into_iter().enumerate() {
             let contribution = 1.0 / (rrf_k + (rank as f64) + 1.0);
-            let vector_id = hit.vector_id.clone();
-            let entry = fused.entry(vector_id.clone()).or_insert_with(|| {
-                order.push(vector_id.clone());
+            let record_id = hit.record_id.clone();
+            let entry = fused.entry(record_id.clone()).or_insert_with(|| {
+                order.push(record_id.clone());
                 FusedHit {
-                    vector_id,
+                    record_id,
                     score: 0.0,
                     row: Map::new(),
                 }
@@ -88,7 +85,7 @@ fn rrf_fuse(rrf_k: f64, legs: Vec<Vec<Hit>>, k: usize) -> Vec<FusedHit> {
     }
     let mut ranked: Vec<FusedHit> = order
         .into_iter()
-        .filter_map(|vector_id| fused.remove(&vector_id))
+        .filter_map(|record_id| fused.remove(&record_id))
         .collect();
     ranked.sort_by(|left, right| {
         right
@@ -123,11 +120,11 @@ fn weighted_fuse(vector_weight: f64, legs: Vec<Vec<Hit>>, k: usize) -> Vec<Fused
         let weight = if lower_is_better { vector_weight } else { text_weight };
         let normalized = min_max_normalize(&leg, lower_is_better);
         for (hit, norm) in leg.into_iter().zip(normalized) {
-            let vector_id = hit.vector_id.clone();
-            let entry = fused.entry(vector_id.clone()).or_insert_with(|| {
-                order.push(vector_id.clone());
+            let record_id = hit.record_id.clone();
+            let entry = fused.entry(record_id.clone()).or_insert_with(|| {
+                order.push(record_id.clone());
                 FusedHit {
-                    vector_id,
+                    record_id,
                     score: 0.0,
                     row: Map::new(),
                 }
@@ -140,7 +137,7 @@ fn weighted_fuse(vector_weight: f64, legs: Vec<Vec<Hit>>, k: usize) -> Vec<Fused
     }
     let mut ranked: Vec<FusedHit> = order
         .into_iter()
-        .filter_map(|vector_id| fused.remove(&vector_id))
+        .filter_map(|record_id| fused.remove(&record_id))
         .collect();
     ranked.sort_by(|left, right| {
         right
@@ -192,7 +189,7 @@ mod tests {
         let mut row = Map::new();
         row.insert("id".to_string(), Value::from(row_id));
         Hit {
-            vector_id: row_id.to_string(),
+            record_id: row_id.to_string(),
             score: 0.0,
             row,
         }
@@ -203,7 +200,7 @@ mod tests {
         let fusion = FusionSpec::Rrf { rrf_k: 60.0 };
         let fused = fusion.fuse(vec![vec![hit(1), hit(2)], vec![hit(2), hit(3)]], 10);
         assert_eq!(fused.len(), 3);
-        assert_eq!(fused[0].vector_id, "2");
+        assert_eq!(fused[0].record_id, "2");
         let expected_top = 1.0 / 62.0 + 1.0 / 61.0;
         assert!((fused[0].score - expected_top).abs() < 1e-12);
         let expected_single = 1.0 / 61.0;
@@ -216,7 +213,7 @@ mod tests {
         let fusion = FusionSpec::Rrf { rrf_k: 1.0 };
         let fused = fusion.fuse(vec![vec![hit(7), hit(8)], vec![hit(7)]], 1);
         assert_eq!(fused.len(), 1);
-        assert_eq!(fused[0].vector_id, "7");
+        assert_eq!(fused[0].record_id, "7");
         assert!((fused[0].score - 1.0).abs() < 1e-12);
     }
 
@@ -228,12 +225,12 @@ mod tests {
         right_row.insert("b".to_string(), Value::from(2));
         let legs = vec![
             vec![Hit {
-                vector_id: "5".to_string(),
+                record_id: "5".to_string(),
                 score: 0.0,
                 row: left_row,
             }],
             vec![Hit {
-                vector_id: "5".to_string(),
+                record_id: "5".to_string(),
                 score: 0.0,
                 row: right_row,
             }],
@@ -257,7 +254,7 @@ mod tests {
         let mut row = Map::new();
         row.insert("id".to_string(), Value::from(row_id));
         Hit {
-            vector_id: row_id.to_string(),
+            record_id: row_id.to_string(),
             score,
             row,
         }
@@ -271,7 +268,7 @@ mod tests {
         let score = |id: u64| {
             fused
                 .iter()
-                .find(|hit| hit.vector_id == id.to_string())
+                .find(|hit| hit.record_id == id.to_string())
                 .map(|hit| hit.score)
                 .unwrap()
         };
@@ -284,7 +281,7 @@ mod tests {
             "worst vector + best text gets full text weight"
         );
         assert!((score(3) - 0.0).abs() < 1e-12, "worst in both legs scores zero");
-        assert_eq!(fused[0].vector_id, "1", "ordering is by fused score, best first");
+        assert_eq!(fused[0].record_id, "1", "ordering is by fused score, best first");
     }
 
     #[test]
@@ -314,7 +311,7 @@ mod tests {
         let score = |id: u64| {
             fused
                 .iter()
-                .find(|hit| hit.vector_id == id.to_string())
+                .find(|hit| hit.record_id == id.to_string())
                 .map(|hit| hit.score)
                 .unwrap()
         };
@@ -326,7 +323,7 @@ mod tests {
             (score(2) - 1.0).abs() < 1e-12,
             "best text hit takes the full text weight"
         );
-        assert_eq!(fused[0].vector_id, "2");
+        assert_eq!(fused[0].record_id, "2");
     }
 
     #[test]
@@ -337,7 +334,7 @@ mod tests {
         let score = |id: u64| {
             fused
                 .iter()
-                .find(|hit| hit.vector_id == id.to_string())
+                .find(|hit| hit.record_id == id.to_string())
                 .map(|hit| hit.score)
                 .unwrap()
         };

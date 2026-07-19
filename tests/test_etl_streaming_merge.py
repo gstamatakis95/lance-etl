@@ -34,14 +34,14 @@ def make_batch(keys: list[tuple[str, str, str]], start: int = 0) -> pa.RecordBat
         start: First payload id so batches concatenate without id collisions.
 
     Returns:
-        A record batch with the three routing columns and a ``vector_id`` payload column.
+        A record batch with the three routing columns and a ``record_id`` payload column.
     """
     return pa.RecordBatch.from_pydict(
         {
             "org_id": [k[0] for k in keys],
             "tenant_id": [k[1] for k in keys],
             "namespace": [k[2] for k in keys],
-            "vector_id": [f"v{start + i}" for i in range(len(keys))],
+            "record_id": [f"v{start + i}" for i in range(len(keys))],
         }
     )
 
@@ -53,9 +53,9 @@ def group_ids(groups: list[tuple[tuple[Any, ...], pa.Table]]) -> list[tuple[tupl
         groups: The grouped ``(key, sub_table)`` output.
 
     Returns:
-        One ``(key, [vector_id, ...])`` per group, preserving row order.
+        One ``(key, [record_id, ...])`` per group, preserving row order.
     """
-    return [(key, rows["vector_id"].to_pylist()) for key, rows in groups]
+    return [(key, rows["record_id"].to_pylist()) for key, rows in groups]
 
 
 def test_stream_matches_group_by_routing() -> None:
@@ -91,7 +91,7 @@ def test_run_spanning_multiple_batches_yields_one_group() -> None:
     assert len(groups) == 1
     key, rows = groups[0]
     assert key == ("o1", "t1", "n1")
-    assert rows["vector_id"].to_pylist() == [f"v{i}" for i in range(6)]
+    assert rows["record_id"].to_pylist() == [f"v{i}" for i in range(6)]
 
 
 def test_byte_budget_splits_a_big_run() -> None:
@@ -108,7 +108,7 @@ def test_byte_budget_splits_a_big_run() -> None:
 
     assert len(groups) > 1
     assert all(key == ("o1", "t1", "n1") for key, rows in groups)
-    recovered: list[str] = [vid for key, rows in groups for vid in rows["vector_id"].to_pylist()]
+    recovered: list[str] = [vid for key, rows in groups for vid in rows["record_id"].to_pylist()]
     assert recovered == [f"v{i}" for i in range(6)]
 
 
@@ -175,5 +175,5 @@ def test_unsorted_input_degrades_to_run_per_group() -> None:
     groups: list[tuple[tuple[Any, ...], pa.Table]] = list(stream_routing_groups(iter(batches), ROUTING, None))
 
     assert [key for key, rows in groups] == [("o1", "t1", "n1"), ("o2", "t1", "n1"), ("o1", "t1", "n1")]
-    recovered: list[str] = sorted(vid for key, rows in groups for vid in rows["vector_id"].to_pylist())
+    recovered: list[str] = sorted(vid for key, rows in groups for vid in rows["record_id"].to_pylist())
     assert recovered == ["v0", "v1", "v2"]

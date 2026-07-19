@@ -5,7 +5,7 @@ Status: Accepted
 ## Decision
 
 PostgreSQL is the only durable control plane for the local Iceberg-to-Lance process. The schema is
-normalized into exactly 14 application tables. Dataset is a first-class entity. Immutable dataset
+normalized into exactly 9 application tables. Dataset is a first-class entity. Immutable dataset
 specification revisions own every reproducible schema, ingestion, compaction, indexing,
 qualification, and retention option.
 
@@ -16,12 +16,9 @@ state, untyped configuration document, or parallel control database is part of t
 ## Entity model
 
 ```text
-dataset_specs
-  -> dataset_spec_revisions
-       -> dataset_fields
-       -> index_definitions
-            -> vector_index_options
-            -> fts_index_options
+dataset_spec_revisions
+     -> dataset_fields
+     -> index_definitions
 
 iceberg_sources -> source_snapshots
        |               |
@@ -29,14 +26,15 @@ iceberg_sources -> source_snapshots
     datasets ------> dataset_work
        |               |
        v               v
- dataset_state <-> dataset_publications -> publication_indexes
+       +-----------> dataset_publications -> publication_indexes
 
-reconciler_settings is one PostgreSQL-owned singleton row
+ReconcilerSettings is loaded from environment variables at process startup, not a table
 ```
 
-### `reconciler_settings`
+### `ReconcilerSettings` (not a table)
 
-The singleton row contains local control-loop bounds:
+Local control-loop bounds are process bootstrap configuration built by
+`ReconcilerSettings.from_environment()`, not a PostgreSQL row:
 
 - polling interval, claim batch size, drain batch limit, and maximum snapshots per plan
 - lease duration and heartbeat interval
@@ -44,15 +42,14 @@ The singleton row contains local control-loop bounds:
 - maximum due work and maximum open-work age SLOs
 - maximum retention age, audit retention, and cleanup batch size
 
-The process loads these values once at startup. Restart the local reconciler after changing them.
-They do not alter the meaning of an existing Lance artifact.
-
-### `dataset_specs`
-
-A spec is a stable human-readable identity with a name and optional description. It groups numbered
-revisions. It carries no mutable data-path settings itself.
+The process loads these values once at startup from environment variables. Restart the local
+reconciler after changing them. They do not alter the meaning of an existing Lance artifact.
 
 ### `dataset_spec_revisions`
+
+A specification exists only as its revisions: there is no separate spec-identity table. Each
+revision carries its own `spec_id` (the stable grouping identity shared by all revisions of one
+named spec), `name`, and optional `description`.
 
 A revision is the immutable root of one complete data contract. Lifecycle is `DRAFT`, `ACTIVE`, or
 `RETIRED`. At most one revision per spec is active. `configuration_digest` is a deterministic
@@ -92,9 +89,10 @@ Publication and artifact columns:
 
 A semantic change creates a new revision. Existing work continues with its frozen revision.
 
-The repository owns the complete authoring lifecycle. `create_spec` creates a stable name.
-`create_draft_spec_revision` recomputes the semantic digest and inserts the parent, fields, indexes,
-and typed family options in one transaction. `activate_spec_revision` validates the complete graph,
+The repository owns the complete authoring lifecycle. A specification exists only as its revisions.
+`create_draft_spec_revision` recomputes the semantic digest and inserts the revision under a
+caller-supplied name, its fields, indexes, and typed family options in one transaction.
+`activate_spec_revision` validates the complete graph,
 retires the former ACTIVE revision, and promotes the DRAFT. Database triggers permit DRAFT content
 changes and the single DRAFT to ACTIVE transition. They reject updates or deletion of ACTIVE and
 RETIRED parents and children. Historical work and publications may continue to reference a RETIRED
@@ -106,29 +104,30 @@ Fields define the ordered Lance schema and its projection from Iceberg. Each row
 target name, semantic role, source kind, source column, optional map key, physical data type,
 nullability, upsert requirement, and optional vector dimension.
 
-Roles are `KEY`, `EVENT_TIME`, `VECTOR`, `TEXT`, `METADATA`, `TTL`, `TOMBSTONE`, and
+Roles are `KEY`, `EVENT_TIME`, `VECTOR`, `TEXT`, `METADATA`, `TOMBSTONE`, and
 `LINEAGE`. Source kinds are `DIRECT`, `MAP_KEY`, and `DERIVED`. The schema requires exactly one key,
 one event time, one tombstone, and the three canonical lineage fields
-`lance_etl_window_seq`, `lance_etl_source_sequence`, and `lance_etl_event_digest`. It permits at most
-one TTL field. Fields must use canonical execution order: key, event time, vectors, texts, metadata,
-optional TTL, the three lineage fields, and tombstone. Ordinals are contiguous from zero.
+`lance_etl_window_seq`, `lance_etl_source_sequence`, and `lance_etl_event_digest`. The single
+`EVENT_TIME` field is the canonical `ts` column. Fields must use canonical execution order: key,
+event time, vectors, texts, metadata, the three lineage fields, and tombstone. Ordinals are
+contiguous from zero.
 
 The key, lineage, and tombstone fields are non-nullable. Every other target field is nullable
 because tombstone rows do not carry their payload. Key, event-time, and vector fields are required
-on upsert. Text, metadata, optional TTL, lineage, and tombstone fields are not. Canonical names,
+on upsert. Text, metadata, lineage, and tombstone fields are not. Canonical names,
 physical types, legal source mappings, and vector dimensions are validated before a revision can
 become active.
 
 ### `index_definitions`
 
 Each row declares one ordered required Lance index with a stable name, family, and field reference.
-Families are `IVF_RQ`, `BTREE`, `BITMAP`, `ZONEMAP`, and `INVERTED`. Scalar families need no option
-row because their supported behavior is completely described by the definition and revision-level
-maintenance policy.
+Families are `IVF_RQ`, `BTREE`, `BITMAP`, `ZONEMAP`, and `INVERTED`. Scalar families (`BTREE`,
+`BITMAP`, `ZONEMAP`) need no typed options because their supported behavior is completely described
+by the definition and revision-level maintenance policy. `IVF_RQ` and `INVERTED` carry their typed
+options as nullable columns on this same row, gated by a per-index-type CHECK constraint rather than
+a child table:
 
-### `vector_index_options`
-
-Every IVF_RQ definition owns exactly one vector option row:
+IVF_RQ columns:
 
 - metric `l2`, `cosine`, or `dot`
 - nullable explicit `num_partitions`
@@ -140,10 +139,8 @@ Every IVF_RQ definition owns exactly one vector option row:
 
 The explicit partition count, when present, must fall inside the configured adaptive range.
 
-### `fts_index_options`
-
-Every INVERTED definition owns exactly one full-text option row. It stores `with_position`, optional
-`base_tokenizer`, optional `language`, and `max_unindexed_fragments`.
+INVERTED columns: `with_position`, optional `base_tokenizer`, optional `language`, and
+`max_unindexed_fragments`.
 
 ### `iceberg_sources`
 
@@ -154,17 +151,28 @@ A source row records stable source identity and first-run bootstrap truth:
 - default dataset spec and optional canonical baseline snapshot
 - replay horizon
 - route columns for tenant, namespace, and organization
-- record ID, operation, event time, vectors, texts, metadata, and optional TTL source columns
+- record ID, operation, ts, vectors, texts, and metadata source columns
 
 The first local run inserts the source registration when absent. Later runs load it from PostgreSQL
 and reject a changed table UUID, table name, Lance root, baseline, or column mapping.
 
 ### `datasets`
 
-Dataset is the first-class logical unit. The globally unique route is
-`(tenant_id, namespace, org_id)`. A dataset references its source, lifecycle, and desired spec
-revision. Physical materialization belongs to `dataset_state`, not the dataset identity. The Rust
-search catalog resolves this same route, so source-scoped route duplicates are prohibited.
+Dataset is the first-class logical unit and the only mutable row in the control plane. The globally
+unique route is `(tenant_id, namespace, org_id)`. A dataset references its source, lifecycle, and
+desired spec revision, and carries its own physical materialization state directly: materialized
+spec revision, last applied source snapshot, ingest Lance URI and version, active publication
+pointer, and monotonically increasing fence epoch. The Rust search catalog resolves this same
+route, so source-scoped route duplicates are prohibited.
+
+The active publication pointer references an immutable publication of the same dataset. Search
+resolves:
+
+```text
+datasets -> datasets.active_publication_id -> dataset_publications
+```
+
+Only the resulting allowlisted Lance URI and exact version leave the catalog layer.
 
 ### `source_snapshots`
 
@@ -193,7 +201,7 @@ The row freezes:
 - candidate Lance URI and version
 - applied source time, source row count, and source digest
 - optional artifact manifest URI and digest
-- launcher kind and optional standard Airflow DAG, run, task, map, and try context
+- launcher kind audit label
 
 A retry increments `attempt_count`, obtains a fresh lease, and advances the dataset fence on the
 same deterministic row. PostgreSQL constraints allow at most one running row per dataset and one
@@ -202,9 +210,8 @@ earlier unfinished one. The current lease token plus monotonic dataset fence rej
 workers without a parallel attempt-history table. Composite foreign keys require the dataset and
 snapshot to belong to the same source.
 
-Airflow context is optional claim provenance. The local runtime reads it once from `AIRFLOW_CTX_*`
-environment values and copies it to the deterministic work row. It does not affect eligibility,
-ordering, retries, leases, or fencing, and Airflow remains unnecessary for local operation.
+The `launcher_kind` label is optional claim provenance recorded on the deterministic work row. It
+does not affect eligibility, ordering, retries, leases, or fencing.
 
 ### `dataset_publications`
 
@@ -224,27 +231,13 @@ observed index family to the exact configured definition. The row records indexe
 requires zero unindexed fragments, and carries an optional artifact-generation digest. Publication
 validation requires the evidence set to match the frozen revision exactly.
 
-### `dataset_state`
-
-This is the only mutable row per dataset. It stores materialized spec revision, last applied source
-snapshot, ingest Lance URI and version, active publication pointer, and monotonically increasing
-fence epoch.
-
-The active pointer references an immutable publication in the same dataset. Search resolves:
-
-```text
-datasets -> dataset_state.active_publication_id -> dataset_publications
-```
-
-Only the resulting allowlisted Lance URI and exact version leave the catalog layer.
-
 ## Transaction boundaries
 
 ### Plan source work
 
-One transaction inserts or reuses the exact source snapshot, creates newly discovered datasets and
-their initial state rows, and inserts deterministic ingest work. Unsupported source history is
-persisted as a blocked snapshot with an error code.
+One transaction inserts or reuses the exact source snapshot, creates newly discovered `datasets`
+rows, and inserts deterministic ingest work. Unsupported source history is persisted as a blocked
+snapshot with an error code.
 
 ### Claim and execute
 
@@ -256,7 +249,7 @@ the work identity, lease token, and fence epoch.
 ### Complete ingestion
 
 Successful ingestion compare-and-swaps the expected ingest tuple, records the candidate and source
-evidence, advances dataset state, and schedules publication. The source snapshot becomes complete
+evidence, advances the dataset row, and schedules publication. The source snapshot becomes complete
 only after all of its ingest work succeeds.
 
 ### Publish
@@ -280,7 +273,10 @@ configured artifact and audit horizons.
 
 ## Configuration boundary
 
-PostgreSQL stores all dataset behavior and local loop policy. The environment contains only
+PostgreSQL stores all dataset behavior: schema, ingestion, compaction, indexing, prewarm, and
+retention policy. Local reconciler loop policy (polling, claim, lease, retry, SLO, and cleanup
+bounds) is process bootstrap configuration loaded once at startup by
+`ReconcilerSettings.from_environment()`, not a database row. The environment otherwise contains only
 bootstrap and secret-bearing process concerns:
 
 - PostgreSQL connection URL
@@ -289,13 +285,13 @@ bootstrap and secret-bearing process concerns:
 - optional first baseline snapshot
 - telemetry connection and identity
 
-Do not add environment variables for ingestion, compaction, indexing, prewarm, or retention
-behavior. Add a typed column with validation to the appropriate normalized entity and include it in
-the revision digest.
+Do not add environment variables for dataset-scoped ingestion, compaction, indexing, prewarm, or
+retention behavior. Add a typed column with validation to the appropriate normalized entity and
+include it in the revision digest.
 
 ## Migration strategy
 
 Breaking changes are allowed. `migrations/versions/0001_control_plane.py` is the single Alembic
-baseline and seeds the singleton settings plus the bundled active dataset specification. Fresh
-local databases upgrade directly to the current 14-table schema. There is no compatibility bridge
+baseline and seeds the bundled active dataset specification revision. Fresh
+local databases upgrade directly to the current 9-table schema. There is no compatibility bridge
 for older experimental schemas.
