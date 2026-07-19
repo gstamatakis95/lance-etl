@@ -2,7 +2,7 @@
 
 Reads every ``<phase>.json`` present in the run directory and writes ``summary.md`` (markdown tables), ``recall.csv``
 (the recall/latency sweep), ``results.csv`` (a long-format combination of every phase's headline metrics), and
-``pareto.png`` (recall@10 versus QPS for the release profile). :func:`plot_pareto` forces the Agg
+``pareto.png`` (recall@10 versus QPS for the published dataset). :func:`plot_pareto` forces the Agg
 backend right before drawing so importing this module never touches a GUI toolkit.
 """
 
@@ -43,6 +43,7 @@ def markdown_table(headers: list[str], rows: list[list[Any]]) -> str:
         The markdown text.
     """
     lines: list[str] = ["| " + " | ".join(headers) + " |", "|" + "|".join("---" for _ in headers) + "|"]
+    row: Any
     for row in rows:
         lines.append("| " + " | ".join(str(value) for value in row) + " |")
     return "\n".join(lines)
@@ -56,8 +57,9 @@ def write_sweep_csv(path: Path, sweep: list[dict[str, Any]]) -> None:
         sweep: The sweep points from the search phase.
     """
     with open(path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(SWEEP_COLUMNS), extrasaction="ignore")
+        writer: Any = csv.DictWriter(handle, fieldnames=list(SWEEP_COLUMNS), extrasaction="ignore")
         writer.writeheader()
+        point: Any
         for point in sweep:
             writer.writerow(point)
 
@@ -74,6 +76,8 @@ def flatten_metrics(phase: str, payload: dict[str, Any], prefix: str = "") -> li
         ``(phase, metric, value)`` rows for every scalar numeric value.
     """
     rows: list[tuple[str, str, Any]] = []
+    key: Any
+    value: Any
     for key, value in payload.items():
         name: str = f"{prefix}{key}"
         if isinstance(value, bool):
@@ -96,11 +100,13 @@ def write_results_csv(path: Path, phases: dict[str, dict[str, Any] | None]) -> i
         The number of metric rows written.
     """
     rows: list[tuple[str, str, Any]] = []
+    phase: Any
+    payload: Any
     for phase, payload in phases.items():
         if payload is not None:
             rows.extend(flatten_metrics(phase, payload))
     with open(path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
+        writer: Any = csv.writer(handle)
         writer.writerow(["phase", "metric", "value"])
         writer.writerows(rows)
     return len(rows)
@@ -120,6 +126,8 @@ def plot_pareto(path: Path, sweep: list[dict[str, Any]], title: str) -> bool:
     if not sweep:
         return False
     matplotlib.use("Agg", force=True)
+    figure: Any
+    axes: Any
     figure, axes = plt.subplots(figsize=(8, 6))
     points: list[dict[str, Any]] = sorted(sweep, key=lambda point: point["qps_single_stream"])
     axes.plot(

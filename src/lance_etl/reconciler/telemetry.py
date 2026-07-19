@@ -23,6 +23,6 @@ class TelemetrySloEmitter:
         self.telemetry.gauge("reconciler.healthy", float(status.healthy))
         self.telemetry.gauge("reconciler.due_work", float(status.due_work))
         self.telemetry.gauge("reconciler.blocked_work", float(status.blocked_work))
-        self.telemetry.gauge("reconciler.blocked_source_windows", float(status.blocked_source_windows))
+        self.telemetry.gauge("reconciler.blocked_source_snapshots", float(status.blocked_source_snapshots))
         self.telemetry.gauge("reconciler.oldest_open_age_seconds", status.oldest_open_age_seconds)
         self.telemetry.gauge("reconciler.retention_age_seconds", status.retention_age_seconds)

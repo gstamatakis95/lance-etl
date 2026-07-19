@@ -24,9 +24,9 @@ lance-etl/
   src/lance_etl/     Python package: Spark ETL, indexing, maintenance, pipeline, tools, recall (detail: src/lance_etl/AGENTS.md)
   rust/search-api/   Rust gRPC search service: tonic transport over the Lance crate (detail: rust/search-api/AGENTS.md)
   bench/             End-to-end benchmark package, python -m bench (detail: bench/README.md)
-  airflow/           One parameter-free durable reconciler DAG
+  migrations/        Alembic migrations for the local PostgreSQL control plane
   tests/             pytest suite (conftest.py + test_*.py)
-  docs/adr/          Architecture decisions, six thematic documents plus a numbered index (docs/adr/README.md)
+  docs/adr/          Architecture decisions, seven thematic documents plus a numbered index (docs/adr/README.md)
   market-research/   Detailed evaluation notes, plans, and evidence underlying the ADRs
   pyproject.toml     Build, dependencies, ruff config
 ```
@@ -36,7 +36,7 @@ unsure whether a pylance API exists or what its signature is, read that checkout
 checkout tracks lance main and can be ahead of the pin this repo actually ships: at the time of
 writing the checkout is at `9.0.0-beta.20` while `pyproject.toml` pins `pylance==8.0.0`. When a
 behavior difference between major versions could matter, verify the API against the pinned major
-(read the installed `pylance` package in `etl/venv`, or the release notes) rather than assuming the
+(read the installed `pylance` package in `.venv`, or the release notes) rather than assuming the
 checkout's behavior applies unchanged.
 
 ---
@@ -48,7 +48,8 @@ the change done.
 
 ### 1. No leading underscores on any defined name
 
-Do not define names that begin with `_` or `__` anywhere in `src/`, `tests/`, or `airflow/`.
+Do not define names that begin with `_` or `__` anywhere in `src/`, `tests/`, `bench/`, or
+`migrations/`.
 Third-party internals accessed through a leading underscore (e.g. `dataset._ds`) must go through a
 single, documented helper function. Never scatter bare `_attr` accesses across the codebase. Note:
 the `__version__` dunder was removed from `src/lance_etl/__init__.py` precisely because it violated
@@ -74,8 +75,8 @@ ALWAYS run both commands after any Python change (a PostToolUse hook in `.claude
 also runs them automatically after every file edit):
 
 ```bash
-uvx ruff format src/ tests/ airflow/ bench/
-uvx ruff check src/ tests/ airflow/ bench/
+uvx ruff format src/ tests/ bench/ migrations/
+uvx ruff check src/ tests/ bench/ migrations/
 ```
 
 The enabled rule sets are `E, W, F, I, B, UP, SIM, ARG, PLC0415, D, ANN, C901` (see
@@ -169,6 +170,34 @@ Move-stable row IDs (`enable_stable_row_ids`) were evaluated and rejected becaus
 risking silent data corruption on release builds. Do not add `enable_stable_row_ids=True` to any
 dataset creation or compaction path. See ADR 0010 in `docs/adr/rejected-and-operator-tools.md` for the full
 decision. Revisiting requires a fresh ADR.
+
+### 9. The reconciler runs locally
+
+PostgreSQL is the durable control plane and `lance-etl-reconcile` is a local one-shot or looping
+process. Do not add an external scheduler, remote Spark submission wrappers, reconciler manifests,
+reconciler container images, or operator code. Local Spark is an execution dependency created and
+stopped by the process. The optional search service is built and started directly when it is needed.
+
+### 10. PostgreSQL configuration is normalized and revisioned
+
+The control plane has exactly 14 application tables:
+`reconciler_settings`, `dataset_specs`, `dataset_spec_revisions`, `dataset_fields`,
+`index_definitions`, `vector_index_options`, `fts_index_options`, `iceberg_sources`, `datasets`,
+`source_snapshots`, `dataset_work`, `dataset_publications`, `publication_indexes`, and
+`dataset_state`. Do not add JSON configuration blobs or parallel configuration entities. Dataset
+schema plus ingestion, compaction, indexing, prewarm, publication, and retention policy belongs to
+an immutable `dataset_spec_revisions` row and its normalized children. Every work item and
+publication freezes that revision identity. Process bootstrap values and secrets remain outside the
+database. Current lease, monotonic fence, attempt count, and latest bounded error evidence remain on
+the deterministic `dataset_work` row. `reconciler_settings` is loaded once at process startup, so a
+local reconciler restart is required after changing loop policy.
+
+Specification authoring must use `ControlPlaneRepository.create_spec`,
+`create_draft_spec_revision`, `activate_spec_revision`, `set_source_default_spec`, and
+`assign_dataset_spec_revision`. Only DRAFT graphs may change. PostgreSQL triggers freeze ACTIVE and
+RETIRED parents and all normalized children. Dataset assignment accepts only ACTIVE revisions and
+enqueues deterministic REBUILD work when the materialized revision differs. `dataset_work` may
+store optional `AIRFLOW_CTX_*` launch provenance, but provenance never participates in scheduling.
 
 ---
 

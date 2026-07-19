@@ -45,7 +45,11 @@ RETRAIN_GROWTH_FACTOR: float = 4.0
 """Retrain when row count exceeds this multiple of ``rows_at_train``, never varied."""
 
 
-def growth_exceeds_retrain_factor(rows: int, rows_at_train: int) -> bool:
+def growth_exceeds_retrain_factor(
+    rows: int,
+    rows_at_train: int,
+    retrain_growth_factor: float = RETRAIN_GROWTH_FACTOR,
+) -> bool:
     """Report whether dataset growth since centroid training exceeds the retrain factor.
 
     Shared comparison behind both retrain triggers. Callers keep their own
@@ -54,11 +58,12 @@ def growth_exceeds_retrain_factor(rows: int, rows_at_train: int) -> bool:
     Args:
         rows: The dataset's current row count.
         rows_at_train: The row count recorded when the centroids were last trained.
+        retrain_growth_factor: Growth multiple that forces a retrain.
 
     Returns:
         ``True`` when growth since training exceeds :data:`RETRAIN_GROWTH_FACTOR`.
     """
-    return rows > RETRAIN_GROWTH_FACTOR * rows_at_train
+    return rows > retrain_growth_factor * rows_at_train
 
 
 MAX_STALE_REPLANS: int = 3
@@ -69,22 +74,25 @@ MAX_STALE_REPLANS: int = 3
 class IndexJobConfig:
     """Configuration for :class:`lance_etl.indexing.runner.LanceIndexer`.
 
-    The IVF partition policy bounds (:data:`MIN_IVF_PARTITIONS`, :data:`MAX_IVF_PARTITIONS`,
-    :data:`TARGET_ROWS_PER_IVF_PARTITION`), the RaBitQ bit width (:data:`IVF_RQ_NUM_BITS`), the
-    streaming k-means knobs (:data:`STREAMING_SAMPLE_RATE`, :data:`STREAMING_REFINE_PASSES`), the
-    retrain trigger (:data:`RETRAIN_GROWTH_FACTOR`), and the
-    stale-replan bound (:data:`MAX_STALE_REPLANS`) are fixed module-level constants, not fields,
-    because they are never varied. The IVF training distance is always derived from ``metric`` via
-    :meth:`resolved_distance_type`, and the four fine-grained FTS tokenizer toggles
-    (lowercase/stem/stop-words/ASCII-folding) are always omitted from ``fts_params()``.
+    Every semantic indexing option is an instance field so one frozen PostgreSQL specification
+    reproduces the same index generation. Module constants provide backward-compatible defaults.
+    The four fine-grained FTS tokenizer toggles (lowercase, stemming, stop words, and ASCII folding)
+    are always omitted from ``fts_params()`` because pylance does not expose them independently.
 
     Attributes:
         telemetry: Telemetry configuration.
         storage_options: Object-store options forwarded to pylance.
         vector_columns: Vector columns to index with IVF_RQ; each gets its own handler and config entry.
         num_partitions: IVF partitions; derived from the size-aware policy when unset.
+        minimum_partitions: Floor for the derived IVF partition count.
+        maximum_partitions: Ceiling for the derived IVF partition count.
+        target_rows_per_partition: Desired rows represented by each derived IVF partition.
         vector_min_rows: Skip the vector index below this row count; flat KNN is sufficient.
         metric: Distance metric such as ``L2``, ``cosine``, or ``dot``.
+        num_bits: RaBitQ bits per sub-dimension.
+        streaming_sample_rate: Rows sampled per IVF partition in each streaming training chunk.
+        streaming_refine_passes: Extra streaming Lloyd refinement passes.
+        retrain_growth_factor: Dataset growth multiple that rotates vector artifacts.
         scalar_columns: Columns to index with btree.
         bitmap_columns: Columns to index with bitmap.
         zonemap_columns: Columns to index with zonemap, an inexact index effective only when the
@@ -99,6 +107,7 @@ class IndexJobConfig:
             same segment API.
         rebuild: Reindex every fragment; forces every handler to rebuild instead of maintaining.
         max_index_deltas: Merge accumulated index deltas into one when the count exceeds this cap.
+        max_stale_replans: Plan-build-commit rounds allowed after stale-fragment conflicts.
         fts_max_unindexed_fragments: Maintain an inverted index incrementally only within this unindexed backlog.
         commit_retries: Retry budget for commit conflicts.
         commit_backoff_seconds: Base backoff between commit retries.
@@ -107,9 +116,17 @@ class IndexJobConfig:
     telemetry: TelemetryConfig
     storage_options: dict[str, Any] | None = None
     vector_columns: list[str] = field(default_factory=list)
+    index_name_overrides: dict[str, str] = field(default_factory=dict)
     num_partitions: int | None = None
+    minimum_partitions: int = MIN_IVF_PARTITIONS
+    maximum_partitions: int = MAX_IVF_PARTITIONS
+    target_rows_per_partition: int = TARGET_ROWS_PER_IVF_PARTITION
     vector_min_rows: int = 10_000
     metric: str = "L2"
+    num_bits: int = IVF_RQ_NUM_BITS
+    streaming_sample_rate: int = STREAMING_SAMPLE_RATE
+    streaming_refine_passes: int = STREAMING_REFINE_PASSES
+    retrain_growth_factor: float = RETRAIN_GROWTH_FACTOR
     scalar_columns: list[str] = field(default_factory=list)
     bitmap_columns: list[str] = field(default_factory=list)
     zonemap_columns: list[str] = field(default_factory=list)
@@ -120,17 +137,22 @@ class IndexJobConfig:
     fragments_per_index_task: int = 8
     rebuild: bool = False
     max_index_deltas: int = 4
+    max_stale_replans: int = MAX_STALE_REPLANS
     fts_max_unindexed_fragments: int = 32
     commit_retries: int = DEFAULT_COMMIT_RETRIES
     commit_backoff_seconds: float = 0.5
 
-    def resolved_distance_type(self) -> str:
-        """Return the IVF training distance derived from the metric.
+    def index_name(self, column: str, default: str) -> str:
+        """Resolve a PostgreSQL-defined index name or its conventional fallback.
+
+        Args:
+            column: Indexed Lance column.
+            default: Conventional index name used by legacy callers.
 
         Returns:
-            A Lance distance type string.
+            Explicit immutable name when configured, otherwise ``default``.
         """
-        return METRIC_TO_DISTANCE.get(self.metric.lower(), "l2")
+        return self.index_name_overrides.get(column, default)
 
     def fts_params(self) -> dict[str, Any]:
         """Build the inverted-index parameters, omitting unset options.
@@ -257,7 +279,13 @@ def config_reusable(cfg: dict[str, Any], dimension: int, metric: str, num_bits: 
     return all(cfg.get(name) == value for name, value in expected.items())
 
 
-def derive_num_partitions(rows: int, configured: int | None) -> int:
+def derive_num_partitions(
+    rows: int,
+    configured: int | None,
+    minimum: int = MIN_IVF_PARTITIONS,
+    maximum: int = MAX_IVF_PARTITIONS,
+    target_rows: int = TARGET_ROWS_PER_IVF_PARTITION,
+) -> int:
     """Return the IVF partition count for a dataset size.
 
     Follows the size-aware policy
@@ -268,6 +296,9 @@ def derive_num_partitions(rows: int, configured: int | None) -> int:
     Args:
         rows: The dataset row count.
         configured: An explicit partition count, taking precedence when set.
+        minimum: Minimum automatically derived partition count.
+        maximum: Maximum automatically derived partition count.
+        target_rows: Target rows represented by one partition.
 
     Returns:
         The planned IVF partition count.
@@ -275,8 +306,8 @@ def derive_num_partitions(rows: int, configured: int | None) -> int:
     if configured is not None:
         return configured
     return min(
-        MAX_IVF_PARTITIONS,
-        max(MIN_IVF_PARTITIONS, rows // TARGET_ROWS_PER_IVF_PARTITION),
+        maximum,
+        max(minimum, rows // target_rows),
     )
 
 

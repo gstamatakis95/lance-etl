@@ -2,7 +2,7 @@
 
 Four legs run against catalog-resolved targets through the real server:
 
-- recall: the SIFT query vectors measure the release-owned target profile. Recall@1/@10/@100 is computed against the
+- recall: the SIFT query vectors measure the catalog-selected publication. Recall@1/@10/@100 is computed against the
   prepared ground truth and latency statistics are recorded.
 - fts: deterministic cluster-vocabulary text queries measure BM25 latency and the
   cluster-consistency hit rate (the fraction of hits whose vector belongs to the queried cluster).
@@ -83,7 +83,7 @@ def load_artifacts(config: BenchConfig) -> dict[str, Any]:
     prepared: Path = config.prepared_dir()
     if not (prepared / "manifest.json").exists():
         raise FileNotFoundError(f"no prepared artifacts at {prepared}; run 'python -m bench prepare' first")
-    ground_truth_file = np.load(prepared / "ground_truth.npz")
+    ground_truth_file: Any = np.load(prepared / "ground_truth.npz")
     result: dict[str, Any] = {
         "queries": np.load(prepared / "queries.npy"),
         "ground_truth": {org: ground_truth_file[org] for org in ground_truth_file.files},
@@ -119,9 +119,16 @@ def measure_first_queries(
         Per-org cold and warm latencies in milliseconds.
     """
     timings: dict[str, Any] = {}
+    org: Any
     for org in config.org_ids():
-        request = pb2.VectorSearchRequest(target=dataset_target(pb2, org), query=vector_query(pb2, queries[0]), k=10)
+        request: Any = pb2.VectorSearchRequest(
+            target=dataset_target(pb2, org), query=vector_query(pb2, queries[0]), k=10
+        )
+        cold_response: Any
+        cold_ms: Any
         cold_response, cold_ms = timed_call(stub.VectorSearch, request, authorization_metadata(config, org))
+        warm_response: Any
+        warm_ms: Any
         warm_response, warm_ms = timed_call(stub.VectorSearch, request, authorization_metadata(config, org))
         served_version: int = validate_served_version(cold_response, org, expected_versions[org])
         validate_served_version(warm_response, org, expected_versions[org])
@@ -141,7 +148,7 @@ def sweep_point(
     ground_truth: dict[str, np.ndarray],
     expected_versions: dict[str, int],
 ) -> dict[str, Any]:
-    """Measure the catalog-selected release profile over every org.
+    """Measure the catalog-selected publication over every org.
 
     Args:
         stub: The connected service stub.
@@ -156,17 +163,22 @@ def sweep_point(
     """
     latencies: list[float] = []
     recalls: dict[int, list[float]] = {cutoff: [] for cutoff in RECALL_CUTOFFS}
+    org: Any
     for org in config.org_ids():
         retrieved: list[np.ndarray] = []
+        query: Any
         for query in queries:
-            request = pb2.VectorSearchRequest(
+            request: Any = pb2.VectorSearchRequest(
                 target=dataset_target(pb2, org), query=vector_query(pb2, query), k=config.search_k
             )
+            response: Any
+            elapsed_ms: Any
             response, elapsed_ms = timed_call(stub.VectorSearch, request, authorization_metadata(config, org))
             validate_served_version(response, org, expected_versions[org])
             latencies.append(elapsed_ms)
             retrieved.append(result_vector_ids(response.results))
         expected: np.ndarray = ground_truth[org][: len(queries)]
+        cutoff: Any
         for cutoff in RECALL_CUTOFFS:
             recalls[cutoff].append(recall_at(expected, retrieved, cutoff))
     stats: dict[str, Any] = latency_stats(latencies)
@@ -223,14 +235,17 @@ def run_fts_leg(
     orgs: list[str] = config.org_ids()
     latencies: list[float] = []
     hit_rates: list[float] = []
+    query_index: Any
     for query_index in range(config.fts_query_count):
         cluster: int = query_index % len(cluster_vocab)
         org: str = orgs[query_index % len(orgs)]
-        request = pb2.TextSearchRequest(
+        request: Any = pb2.TextSearchRequest(
             target=dataset_target(pb2, org),
             query=text_query(pb2, fts_terms(config, cluster_vocab, query_index, cluster)),
             k=10,
         )
+        response: Any
+        elapsed_ms: Any
         response, elapsed_ms = timed_call(stub.TextSearch, request, authorization_metadata(config, org))
         validate_served_version(response, org, expected_versions[org])
         latencies.append(elapsed_ms)
@@ -277,16 +292,19 @@ def run_hybrid_leg(
     latencies: list[float] = []
     recalls: list[float] = []
     count: int = min(config.hybrid_query_count, len(queries))
+    query_index: Any
     for query_index in range(count):
         org: str = orgs[query_index % len(orgs)]
         expected: np.ndarray = ground_truth[org][query_index]
         cluster: int = int(clusters[int(expected[0])])
-        request = pb2.HybridSearchRequest(
+        request: Any = pb2.HybridSearchRequest(
             target=dataset_target(pb2, org),
             vector=vector_query(pb2, queries[query_index]),
             text=text_query(pb2, fts_terms(config, cluster_vocab, query_index, cluster)),
             k=10,
         )
+        response: Any
+        elapsed_ms: Any
         response, elapsed_ms = timed_call(stub.HybridSearch, request, authorization_metadata(config, org))
         validate_served_version(response, org, expected_versions[org])
         latencies.append(elapsed_ms)
@@ -325,13 +343,15 @@ def run_load_worker(
     Raises:
         Exception: Propagates authentication, deadline, transport, and version failures so the benchmark exits nonzero.
     """
-    request = pb2.VectorSearchRequest(
+    request: Any = pb2.VectorSearchRequest(
         target=dataset_target(pb2, org_id),
         query=vector_query(pb2, sample_vector),
         k=10,
     )
     latencies: list[float] = []
     while not latencies or time.perf_counter() < stop_at:
+        response: Any
+        elapsed_ms: Any
         response, elapsed_ms = timed_call(stub.VectorSearch, request, authorization_metadata(config, org_id))
         validate_served_version(response, org_id, expected_version)
         latencies.append(elapsed_ms)
@@ -424,6 +444,8 @@ def run_search(config: BenchConfig) -> dict[str, Any]:
     """
     artifacts: dict[str, Any] = load_artifacts(config)
     expected_versions: dict[str, int] = load_expected_versions(config)
+    pb2: Any
+    pb2_grpc: Any
     pb2, pb2_grpc = load_stubs(generate_stubs(config.workspace / "grpc_gen"))
     stub: Any = open_stub(config, pb2_grpc)
     queries: np.ndarray = artifacts["queries"]
@@ -434,11 +456,15 @@ def run_search(config: BenchConfig) -> dict[str, Any]:
     warmup_count: int = config.warmup_queries
     if warmup_count > 0:
         logger.info("warmup: %d profile-owned queries with results discarded", warmup_count)
+        org: Any
         for org in config.org_ids():
+            query: Any
             for query in queries[:warmup_count]:
-                request = pb2.VectorSearchRequest(
+                request: Any = pb2.VectorSearchRequest(
                     target=dataset_target(pb2, org), query=vector_query(pb2, query), k=config.search_k
                 )
+                response: Any
+                unused_ms: Any
                 response, unused_ms = timed_call(stub.VectorSearch, request, authorization_metadata(config, org))
                 del unused_ms
                 validate_served_version(response, org, expected_versions[org])

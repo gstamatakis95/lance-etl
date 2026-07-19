@@ -1,29 +1,45 @@
-"""Bounded durable reconciler services shared by the CLI and scheduler."""
+"""Bounded durable reconciler services used by the local process."""
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
-from lance_etl.reconciler.config import DeploymentProfile
+from lance_etl.reconciler.config import ReconcilerSettings
 from lance_etl.reconciler.planning import EnqueueSummary, SourcePlanEnqueuer
 from lance_etl.reconciler.results import DispatchSummary, ReconcileSummary, ResultKind, WorkResult
 from lance_etl.source import SourcePlan
-from lance_etl.state import ControlPlaneStatus, RoutingIdentity, WorkClaim, WorkPhase
+from lance_etl.state import (
+    ControlPlaneStatus,
+    PublicationEvidence,
+    RoutingIdentity,
+    SourceSnapshotState,
+    WorkClaim,
+    WorkPhase,
+    WorkProvenance,
+)
 
 
 class WorkRepository(Protocol):
-    """Fenced state transitions required by target-work reconciliation."""
+    """Fenced state transitions required by dataset-work reconciliation."""
 
-    def claim_due_work(self, limit: int, lease_duration: timedelta, now: datetime | None = None) -> list[WorkClaim]:
-        """Claim a bounded target-disjoint batch.
+    def claim_due_work(
+        self,
+        limit: int,
+        lease_duration: timedelta,
+        now: datetime | None = None,
+        provenance: WorkProvenance | None = None,
+    ) -> list[WorkClaim]:
+        """Claim a bounded dataset-disjoint batch.
 
         Args:
             limit: Maximum claims.
-            lease_duration: Code-owned lease duration.
+            lease_duration: PostgreSQL-backed lease duration.
             now: Optional deterministic clock.
+            provenance: Optional process launch provenance.
 
         Returns:
             Fenced claims.
@@ -52,23 +68,25 @@ class WorkRepository(Protocol):
         """
         ...
 
-    def publish_serve(
+    def publish_dataset(
         self,
         claim: WorkClaim,
         candidate_lance_uri: str,
         indexed_lance_version: int,
-        artifact_manifest_uri: str,
-        artifact_digest: bytes,
+        manifest_uri: str,
+        manifest_digest: bytes,
+        evidence: PublicationEvidence,
         now: datetime | None = None,
     ) -> bool:
-        """Atomically publish and complete one exact SERVE or REBUILD result.
+        """Atomically publish and complete one exact dataset generation.
 
         Args:
             claim: Fenced work claim.
             candidate_lance_uri: Validated immutable candidate dataset URI.
             indexed_lance_version: Exact published version.
-            artifact_manifest_uri: Immutable artifact manifest.
-            artifact_digest: Frozen artifact digest.
+            manifest_uri: Immutable artifact manifest.
+            manifest_digest: Frozen artifact digest.
+            evidence: Exact schema, cardinality, fragment, and index evidence.
             now: Optional deterministic clock.
 
         Returns:
@@ -80,9 +98,8 @@ class WorkRepository(Protocol):
         self,
         claim: WorkClaim,
         phase: WorkPhase,
-        data_lance_version: int | None = None,
-        indexed_lance_version: int | None = None,
         candidate_lance_uri: str | None = None,
+        candidate_lance_version: int | None = None,
         artifact_manifest_uri: str | None = None,
         artifact_digest: bytes | None = None,
         now: datetime | None = None,
@@ -92,9 +109,8 @@ class WorkRepository(Protocol):
         Args:
             claim: Fenced work claim.
             phase: Later phase.
-            data_lance_version: Optional exact data version.
-            indexed_lance_version: Optional exact index version.
             candidate_lance_uri: Optional immutable candidate URI.
+            candidate_lance_version: Optional exact candidate version.
             artifact_manifest_uri: Optional immutable artifact manifest.
             artifact_digest: Optional artifact digest.
             now: Optional deterministic clock.
@@ -158,15 +174,15 @@ class WorkRepository(Protocol):
         """
         ...
 
-    def enqueue_rollback(self, identity: RoutingIdentity, successful_work_id: uuid.UUID) -> uuid.UUID:
-        """Enqueue exact retained publication evidence for fenced PREWARM.
+    def enqueue_rebuild(self, identity: RoutingIdentity, request_id: uuid.UUID) -> uuid.UUID:
+        """Enqueue one idempotent canonical duplicate-recovery generation.
 
         Args:
-            identity: Validated target routing identity.
-            successful_work_id: Retained successful publication identity.
+            identity: Validated dataset routing identity.
+            request_id: Stable operator idempotency identity.
 
         Returns:
-            New rollback work identity.
+            Deterministic rebuild work identity.
         """
         ...
 
@@ -195,13 +211,13 @@ class SourcePlanProvider(Protocol):
 
 
 class WorkExecutor(Protocol):
-    """Execute one target-scoped fenced claim without owning state transitions."""
+    """Execute one dataset-scoped fenced claim without owning state transitions."""
 
     def execute(self, claim: WorkClaim) -> WorkResult:
         """Execute one exact claim and return durable evidence.
 
         Args:
-            claim: Fenced target work.
+            claim: Fenced dataset work.
 
         Returns:
             Typed result for repository reconciliation.
@@ -222,7 +238,7 @@ class ExternalResultSweep(Protocol):
 
 
 class SloEmitter(Protocol):
-    """Emit low-cardinality reconciler health without target identifiers."""
+    """Emit low-cardinality reconciler health without dataset identifiers."""
 
     def emit(self, status: SloStatus) -> None:
         """Emit one evaluated status.
@@ -235,10 +251,10 @@ class SloEmitter(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ResultReconciler:
-    """Apply typed worker outcomes through lease-token and target-fence checks."""
+    """Apply typed worker outcomes through lease-token and dataset-fence checks."""
 
     repository: WorkRepository
-    profile: DeploymentProfile
+    settings: ReconcilerSettings
 
     def reconcile(self, result: WorkResult, now: datetime | None = None) -> bool:
         """Persist one result idempotently or reject its stale fence.
@@ -259,25 +275,26 @@ class ResultReconciler:
                 required_bytes(result.source_digest),
                 now,
             )
-        if result.kind is ResultKind.SERVE_SUCCEEDED:
-            if not self.advance_serve_phases(result, now):
+        if result.kind is ResultKind.PUBLISH_SUCCEEDED:
+            if not self.advance_publish_phases(result, now):
                 return False
-            return self.repository.publish_serve(
+            return self.repository.publish_dataset(
                 result.claim,
                 required_str(result.candidate_lance_uri),
                 required_int(result.indexed_lance_version),
-                required_str(result.artifact_manifest_uri),
-                required_bytes(result.artifact_digest),
+                required_str(result.manifest_uri),
+                required_bytes(result.manifest_digest),
+                required_publication_evidence(result.publication_evidence),
                 now,
             )
         if result.kind is ResultKind.PHASE_ADVANCED:
-            advanced = self.repository.advance_phase(
+            advanced: bool = self.repository.advance_phase(
                 result.claim,
                 required_phase(result.next_phase),
-                indexed_lance_version=result.indexed_lance_version,
                 candidate_lance_uri=result.candidate_lance_uri,
-                artifact_manifest_uri=result.artifact_manifest_uri,
-                artifact_digest=result.artifact_digest,
+                candidate_lance_version=result.indexed_lance_version,
+                artifact_manifest_uri=result.manifest_uri,
+                artifact_digest=result.manifest_digest,
                 now=now,
             )
             if not advanced:
@@ -286,7 +303,7 @@ class ResultReconciler:
         if result.kind is ResultKind.RETRY:
             return self.repository.retry_work(
                 result.claim,
-                self.profile.retry_delay(result.claim.attempt_count, result.claim.work_id),
+                self.settings.retry_delay(result.claim.attempt_count, result.claim.work_id),
                 required_str(result.error_code),
                 result.error_message or "",
                 now,
@@ -298,7 +315,7 @@ class ResultReconciler:
             now,
         )
 
-    def advance_serve_phases(self, result: WorkResult, now: datetime | None) -> bool:
+    def advance_publish_phases(self, result: WorkResult, now: datetime | None) -> bool:
         """Checkpoint completed fixed phases before atomic publication.
 
         Args:
@@ -308,16 +325,22 @@ class ResultReconciler:
         Returns:
             Whether every required phase checkpoint retained the live fence.
         """
-        phases = (WorkPhase.MAINTAIN, WorkPhase.INDEX, WorkPhase.VALIDATE, WorkPhase.PREWARM)
-        current_index = phases.index(result.claim.phase)
+        phases: tuple[WorkPhase, ...] = (
+            WorkPhase.COMPACT,
+            WorkPhase.INDEX,
+            WorkPhase.VALIDATE,
+            WorkPhase.PREWARM,
+        )
+        current_index: int = phases.index(result.claim.phase)
+        phase: WorkPhase
         for phase in phases[current_index + 1 :]:
-            accepted = self.repository.advance_phase(
+            accepted: bool = self.repository.advance_phase(
                 result.claim,
                 phase,
-                indexed_lance_version=result.indexed_lance_version,
                 candidate_lance_uri=result.candidate_lance_uri,
-                artifact_manifest_uri=result.artifact_manifest_uri,
-                artifact_digest=result.artifact_digest,
+                candidate_lance_version=result.indexed_lance_version,
+                artifact_manifest_uri=result.manifest_uri,
+                artifact_digest=result.manifest_digest,
                 now=now,
             )
             if not accepted:
@@ -327,12 +350,13 @@ class ResultReconciler:
 
 @dataclass(frozen=True, slots=True)
 class BoundedDispatcher:
-    """Drain a code-owned number of target-disjoint claims with failure isolation."""
+    """Drain a bounded number of dataset-disjoint claims with failure isolation."""
 
     repository: WorkRepository
     executor: WorkExecutor
     results: ResultReconciler
-    profile: DeploymentProfile
+    settings: ReconcilerSettings
+    provenance: WorkProvenance = WorkProvenance()
 
     def run(self) -> DispatchSummary:
         """Claim, execute, and reconcile a bounded amount of due work.
@@ -340,25 +364,31 @@ class BoundedDispatcher:
         Returns:
             Constant-size outcome counts.
         """
-        counts = {kind: 0 for kind in ResultKind}
-        stale = 0
-        claimed = 0
-        for batch_number in range(self.profile.max_drain_batches):
+        counts: dict[ResultKind, int] = {kind: 0 for kind in ResultKind}
+        stale: int = 0
+        claimed: int = 0
+        batch_number: int
+        for batch_number in range(self.settings.max_drain_batches):
             del batch_number
-            claims = self.repository.claim_due_work(self.profile.claim_batch_size, self.profile.lease_duration)
+            claims: list[WorkClaim] = self.repository.claim_due_work(
+                self.settings.claim_batch_size,
+                self.settings.lease_duration,
+                provenance=self.provenance,
+            )
             if not claims:
                 break
             claimed += len(claims)
+            claim: WorkClaim
             for claim in claims:
-                result = execute_isolated(self.executor, claim)
+                result: WorkResult = execute_isolated(self.executor, claim)
                 counts[result.kind] += 1
                 if not self.results.reconcile(result):
                     stale += 1
-            if len(claims) < self.profile.claim_batch_size:
+            if len(claims) < self.settings.claim_batch_size:
                 break
         return DispatchSummary(
             claimed=claimed,
-            succeeded=counts[ResultKind.INGEST_SUCCEEDED] + counts[ResultKind.SERVE_SUCCEEDED],
+            succeeded=counts[ResultKind.INGEST_SUCCEEDED] + counts[ResultKind.PUBLISH_SUCCEEDED],
             advanced=counts[ResultKind.PHASE_ADVANCED],
             retried=counts[ResultKind.RETRY],
             blocked=counts[ResultKind.BLOCKED],
@@ -367,7 +397,7 @@ class BoundedDispatcher:
 
 
 def execute_isolated(executor: WorkExecutor, claim: WorkClaim) -> WorkResult:
-    """Convert an unexpected target-local exception into durable retry state.
+    """Convert an unexpected dataset-local exception into durable retry state.
 
     Args:
         executor: Target work executor.
@@ -392,7 +422,7 @@ class RetentionDecision:
     """Exact Iceberg snapshot floor that expiration must preserve."""
 
     retention_held: bool
-    window_seq: int | None
+    source_snapshot_seq: int | None
     retain_snapshot_id: int | None
     state: str | None
 
@@ -405,9 +435,24 @@ class SloStatus:
     reasons: tuple[str, ...]
     due_work: int
     blocked_work: int
-    blocked_source_windows: int
+    blocked_source_snapshots: int
     oldest_open_age_seconds: float
     retention_age_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class RunOnceSummary:
+    """Typed result of one complete local reconciliation cycle."""
+
+    planning: EnqueueSummary
+    dispatch: DispatchSummary
+    reconciliation: ReconcileSummary
+    retention: RetentionDecision
+    slo: SloStatus
+
+
+def no_shutdown() -> None:
+    """Provide a no-op shutdown callback for injected test applications."""
 
 
 def retention_decision(status: ControlPlaneStatus) -> RetentionDecision:
@@ -417,50 +462,57 @@ def retention_decision(status: ControlPlaneStatus) -> RetentionDecision:
         status: Bounded control-plane snapshot.
 
     Returns:
-        Floor decision that never treats SERVE work as a source dependency.
+        Floor decision that never treats publication work as a source dependency.
     """
-    if status.retention_window_seq is None:
+    if status.retention_source_snapshot_seq is None:
         return RetentionDecision(False, None, None, None)
-    retain_snapshot_id = status.retention_parent_snapshot_id or status.retention_snapshot_id
+    retain_snapshot_id: int | None = status.retention_parent_snapshot_id or status.retention_snapshot_id
     return RetentionDecision(
         True,
-        status.retention_window_seq,
+        status.retention_source_snapshot_seq,
         retain_snapshot_id,
         status.retention_state.value if status.retention_state is not None else None,
     )
 
 
-def evaluate_slo(status: ControlPlaneStatus, profile: DeploymentProfile, now: datetime | None = None) -> SloStatus:
+def evaluate_slo(
+    status: ControlPlaneStatus,
+    settings: ReconcilerSettings,
+    now: datetime | None = None,
+) -> SloStatus:
     """Evaluate fixed queue and retention thresholds.
 
     Args:
         status: Bounded control-plane snapshot.
-        profile: Release-owned thresholds.
+        settings: PostgreSQL-backed operational thresholds.
         now: Optional deterministic clock.
 
     Returns:
         Low-cardinality health result.
     """
-    current = now or datetime.now(UTC)
-    oldest_age = age_seconds(status.oldest_open_work_at, current)
-    retention_age = age_seconds(status.retention_created_at, current)
+    current: datetime = now or datetime.now(UTC)
+    oldest_age: float = age_seconds(status.oldest_open_work_at, current)
+    retention_age: float = age_seconds(status.retention_created_at, current)
     reasons: list[str] = []
     if status.blocked_work > 0:
         reasons.append("blocked_work")
-    if status.blocked_source_windows > 0:
-        reasons.append("blocked_source_window")
-    if status.due_work > profile.max_due_work:
+    if status.blocked_source_snapshots > 0:
+        reasons.append("blocked_source_snapshot")
+    if status.due_work > settings.max_due_work:
         reasons.append("due_queue_over_budget")
-    if oldest_age > profile.max_open_work_age.total_seconds():
+    if oldest_age > settings.max_open_work_age.total_seconds():
         reasons.append("open_work_age_over_budget")
-    if retention_age > profile.max_retention_age.total_seconds():
+    if (
+        status.retention_state != SourceSnapshotState.COMPLETE
+        and retention_age > settings.max_retention_age.total_seconds()
+    ):
         reasons.append("source_retention_age_over_budget")
     return SloStatus(
         healthy=not reasons,
         reasons=tuple(reasons),
         due_work=status.due_work,
         blocked_work=status.blocked_work,
-        blocked_source_windows=status.blocked_source_windows,
+        blocked_source_snapshots=status.blocked_source_snapshots,
         oldest_open_age_seconds=oldest_age,
         retention_age_seconds=retention_age,
     )
@@ -483,7 +535,7 @@ def age_seconds(value: datetime | None, now: datetime) -> float:
 
 @dataclass(frozen=True, slots=True)
 class ReconcilerApplication:
-    """Five idempotent scheduler actions over durable source and target state."""
+    """One-process application over durable source and dataset state."""
 
     plan_provider: SourcePlanProvider
     plan_enqueuer: SourcePlanEnqueuer
@@ -491,38 +543,44 @@ class ReconcilerApplication:
     result_sweep: ExternalResultSweep
     repository: WorkRepository
     slo_emitter: SloEmitter
-    profile: DeploymentProfile
+    settings: ReconcilerSettings
+    shutdown: Callable[[], None] = no_shutdown
 
-    def plan_and_enqueue_window(self) -> EnqueueSummary:
+    def close(self) -> None:
+        """Release process-owned Spark and PostgreSQL resources."""
+        self.shutdown()
+
+    def plan_and_enqueue_snapshots(self) -> EnqueueSummary:
         """Classify and enqueue a bounded source backlog one snapshot at a time.
 
         Returns:
             Durable enqueue summary.
         """
         pinned_head: int | None = None
-        planned = 0
-        enqueued = 0
+        planned: int = 0
+        enqueued: int = 0
         sequences: list[int] = []
-        truncated = False
-        for planner_pass in range(self.profile.max_windows_per_plan):
+        truncated: bool = False
+        planner_pass: int
+        for planner_pass in range(self.settings.max_snapshots_per_plan):
             del planner_pass
-            summary = self.plan_enqueuer.enqueue(self.plan_provider.plan())
+            summary: EnqueueSummary = self.plan_enqueuer.enqueue(self.plan_provider.plan())
             pinned_head = summary.pinned_head_snapshot_id
-            planned += summary.planned_windows
-            enqueued += summary.enqueued_windows
-            sequences.extend(summary.window_sequences)
+            planned += summary.planned_snapshots
+            enqueued += summary.enqueued_snapshots
+            sequences.extend(summary.source_snapshot_sequences)
             truncated = truncated or summary.truncated
-            if summary.enqueued_windows == 0 or summary.truncated:
+            if summary.enqueued_snapshots == 0 or summary.truncated:
                 break
         else:
             truncated = True
         return EnqueueSummary(pinned_head, planned, enqueued, tuple(sequences), truncated)
 
-    def run_due_target_work(self) -> DispatchSummary:
+    def run_due_dataset_work(self) -> DispatchSummary:
         """Drain a bounded amount of due work.
 
         Returns:
-            Target-isolated dispatch summary.
+            Dataset-isolated dispatch summary.
         """
         return self.dispatcher.run()
 
@@ -548,9 +606,22 @@ class ReconcilerApplication:
         Returns:
             Emitted SLO status.
         """
-        status = evaluate_slo(self.repository.control_plane_status(), self.profile)
+        status: SloStatus = evaluate_slo(self.repository.control_plane_status(), self.settings)
         self.slo_emitter.emit(status)
         return status
+
+    def run_once(self) -> RunOnceSummary:
+        """Execute one complete reconciliation cycle in dependency order.
+
+        Returns:
+            Planning, work, reconciliation, retention, and SLO results.
+        """
+        planning: EnqueueSummary = self.plan_and_enqueue_snapshots()
+        dispatch: DispatchSummary = self.run_due_dataset_work()
+        reconciliation: ReconcileSummary = self.reconcile_results()
+        retention: RetentionDecision = self.gate_source_retention()
+        slo: SloStatus = self.emit_slo_status()
+        return RunOnceSummary(planning, dispatch, reconciliation, retention, slo)
 
     def repair_blocked_work(self, work_id: uuid.UUID, dry_run: bool) -> bool:
         """Retry one explicit blocked work identity without changing source ownership.
@@ -564,24 +635,79 @@ class ReconcilerApplication:
         """
         return True if dry_run else self.repository.retry_blocked_work(work_id)
 
-    def repair_rollback(
+    def repair_rebuild(
         self,
         identity: RoutingIdentity,
-        retained_work_id: uuid.UUID,
+        request_id: uuid.UUID,
         dry_run: bool,
     ) -> uuid.UUID | None:
-        """Enqueue one exact retained publication without directly mutating the catalog.
+        """Enqueue canonical duplicate recovery without directly mutating a catalog.
 
         Args:
-            identity: Fully specified validated target identity.
-            retained_work_id: Successful serving work carrying retained evidence.
+            identity: Fully specified validated dataset identity.
+            request_id: Stable operator-issued idempotency identity.
             dry_run: Validate input without enqueuing work.
 
         Returns:
-            New rollback work id, or ``None`` for a dry run.
+            Deterministic rebuild work id, or ``None`` for a dry run.
         """
         identity.validate()
-        return None if dry_run else self.repository.enqueue_rollback(identity, retained_work_id)
+        return None if dry_run else self.repository.enqueue_rebuild(identity, request_id)
+
+
+@dataclass(frozen=True, slots=True)
+class ReconcilerOperator:
+    """PostgreSQL-only status and repair surface that never starts Spark."""
+
+    repository: WorkRepository
+    slo_emitter: SloEmitter
+    settings: ReconcilerSettings
+    shutdown: Callable[[], None] = no_shutdown
+
+    def close(self) -> None:
+        """Release process-owned PostgreSQL resources."""
+        self.shutdown()
+
+    def emit_slo_status(self) -> SloStatus:
+        """Evaluate and emit low-cardinality control-plane health.
+
+        Returns:
+            Emitted SLO status.
+        """
+        status: SloStatus = evaluate_slo(self.repository.control_plane_status(), self.settings)
+        self.slo_emitter.emit(status)
+        return status
+
+    def repair_blocked_work(self, work_id: uuid.UUID, dry_run: bool) -> bool:
+        """Retry one explicit blocked identity without starting Spark.
+
+        Args:
+            work_id: Existing durable work identity.
+            dry_run: Validate without mutating state.
+
+        Returns:
+            True for a dry run or when the blocked row transitioned.
+        """
+        return True if dry_run else self.repository.retry_blocked_work(work_id)
+
+    def repair_rebuild(
+        self,
+        identity: RoutingIdentity,
+        request_id: uuid.UUID,
+        dry_run: bool,
+    ) -> uuid.UUID | None:
+        """Enqueue canonical duplicate recovery without starting Spark.
+
+        Args:
+            identity: Fully specified validated dataset identity.
+            request_id: Stable operator idempotency identity.
+            dry_run: Validate input without enqueuing work.
+
+        Returns:
+            Deterministic rebuild work identity, or ``None`` for a dry run.
+        """
+        identity.validate()
+        return None if dry_run else self.repository.enqueue_rebuild(identity, request_id)
 
 
 def required_int(value: int | None) -> int:
@@ -637,4 +763,18 @@ def required_phase(value: WorkPhase | None) -> WorkPhase:
     """
     if value is None:
         raise ValueError("required phase result field is absent")
+    return value
+
+
+def required_publication_evidence(value: PublicationEvidence | None) -> PublicationEvidence:
+    """Narrow a result field already validated as publication evidence.
+
+    Args:
+        value: Optional publication evidence.
+
+    Returns:
+        Required publication evidence.
+    """
+    if value is None:
+        raise ValueError("required publication evidence result field is absent")
     return value

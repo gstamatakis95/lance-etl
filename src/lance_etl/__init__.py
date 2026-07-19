@@ -3,3 +3,5 @@
 Provides the ETL, compaction, and indexing jobs that move data from Iceberg into per-tenant Lance datasets on a Spark
 cluster, together with the shared telemetry and cloud-storage helpers they rely on.
 """
+
+from __future__ import annotations

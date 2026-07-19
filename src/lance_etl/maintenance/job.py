@@ -90,6 +90,9 @@ class MaintenanceConfig:
         target_rows_per_fragment: Desired rows per compacted fragment; matches lance's
             ``CompactionOptions`` default of ``1_048_576`` so the default is explicit and immune
             to upstream shifts.
+        materialize_deletions: Whether compaction physically removes deleted rows.
+        materialize_deletions_threshold: Deleted-row fraction that makes a fragment eligible.
+        compaction_mode: Lance rewrite strategy, normally ``try_binary_copy`` or ``reencode``.
         defer_index_remap: Defer index remap at commit time through the options passed to
             ``Compaction.commit``.
         max_source_fragments: Cap on source fragments consumed per run for incremental
@@ -123,6 +126,9 @@ class MaintenanceConfig:
     ttl_column: str | None = None
     ts_column: str = "event_timestamp"
     target_rows_per_fragment: int = 1_048_576
+    materialize_deletions: bool = True
+    materialize_deletions_threshold: float = MATERIALIZE_DELETIONS_THRESHOLD
+    compaction_mode: str = COMPACTION_MODE
     defer_index_remap: bool = False
     max_source_fragments: int | None = 256
     num_threads: int | None = None
@@ -163,11 +169,11 @@ class MaintenanceConfig:
             raise ValueError("max_source_fragments=0 is not supported; use None to disable the limit")
         candidates: dict[str, Any] = {
             "target_rows_per_fragment": self.target_rows_per_fragment,
-            "materialize_deletions": True,
-            "materialize_deletions_threshold": MATERIALIZE_DELETIONS_THRESHOLD,
+            "materialize_deletions": self.materialize_deletions,
+            "materialize_deletions_threshold": self.materialize_deletions_threshold,
             "max_source_fragments": self.max_source_fragments,
             "num_threads": self.num_threads,
-            "compaction_mode": COMPACTION_MODE,
+            "compaction_mode": self.compaction_mode,
         }
         if self.defer_index_remap:
             candidates["defer_index_remap"] = True
@@ -380,6 +386,24 @@ def compaction_metrics_dict(metrics: CompactionMetrics) -> dict[str, int]:
     }
 
 
+def validate_cleanup_horizon(config: MaintenanceConfig) -> None:
+    """Reject cleanup horizons that could race with a concurrent job.
+
+    Args:
+        config: Maintenance configuration carrying the cleanup horizon.
+
+    Raises:
+        ValueError: If ``cleanup_older_than_seconds`` is set below
+            :data:`MIN_CLEANUP_HORIZON_SECONDS`.
+    """
+    cleanup_horizon: int | None = config.cleanup_older_than_seconds
+    if cleanup_horizon is not None and cleanup_horizon < MIN_CLEANUP_HORIZON_SECONDS:
+        raise ValueError(
+            f"cleanup_older_than_seconds={cleanup_horizon} is below the safe floor of "
+            f"{MIN_CLEANUP_HORIZON_SECONDS}; cleanup horizons must exceed the longest concurrent job"
+        )
+
+
 def cleanup_dataset(
     uri: str, config: MaintenanceConfig, telemetry: Telemetry, dataset: lance.LanceDataset | None = None
 ) -> int:
@@ -410,21 +434,14 @@ def cleanup_dataset(
             :data:`MIN_CLEANUP_HORIZON_SECONDS`. The horizon must exceed the
             longest-running concurrent job so its rebase can still read old transaction files.
     """
-    if (
-        config.cleanup_older_than_seconds is not None
-        and config.cleanup_older_than_seconds < MIN_CLEANUP_HORIZON_SECONDS
-    ):
-        raise ValueError(
-            f"cleanup_older_than_seconds={config.cleanup_older_than_seconds} is below the safe floor of "
-            f"{MIN_CLEANUP_HORIZON_SECONDS}; cleanup horizons must exceed the longest concurrent job"
-        )
+    validate_cleanup_horizon(config)
     older_than: timedelta | None = (
         timedelta(seconds=config.cleanup_older_than_seconds) if config.cleanup_older_than_seconds is not None else None
     )
     if dataset is None:
         dataset = lance.dataset(uri, storage_options=config.storage_options)
     with telemetry.timed("dataset.cleanup_ms"):
-        stats = dataset.cleanup_old_versions(
+        stats: Any = dataset.cleanup_old_versions(
             older_than=older_than,
             retain_versions=config.retain_versions,
             error_if_tagged_old_versions=False,
@@ -433,6 +450,24 @@ def cleanup_dataset(
     telemetry.distribution("dataset.old_versions_removed", stats.old_versions)
     telemetry.incr("dataset.cleaned")
     return int(stats.bytes_removed)
+
+
+def cleanup_hot_dataset(uri: str, config: MaintenanceConfig, telemetry: Telemetry) -> dict[str, Any]:
+    """Clean versions created by same-run TTL work after compaction conflicts exhaust.
+
+    The cleanup opens the latest dataset version on its executor. It does not reuse any handle
+    from a conflicted compaction plan and does not attempt to commit those stale rewrites.
+
+    Args:
+        uri: Dataset URI whose compaction was deferred as hot.
+        config: Maintenance configuration.
+        telemetry: Telemetry facade for the current executor process.
+
+    Returns:
+        A result carrying the dataset URI and reclaimed byte count.
+    """
+    bytes_removed: int = cleanup_dataset(uri, config, telemetry)
+    return {"uri": uri, "bytes_removed": bytes_removed}
 
 
 def compaction_skip_reason(dataset: lance.LanceDataset) -> str | None:
@@ -580,7 +615,7 @@ def plan_one_dataset(
         result.update({"skipped": skip, "tasks": 0, "bytes_removed": bytes_removed})
         return result
 
-    plan = Compaction.plan(dataset, options=config.execute_options())
+    plan: Any = Compaction.plan(dataset, options=config.execute_options())
     task_jsons: list[str] = [task.json() for task in plan.tasks]
     if not task_jsons:
         bytes_removed = idle_cleanup_bytes(uri, config, telemetry, dataset, did_work, cleanup_slot)
@@ -727,6 +762,8 @@ class MaintenanceJob:
                 the rewrite raised, so the driver can isolate the failing dataset.
             """
             try:
+                uri: Any
+                rewrite_json: Any
                 uri, rewrite_json = execute_rewrite_task(item[0], item[1], item[2], storage_options)
                 return FLAT_OK, uri, rewrite_json
             except Exception as exc:
@@ -761,6 +798,8 @@ class MaintenanceJob:
                 One outcome dict per dataset, an error marker when the commit raised.
             """
             executor_telemetry: Telemetry = Telemetry.create(config.telemetry)
+            uri: Any
+            rewrite_jsons: Any
             for uri, rewrite_jsons in items:
                 try:
                     yield commit_one_dataset(uri, rewrite_jsons, config, executor_telemetry)
@@ -819,6 +858,7 @@ class MaintenanceJob:
             phase="plan",
         )
         planned: list[dict[str, Any]] = []
+        plan: Any
         for plan in plans:
             uri: str = plan["uri"]
             if round_index == 0:
@@ -843,6 +883,8 @@ class MaintenanceJob:
             len(flat_tasks),
         )
         with driver_telemetry.timed("run.rewrite_ms"):
+            rewrites_by_uri: Any
+            errors_by_uri: Any
             rewrites_by_uri, errors_by_uri = self.execute_fleet_tasks(spark, flat_tasks)
 
         commit_pairs: list[tuple[str, list[str]]] = []
@@ -860,6 +902,7 @@ class MaintenanceJob:
             commit_pairs.append((planned_uri, rewrites_by_uri.get(planned_uri, [])))
         outcomes: list[dict[str, Any]] = self.commit_fleet(spark, commit_pairs)
         conflicted: list[str] = []
+        outcome: Any
         for outcome in outcomes:
             uri = outcome["uri"]
             if outcome.get("conflict"):
@@ -905,14 +948,7 @@ class MaintenanceJob:
                 whole run rather than mark every dataset with the same error.
         """
         config: MaintenanceConfig = self.config
-        if (
-            config.cleanup_older_than_seconds is not None
-            and config.cleanup_older_than_seconds < MIN_CLEANUP_HORIZON_SECONDS
-        ):
-            raise ValueError(
-                f"cleanup_older_than_seconds={config.cleanup_older_than_seconds} is below the safe floor of "
-                f"{MIN_CLEANUP_HORIZON_SECONDS}; cleanup horizons must exceed the longest concurrent job"
-            )
+        validate_cleanup_horizon(config)
         driver_telemetry: Telemetry = Telemetry.create(config.telemetry)
         with driver_telemetry.span("lance.maintenance.run") as run_span:
             uris: list[str] = list(dataset_uris)
@@ -929,12 +965,14 @@ class MaintenanceJob:
             pending_uris: list[str] = uris
 
             if config.cluster_rewrite:
+                cluster_results: Any
                 cluster_results, pending_uris = maintenance_cluster.run_cluster_rewrites(
                     spark, uris, config, cutoff, driver_telemetry, cleanup_slot
                 )
                 results_by_uri.update(cluster_results)
 
             with driver_telemetry.timed("run.maintain_ms"):
+                round_index: Any
                 for round_index in range(REPLAN_BUDGET):
                     pending_uris = self.run_round(
                         spark,
@@ -949,6 +987,23 @@ class MaintenanceJob:
                     if not pending_uris:
                         break
 
+            did_work_hot_uris: list[str] = [
+                uri for uri in pending_uris if int(base_by_uri.get(uri, {}).get("ttl_rows_deleted", 0)) > 0
+            ]
+            cleanup_partitions: int = derive_partitions(spark, FANOUT_PARTITION_FACTOR)
+            hot_cleanup_outcomes: list[dict[str, Any]] = fan_out_per_dataset(
+                spark,
+                did_work_hot_uris,
+                config.telemetry,
+                lambda uri, telemetry: cleanup_hot_dataset(uri, config, telemetry),
+                cleanup_partitions,
+                phase="cleanup",
+            )
+            hot_cleanup_by_uri: dict[str, dict[str, Any]] = {
+                str(outcome["uri"]): outcome for outcome in hot_cleanup_outcomes
+            }
+
+            uri: Any
             for uri in pending_uris:
                 driver_telemetry.incr("dataset.hot_skipped")
                 logger.warning(
@@ -956,10 +1011,12 @@ class MaintenanceJob:
                     uri,
                     REPLAN_BUDGET,
                 )
+                cleanup_outcome: dict[str, Any] = hot_cleanup_by_uri.get(uri, {})
                 results_by_uri[uri] = {
                     **base_by_uri.get(uri, {}),
+                    **cleanup_outcome,
                     "uri": uri,
-                    "bytes_removed": 0,
+                    "bytes_removed": int(cleanup_outcome.get("bytes_removed", 0)),
                     "skipped": f"commit conflicted in all {REPLAN_BUDGET} re-plan rounds",
                 }
 

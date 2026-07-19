@@ -89,9 +89,12 @@ def parse_key_values(pairs: Sequence[str] | None) -> dict[str, str]:
         ValueError: If an argument is not in ``key=value`` form.
     """
     result: dict[str, str] = {}
+    pair: Any
     for pair in pairs or []:
         if "=" not in pair:
             raise ValueError(f"expected key=value, got {pair!r}")
+        key: Any
+        value: Any
         key, value = pair.split("=", 1)
         result[key] = value
     return result
@@ -370,10 +373,14 @@ def build_spark(app_name: str | None = None) -> SparkSession:
         An active SparkSession.
     """
     builder: SparkSession.Builder = SparkSession.builder.appName(app_name or APP_NAME)
+    pin_key: Any
+    pin_value: Any
     for pin_key, pin_value in SPARK_CORE_CONF_PINS.items():
         builder = builder.config(pin_key, pin_value)
     session: SparkSession = builder.getOrCreate()
-    explicit = session.sparkContext.getConf()
+    explicit: Any = session.sparkContext.getConf()
+    conf_key: Any
+    conf_value: Any
     for conf_key, conf_value in SPARK_CONF_DEFAULTS.items():
         if not explicit.contains(conf_key):
             session.conf.set(conf_key, conf_value)
@@ -511,8 +518,7 @@ def parse_tag_datetime(value: str) -> datetime:
     form, with or without timezone info. Naive datetimes are treated as UTC.
 
     Args:
-        value: An ISO 8601 datetime string, as templated by Airflow's
-            ``{{ data_interval_end | string }}`` or supplied by an operator.
+        value: An ISO 8601 datetime string supplied by a local caller.
 
     Returns:
         The parsed instant converted to UTC.
@@ -530,14 +536,13 @@ def parse_tag_datetime(value: str) -> datetime:
 
 
 def parse_window_tag(value: str) -> str:
-    """Convert an Airflow-rendered datetime string to a colon-free UTC interval tag.
+    """Convert an ISO 8601 datetime string to a colon-free UTC interval tag.
 
     The result is formatted as ``%Y%m%dT%H%M%SZ`` (e.g. ``"20260611T120000Z"``), the colon-free
     stamp used as the interval tag name throughout the pipeline.
 
     Args:
-        value: An ISO 8601 datetime string, as templated by Airflow's
-            ``{{ data_interval_end | string }}``.
+        value: An ISO 8601 datetime string supplied by a local caller.
 
     Returns:
         The tag name in ``%Y%m%dT%H%M%SZ`` format.
@@ -558,8 +563,7 @@ def parse_hour_tag(value: str) -> str:
     ``%Y%m%dT%H%M%SZ`` format the interval-tag pruning recognizes.
 
     Args:
-        value: An ISO 8601 datetime string, as templated by Airflow's
-            ``{{ data_interval_end | string }}`` or supplied by an operator.
+        value: An ISO 8601 datetime string supplied by a local caller.
 
     Returns:
         The truncated-hour tag name in ``%Y%m%dT%H%M%SZ`` format.

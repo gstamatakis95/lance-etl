@@ -1,11 +1,10 @@
 # AGENTS.md — Python package (`src/lance_etl/`)
 
-The repository-root `AGENTS.md` is the canonical rulebook. Its eight **Hard coding rules** (no
-leading underscores, no inline comments, complete type hints, ruff formatting and imports-at-top,
-executors-only heavy work, segment-API-only index builds, no raw SQL in the filter API, no stable
-row IDs) apply here in full and are not repeated. This file adds the Python-package specifics: the
-detailed layout, the pylance API ground truth, Python build and test commands, Python telemetry
-conventions, and the commit-retry constants.
+The repository-root `AGENTS.md` is the canonical rulebook. Its ten **Hard coding rules** apply here
+in full and are not repeated. This file adds the Python-package layout, pylance API ground truth,
+build and test commands, telemetry conventions, and commit-retry constants. The ninth rule makes
+the PostgreSQL-backed reconciler a local process. The tenth fixes the normalized configuration and
+publication model.
 
 The load-bearing Python rule is hard rule 6 (segment-API-only index builds). Its full per-type
 recipe for Vector / BTREE / BITMAP / ZONEMAP / FTS lives in the root `AGENTS.md`. The pylance API
@@ -19,61 +18,53 @@ architecture decisions, see `../../docs/adr/README.md`.
 ## Layout
 
 ```
-src/lance_etl/          Python package (production sources)
-  etl/                  ETL job package (python -m lance_etl.etl)
-    __init__.py         Re-exports: IcebergToLanceETL, ETLConfig, ROUTING_COLS, apply_merge, apply_ttl_cast, dataset_uri, derive_bulk_schemas, pivot_map_columns, plan_bulk_append, snapshot_id_bounds
-    cli.py              Entry point for lance-etl-etl script and python -m lance_etl.etl
-    __main__.py         Calls cli.main()
-    job.py              IcebergToLanceETL: read_increment, collapse, adaptive-plan routing (explicit N salted shuffle + partition sort), production-disabled bulk qualification path, streaming merge fan-out (merge_partition), hourly interval-tag stamp (stamp_interval_tags)
-    plan.py             ETLConfig-driven adaptive routing: RoutingPlan, compute_routing_plan (per-trio count aggregation), apply_salted_shuffle (big-dataset key-hash sub-bucketing), bucket_count/shuffle_partition_count sizing
-    bulk.py             Production-disabled bulk-append qualification path for big NEW or empty datasets. It remains testable through explicit ETLConfig opt-in until MUTATION-01 deletes the raw append path.
-    pivot.py            ETLConfig, ROUTING_COLS, pivot_map_columns (returns column roles, canonical vector dims), align_to_schema (null-fill/reorder/cast a slice to the driver-derived canonical schema), stream_routing_groups (streaming sorted-run group split), routing_stats_schema/routing_stats_ddl (shared with bulk.py), apply_fsl_cast, apply_ttl_cast
-    sink.py             The Lance sink seam: apply_merge, table_chunks, build_update_condition, dataset_uri (format 2.1 bootstrap, role writes), open_or_bootstrap (used by the bulk-append bootstrap)
-  indexing/             Indexing job package (python -m lance_etl.indexing)
-    __init__.py         Re-exports: LanceIndexer, IndexJobConfig, all handlers, segments, optimize helpers
-    cli.py              Entry point for lance-etl-index script and python -m lance_etl.indexing
-    __main__.py         Calls cli.main()
-    config.py           IndexJobConfig, METRIC_TO_DISTANCE, FTS_OPTIONAL_PARAMS, growth_exceeds_retrain_factor, index-name helpers
-    handlers.py         IndexHandler, VectorIndexHandler, BTreeIndexHandler, BitmapIndexHandler, ZonemapIndexHandler, FtsIndexHandler, commit_fts_index, publish_fts_index. Each handler exposes prepare / build_segment / merges().
-    optimize.py         load_vector_config, write_vector_config, optimize_existing_index, merge_index_deltas, maintain_index_locally
-    runner.py           LanceIndexer fleet phases: make_handler (kind -> IndexHandler dispatch), plan_dataset_indexes, bootstrap_vector_index (streaming k-means), persist_bootstrap_centroids, build_one_shard, commit_one_index, role-based target discovery
-    segments.py         build_vector_segment, build_scalar_segment, commit_segments, split_evenly, lance_field_id, stale-fragment guards
-  maintenance/          Maintenance job package (python -m lance_etl.maintenance)
-    __init__.py         Re-exports: MaintenanceJob, MaintenanceConfig, plan_one_dataset, commit_one_dataset, fan_out_per_dataset, update_serving_tag, and helpers
-    cli.py              Entry point for lance-etl-maintenance script and python -m lance_etl.maintenance
-    __main__.py         Calls cli.main()
-    job.py              MaintenanceJob fleet phases: plan_one_dataset, execute_rewrite_task, commit_one_dataset, cleanup_dataset, run_ttl_on_open_dataset, compaction_skip_reason (derived-state skip: dataset_stats num_fragments)
-    tools.py            update_serving_tag / update_serving_tags (both take tags: Sequence[str], default ("HEAD",), and flip every named tag in ONE dataset open), flip_one_tag, migrate_dataset_manifest_paths, migrate_manifest_paths, prune_interval_tags, prune_interval_tags_fleet
-    cluster.py          Internal clustered-rewrite qualification phases. Production maintenance exposes no CLI enablement and MaintenanceConfig defaults the path off.
-  pipeline/             Unified pipeline job package (python -m lance_etl.pipeline)
-    __init__.py         Re-exports: PipelineJob, PipelineConfig, prune_interval_tags, prune_interval_tags_fleet, stamp_eligible
-    cli.py              Entry point for lance-etl-pipeline script and python -m lance_etl.pipeline
-    __main__.py         Calls cli.main()
-    job.py              PipelineJob, PipelineConfig: prune -> maintenance -> index -> stamp serialized fleet phases. The temporary stamp phase writes interval tags only and never publishes HEAD.
-  tools/                Operator tools package (python -m lance_etl.tools)
-    __init__.py         Package marker
-    cli.py              Entry point for lance-etl-tools script and python -m lance_etl.tools
-    __main__.py         Calls cli.main()
-  cliutil.py            Shared CLI helpers: add_common_arguments, add_dataset_arguments, add_index_column_arguments, build_spark (memory-safe SQL defaults), build_telemetry_config, load_dataset_uris, parse_* helpers, run_cli_main (the shared per-job main shell reused by all five cli.py mains: parse, logging, dispatch, exit-code mapping)
-  column_roles.py       Column-role metadata (lance-etl.columns): load_column_roles, merge_column_roles
-  fanout.py             Shared Spark fleet helpers used by the maintenance, indexing, and operator-tool fleet phases: fan_out_per_dataset, run_fleet_fanout (single-phase driver shell: span, empty guard, timed fan-out, gauge, log), run_flat_tagged_job (flat parallelize/collect with per-dataset ok/error isolation, FLAT_OK/FLAT_ERROR markers), derive_partitions, TAG_FANOUT_PARTITIONS
-  recall/               Offline recall audit package (invoked via python -m lance_etl.tools recall)
-    __init__.py         Re-exports the externally-used set: RecallAuditJob, RecallJobConfig, RecallSample, RecallReport, DatadogSpanSource, InMemorySpanSource, plus the scoring, query-translation, and reporting helpers listed in __all__
-    config.py           RecallJobConfig, identifier/path allowlists, BM25 params, scanner batch size
-    source.py           SpanSource, DatadogSpanSource, InMemorySpanSource: fetch and parse recall.* span attributes into RecallSample
-    queries.py          filter_ast_to_sql, text_query_field_queries, tokenize_text, fuse_legs: span-to-query replay translation
-    scoring.py          brute_force_top_k, bm25_top_k, grade_against_reference, grade_hybrid_reference: recall@k/nDCG@k/MRR scoring
-    job.py              RecallAuditJob: two-tier Spark fan-out that scores every sample and renders the aggregate report
-  telemetry.py          Telemetry, TelemetryConfig, LanceRuntimeConfig, commit_with_retries
-  cloud_storage.py      resolve_filesystem + discover_datasets (driver walk or executor-fanned listing) for pyarrow filesystem I/O
-  iceberg_optimize.py   IcebergOptimizer + IcebergOptimizeConfig: source Iceberg table maintenance via CALL procedures (rewrite_data_files, rewrite_manifests, expire_snapshots, opt-in remove_orphan_files)
-  migrate_namespace.py  NamespaceMigrator + MigrateConfig: one-off namespace copy/optimize utility
+src/lance_etl/            Python package
+  reconciler/             Local PostgreSQL-backed control loop
+    cli.py                Installed lance-etl-reconcile command
+    config.py             Local process bootstrap and Spark settings
+    runtime.py            PostgreSQL, local Spark, worker, and prewarm wiring
+    service.py            One-shot and looping orchestration over durable state
+    iceberg.py            Spark Iceberg metadata adapter and baseline qualification
+    planning.py           Source-plan to PostgreSQL work mapping
+    workers.py            Fenced ingest, maintenance, indexing, validation, and publication
+    prewarm.py            Local executor-owned exact-version verification
+    retention.py          Publication and audit cleanup
+  state/                  PostgreSQL control plane
+    tables.py             SQLAlchemy Core metadata for the exact 14-table control plane
+    specs.py              Immutable field, ingestion, compaction, index, and publication policy
+    settings.py           PostgreSQL-owned local loop limits and retention bounds
+    types.py              Validated routing, source, plan, claim, status, and serving values
+    repository.py         Visible transactions, leases, cursors, and catalog publication
+  source/                 Iceberg source contract and side-effect-free planning
+    contract.py           Fixed table UUID and partition specification validation
+    lineage.py            Direct-parent snapshot chronology
+    manifests.py          Physical-change classification and touched-target discovery
+    planner.py            Pinned baseline and incremental window planning
+    scans.py              Exact Spark snapshot scan construction
+  etl/                    Reusable mutation and ingestion libraries
+    replay_sink.py        Source-sequenced replay-safe Lance merge
+    completion.py         Monotonic Lance completion marker
+    digest.py             Canonical mutation and source digests
+    mutation.py           Operation normalization and terminal mutation collapse
+    job.py                Legacy adaptive Spark ETL library
+    pivot.py              Map projection, schema alignment, and Arrow casts
+  indexing/               Segment-API index planning, build, commit, and maintenance libraries
+  maintenance/            TTL, compaction, cleanup, and tag libraries
+  publication/            Exact candidate manifests and publication workflow helpers
+  pipeline/               Legacy unified pipeline library retained for tests and reuse
+  recall/                 Offline recall audit libraries
+  tools/                  Uninstalled operator library CLI
+  cliutil.py              Shared local Spark and CLI helpers
+  telemetry.py            Datadog facade, Lance event bridge, and commit retries
+  cloud_storage.py        PyArrow filesystem resolution and dataset discovery
+  iceberg_optimize.py     Iceberg table maintenance library
+  migrate_namespace.py    Namespace copy and optimization library
 ```
 
 The `group_by_routing` sorted-run split is not a production symbol. It exists only as a test-only
 oracle in `tests/conftest.py`. Production streaming routing uses `stream_routing_groups`.
 
-### Adjacent Python trees
+### Adjacent trees
 
 ```
 bench/                  Benchmark package (python -m bench). See bench/README.md for the full guide.
@@ -92,11 +83,22 @@ bench/                  Benchmark package (python -m bench). See bench/README.md
   report.py             summary.md, recall.csv, results.csv, pareto.png aggregation
   grpc_client.py        gRPC stub helpers for the search legs
   results.py            Phase artifact I/O (save_phase, load_phase, read_json, write_json)
-airflow/
-  lance_etl_common.py          Shared fixed Spark and retry policy
-  lance_etl_reconciler_dag.py Sole serialized five-phase reconciler DAG
-tests/                  pytest suite (conftest.py + test_*.py)
+migrations/             Alembic environment and PostgreSQL revisions
+tests/                  pytest suite, including isolated-schema PostgreSQL tests
 ```
+
+The normalized PostgreSQL entity list and transaction boundaries are ADR 0042 in
+`../../docs/adr/postgresql-dataset-control-plane.md`. Runtime code must read an active immutable
+dataset specification revision by identity. The database carries typed columns for every supported
+data-path option. Do not introduce an untyped configuration document or a second scheduling state
+machine.
+
+Author configuration through the repository lifecycle APIs. A complete typed graph is inserted as
+DRAFT in one transaction, its digest is recomputed, and activation retires the former ACTIVE
+revision. Database triggers freeze ACTIVE and RETIRED parent, field, index, and option rows. Source
+defaults and dataset desired revisions must resolve to ACTIVE revisions. Assigning a different
+revision to materialized data creates deterministic REBUILD work. Optional Airflow environment
+context is copied to the claimed `dataset_work` row for audit only.
 
 ---
 
@@ -147,12 +149,9 @@ uv sync --locked --group dev --python 3.14.0
 # Install bench dependencies
 uv sync --locked --group dev --group bench --python 3.14.0
 
-# Install airflow dependencies (only needed to run tests/test_airflow_dags.py unskipped)
-uv sync --locked --group dev --group airflow --python 3.14.0
-
 # Lint and format (must pass before any commit)
-uvx ruff format src/ tests/ airflow/ bench/
-uvx ruff check src/ tests/ airflow/ bench/
+uvx ruff format src/ tests/ bench/ migrations/
+uvx ruff check src/ tests/ bench/ migrations/
 
 # Run tests
 .venv/bin/pytest -m "not integration"

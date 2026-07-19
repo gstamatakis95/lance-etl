@@ -218,6 +218,7 @@ def flip_one_tag(dataset: lance.LanceDataset, tag: str, version: int, telemetry:
     actual_created: bool = created
     last_exc: ValueError | None = None
     with telemetry.timed("dataset.tag_update_ms", tags=[f"tag:{tag}"]):
+        attempt: Any
         for attempt in range(MAX_TAG_RACE_ATTEMPTS):
             attempt_created: bool = created if attempt == 0 else tag not in dataset.tags.list()
             try:
@@ -395,14 +396,13 @@ def prune_interval_tags(
         telemetry: Telemetry facade for the current process.
 
     Returns:
-        A statistics dictionary with keys ``uri``, ``tags_pruned``, ``tags_kept``, and
-        optionally ``skipped`` when ``tag_keep_last`` is ``None`` (though callers
-        checking ``None`` should skip calling this function entirely).
+        A statistics dictionary with keys ``uri``, ``tags_pruned``, and ``tags_kept``.
     """
     dataset: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
     all_tags: list[str] = list(dataset.tags.list())
 
     interval_tags: list[tuple[datetime, str]] = []
+    name: Any
     for name in all_tags:
         try:
             parsed: datetime = datetime.strptime(name, "%Y%m%dT%H%M%SZ")

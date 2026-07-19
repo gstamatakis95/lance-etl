@@ -268,7 +268,7 @@ enough for manifests, and unreferenced data files are already 7-day protected.
 
 ## Verification results
 
-`tests/test_concurrent_coexistence.py` runs the three jobs as concurrent threads against one head dataset
+The former coexistence prototype ran the three jobs as concurrent threads against one head dataset
 (~191,000 final rows, dim 16, 16 merge_insert rounds mixing inserts, updates, and deletes) plus four tail
 datasets, using the production helpers directly: `apply_merge`, the tier-B plan/execute/commit triad with the
 re-plan loop, `compact_small_dataset`, the segment-API and FTS metadata-merge index paths, and

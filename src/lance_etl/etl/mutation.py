@@ -87,7 +87,7 @@ def normalize_operation(operation: str) -> str:
     Raises:
         ValueError: If the operation is unsupported.
     """
-    normalized = operation.strip().lower()
+    normalized: Any = operation.strip().lower()
     if normalized in UPSERT_OPERATIONS:
         return "upsert"
     if normalized in DELETE_OPERATIONS:
@@ -106,12 +106,12 @@ def materialize_post_image(payload: Mapping[str, Any], allowed_fields: Sequence[
         Dictionary containing every allowed field, with omitted fields set to null.
 
     Raises:
-        ValueError: If the payload contains a field outside the release profile.
+        ValueError: If the payload contains a field outside the dataset specification.
     """
-    allowed = frozenset(allowed_fields)
-    unknown = sorted(set(payload) - allowed)
+    allowed: Any = frozenset(allowed_fields)
+    unknown: Any = sorted(set(payload) - allowed)
     if unknown:
-        raise ValueError(f"payload contains fields outside the release profile: {unknown}")
+        raise ValueError(f"payload contains fields outside the dataset specification: {unknown}")
     return {field: payload.get(field) for field in allowed_fields}
 
 
@@ -135,10 +135,11 @@ def collapse_snapshot_mutations(
         ValueError: If a row carries an unsupported operation.
     """
     terminal_by_key: dict[tuple[tuple[str, str, str], str], TerminalMutation] = {}
+    row: Any
     for row in rows:
-        operation = normalize_operation(row.operation)
-        digest = canonical_event_digest(row.target, row.vector_id, operation, row.event_timestamp, row.payload)
-        terminal = TerminalMutation(
+        operation: Any = normalize_operation(row.operation)
+        digest: Any = canonical_event_digest(row.target, row.vector_id, operation, row.event_timestamp, row.payload)
+        terminal: Any = TerminalMutation(
             target=row.target,
             vector_id=row.vector_id,
             operation=operation,
@@ -148,8 +149,8 @@ def collapse_snapshot_mutations(
             source_sequence=source_sequence,
             event_digest=digest,
         )
-        key = row.target, row.vector_id
-        previous = terminal_by_key.get(key)
+        key: Any = row.target, row.vector_id
+        previous: Any = terminal_by_key.get(key)
         if previous is not None and previous.event_digest != digest:
             raise MutationConflict(
                 f"source snapshot has distinct unordered mutations for target={row.target!r}, "
@@ -171,8 +172,8 @@ def terminal_source_digest(rows: Iterable[TerminalMutation]) -> bytes:
     Raises:
         ValueError: If rows from different targets are mixed.
     """
-    materialized = list(rows)
-    targets = {row.target for row in materialized}
+    materialized: Any = list(rows)
+    targets: Any = {row.target for row in materialized}
     if len(targets) > 1:
         raise ValueError("source digest rows must belong to one target")
     return canonical_source_digest((row.vector_id, row.source_sequence, row.event_digest) for row in materialized)

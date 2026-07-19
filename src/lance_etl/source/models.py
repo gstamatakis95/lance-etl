@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any
 
 
 class WindowKind(StrEnum):
@@ -156,6 +157,7 @@ class SparkScanPlan:
     options: tuple[tuple[str, str], ...]
     target: TargetKey
     source_sequence: int
+    route_columns: tuple[str, str, str] = ("tenant_id", "namespace", "org_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,7 +187,7 @@ class SourcePlan:
         """
         if not self.windows:
             return None
-        first = self.windows[0]
+        first: Any = self.windows[0]
         if first.kind is WindowKind.BASELINE:
             return first.snapshot.snapshot_id
         return first.snapshot.parent_snapshot_id

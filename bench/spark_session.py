@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import sys
+from typing import Any
 
 from pyspark.sql import SparkSession
 
@@ -60,10 +61,12 @@ def build_spark(config: BenchConfig, app_name: str) -> SparkSession:
     """
     os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
     warehouse: str = ensure_dir(config.warehouse_dir()).resolve().as_uri()
-    builder = (
+    ivy_dir: str = str(ensure_dir(config.workspace / "ivy").resolve())
+    builder: Any = (
         SparkSession.builder.appName(app_name)
         .master(config.spark_master)
         .config("spark.jars.packages", config.iceberg_package)
+        .config("spark.jars.ivy", ivy_dir)
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
         .config(f"spark.sql.catalog.{config.catalog}", "org.apache.iceberg.spark.SparkCatalog")
         .config(f"spark.sql.catalog.{config.catalog}.type", "hadoop")

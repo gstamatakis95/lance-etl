@@ -77,6 +77,9 @@ pub mod metrics;
 pub mod recall;
 pub mod traces;
 
+#[cfg(test)]
+pub(crate) static TRACING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub use metrics::{
     CacheName, DatasetEvent, EvictionReason, FileAuditMode, FileAuditType, LanceIoType, Metrics, PrewarmIndexKind,
     PrewarmStatus, Rpc, StoreOp, Tier,

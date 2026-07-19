@@ -1,310 +1,359 @@
-# Production release and rollback
+# Local operation and release runbook
 
-Production runs only an image addressed by its OCI digest. The image is built from pinned base
-images with Cargo's lockfile and records the exact Git revision and Lance version in OCI labels.
-The release workflow also publishes an SPDX JSON SBOM, provenance attestation, vulnerability gate,
-and immutable release identity artifact.
+This project runs as local processes. PostgreSQL is the durable control plane. The Python
+reconciler creates and stops a local Spark session. The Rust search service is optional and starts
+directly when local search is needed.
 
-## Build and inspect locally
+## Prerequisites
 
-Use the repository toolchain and lockfiles. The Git revision build argument is required.
+- Python 3.14 and `uv`
+- Java compatible with the pinned PySpark release
+- Docker Compose or local PostgreSQL with `createdb`, `psql`, and `pg_isready`
+- `protoc` and Rust when running the optional search process
+- enough local storage for Iceberg, Lance, Spark scratch data, and index artifacts
 
-```bash
-GIT_REVISION=$(git rev-parse HEAD)
-docker build \
-  --file containers/search-api.Dockerfile \
-  --build-arg "GIT_REVISION=${GIT_REVISION}" \
-  --tag "lance-etl-search:git-${GIT_REVISION}" \
-  .
-docker inspect \
-  --format '{{index .Config.Labels "org.opencontainers.image.revision"}} {{index .Config.Labels "io.lance-etl.lance.version"}}' \
-  "lance-etl-search:git-${GIT_REVISION}"
-docker build \
-  --file containers/reconciler.Dockerfile \
-  --build-arg "GIT_REVISION=${GIT_REVISION}" \
-  --tag "lance-etl-reconciler:git-${GIT_REVISION}" \
-  .
-docker run --rm --entrypoint /opt/lance-etl/.venv/bin/python \
-  "lance-etl-reconciler:git-${GIT_REVISION}" \
-  -c "import importlib.metadata as m, pyspark, sys; print(sys.version.split()[0], pyspark.__version__, m.version('pylance'))"
-```
-
-The label output must be the current Git revision followed by `8.0.0`. The reconciler smoke output
-must be Python `3.14.0`, PySpark `4.0.1`, and pylance `8.0.0`. Its Spark jars directory includes
-`iceberg-spark-runtime-4.0_2.13:1.10.0` with SHA-256
-`0480f1248e0a8b50ae2a730d7ad3e1a727351c362ca63f4a0c35182087a49323`. The cluster must use the
-reconciler image by digest for driver and executors. No platform-supplied Spark or Iceberg runtime
-may shadow those locked artifacts.
-
-Release tags execute
-[the release workflow](../.github/workflows/release.yml), which refuses images with a fixed HIGH
-or CRITICAL vulnerability and records each registry digest. Never deploy a mutable image tag.
-
-## Install production configuration
-
-Create configuration and secrets before rendering the workload. The database role should have
-read access to the serving catalog only. Storage credentials should use the cluster workload
-identity rather than static environment variables.
+Install the locked Python environment:
 
 ```bash
-kubectl create configmap lance-etl-search \
-  --from-literal=lance-base-uri='s3://production-bucket/lance' \
-  --from-literal=jwt-issuer='https://identity.example.com/' \
-  --from-literal=jwt-audience='lance-etl-search' \
-  --from-literal=jwks-uri='https://identity.example.com/.well-known/jwks.json' \
-  --dry-run=client -o yaml | kubectl apply -f -
-kubectl create secret generic lance-etl-search \
-  --from-literal=database-url='postgresql://search@postgres.example.com/lance?sslmode=verify-full' \
-  --from-file=database-ca.pem="$DATABASE_CA_PATH" \
-  --from-file=tls.crt="$SEARCH_TLS_CERT_PATH" \
-  --from-file=tls.key="$SEARCH_TLS_KEY_PATH" \
-  --dry-run=client -o yaml | kubectl apply -f -
-kubectl create secret generic lance-etl-reconciler-admin \
-  --from-file=admin-token="$SEARCH_ADMIN_JWT_PATH" \
-  --dry-run=client -o yaml | kubectl apply -f -
-kubectl create secret generic lance-etl-search-client-ca \
-  --from-file=search-ca.pem="$SEARCH_SERVER_CA_PATH" \
-  --dry-run=client -o yaml | kubectl apply -f -
-kubectl create configmap lance-etl-reconciler \
-  --from-literal=lance-base-uri='s3://production-bucket/lance' \
-  --from-literal=source-table='production.vectors.events' \
-  --from-literal=environment='production' \
-  --dry-run=client -o yaml | kubectl apply -f -
-kubectl create secret generic lance-etl-reconciler-runtime \
-  --from-literal=database-url='postgresql+psycopg://reconciler@postgres.example.com/lance?sslmode=verify-full&sslrootcert=/var/run/secrets/lance-etl-reconciler/database-ca.pem' \
-  --from-file=database-ca.pem="$DATABASE_CA_PATH" \
-  --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -k deploy/reconciler
-kubectl apply \
-  -f deploy/search-api/service-account.yaml \
-  -f deploy/search-api/headless-service.yaml \
-  -f deploy/search-api/service.yaml \
-  -f deploy/search-api/pod-disruption-budget.yaml \
-  -f deploy/search-api/network-policy.yaml
+uv sync --locked --group dev --python 3.14.0
 ```
 
-The source catalog name is the first component of `source-table`. Supply its Iceberg catalog
-implementation and warehouse or REST settings through the deployment-owned Spark defaults. Do not
-accept those settings as a DAG-run parameter. Driver and executors must use the reconciler image's
-bundled Iceberg runtime instead of resolving Maven packages at job start.
+## Create PostgreSQL
 
-## Migrate the control plane
-
-Run Alembic once per release before starting search or allowing the reconciler DAG to claim work.
-The migration role is separate from the search read role and reconciler data role. Its URL uses
-psycopg, `sslmode=verify-full`, and the exact mounted CA path.
+The included Compose file starts only PostgreSQL:
 
 ```bash
-kubectl create secret generic lance-etl-migrator \
-  --from-literal=database-url='postgresql+psycopg://migrator@postgres.example.com/lance?sslmode=verify-full&sslrootcert=/var/run/secrets/lance-etl-migrator/database-ca.pem' \
-  --from-file=database-ca.pem="$DATABASE_CA_PATH" \
-  --dry-run=client -o yaml | kubectl apply -f -
-RECONCILER_IMAGE='ghcr.io/gstamatakis95/lance-etl-reconciler@sha256:RELEASE_DIGEST'
-MIGRATION_JOB=$(
-  sed "s|ghcr.io/gstamatakis95/lance-etl-reconciler@sha256:0\{64\}|${RECONCILER_IMAGE}|" \
-    deploy/control-plane/migration-job.yaml | kubectl create -f - -o name
-)
-kubectl wait --for=condition=complete --timeout=15m "$MIGRATION_JOB"
-kubectl logs "$MIGRATION_JOB"
+docker compose up -d postgres
+export LANCE_ETL_DATABASE_URL='postgresql+psycopg://lance_etl:lance_etl@localhost:5432/lance_etl'
+export PGHOST='localhost' PGPORT='5432' PGUSER='lance_etl' PGPASSWORD='lance_etl' PGDATABASE='lance_etl'
+docker compose ps
 ```
 
-Never run migration from each Spark task and never run multiple release migrations concurrently.
-Keep a verified PostgreSQL backup before migration. Database changes remain backward compatible
-with the previous application image for the rollback window. Image rollback does not downgrade the
-schema. A migration that cannot preserve that compatibility requires a separate expand, migrate,
-and contract release sequence with restore rehearsal.
+Or use an existing local installation:
 
-The zero digest in the checked-in manifests is a fail-closed placeholder. Substitute a verified
-release digest before applying either deployment. The workload runs as UID and GID 65532 with a
-read-only root filesystem, no service-account token, no Linux capabilities, bounded ephemeral
-volumes, and a 45 second termination window around the service's fixed 30 second drain. The 12 GiB
-cache volume is explicitly selected through `SEARCH_API_CACHE_DIR=/var/cache/search-api`. Public
-search is TLS-only on port 8080 and requires
-a JWT whose issuer, audience, signature, role, and target claims pass validation. PostgreSQL uses
-`sslmode=verify-full` with the mounted database CA. Startup, readiness, and liveness use the
-plaintext standard gRPC health service on private port 8081, which the public Service never exposes.
-Readiness follows catalog connectivity, JWKS health, and graceful drain state.
-The server certificate must cover the stable Service, canary Service, headless Service, and all
-three ordinal DNS names used by exact prewarm. Keep the signing CA available to reconciler and
-smoke-test clients.
+```bash
+createdb lance_etl
+export LANCE_ETL_DATABASE_URL='postgresql+psycopg://localhost/lance_etl'
+pg_isready
+```
 
-Stable serving uses three StatefulSet replicas with the fixed internal endpoints
-`lance-etl-search-0.lance-etl-search-internal:8080` through
-`lance-etl-search-2.lance-etl-search-internal:8080`. The headless Service publishes no public health
-port. The reconciler must prewarm every ordinal through TLS and admin JWT authorization before a
-catalog publication succeeds. Provide at least three eligible worker nodes. Hard hostname
-anti-affinity prevents two stable replicas from sharing one node, and zone spreading keeps failure
-domains balanced.
+Apply the single Alembic baseline through the installed command:
 
-Configure the Spark driver with
-[`deploy/reconciler/driver-pod-template.yaml`](../deploy/reconciler/driver-pod-template.yaml). The
-template fixes the ordered `LANCE_ETL_SEARCH_REPLICA_ENDPOINTS` list to those three TLS endpoints
-and mounts the admin JWT at the path named by `LANCE_ETL_SEARCH_ADMIN_TOKEN_PATH`. The reconciler
-reads that file afresh for every replica attempt, so projected Secret rotation does not require a
-process restart. `LANCE_ETL_SEARCH_CA_PATH` names the separately projected PEM trust root. Hostname
-verification remains enabled for every ordinal. The deployment-scoped token requires the `admin`
-role and `lance-etl:prewarm` scope. It intentionally carries no exact logical-target claims because
-one rotating fleet credential prewarms every fenced candidate. It must not be mounted into search
-pods or Spark executors. Each ordinal handles
-`/lance_etl.internal.v1.AdminService/PrewarmExact` locally and returns its stable replica identity
-plus resolved exact version. Publication fails until all three unique identities confirm the
-candidate URI and version.
+```bash
+uv run lance-etl-reconcile migrate
+```
 
-Replace the reconciler image's zero digest in the pod template with the verified digest from the
-reconciler release identity. Configure the Spark Kubernetes driver pod template and container
-image through the deployment-owned Spark connection. Executors use the same image digest but do
-not receive the admin-token volume.
+The migration creates exactly 14 application tables and seeds the singleton reconciler settings
+plus the bundled active dataset specification.
 
-The Airflow deployment fixes cluster deploy mode, the reconciler image digest, driver and executor
-pod-template paths, namespace, and service account. The checked-in application reads
-`LANCE_ETL_RECONCILER_IMAGE` only from the scheduler environment and rejects a value that is not a
-registry digest. It sets these Spark properties without exposing them as DAG or user parameters:
+Verify the table set:
+
+```bash
+psql lance_etl -Atc \
+  "SELECT tablename FROM pg_tables WHERE schemaname = current_schema() ORDER BY tablename"
+```
+
+Expected application tables:
 
 ```text
-spark.submit.deployMode=cluster
-spark.kubernetes.container.image=${LANCE_ETL_RECONCILER_IMAGE}
-spark.kubernetes.driver.podTemplateFile=/opt/lance-etl/deploy/reconciler/driver-pod-template.yaml
-spark.kubernetes.executor.podTemplateFile=/opt/lance-etl/deploy/reconciler/executor-pod-template.yaml
-spark.kubernetes.authenticate.driver.serviceAccountName=lance-etl-reconciler
+dataset_fields
+dataset_publications
+dataset_spec_revisions
+dataset_specs
+dataset_state
+dataset_work
+datasets
+fts_index_options
+iceberg_sources
+index_definitions
+publication_indexes
+reconciler_settings
+source_snapshots
+vector_index_options
 ```
 
-The driver template injects the PostgreSQL URL, Lance base URI, source table, environment,
-replica endpoints, search CA, and rotating admin JWT from deployment ConfigMaps and Secrets. The
-executor template receives only the immutable image, telemetry environment, writable temporary
-storage, and cloud workload identity needed by executor-side Iceberg and Lance work.
-Bind object-store workload identity to the `lance-etl-executor` ServiceAccount without granting it
-the driver's Kubernetes Role. The `lance-etl-reconciler` ServiceAccount is reserved for the Spark
-driver's bounded pod, Service, and ConfigMap lifecycle permissions.
+`alembic_version` is Alembic metadata and is not one of the 14 application entities.
 
-The Airflow Spark connection supplies the Kubernetes API master, namespace, and fixed cluster
-deploy mode. Its scheduler image must contain the repository at `/opt/lance-etl`, including both
-pod templates and `spark-submit` from the same lock. The production DAG has no params and no
-per-run configuration override.
-
-Server certificate and private-key projection also updates files in place. The search process
-loads those files at startup, so roll the StatefulSet after certificate rotation. JWKS signing-key
-rotation is discovered through the HTTPS JWKS document without mounting private identity-provider
-material.
-
-## Canary an image digest
-
-Set `IMAGE` to the exact image and registry digest from `release-identity.json`. The following
-command renders the canary without modifying the checked-in manifest.
+## Configure local paths
 
 ```bash
-IMAGE='ghcr.io/gstamatakis95/lance-etl-search@sha256:RELEASE_DIGEST'
-test "${IMAGE#*@sha256:}" != "$IMAGE"
-sed "s|ghcr.io/gstamatakis95/lance-etl-search@sha256:0\{64\}|${IMAGE}|" \
-  deploy/search-api/canary.yaml | kubectl apply -f -
-kubectl rollout status deployment/lance-etl-search-canary --timeout=15m
-kubectl port-forward service/lance-etl-search-canary 18080:8080
+mkdir -p .lance-etl/lance .lance-etl/iceberg
+export LANCE_ETL_LANCE_BASE_URI="$PWD/.lance-etl/lance"
+export LANCE_ETL_SOURCE_TABLE='local.db.events'
+export LANCE_ETL_SPARK_WAREHOUSE="$PWD/.lance-etl/iceberg"
+export LANCE_ETL_SPARK_MASTER='local[*]'
 ```
 
-From another shell, verify the registered service and run the release-owned authenticated smoke
-query against a non-sensitive test target. The search response must report the exact catalog
-`served_version`.
-
-Use a short-lived JWT scoped to the non-sensitive smoke target. The request file is a
-release-controlled valid search request for that same target. Verify that the response reports the
-expected exact `served_version`.
+The first run reads the actual Iceberg table UUID and creates the `iceberg_sources` registration.
+If the table already contains history, also set the exact retained baseline:
 
 ```bash
-python -m bench.smoke_client \
-  --endpoint 127.0.0.1:18080 \
-  --server-name "$SEARCH_TLS_SERVER_NAME" \
-  --ca-path "$SEARCH_SERVER_CA_PATH" \
-  --token-path "$SEARCH_CANARY_JWT_PATH" \
-  --request-path "$SEARCH_CANARY_REQUEST_PATH" \
-  --expected-version "$SEARCH_CANARY_EXPECTED_VERSION"
+export LANCE_ETL_CANONICAL_BASELINE_SNAPSHOT_ID='123456789'
 ```
 
-The smoke client reads the token file inside the process immediately before the RPC. The secret is
-never expanded into a command-line argument or printed in evidence.
+PostgreSQL becomes authoritative after registration. A later change to the table identity, source
+mapping, storage namespace, or baseline is rejected instead of silently changing an existing
+source.
 
-Hold the canary for the observation window. Compare request errors, deadlines, saturation, object
-store requests, cold latency, and recall against stable replicas. Delete the canary immediately on
-any regression.
+## Prepare the Iceberg source
 
-```bash
-kubectl delete -f deploy/search-api/canary.yaml --ignore-not-found
+The source table must exist before the first reconciliation cycle. The bundled specification uses
+this local Iceberg contract:
+
+```sql
+CREATE NAMESPACE IF NOT EXISTS local.db;
+
+CREATE TABLE local.db.events (
+    tenant_id STRING NOT NULL,
+    namespace STRING NOT NULL,
+    org_id STRING NOT NULL,
+    vector_id STRING NOT NULL,
+    op STRING NOT NULL,
+    event_timestamp TIMESTAMP NOT NULL,
+    processing_timestamp TIMESTAMP NOT NULL,
+    vectors MAP<STRING, ARRAY<FLOAT>> NOT NULL,
+    texts MAP<STRING, STRING> NOT NULL,
+    metadata MAP<STRING, STRING> NOT NULL,
+    ttl BIGINT
+) USING iceberg
+PARTITIONED BY (tenant_id, namespace, org_id, hours(processing_timestamp))
+TBLPROPERTIES ('format-version' = '2');
 ```
 
-Promote by applying the same verified digest to the stable manifest. Wait for every replica to
-become ready before ending the release window.
+Mutation values are `insert`, `update`, `upsert`, `delete`, `i`, `u`, or `d`, matched without case
+sensitivity. Map keys must match the active `dataset_fields` contract. Every non-delete row must
+carry each configured vector at its exact dimension. `ttl` is seconds and is required as a source
+column while the active specification includes the TTL field.
+
+## Inspect the dataset specification
+
+The bundled active revision is intentionally relational. Inspect it before the first substantial
+run:
 
 ```bash
-sed "s|ghcr.io/gstamatakis95/lance-etl-search@sha256:0\{64\}|${IMAGE}|" \
-  deploy/search-api/statefulset.yaml | kubectl apply -f -
-kubectl rollout status statefulset/lance-etl-search --timeout=20m
+psql lance_etl -c \
+  "SELECT s.name, r.revision_number, r.state, encode(r.configuration_digest, 'hex') AS digest
+   FROM dataset_specs AS s
+   JOIN dataset_spec_revisions AS r USING (spec_id)
+   ORDER BY s.name, r.revision_number"
 ```
 
-## Roll back the service image
-
-Kubernetes retains ten stable StatefulSet revisions. This command restores the immediately
-preceding image digest and waits for its private gRPC health checks.
+Inspect ingestion, compaction, index maintenance, and publication policy:
 
 ```bash
-kubectl rollout undo statefulset/lance-etl-search
-kubectl rollout status statefulset/lance-etl-search --timeout=20m
+psql lance_etl -x -c \
+  "SELECT ingest_shuffle_partitions, merge_rows_per_chunk, merge_batch_bytes,
+          write_rows_per_fragment, compaction_enabled, compaction_mode,
+          target_rows_per_fragment, max_source_fragments, compaction_threads,
+          defer_index_remap, materialize_deletions, materialize_deletions_threshold,
+          cleanup_older_than_seconds, retain_versions, fragments_per_index_task,
+          max_index_deltas, max_stale_replans, prewarm_required,
+          retained_publications, artifact_retention_seconds
+   FROM dataset_spec_revisions WHERE state = 'ACTIVE'"
 ```
 
-Confirm the resulting pod image is digest-addressed.
+Field and index configuration is under `dataset_fields`, `index_definitions`,
+`vector_index_options`, and `fts_index_options`. Do not edit an active revision in place. Insert and
+validate a complete DRAFT through `ControlPlaneRepository.create_draft_spec_revision`, promote it
+with `activate_spec_revision`, and assign existing datasets with `assign_dataset_spec_revision`.
+Use `set_source_default_spec` to select the named spec for newly discovered datasets. PostgreSQL
+freezes ACTIVE and RETIRED graphs. Assignment creates one deterministic REBUILD when the existing
+materialization carries another revision.
+
+Airflow is optional. If a local launch supplies `AIRFLOW_CTX_DAG_ID`, `AIRFLOW_CTX_DAG_RUN_ID`,
+`AIRFLOW_CTX_TASK_ID`, `AIRFLOW_CTX_MAP_INDEX`, and `AIRFLOW_CTX_TRY_NUMBER`, claims persist them on
+`dataset_work` as audit provenance. They do not affect work order or eligibility.
+
+## Run one cycle
 
 ```bash
-kubectl get pods -l app.kubernetes.io/name=lance-etl-search,app.kubernetes.io/track=stable \
-  -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.containerStatuses[0].imageID}{"\n"}{end}'
+uv run lance-etl-reconcile run-once
 ```
 
-## Roll back one serving catalog target
+The command:
 
-Catalog rollback never changes `ingest_lance_uri` and never updates PostgreSQL directly. The
-restricted repair command validates a retained successful SERVE or REBUILD publication and
-enqueues new PREWARM work containing its exact immutable URI, version, manifest, and digest. The
-ordinary reconciler then claims the work with a new lease and target fence, prewarms every required
-replica, and performs the normal catalog compare-and-swap. A busy target lane, mismatched target,
-or incomplete retained result is rejected before enqueue.
+1. validates the registered source and next direct-parent snapshot
+2. persists source evidence and deterministic dataset work
+3. claims bounded work with dataset fencing
+4. runs ingestion, compaction, indexing, validation, and local prewarm
+5. appends qualified publications and moves active pointers atomically
+6. performs bounded retention
 
-First list retained validated publications for the target. Read-only evidence selection may use a
-catalog replica.
+Run continuously when desired:
 
 ```bash
-psql "$LANCE_ETL_DATABASE_URL" -X -v ON_ERROR_STOP=1 -v target_id="$TARGET_ID" -c \
-  "SELECT work_id, candidate_lance_uri, indexed_lance_version, updated_at
-   FROM target_work
-   WHERE target_id = :'target_id'::uuid
-     AND state = 'SUCCEEDED'
-     AND kind IN ('SERVE', 'REBUILD')
-     AND artifact_manifest_uri IS NOT NULL
-     AND artifact_digest IS NOT NULL
-   ORDER BY updated_at DESC;"
+uv run lance-etl-reconcile run
 ```
 
-Validate the fully specified logical target first. The dry run parses and validates the restricted
-command without changing control state.
+Override only the local sleep interval for an interactive run:
 
 ```bash
-lance-etl-reconcile repair \
-  --action rollback \
-  --tenant-id "$TENANT_ID" \
-  --namespace "$NAMESPACE" \
-  --org-id "$ORG_ID" \
-  --retained-work-id "$RETAINED_WORK_ID" \
+uv run lance-etl-reconcile run --poll-seconds 10
+```
+
+The durable polling, claim, lease, retry, SLO, and cleanup defaults remain in
+`reconciler_settings`.
+
+## Status checks
+
+```bash
+uv run lance-etl-reconcile status
+```
+
+Inspect open work directly:
+
+```bash
+psql lance_etl -x -c \
+  "SELECT work_id, dataset_id, kind, phase, state, attempt_count,
+          launcher_kind, airflow_ctx_dag_id, airflow_ctx_dag_run_id,
+          airflow_ctx_task_id, airflow_ctx_map_index, airflow_ctx_try_number,
+          next_attempt_at, lease_expires_at, error_code
+   FROM dataset_work
+   WHERE state <> 'SUCCEEDED'
+   ORDER BY next_attempt_at, created_at"
+```
+
+Inspect source progress:
+
+```bash
+psql lance_etl -x -c \
+  "SELECT source_snapshot_seq, snapshot_id, parent_snapshot_id,
+          iceberg_sequence_number, kind, state, error_code, error_message
+   FROM source_snapshots
+   ORDER BY source_snapshot_seq DESC LIMIT 20"
+```
+
+Inspect serving routes:
+
+```bash
+psql lance_etl -x -c \
+  "SELECT d.tenant_id, d.namespace, d.org_id,
+          p.lance_uri, p.lance_version, p.published_at
+   FROM datasets AS d
+   JOIN dataset_state AS st USING (dataset_id)
+   JOIN dataset_publications AS p
+     ON p.dataset_id = st.dataset_id
+    AND p.publication_id = st.active_publication_id
+   ORDER BY d.tenant_id, d.namespace, d.org_id"
+```
+
+## Failure recovery
+
+### Retryable work
+
+Retryable failures enter `RETRY_WAIT` with bounded exponential backoff. The same work ID is reused
+and `attempt_count` increases. Expired running work becomes eligible for a fresh token and higher
+fence. Stale executors cannot complete after losing their token or dataset fence.
+
+### Blocked work
+
+Diagnose the stored error before reopening one explicit work row:
+
+```bash
+uv run lance-etl-reconcile repair \
+  --action retry-blocked \
+  --work-id WORK_UUID \
   --dry-run
-lance-etl-reconcile repair \
-  --action rollback \
-  --tenant-id "$TENANT_ID" \
-  --namespace "$NAMESPACE" \
-  --org-id "$ORG_ID" \
-  --retained-work-id "$RETAINED_WORK_ID"
+
+uv run lance-etl-reconcile repair \
+  --action retry-blocked \
+  --work-id WORK_UUID
 ```
 
-The second command returns the new work identity. Do not bypass the queue if it remains pending or
-retrying. Run the normal `run_due_target_work`, `reconcile_results`, and `emit_slo_status` phases or
-wait for the next scheduled reconciler cycle. Observe that work identity until it reaches
-`SUCCEEDED` and `PUBLISH`. A `BLOCKED` result requires operator diagnosis and a `RETRY_WAIT` result
-must retain its identity for ordinary retry.
+### Rebuild
 
-After success, resolve the logical target through every replica until each reports the restored
-exact version. Catalog caches can retain the prior validated tuple for at most their short
-propagation TTL. Keep the replaced publication pin and artifact manifest through the full rollback
-and audit horizon.
+Enqueue a deterministic rebuild for one route. `request-id` makes repeated operator invocation
+idempotent:
+
+```bash
+uv run lance-etl-reconcile repair \
+  --action rebuild \
+  --tenant-id TENANT \
+  --namespace NAMESPACE \
+  --org-id ORG \
+  --request-id REQUEST_UUID \
+  --dry-run
+```
+
+Remove `--dry-run` after confirming the route and request identity. Repair never edits the active
+publication pointer directly.
+
+### Crash after a Lance commit
+
+The reconciler compares PostgreSQL expected state with the Lance completion marker. A matching
+marker reconciles the result without replaying rows. A mismatched digest blocks rather than
+guessing.
+
+## Start local search
+
+Search is optional. Build it once:
+
+```bash
+cd rust/search-api
+cargo build --locked
+```
+
+Run it against the same database and Lance namespace:
+
+```bash
+SEARCH_API_LOCAL_MODE=true \
+LANCE_ETL_BASE_URI="$PWD/../../.lance-etl/lance" \
+LANCE_ETL_DATABASE_URL='postgresql://lance_etl:lance_etl@localhost/lance_etl' \
+SEARCH_API_TELEMETRY_DISABLED=true \
+cargo run --locked
+```
+
+The service resolves the active URI and exact version from PostgreSQL. Search listens only on
+loopback in local mode.
+
+## Retention and cleanup
+
+Retention is conservative. It protects:
+
+- every active publication
+- candidates referenced by open work
+- the source replay floor required by unfinished snapshots
+- the historical publication count required by the frozen dataset specification
+- evidence younger than artifact and audit horizons
+
+Lance version cleanup must never use a zero horizon or unverified deletion while concurrent writers
+may exist. Do not reuse a retired dataset URI for unrelated content without clearing every URI-keyed
+cache generation.
+
+## Validation before release
+
+```bash
+uvx ruff format src/ tests/ bench/ migrations/
+uvx ruff check src/ tests/ bench/ migrations/
+.venv/bin/pytest -m "not integration"
+```
+
+Run PostgreSQL tests against a disposable local database:
+
+```bash
+createdb lance_etl_test
+LANCE_ETL_TEST_DATABASE_URL='postgresql+psycopg://localhost/lance_etl_test' \
+  .venv/bin/pytest tests/test_state_postgres.py tests/test_postgres_queue_load.py
+```
+
+Run the full local data path in a fresh process so Spark loads the Iceberg runtime at JVM startup:
+
+```bash
+LANCE_ETL_TEST_DATABASE_URL='postgresql+psycopg://localhost/lance_etl_test' \
+  .venv/bin/pytest tests/test_local_e2e.py -x -q -m integration
+```
+
+Validate Rust independently:
+
+```bash
+cd rust/search-api
+cargo fmt --check
+cargo clippy --locked -- -D warnings
+cargo test --locked
+```
+
+## Backup boundary
+
+Back up PostgreSQL and the Iceberg and Lance storage directories together when a reproducible local
+snapshot is needed. PostgreSQL is serving truth, but immutable publication rows refer to exact Lance
+objects. Restoring only one side does not recreate a consistent publication.

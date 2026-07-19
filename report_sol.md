@@ -1,5 +1,9 @@
 # Autonomous production implementation runbook
 
+> Historical implementation input. This runbook is no longer authoritative. Use `AGENTS.md`,
+> `README.md`, and ADR 0042 for the current local PostgreSQL-backed design. Airflow, Kubernetes,
+> CI workflows, and remote deployment surfaces described below have been removed.
+
 Status: complete implementation specification and durable restart context
 
 Audit date: 2026-07-14

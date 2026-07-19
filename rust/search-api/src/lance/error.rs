@@ -190,10 +190,14 @@ mod tests {
 
     #[test]
     fn emitted_logs_never_contain_raw_uri_or_engine_detail() {
+        let tracing_guard = crate::telemetry::TRACING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let writer = CaptureWriter(bytes.clone());
         let subscriber = tracing_subscriber::fmt().with_writer(move || writer.clone()).finish();
         tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
             classify_lance_error(&lance::Error::dataset_not_found(
                 "s3://secret-bucket/private-target.lance",
                 "private detail".into(),
@@ -207,5 +211,6 @@ mod tests {
         assert!(output.contains("error_class=\"internal\""));
         assert!(!output.contains("secret-bucket"));
         assert!(!output.contains("private detail"));
+        drop(tracing_guard);
     }
 }

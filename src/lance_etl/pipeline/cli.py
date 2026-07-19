@@ -50,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--log-level", default="INFO")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers: Any = parser.add_subparsers(dest="command", required=True)
 
     run_parser: argparse.ArgumentParser = subparsers.add_parser(
         "run",
@@ -73,9 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         type=parse_window_tag,
         help=(
-            "Airflow-rendered datetime or ISO 8601 string (e.g. '2026-06-11 12:00:00+00:00') that is converted "
-            "to a colon-free UTC interval tag name (e.g. '20260611T120000Z') and written after a successful run. "
-            "Omit to skip the stamp phase."
+            "ISO 8601 datetime (e.g. '2026-06-11 12:00:00+00:00') converted to a colon-free UTC interval tag "
+            "name (e.g. '20260611T120000Z') and written after a successful run. Omit to skip the stamp phase."
         ),
     )
     run_parser.add_argument(
@@ -105,7 +104,7 @@ def run_run(args: argparse.Namespace) -> int:
     Returns:
         The number of datasets that failed in isolation, ``0`` when all succeeded.
     """
-    spark = build_spark()
+    spark: Any = build_spark()
 
     def work() -> int:
         """Load the fleet, run the four pipeline phases, and return the failed-dataset count."""

@@ -10,6 +10,7 @@ from lance_etl.etl.digest import canonical_event_digest, canonical_source_digest
 from lance_etl.etl.mutation import (
     MutationConflict,
     MutationInput,
+    TerminalMutation,
     collapse_snapshot_mutations,
     materialize_post_image,
     terminal_source_digest,
@@ -39,10 +40,12 @@ def mutation(payload: dict[str, object], operation: str = "update") -> MutationI
 
 def test_event_digest_is_stable_across_mapping_order() -> None:
     """Mapping insertion order does not change immutable event identity."""
-    first = mutation({"text": "hello", "metadata": {"b": "2", "a": "1"}})
-    second = mutation({"metadata": {"a": "1", "b": "2"}, "text": "hello"})
-    first_digest = canonical_event_digest(first.target, first.vector_id, "upsert", first.event_timestamp, first.payload)
-    second_digest = canonical_event_digest(
+    first: MutationInput = mutation({"text": "hello", "metadata": {"b": "2", "a": "1"}})
+    second: MutationInput = mutation({"metadata": {"a": "1", "b": "2"}, "text": "hello"})
+    first_digest: bytes = canonical_event_digest(
+        first.target, first.vector_id, "upsert", first.event_timestamp, first.payload
+    )
+    second_digest: bytes = canonical_event_digest(
         second.target, second.vector_id, "upsert", second.event_timestamp, second.payload
     )
     assert first_digest == second_digest
@@ -51,7 +54,7 @@ def test_event_digest_is_stable_across_mapping_order() -> None:
 
 def test_event_digest_rejects_naive_timestamp_and_non_finite_vector() -> None:
     """Ambiguous timestamps and non-finite numeric values fail before mutation writes."""
-    row = mutation({"vector": [1.0]})
+    row: MutationInput = mutation({"vector": [1.0]})
     with pytest.raises(ValueError, match="timezone-aware"):
         canonical_event_digest(
             row.target, row.vector_id, "upsert", row.event_timestamp.replace(tzinfo=None), row.payload
@@ -62,13 +65,14 @@ def test_event_digest_rejects_naive_timestamp_and_non_finite_vector() -> None:
 
 def test_exact_duplicates_collapse_across_one_hundred_retries() -> None:
     """Repeated exact delivery converges to one terminal mutation and one source digest."""
-    rows = [mutation({"text": "same"}) for attempt in range(100)]
-    terminal = collapse_snapshot_mutations(rows, window_seq=7, source_sequence=91)
+    rows: list[MutationInput] = [mutation({"text": "same"}) for attempt in range(100)]
+    terminal: list[TerminalMutation] = collapse_snapshot_mutations(rows, window_seq=7, source_sequence=91)
     assert len(terminal) == 1
     assert terminal[0].source_sequence == 91
-    expected = terminal_source_digest(terminal)
+    expected: bytes = terminal_source_digest(terminal)
+    replay_rows: list[MutationInput]
     for replay_rows in [rows] * 100:
-        replay = collapse_snapshot_mutations(replay_rows, window_seq=7, source_sequence=91)
+        replay: list[TerminalMutation] = collapse_snapshot_mutations(replay_rows, window_seq=7, source_sequence=91)
         assert terminal_source_digest(replay) == expected
 
 
@@ -84,8 +88,8 @@ def test_distinct_same_snapshot_mutations_block() -> None:
 
 def test_later_snapshot_source_sequence_is_delivery_order() -> None:
     """A later snapshot produces a greater source sequence even with older event time."""
-    first = collapse_snapshot_mutations([mutation({"text": "first"})], 1, 10)[0]
-    older_time = MutationInput(
+    first: TerminalMutation = collapse_snapshot_mutations([mutation({"text": "first"})], 1, 10)[0]
+    older_time: MutationInput = MutationInput(
         tenant_id=first.target[0],
         namespace=first.target[1],
         org_id=first.target[2],
@@ -94,7 +98,7 @@ def test_later_snapshot_source_sequence_is_delivery_order() -> None:
         event_timestamp=datetime(2020, 1, 1, tzinfo=UTC),
         payload={"text": "correction"},
     )
-    later = collapse_snapshot_mutations([older_time], 2, 11)[0]
+    later: TerminalMutation = collapse_snapshot_mutations([older_time], 2, 11)[0]
     assert later.source_sequence > first.source_sequence
     assert later.event_timestamp < first.event_timestamp
     assert later.event_digest != first.event_digest
@@ -106,23 +110,23 @@ def test_complete_post_image_nulls_omissions_and_rejects_unknown_fields() -> Non
         "text": "value",
         "category": None,
     }
-    with pytest.raises(ValueError, match="outside the release profile"):
+    with pytest.raises(ValueError, match="outside the dataset specification"):
         materialize_post_image({"surprise": 1}, ["text"])
 
 
 def test_source_digest_is_partition_and_input_order_independent() -> None:
     """Terminal tuple ordering does not change the durable source digest."""
-    first = b"a" * 32
-    second = b"b" * 32
-    forward = canonical_source_digest([("z", 2, second), ("a", 2, first)])
-    reverse = canonical_source_digest([("a", 2, first), ("z", 2, second)])
+    first: bytes = b"a" * 32
+    second: bytes = b"b" * 32
+    forward: bytes = canonical_source_digest([("z", 2, second), ("a", 2, first)])
+    reverse: bytes = canonical_source_digest([("a", 2, first), ("z", 2, second)])
     assert forward == reverse
 
 
 def test_source_digest_rejects_mixed_targets() -> None:
     """One target digest cannot accidentally include another target's mutation."""
-    first = collapse_snapshot_mutations([mutation({"text": "first"})], 1, 1)[0]
-    other = MutationInput(
+    first: TerminalMutation = collapse_snapshot_mutations([mutation({"text": "first"})], 1, 1)[0]
+    other: MutationInput = MutationInput(
         tenant_id="other",
         namespace="namespace",
         org_id="org",
@@ -131,6 +135,6 @@ def test_source_digest_rejects_mixed_targets() -> None:
         event_timestamp=datetime(2026, 7, 14, tzinfo=UTC),
         payload={},
     )
-    second = collapse_snapshot_mutations([other], 1, 1)[0]
+    second: TerminalMutation = collapse_snapshot_mutations([other], 1, 1)[0]
     with pytest.raises(ValueError, match="one target"):
         terminal_source_digest([first, second])

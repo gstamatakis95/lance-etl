@@ -5,14 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from lance_etl.state import WorkClaim, WorkPhase
+from lance_etl.state import PublicationEvidence, WorkClaim, WorkPhase
 
 
 class ResultKind(StrEnum):
     """Closed set of worker outcomes understood by the reconciler."""
 
     INGEST_SUCCEEDED = "INGEST_SUCCEEDED"
-    SERVE_SUCCEEDED = "SERVE_SUCCEEDED"
+    PUBLISH_SUCCEEDED = "PUBLISH_SUCCEEDED"
     PHASE_ADVANCED = "PHASE_ADVANCED"
     RETRY = "RETRY"
     BLOCKED = "BLOCKED"
@@ -30,8 +30,9 @@ class WorkResult:
     source_row_count: int | None = None
     source_digest: bytes | None = None
     candidate_lance_uri: str | None = None
-    artifact_manifest_uri: str | None = None
-    artifact_digest: bytes | None = None
+    manifest_uri: str | None = None
+    manifest_digest: bytes | None = None
+    publication_evidence: PublicationEvidence | None = None
     error_code: str | None = None
     error_message: str | None = None
 
@@ -45,7 +46,7 @@ class WorkResult:
             ValueError: If required exact outputs are absent or malformed.
         """
         if self.kind is ResultKind.INGEST_SUCCEEDED:
-            accepted = (
+            accepted: bool = (
                 self.data_lance_version is not None
                 and self.data_lance_version > 0
                 and self.source_row_count is not None
@@ -55,19 +56,21 @@ class WorkResult:
             )
             if not accepted:
                 raise ValueError("INGEST success requires exact Lance version, row count, and 32-byte source digest")
-        elif self.kind is ResultKind.SERVE_SUCCEEDED:
-            accepted = (
+        elif self.kind is ResultKind.PUBLISH_SUCCEEDED:
+            accepted: bool = (
                 self.indexed_lance_version is not None
                 and self.indexed_lance_version > 0
                 and bool(self.candidate_lance_uri)
-                and bool(self.artifact_manifest_uri)
-                and self.artifact_digest is not None
-                and len(self.artifact_digest) == 32
+                and bool(self.manifest_uri)
+                and self.manifest_digest is not None
+                and len(self.manifest_digest) == 32
+                and self.publication_evidence is not None
             )
             if not accepted:
                 raise ValueError(
-                    "SERVE success requires candidate URI, exact indexed version, and immutable artifact evidence"
+                    "PUBLISH success requires candidate URI, exact version, manifest, and publication evidence"
                 )
+            self.publication_evidence.validate()
         elif self.kind is ResultKind.PHASE_ADVANCED and self.next_phase is None:
             raise ValueError("phase advancement requires next_phase")
         elif self.kind in (ResultKind.RETRY, ResultKind.BLOCKED) and not self.error_code:

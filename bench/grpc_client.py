@@ -8,7 +8,7 @@ reflection, which would make the benchmark depend on the server having reflectio
 ``SearchService`` contract exercised by the benchmark.
 
 Every request addresses a logical ``DatasetTarget`` built by :func:`dataset_target`. The service resolves its exact
-URI, Lance version, and release profile through the serving catalog. The public client cannot select storage paths,
+URI and exact Lance version through the serving catalog. The public client cannot select storage paths,
 versions, tags, index execution knobs, or administrative cache operations.
 """
 
@@ -105,7 +105,7 @@ def open_stub(config: BenchConfig, pb2_grpc: ModuleType, timeout_seconds: float 
         raise RuntimeError(f"cannot read search CA file at {config.search_ca_path}") from error
     if not trusted_ca:
         raise RuntimeError(f"search CA file is empty at {config.search_ca_path}")
-    channel = grpc.secure_channel(config.endpoint, grpc.ssl_channel_credentials(root_certificates=trusted_ca))
+    channel: Any = grpc.secure_channel(config.endpoint, grpc.ssl_channel_credentials(root_certificates=trusted_ca))
     try:
         grpc.channel_ready_future(channel).result(timeout=timeout_seconds)
     except grpc.FutureTimeoutError as error:
@@ -177,6 +177,7 @@ def load_expected_versions(config: BenchConfig) -> dict[str, int]:
             f"got {sorted(str(key) for key in raw)}"
         )
     versions: dict[str, int] = {}
+    org: Any
     for org in config.org_ids():
         value: object = raw[target_key(org)]
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -253,7 +254,7 @@ def text_query(pb2: ModuleType, terms: str, columns: tuple[str, ...] = ("text",)
     Returns:
         The populated message.
     """
-    query = pb2.TextQuery(simple=terms)
+    query: Any = pb2.TextQuery(simple=terms)
     query.columns.extend(columns)
     return query
 
@@ -277,6 +278,7 @@ def result_vector_ids(results: Any) -> np.ndarray:
     ids: list[int] = []
     malformed: list[str] = []
     total: int = 0
+    result: Any
     for result in results:
         try:
             ids.append(int(result.vector_id))
@@ -335,11 +337,13 @@ def vector_search(
     Returns:
         Response and client-side latency in milliseconds.
     """
-    request = pb2.VectorSearchRequest(
+    request: Any = pb2.VectorSearchRequest(
         target=dataset_target(pb2, org_id),
         query=vector_query(pb2, query),
         k=k,
     )
+    response: Any
+    elapsed_ms: Any
     response, elapsed_ms = timed_call(stub.VectorSearch, request, authorization_metadata(config, org_id))
     validate_served_version(response, org_id, expected_version)
     return response, elapsed_ms
@@ -368,11 +372,13 @@ def text_search(
     Returns:
         Response and client-side latency in milliseconds.
     """
-    request = pb2.TextSearchRequest(
+    request: Any = pb2.TextSearchRequest(
         target=dataset_target(pb2, org_id),
         query=text_query(pb2, terms),
         k=k,
     )
+    response: Any
+    elapsed_ms: Any
     response, elapsed_ms = timed_call(stub.TextSearch, request, authorization_metadata(config, org_id))
     validate_served_version(response, org_id, expected_version)
     return response, elapsed_ms
@@ -403,12 +409,14 @@ def hybrid_search(
     Returns:
         Response and client-side latency in milliseconds.
     """
-    request = pb2.HybridSearchRequest(
+    request: Any = pb2.HybridSearchRequest(
         target=dataset_target(pb2, org_id),
         vector=vector_query(pb2, query),
         text=text_query(pb2, terms),
         k=k,
     )
+    response: Any
+    elapsed_ms: Any
     response, elapsed_ms = timed_call(stub.HybridSearch, request, authorization_metadata(config, org_id))
     validate_served_version(response, org_id, expected_version)
     return response, elapsed_ms

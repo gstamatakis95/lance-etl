@@ -1,9 +1,14 @@
 # Market research: operating Lance at 30k-org power-law scale
 
-Research basis for evolving the lance-etl pipeline, where ingestion (merge_insert upserts and deletes),
-compaction (plan, execute, commit, version cleanup), and indexing (segment-API builds plus incremental
-maintenance) must coexist against the same datasets. Each namespace holds up to 30,000 orgs and up to 1 billion
-rows, power-law distributed: most orgs are tiny while a small head holds most of the data.
+Research basis for the local PostgreSQL-backed lance-etl pipeline, where ingestion (`merge_insert`
+upserts and deletes), compaction, and segment-API indexing coexist against the same datasets. The
+research models up to 30,000 organizations and one billion rows under a power-law distribution.
+Most datasets are tiny while a small head contains most rows.
+
+ADR 0042 is the current control-plane decision. Older research references to scheduler queues or
+fixed code configuration are historical evidence only. The implementation now stores first-class
+datasets, exact source snapshots, durable work, immutable publications, and normalized dataset
+specification revisions in PostgreSQL. The local reconciler creates and stops Spark directly.
 
 All lance `path:line` citations were spot-verified against the read-only checkout at
 `/Users/gstamatakis/IdeaProjects/lance` and found accurate.
@@ -40,18 +45,19 @@ for evidence and the full verdict per item.
    turns every dataset open from O(version_count) LIST requests into one LIST (or a HEAD with the version-hint
    file). UUID fragment names already self-distribute across S3 partitions, so no prefix sharding is needed.
 
-2. Adopt tag-based blue/green serving (yes-now). Keep a `prod` tag per dataset, validate the freshly
-   ingested-plus-indexed version, then `tags.update("prod", new_version)` for an O(1) atomic cutover. The gRPC
-   service opens `version="prod"`, and tagged versions are exempt from cleanup, protecting the live snapshot.
+2. Publish exact versions through PostgreSQL (implemented). Validate the freshly ingested and indexed
+   candidate, append immutable publication evidence, then compare-and-swap the dataset state's active-publication
+   pointer. The gRPC service opens that exact URI and version. Lance tags remain retention pins and compatibility
+   mirrors, not serving authority.
 
 3. Correct the cleanup horizon understanding (yes-now). The low-level `cleanup_old_versions` default is 14
    days, not 7 (`dataset.py:2934-2936`). Keep the horizon longer than the longest head-org job, set
    `delete_rate_limit` on the fleet to dodge S3 503s, never use older_than=0 or delete_unverified with
    concurrent writers, and tag reproducibility versions.
 
-4. Drive incremental orchestration with the CDF API (yes-now). `Dataset.delta()` exposes inserted/updated rows
-   per version in pylance, so Airflow/Dagster can materialize only changed rows since the last run instead of
-   full scans. Confirms our DAG should schedule compute, not do row-level work in operators (rule #5).
+4. Drive incremental reconciliation from durable source identity (implemented). PostgreSQL stores exact Iceberg
+   source snapshots and per-dataset cursors. The local process materializes only dataset work discovered from the
+   pinned snapshot manifests instead of deriving progress from wall-clock scheduler intervals.
 
 5. Tune the search service for S3 throughput (yes-now, benchmark first). Raise LANCE_IO_THREADS toward 128-256
    with proportionally larger io_buffer_size in the Rust prewarm and disk_cache paths, and adopt
@@ -62,13 +68,12 @@ for evidence and the full verdict per item.
    concurrent jobs need no DynamoDB. Reserve `s3+ddb://` only for older S3-compatible stores lacking conditional
    put, and remember S3 CRR does not replicate the DynamoDB commit store.
 
-7. Stable row ids plus the Fragment Reuse Index are the structural endgame (later). New datasets should set
-   `enable_stable_row_ids` so future compaction needs no index remap, removing most compact-vs-index contention.
-   Blocked on migrating 30K datasets and on the distributed `Compaction.commit` binding that still discards
-   `defer_index_remap` (`python/src/dataset/optimize.rs:567`).
+7. Stable row ids were investigated and rejected (ADR 0010). The tested combination of merge, delete, and
+   concurrent compaction violates the row-id index invariant. Do not enable them without a fresh ADR and new
+   upstream evidence.
 
 8. WeRide and Harvey are our two closest production analogues (validation). WeRide's weekly/monthly scheduled
-   re-indexing over growing sensor embeddings maps to our compaction-plus-index DAG cadence, and Harvey's
+   re-indexing over growing sensor embeddings maps to our reconciler's maintenance cadence, and Harvey's
    sub-2-second P50 metadata-filtered search on 15 M rows validates the typed Filter AST direction (rule #7).
 
 ## Top 10 takeaways (round 1)
@@ -85,7 +90,7 @@ for evidence and the full verdict per item.
    `CompactionOptions::default()`), so every distributed compaction commit remaps covering indexes inline.
    Until fixed upstream, serialize compact and index per dataset on the large tier.
 
-4. Reordering the DAG to etl >> compact >> index removes inline remap cost for fresh data, because the planner
+4. Ordering dataset work as ingest, compact, then index removes inline remap cost for fresh data, because the planner
    flushes a bin whenever the covering-index set changes (`optimize.rs:676-695`) and uncovered fragments merge
    freely. Verify against lancedb issue #2751 (which recommends the opposite order for the OSS client) in e2e.
 
@@ -108,12 +113,11 @@ for evidence and the full verdict per item.
    head-org job, never use `cleanup_older_than=0` or `delete_unverified=true` with concurrent writers, and tag
    versions needed for reproducibility. Unmanaged versions reach terabytes in production.
 
-9. Enforce per-(dataset, index-name) mutual exclusion in the orchestrator. Same-name CreateIndex commits are
+9. Enforce per-(dataset, index-name) mutual exclusion in the PostgreSQL dataset lane. Same-name CreateIndex commits are
    retryable conflicts (`conflict_resolver.rs:502-536`) where the loser's entire build is silently discarded,
    and a blind index-commit retry after a rewrite conflict can publish segments pointing at compacted-away
    fragments. Rebuild stale segments before recommitting.
 
-10. Move-stable row ids are the structural endgame. With them compaction needs no index remapping at all
-    (`needs_remapping = !uses_stable_row_ids && !defer_index_remap`, `optimize.rs:1893`), removing the
-    remap problem, the binding gap, and most compact-versus-index contention. Deferred only because it
-    requires migrating 30k existing datasets and a verification pass on the pinned build.
+10. Move-stable row ids looked attractive in the initial research because they remove compaction remapping.
+    Subsequent qualification rejected them after finding an overlapping-chunk invariant failure under merge,
+    delete, and concurrent compaction. ADR 0010 is authoritative.

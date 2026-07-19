@@ -57,7 +57,6 @@ impl<B: ExactPrewarmer> AdminService for AdminGrpc<B> {
         let route = ServingRoute {
             lance_uri: request.candidate_lance_uri.clone(),
             lance_version: request.candidate_lance_version,
-            profile_id: "internal-prewarm".to_owned(),
         };
         let report = self
             .backend

@@ -1,56 +1,64 @@
-# Iceberg time partitioning and the reconciler
+# Date partitioning in the local reconciler
 
-Production does not create one Lance dataset per date and does not pass date windows through
-Airflow. Iceberg owns time partitioning. Lance owns one durable dataset per logical target.
+## Source partition contract
 
-## Source layout
+The registered Iceberg source uses route partition fields for tenant, namespace, and organization.
+It may also carry an hour transform for physical pruning. The exact configured route-column names
+come from `iceberg_sources`, not from a command-line flag.
 
-The accepted Iceberg partition order is:
+The source adapter validates the active Iceberg partition specification before planning work. A
+partition-spec change is blocked because manifest routing and exact-snapshot qualification depend on
+that contract.
 
-1. `tenant_id`
-2. `namespace`
-3. `org_id`
-4. `hours(processing_timestamp)`
+## Event time is not source progress
 
-The hour transform is a pruning key. `event_timestamp` remains the query and TTL clock. The
-reconciler reads manifest partition values to discover touched logical targets and hours, then
-executes a scan pinned to an exact Iceberg snapshot or direct parent-to-child snapshot pair.
+The dataset specification contains exactly one `EVENT_TIME` field. Event time drives search ranges
+and optional TTL expiration. It does not define which source data has been processed.
 
-## Why Airflow has no date parameters
+Source progress uses:
 
-Wall-clock intervals cannot prove which Iceberg files or deletes belong to an immutable source
-generation. They also make manual retries dependent on the time at which a task is rerun. The
-single production DAG therefore exposes only five closed actions and has no `start`, `end`,
-`partition-by`, dataset-list, or backfill parameters.
+- exact Iceberg snapshot ID
+- direct parent snapshot ID
+- Iceberg sequence number
+- partition specification ID
+- operation and commit evidence
 
-Catch-up is durable and cursor-free. `plan_and_enqueue_window` compares the newest recorded source
-window with the current pinned Iceberg head. It enqueues a bounded prefix of direct descendants.
-Repeated runs enqueue the same immutable identities, then continue until the durable tip reaches
-the pinned head.
+Snapshot IDs are opaque identities. The reconciler never builds a source interval by sorting IDs or
+by comparing wall-clock times.
 
-## Retention
+## Planning touched datasets
 
-`gate_source_retention` reports the oldest unfinished source window. For an append window the
-retained floor is its direct parent snapshot, because that parent is required by the exact
-incremental scan. A blocked INGEST keeps the floor. A serving retry does not keep source retention
-after source application has completed.
+For each qualified snapshot transition, the local reconciler reads manifest partition values to
+discover affected `(tenant_id, namespace, org_id)` routes. It creates deterministic ingest work only
+for those datasets. An hour partition may improve pruning but does not become a dataset identity or
+a durable cursor.
 
-Iceberg snapshot expiration must consume this decision. It must not infer a cutoff from Airflow's
-execution date. Destructive orphan removal remains a separately authorized maintenance operation.
+## Reading one transition
 
-## Query-time date filtering
+Spark uses exact snapshot ID bounds. Timestamp options are first resolved through Iceberg metadata
+when a library operation needs them. The production reconciliation path already has exact IDs from
+`source_snapshots` and does not translate a scheduled time window.
 
-Date and time ranges remain logical predicates over `event_timestamp`. The release profile builds
-the required scalar and zone-map time indexes. The search service combines its typed time range
-with any typed filter expression. Physical Iceberg hour partitions do not leak into the search
-API.
+## Search date ranges
 
-## Backfill and replay
+The gRPC search request may carry a `TimeRange` with optional start and end milliseconds. The Rust
+service converts it to a typed predicate on the specification's fixed event-time target column. The
+start bound is inclusive and the end bound is exclusive.
 
-Use a retained canonical Iceberg snapshot for first startup. The baseline qualifier scans that
-exact snapshot on executors, validates the release schema, computes canonical mutation digests,
-and rejects more than one distinct mutation per target and `vector_id`.
+Time filtering stays within the one resolved dataset and exact publication version. There is no
+date-based dataset fan-out.
 
-After startup, do not launch date-specific DAGs. Restore the required Iceberg ancestry when it was
-expired, then let the reconciler advance direct snapshot lineage. Target work is idempotent under
-its deterministic identity, lease token, target fence, source digest, and Lance completion marker.
+## TTL interaction
+
+When the active spec contains a `TTL` field, maintenance computes expiry from event time plus the TTL
+duration. Deletion materialization then follows the revision's `materialize_deletions` and
+`materialize_deletions_threshold` settings. Source snapshot retention remains independent of TTL.
+
+## Validation checklist
+
+- Confirm the registered route-column mapping matches the Iceberg table.
+- Confirm the active partition spec is the one stored in qualified source evidence.
+- Confirm the dataset spec event-time field maps to the intended source column.
+- Confirm snapshot lineage is direct and complete from the canonical baseline.
+- Confirm range queries use typed bounds and the event-time scalar index.
+- Never use an hourly schedule label as a replay or publication identity.

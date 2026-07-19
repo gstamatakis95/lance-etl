@@ -176,7 +176,7 @@ Keep:
 - `tests/test_recall_scoring.py:204,287,332`, `tests/test_index_maintenance.py:121`,
   `tests/test_schema_evolution.py:40`, `tests/test_compaction_replan.py:113` — add the flag where compaction is
   exercised.
-- `tests/test_concurrent_coexistence.py:914-915` — owned by another agent right now; coordinate to add the flag
+- The former concurrent-writer stress prototype was retired when PostgreSQL dataset lanes made that race unsupported.
   to its dataset bootstrap.
 
 ## 4. What becomes deletable vs. what must stay

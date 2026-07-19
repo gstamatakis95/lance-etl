@@ -10,7 +10,13 @@ from lance_etl.source.errors import SourcePlanningError
 from lance_etl.source.models import SnapshotRecord, SparkScanPlan, TargetKey, WindowKind
 
 
-def build_spark_scan(table: str, snapshot: SnapshotRecord, kind: WindowKind, target: TargetKey) -> SparkScanPlan:
+def build_spark_scan(
+    table: str,
+    snapshot: SnapshotRecord,
+    kind: WindowKind,
+    target: TargetKey,
+    route_columns: tuple[str, str, str] = ("tenant_id", "namespace", "org_id"),
+) -> SparkScanPlan:
     """Build a deterministic target scan for one exact baseline or parent-to-snapshot increment.
 
     Args:
@@ -18,6 +24,7 @@ def build_spark_scan(table: str, snapshot: SnapshotRecord, kind: WindowKind, tar
         snapshot: Immutable source snapshot.
         kind: Accepted source window kind.
         target: Target filter applied after Iceberg manifest pruning.
+        route_columns: Physical tenant, namespace, and organization column names.
 
     Returns:
         Frozen Spark read options and typed target filter.
@@ -26,7 +33,7 @@ def build_spark_scan(table: str, snapshot: SnapshotRecord, kind: WindowKind, tar
         SourcePlanningError: If an append lacks a direct parent or maintenance is requested as data.
     """
     if kind is WindowKind.BASELINE:
-        options = (("snapshot-id", str(snapshot.snapshot_id)),)
+        options: tuple[tuple[str, str], ...] = (("snapshot-id", str(snapshot.snapshot_id)),)
     elif kind is WindowKind.APPEND:
         if snapshot.parent_snapshot_id is None:
             raise SourcePlanningError("append source window requires a direct parent snapshot")
@@ -36,7 +43,7 @@ def build_spark_scan(table: str, snapshot: SnapshotRecord, kind: WindowKind, tar
         )
     else:
         raise SourcePlanningError("trusted maintenance windows do not produce Spark data scans")
-    return SparkScanPlan(table, options, target, snapshot.sequence_number)
+    return SparkScanPlan(table, options, target, snapshot.sequence_number, route_columns)
 
 
 def execute_spark_scan(spark: Any, plan: SparkScanPlan) -> Any:
@@ -49,13 +56,19 @@ def execute_spark_scan(spark: Any, plan: SparkScanPlan) -> Any:
     Returns:
         Filtered Spark DataFrame carrying the window's internal source sequence.
     """
-    reader = spark.read.format("iceberg")
+    reader: Any = spark.read.format("iceberg")
+    key: Any
+    value: Any
     for key, value in plan.options:
         reader = reader.option(key, value)
-    frame = reader.load(plan.table)
-    target_filter = (
-        (col("tenant_id") == lit(plan.target.tenant_id))
-        & (col("namespace") == lit(plan.target.namespace))
-        & (col("org_id") == lit(plan.target.org_id))
+    frame: Any = reader.load(plan.table)
+    tenant_column: str
+    namespace_column: str
+    org_column: str
+    tenant_column, namespace_column, org_column = plan.route_columns
+    target_filter: Any = (
+        (col(tenant_column) == lit(plan.target.tenant_id))
+        & (col(namespace_column) == lit(plan.target.namespace))
+        & (col(org_column) == lit(plan.target.org_id))
     )
     return frame.where(target_filter).withColumn("lance_etl_source_sequence", lit(plan.source_sequence))

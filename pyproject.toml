@@ -5,7 +5,7 @@ requires-python = ">=3.12"
 dependencies = [
     "pylance==8.0.0",
     "pyarrow>=23",
-    "pyspark>=4.1",
+    "pyspark==4.0.1",
     "pandas>=2.2.0",
     "numpy",
     "datadog",
@@ -17,7 +17,6 @@ dependencies = [
 
 [project.scripts]
 lance-etl-reconcile = "lance_etl.reconciler.cli:main"
-lance-etl-tools = "lance_etl.tools.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -29,7 +28,6 @@ packages = ["src/lance_etl"]
 [dependency-groups]
 dev = ["pytest", "ruff"]
 bench = ["matplotlib", "grpcio", "grpcio-tools", "opentelemetry-proto"]
-airflow = ["apache-airflow>=3.3.0", "apache-airflow-providers-apache-spark>=6.2.0"]
 
 [tool.ruff]
 line-length = 120

@@ -11,13 +11,11 @@ pub struct ServingRoute {
     pub lance_uri: String,
     /// Exact committed Lance version that may be served.
     pub lance_version: u64,
-    /// Code-owned product profile selecting server-side execution policy.
-    pub profile_id: String,
 }
 
 /// Resolves a validated logical target to its exact published serving tuple.
 #[async_trait]
 pub trait ServingCatalog: Send + Sync + 'static {
-    /// Returns the exact URI, version, and product profile currently published for `target`.
+    /// Returns the exact URI and version currently published for `target`.
     async fn resolve(&self, target: &DatasetTarget) -> Result<ServingRoute, SearchError>;
 }

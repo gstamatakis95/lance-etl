@@ -7,9 +7,10 @@ use std::time::Duration;
 
 use search_api::catalog::PostgresServingCatalog;
 use search_api::config::Config;
+use search_api::domain::DatasetTarget;
 use search_api::grpc::admin::AdminGrpc;
 use search_api::grpc::admission::AdmissionController;
-use search_api::grpc::auth::JwtAuthorizer;
+use search_api::grpc::auth::{JwtAuthorizer, RequestAuthorizer, RequiredRole};
 use search_api::grpc::{RouteTimeoutLayer, SearchGrpc};
 use search_api::internal_pb::admin_service_server::AdminServiceServer;
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
@@ -17,6 +18,7 @@ use search_api::pb::search_service_server::SearchServiceServer;
 use search_api::telemetry::{self, Metrics, RecallCapture};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic::{Status, metadata::MetadataMap};
 use tonic_health::ServingStatus;
 use tonic_tracing_opentelemetry::middleware::filters::reject_healthcheck;
 use tonic_tracing_opentelemetry::middleware::server::OtelGrpcLayer;
@@ -91,8 +93,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.block_on(serve(config))
 }
 
-/// Runs the async service body on the already-built runtime: wires telemetry, provider, backend,
-/// and transport, then serves TLS search and plaintext health on separate listeners.
+struct LocalAuthorizer;
+
+#[async_trait::async_trait]
+impl RequestAuthorizer for LocalAuthorizer {
+    async fn authorize(
+        &self,
+        metadata: &MetadataMap,
+        target: &DatasetTarget,
+        required_role: RequiredRole,
+    ) -> Result<(), Status> {
+        let _ = (metadata, target, required_role);
+        Ok(())
+    }
+}
+
+/// Runs the async service body on the already-built runtime and serves search plus health.
 async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(if config.telemetry_disabled {
         Metrics::disabled()
@@ -100,24 +116,34 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         Metrics::dogstatsd(&config.statsd_addr)
     });
     let telemetry_guard = telemetry::init_tracing(config.telemetry_disabled, metrics.clone());
-    let addr: SocketAddr = ([0, 0, 0, 0], config.port).into();
-    let health_addr: SocketAddr = ([0, 0, 0, 0], search_api::config::DEFAULT_HEALTH_PORT).into();
-    let catalog = Arc::new(PostgresServingCatalog::connect(&config.database_url, &config.database_ca_path).await?);
-    let authorizer = Arc::new(
-        JwtAuthorizer::connect(
-            config.jwt_issuer.clone(),
-            config.jwt_audience.clone(),
-            config.jwks_uri.clone(),
-        )
-        .await?,
-    );
+    let bind_ip = if config.local_mode {
+        [127, 0, 0, 1]
+    } else {
+        [0, 0, 0, 0]
+    };
+    let addr: SocketAddr = (bind_ip, config.port).into();
+    let health_addr: SocketAddr = (bind_ip, search_api::config::DEFAULT_HEALTH_PORT).into();
+    let database_ca_path = (!config.local_mode).then_some(config.database_ca_path.as_path());
+    let catalog = Arc::new(PostgresServingCatalog::connect(&config.database_url, database_ca_path).await?);
+    let (authorizer, readiness_authorizer): (Arc<dyn RequestAuthorizer>, Option<Arc<JwtAuthorizer>>) =
+        if config.local_mode {
+            tracing::warn!("explicit local mode enabled, binding plaintext unauthenticated gRPC to loopback");
+            (Arc::new(LocalAuthorizer), None)
+        } else {
+            let jwt_authorizer = Arc::new(
+                JwtAuthorizer::connect(
+                    config.jwt_issuer.clone(),
+                    config.jwt_audience.clone(),
+                    config.jwks_uri.clone(),
+                )
+                .await?,
+            );
+            (jwt_authorizer.clone(), Some(jwt_authorizer))
+        };
     let admission = Arc::new(AdmissionController::new(
         search_api::config::DEFAULT_GLOBAL_SEARCH_CONCURRENCY,
         search_api::config::DEFAULT_PER_TENANT_SEARCH_CONCURRENCY,
     )?);
-    let certificate = tokio::fs::read(&config.tls_cert_path).await?;
-    let private_key = tokio::fs::read(&config.tls_key_path).await?;
-    let tls = ServerTlsConfig::new().identity(Identity::from_pem(certificate, private_key));
     let provider = CachingDatasetProvider::with_catalog_and_telemetry(&config, catalog.clone(), metrics.clone()).await;
     if let Some(janitor) = provider.janitor(&config) {
         janitor.spawn(std::time::Duration::from_secs(
@@ -135,8 +161,14 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let search_listener = tokio::net::TcpListener::bind(addr).await?;
     let health_listener = tokio::net::TcpListener::bind(health_addr).await?;
     tracing::info!(address = %addr, health_address = %health_addr, "search-api listening");
-    let server_builder = Server::builder()
-        .tls_config(tls)?
+    let mut server_builder = Server::builder();
+    if !config.local_mode {
+        let certificate = tokio::fs::read(&config.tls_cert_path).await?;
+        let private_key = tokio::fs::read(&config.tls_key_path).await?;
+        let tls = ServerTlsConfig::new().identity(Identity::from_pem(certificate, private_key));
+        server_builder = server_builder.tls_config(tls)?;
+    }
+    let server_builder = server_builder
         .concurrency_limit_per_connection(search_api::config::DEFAULT_CONCURRENCY_LIMIT_PER_CONNECTION)
         .max_concurrent_streams(search_api::config::DEFAULT_MAX_CONCURRENT_STREAMS);
     let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
@@ -169,7 +201,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut readiness_task = tokio::spawn(monitor_readiness(
         catalog,
-        authorizer,
+        readiness_authorizer,
         health_reporter.clone(),
         shutdown_receiver,
     ));
@@ -179,7 +211,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             health_task.abort();
             readiness_task.abort();
             result??;
-            return Err(std::io::Error::other("TLS search server stopped before shutdown").into());
+            return Err(std::io::Error::other("search server stopped before shutdown").into());
         }
         result = &mut health_task => {
             search_task.abort();
@@ -231,10 +263,10 @@ async fn wait_for_shutdown(mut receiver: tokio::sync::watch::Receiver<bool>) {
     }
 }
 
-/// Keeps readiness synchronized with catalog and JWKS health until drain begins.
+/// Keeps readiness synchronized with catalog and optional JWKS health until drain begins.
 async fn monitor_readiness(
     catalog: Arc<PostgresServingCatalog>,
-    authorizer: Arc<JwtAuthorizer>,
+    authorizer: Option<Arc<JwtAuthorizer>>,
     reporter: tonic_health::server::HealthReporter,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -247,7 +279,11 @@ async fn monitor_readiness(
                 }
             }
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                let status = if catalog.health().await.is_ok() && authorizer.health().await.is_ok() {
+                let authentication_healthy = match &authorizer {
+                    Some(authorizer) => authorizer.health().await.is_ok(),
+                    None => true,
+                };
+                let status = if catalog.health().await.is_ok() && authentication_healthy {
                     ServingStatus::Serving
                 } else {
                     ServingStatus::NotServing
@@ -260,11 +296,11 @@ async fn monitor_readiness(
 
 /// Resolves when the process receives SIGTERM or ctrl-c (SIGINT), starting the graceful drain.
 ///
-/// Kubernetes (and most process supervisors) deliver SIGTERM on deploy or scale-down. Wiring the
-/// signal into `serve_with_shutdown` lets tonic stop accepting new requests while in-flight
-/// requests complete, and the explicit `drop(telemetry_guard)` afterwards flushes the tracer
-/// provider so drain-window spans are exported instead of lost. A SIGTERM handler that cannot be
-/// installed degrades to ctrl-c handling alone with a warning, never a startup failure.
+/// Process supervisors deliver SIGTERM when stopping a service. Wiring the signal into
+/// `serve_with_shutdown` lets tonic stop accepting new requests while in-flight requests complete,
+/// and the explicit `drop(telemetry_guard)` afterwards flushes the tracer provider so drain-window
+/// spans are exported instead of lost. A SIGTERM handler that cannot be installed degrades to
+/// ctrl-c handling alone with a warning, never a startup failure.
 async fn shutdown_signal() {
     tokio::select! {
         _ = terminate_signal() => {},

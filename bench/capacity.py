@@ -25,7 +25,9 @@ def command_output(arguments: list[str], cwd: Path) -> str | None:
         Stripped stdout or null when unavailable.
     """
     try:
-        result = subprocess.run(arguments, cwd=cwd, check=True, capture_output=True, text=True, timeout=10)
+        result: subprocess.CompletedProcess[str] = subprocess.run(
+            arguments, cwd=cwd, check=True, capture_output=True, text=True, timeout=10
+        )
     except (OSError, subprocess.SubprocessError):
         return None
     return result.stdout.strip() or None
@@ -38,10 +40,14 @@ def memory_bytes() -> int | None:
         Physical bytes or null when the platform exposes no supported query.
     """
     if platform.system() == "Darwin":
-        value = command_output(["sysctl", "-n", "hw.memsize"], Path.cwd())
-        return int(value) if value is not None else None
-    page_size = os.sysconf("SC_PAGE_SIZE") if "SC_PAGE_SIZE" in os.sysconf_names else None
-    page_count = os.sysconf("SC_PHYS_PAGES") if "SC_PHYS_PAGES" in os.sysconf_names else None
+        value: str | None = command_output(["sysctl", "-n", "hw.memsize"], Path.cwd())
+        if value is not None:
+            return int(value)
+    try:
+        page_size: int | None = os.sysconf("SC_PAGE_SIZE") if "SC_PAGE_SIZE" in os.sysconf_names else None
+        page_count: int | None = os.sysconf("SC_PHYS_PAGES") if "SC_PHYS_PAGES" in os.sysconf_names else None
+    except (OSError, ValueError):
+        return None
     return int(page_size * page_count) if page_size is not None and page_count is not None else None
 
 
@@ -69,11 +75,12 @@ def capacity_artifact(config: BenchConfig) -> dict[str, Any]:
     Returns:
         JSON-compatible capacity and workload evidence.
     """
-    disk = shutil.disk_usage(config.workspace.parent if config.workspace.parent.exists() else Path.cwd())
-    repository = Path(__file__).resolve().parent.parent
-    commit = command_output(["git", "rev-parse", "HEAD"], repository)
-    dirty = command_output(["git", "status", "--porcelain", "--untracked-files=no"], repository)
-    workload = asdict(config)
+    disk: Any = shutil.disk_usage(config.workspace.parent if config.workspace.parent.exists() else Path.cwd())
+    repository: Path = Path(__file__).resolve().parent.parent
+    commit: str | None = command_output(["git", "rev-parse", "HEAD"], repository)
+    dirty: str | None = command_output(["git", "status", "--porcelain", "--untracked-files=no"], repository)
+    workload: dict[str, Any] = asdict(config)
+    name: Any
     for name in ("workspace", "corpus_root", "results_root"):
         workload[name] = str(workload[name])
     return {

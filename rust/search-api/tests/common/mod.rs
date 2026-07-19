@@ -52,7 +52,6 @@ impl FakeServingCatalog {
             route: ServingRoute {
                 lance_uri: lance_uri.into(),
                 lance_version,
-                profile_id: search_api::config::PRODUCTION_PROFILE_ID.to_string(),
             },
             calls: AtomicU64::new(0),
         }
@@ -292,6 +291,7 @@ pub async fn build_indexed_dataset(uri: &str) {
 /// optimized paths that bypass them).
 pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) -> Config {
     Config {
+        local_mode: false,
         base_uri: format!("file-object-store://{}", dataset_root.display()),
         database_url: "postgresql://unused/test".to_string(),
         database_ca_path: "/tmp/search-api-test-database-ca.pem".into(),

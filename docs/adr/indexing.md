@@ -59,7 +59,8 @@ calls plain `create_index` or an unsharded `create_scalar_index` build (the sole
 exception is ADR 0030's streaming bootstrap, which carries an explicit rotation and stores its
 config). The pre-unification small tier showed how an in-process build path corrupts vector
 indexes by pairing deltas with mismatched models. Enforcement lives in AGENTS.md hard rule 6,
-the unified runner being the only entry point, and the coexistence suite.
+the unified runner being the only entry point, focused segment-API tests, and the local reconciler
+end-to-end test.
 
 Second, role discovery covers all three roles. When no explicit column lists are configured,
 every `vector` role column gets an IVF_RQ index, every `scalar` role column (pivoted from the

@@ -1,6 +1,6 @@
 # AGENTS.md — Rust search service (`rust/search-api/`)
 
-The repository-root `AGENTS.md` is the canonical rulebook. Its eight **Hard coding rules** apply
+The repository-root `AGENTS.md` is the canonical rulebook. Its ten **Hard coding rules** apply
 here in full. For Rust the relevant ones are rule 2 (`///` doc comments only on public items, no
 `//` inline comments in production code paths), rule 7 (no raw SQL strings in the filter API), and
 rule 8 (no stable row IDs). This file adds the service specifics: the crate layout, cargo commands,
@@ -62,8 +62,8 @@ rust/search-api/        Rust gRPC search service (tonic, lance crate)
 ## Build, test, lint
 
 `build.rs` compiles the proto via `tonic_prost_build`, which requires `protoc` on PATH. Install the
-protobuf compiler before building (`apt-get install protobuf-compiler` on the CI runner, `brew
-install protobuf` locally). Without it `cargo build`/`clippy`/`test` fail in the build script.
+protobuf compiler before building (`apt-get install protobuf-compiler` on Debian or `brew install
+protobuf` on macOS). Without it `cargo build`/`clippy`/`test` fail in the build script.
 
 ```bash
 cd rust/search-api
@@ -99,12 +99,12 @@ them together with three coupled things:
 The persistent caches (and Lance's own session caches plus the open-handle LRU) key immutable
 metadata by `(store prefix, object path)` with no etag or generation binding. A dataset that is
 dropped and recreated at the same `{org}/{tenant}/{namespace}` URI restarts version numbering, so
-its new `_versions/1.manifest` collides with the cached manifest of the dead dataset and replicas
-can serve phantom fragments for up to the 7-day cache TTL. Do not build or propose flows that
-delete a dataset and recreate it at the same URI. Replace a dataset by writing the successor under
-a new `namespace` segment and flipping traffic to it. If a URI absolutely must be reused, every
-replica's cache generation has to be wiped first (clear `SEARCH_API_CACHE_DIR`, or flush the Redis
-namespace). See the matching invariant in `README.md`.
+its new `_versions/1.manifest` collides with the cached manifest of the dead dataset and a local
+search process can serve phantom fragments for up to the 7-day cache TTL. Do not build or propose
+flows that delete a dataset and recreate it at the same URI. Replace a dataset by writing the
+successor under a new `namespace` segment and flipping traffic to it. If a URI absolutely must be
+reused, every local cache generation has to be wiped first. Clear `SEARCH_API_CACHE_DIR` or flush
+the Redis namespace. See the matching invariant in `README.md`.
 
 ---
 
@@ -157,9 +157,11 @@ variable table. These finer-grained normative facts are recorded here so they ar
   `SEMANTIC_PRIORITY`, and `LEXICAL_PRIORITY`. The service maps them to fixed code-owned fusion
   policy. It never accepts raw weights or reciprocal-rank constants.
 - **Serving resolution.** Public search requests carry only `DatasetTarget`. The server resolves it
-  through `ServingCatalog` to an allowlisted URI, exact committed version, and profile. URI,
-  version, tag, prewarm, and IVF-cluster inspection are not public search surfaces.
-- **Production transport and auth.** Port 8080 requires TLS and RS256 bearer JWTs validated against
-  the deployment issuer, audience, and bounded JWKS cache. Target claims must exactly match the
-  request before catalog access. Fixed port 8081 exposes only plaintext standard gRPC health for
-  Kubernetes probes. It contains no search or administration methods.
+  through `ServingCatalog` by joining the PostgreSQL dataset registry, active publication pointer,
+  and immutable publication row. The result contains only an allowlisted URI and exact committed
+  version. URI, version, tag, prewarm, and IVF-cluster inspection are not public search surfaces.
+  The publication retains its immutable dataset specification revision for audit.
+- **Local transport.** Set `SEARCH_API_LOCAL_MODE=true` for this repository's supported runtime. It
+  binds search and health to loopback, permits only a loopback PostgreSQL URL, and disables TLS and
+  JWT checks. Fixed port 8081 exposes only standard gRPC health. It contains no search or
+  administration methods.

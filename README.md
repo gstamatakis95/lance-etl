@@ -1,156 +1,181 @@
 # lance-etl
 
-PySpark ETL pipeline that ingests embeddings and text from an Apache Iceberg table into per-org
-Lance vector datasets, builds distributed IVF_RQ / scalar / FTS indices, and compacts them with
-version cleanup. A companion Rust gRPC service (tonic) serves vector, full-text, and hybrid search
-over the same datasets.
+`lance-etl` synchronizes one local Iceberg table into independently published Lance datasets.
+PostgreSQL is the durable control plane. One Python reconciler process plans exact Iceberg snapshot
+transitions, runs bounded work through a local Spark session, and publishes exact Lance versions.
+The optional Rust gRPC process reads the same PostgreSQL catalog for vector, full-text, and hybrid
+search.
 
-Scale target: up to 1 billion vectors spread across up to 30,000 organisations with a power-law
-size distribution. One Lance dataset per `org_id/tenant_id/namespace`. There is no cross-org or
-cross-dataset query surface anywhere in the system.
+Each validated `(tenant_id, namespace, org_id)` route owns one Lance dataset. Search never fans a
+request across datasets or organizations.
 
-This top-level README is the map. The detail lives in the per-directory guides linked below.
+## Local architecture
 
----
-
-## Architecture overview
-
-### ETL tier (Python / PySpark)
-
-The Spark jobs under `src/lance_etl/` produce the Lance datasets and their indices. Every job has
-the same shape: the driver plans the rounds and commits, and all heavy I/O and compute runs in
-executors. Every dataset size follows the same task shape — a small dataset is simply the one-task
-case.
-
-```
+```text
 Iceberg table
-  └─ IcebergToLanceETL.run()              driver: resolve snapshot bounds, split key-hash batches
-       └─ mapInArrow(merge_partition)     executor: pivot + merge_insert upsert/delete per dataset
-       └─ stamp_interval_tags             executors: hour tag on every written dataset
-LanceIndexer.run()                        rounds of plan -> artifacts -> build -> commit
-  └─ plan_dataset_indexes                 executor fan-out: role discovery + shard specs
-  └─ bootstrap_vector_index               executor: committed create_index, streaming k-means
-  └─ build_one_shard                      ONE flat Spark job: vector/scalar/FTS segments
-  └─ commit_one_index                     executor fan-out: merge (vector) + publish
-MaintenanceJob.run()                      rounds of plan -> execute -> commit
-  └─ plan_one_dataset                     executor fan-out: TTL delete + Compaction.plan
-  └─ execute_rewrite_task                 ONE flat Spark job: CompactionTask.execute
-  └─ commit_one_dataset                   executor fan-out: Compaction.commit + cleanup
+  -> local reconciler and local Spark executors
+  -> replay-safe Lance mutation, compaction, and indexing
+  -> PostgreSQL publication evidence and active pointer
+  -> optional local search-api process
 ```
 
-The unified pipeline job serializes the fleet phases `prune -> maintenance -> index -> stamp`.
-Move-stable row IDs are rejected (`docs/adr/rejected-and-operator-tools.md`, ADR 0010). V2 manifest
-paths are on by default, making each of the 30k dataset opens a single object-store request.
-Production serving is pinned to the `HEAD` tag at a concrete version. The ETL stamps hourly
-interval tags for internal qualification and replay. The full job-by-job guide is in
-`src/lance_etl/README.md`.
+PostgreSQL stores the source registration, immutable dataset specifications, exact snapshot
+lineage, durable dataset work, publication evidence, and serving pointer. A work row freezes the
+specification revision used for the run. Dataset specifications contain the field projection plus
+all ingestion, compaction, indexing, prewarm, and retention options. Environment variables are
+limited to process bootstrap, local paths, PostgreSQL connectivity, Spark startup, and telemetry.
 
-### Rust gRPC search service (`rust/search-api`)
+Spark is an execution dependency created and stopped by the local process. There is no external
+scheduler or remote Spark submission layer.
 
-Five-layer design over tonic, each layer with a one-directional dependency on the layer below:
+Specification changes use one repository lifecycle: create a named spec, persist a complete
+normalized `DRAFT`, activate it, select that spec as a source default, and assign its active
+revision to existing datasets. Activation retires the former active revision. PostgreSQL prevents
+changes to every parent, field, index, and option row after activation. Assigning a revision to an
+already materialized dataset creates one deterministic replay-safe `REBUILD` work item.
 
-| Layer | Responsibility |
-|---|---|
-| `domain` | Engine-agnostic types: `Filter` AST, query types, and traits |
-| `cache` | Hybrid Moka + pluggable persistent (disk/redis) caches, plugged into Lance seams |
-| `lance` | `LanceSearchBackend`, `CachingDatasetProvider`, typed AST -> DataFusion `Expr` |
-| `grpc` | Tonic adapter: `SearchGrpc<B>` |
-| `telemetry` | OTLP traces, DogStatsD metrics, JSON logs with trace correlation |
-
-Filters are a typed AST — raw SQL is never accepted or constructed. Every request carries exactly
-one `DatasetTarget` (`org_id`, `tenant_id`, `namespace`). A hybrid persistent cache extends the
-in-process session caches beyond the process (local disk by default or shared Redis) and never
-caches raw row data. The current production search path resolves the fixed `HEAD` tag and fails
-closed when it is absent. The required publication protocol will warm and validate an exact version
-before moving `HEAD`. The full service guide — RPCs, environment variables, invariants, and
-observability — is in `rust/search-api/README.md`.
-
----
+Airflow is optional and is not a scheduler dependency. When the local process is launched with
+standard `AIRFLOW_CTX_*` values, the claim records those values as audit provenance on
+`dataset_work`. They do not affect ordering, eligibility, retries, or fencing.
 
 ## Repository layout
 
-```
+```text
 lance-etl/
-  src/lance_etl/     Python package: Spark ETL, indexing, maintenance, pipeline, tools, recall   (README.md, AGENTS.md)
-  rust/search-api/   Rust gRPC search service: tonic transport over the Lance crate               (README.md, AGENTS.md)
-  bench/             End-to-end benchmark driving the real ETL, indexer, compactor, and server    (bench/README.md)
-  airflow/           Two Airflow DAGs: the ETL DAG and the unified pipeline DAG
-  tests/             pytest suite
-  docs/adr/          Architecture decisions, six thematic documents plus a numbered index          (docs/adr/README.md)
-  market-research/   Evaluation notes, plans, and evidence underlying the ADRs
-  pyproject.toml     Build, dependencies, ruff config
+  src/lance_etl/     Python reconciler, ETL, indexing, maintenance, and control-plane code
+  rust/search-api/   Optional Rust gRPC search service
+  migrations/        Alembic migrations for the local PostgreSQL control plane
+  tests/             Python unit and integration tests
+  bench/             Local end-to-end benchmark package
+  docs/adr/          Architecture decisions
+  market-research/   Design evaluation notes
+  compose.yaml       Disposable local PostgreSQL service
 ```
 
----
+## Start locally
 
-## Getting started
-
-### Python environment
+Create the locked Python environment:
 
 ```bash
-uv venv
-source .venv/bin/activate
-uv pip install -e . --group dev
-uv pip install --group bench
+uv sync --locked --group dev --python 3.14.0
 ```
 
-The project requires `pylance>=8.0.0,<9`, which installs from PyPI, so `uv pip install -e . --group
-dev` suffices. `dev`, `bench`, and `airflow` are PEP 735 dependency groups (install with `--group`,
-not `.[dev]`). The Rust service sources the lance crates from crates.io at the same version and
-needs `protoc` on PATH to build (see `rust/search-api/README.md`).
+Start the included local PostgreSQL service:
 
-### Running the jobs
+```bash
+docker compose up -d postgres
+export LANCE_ETL_DATABASE_URL='postgresql+psycopg://lance_etl:lance_etl@localhost:5432/lance_etl'
+uv run lance-etl-reconcile migrate
+```
 
-Five installed entry points, one per job: `lance-etl-etl`, `lance-etl-index`,
-`lance-etl-maintenance`, `lance-etl-pipeline`, and `lance-etl-tools`. Each is also runnable as
-`python -m lance_etl.<pkg>`. The command reference (CLI flags, the recall/tag/migrate operator
-tools, and the Airflow deployment variables) is in `src/lance_etl/README.md`.
+Or use an existing local PostgreSQL installation:
 
-### Running the gRPC search service
+```bash
+createdb lance_etl
+export LANCE_ETL_DATABASE_URL='postgresql+psycopg://localhost/lance_etl'
+uv run lance-etl-reconcile migrate
+```
+
+Choose local storage and the catalog-qualified Iceberg table:
+
+```bash
+mkdir -p var/lance
+export LANCE_ETL_LANCE_BASE_URI="${PWD}/var/lance"
+export LANCE_ETL_SOURCE_TABLE='local.vectors.events'
+export LANCE_ETL_SPARK_WAREHOUSE="${PWD}/var/iceberg"
+```
+
+The Iceberg table must already exist with the route, mutation, payload-map, TTL, and partition
+contract shown in [the local runbook](docs/production-release.md#prepare-the-iceberg-source).
+
+The defaults use a Hadoop Iceberg catalog named `local`, a warehouse under `.lance-etl/iceberg`,
+and Spark `local[*]`. Set `LANCE_ETL_CANONICAL_BASELINE_SNAPSHOT_ID` when adopting an existing
+Iceberg table. On the first run, the process registers the source and binds it to the bundled active
+dataset specification. Later runs load that registration from PostgreSQL and reject bootstrap
+values that drift from it.
+
+Run one complete bounded pass:
+
+```bash
+uv run lance-etl-reconcile run-once
+```
+
+Run the same pass continuously with a local polling interval:
+
+```bash
+uv run lance-etl-reconcile run
+```
+
+The process loads `reconciler_settings` once at startup. Restart it after changing loop, lease,
+retry, SLO, or cleanup bounds in PostgreSQL.
+
+Inspect the durable queue and retention state:
+
+```bash
+uv run lance-etl-reconcile status
+```
+
+The single Alembic baseline creates exactly 14 application tables. Their responsibilities and
+every stored option are documented in
+[docs/adr/postgresql-dataset-control-plane.md](docs/adr/postgresql-dataset-control-plane.md).
+See [docs/production-release.md](docs/production-release.md) for the local runbook.
+
+## Search service
+
+The Rust service is optional. The reconciler verifies a candidate Lance version locally before
+publication. Build and test the search process independently:
 
 ```bash
 cd rust/search-api
 cargo build --release --locked
-LANCE_ETL_BASE_URI=s3://my-bucket/lance \
-  SEARCH_API_PORT=8080 \
-  ./target/release/search-api
-```
-
-`LANCE_ETL_BASE_URI` is the only required variable. The full environment-variable table, the proto
-RPC surface, and the caching and observability behavior are in `rust/search-api/README.md`.
-
-### Running the benchmark
-
-```bash
-uv sync --locked --group bench --python 3.14.0
-python -m bench e2e --dataset sift1m
-```
-
-The benchmark drives the real ETL, indexer, compactor, and gRPC server end to end. Subcommands,
-flags, and the agent-driveable `experiment` iteration are documented in `bench/README.md`.
-
-### Running the tests
-
-```bash
-# Python tests (the maintained dev venv lives at etl/venv, not .venv)
-etl/venv/bin/pytest -m "not integration"
-
-# Rust tests (needs protoc on PATH)
-cd rust/search-api
 cargo test --locked
 ```
 
----
+Its PostgreSQL catalog, local cache, and RPC configuration are documented in
+[rust/search-api/README.md](rust/search-api/README.md). It is not required to run the reconciler
+locally.
 
-## Documentation
+## Benchmarks
 
-- `docs/adr/README.md` — the architecture decisions, consolidated into six thematic documents (ETL
-  and data model, fleet orchestration and maintenance, indexing, serving and tags, caching and
-  observability, rejected decisions and operator tools). Every original ADR number resolves through
-  the index.
-- `docs/datadog-dashboard-guide.md` — guide to the Datadog dashboards shipped with the pipeline.
-- `docs/production-release.md` — immutable image, deployment, canary, and exact catalog rollback runbook.
-- `market-research/` — detailed evaluation notes, plans, and evidence underlying the ADRs.
+```bash
+uv sync --locked --group dev --group bench --python 3.14.0
+uv run python -m bench e2e --dataset sift1m
+```
 
-For contributors and coding agents, the repo-wide rules are in `AGENTS.md`, with package specifics
-in `src/lance_etl/AGENTS.md` and `rust/search-api/AGENTS.md`.
+The benchmark uses local Spark and file-backed datasets by default. Its subcommands and artifacts
+are documented in [bench/README.md](bench/README.md).
+
+## Tests
+
+Run formatting, linting, and the regular Python suite:
+
+```bash
+uvx ruff format src/ tests/ bench/ migrations/
+uvx ruff check src/ tests/ bench/ migrations/
+.venv/bin/pytest -m "not integration"
+```
+
+PostgreSQL tests create and remove isolated schemas. Point them at a disposable local database:
+
+```bash
+createdb lance_etl_test
+LANCE_ETL_TEST_DATABASE_URL='postgresql+psycopg://localhost/lance_etl_test' \
+  .venv/bin/pytest tests/test_state_postgres.py tests/test_postgres_queue_load.py
+```
+
+Run the complete local Iceberg to PostgreSQL to Lance path in its own process so Spark can load the
+Iceberg runtime at JVM startup:
+
+```bash
+LANCE_ETL_TEST_DATABASE_URL='postgresql+psycopg://localhost/lance_etl_test' \
+  .venv/bin/pytest tests/test_local_e2e.py -x -q -m integration
+```
+
+Run the standalone Iceberg maintenance integration in a separate process for the same reason:
+
+```bash
+.venv/bin/pytest tests/test_iceberg_optimize.py -x -q -m integration
+```
+
+For contributor rules, read [AGENTS.md](AGENTS.md) and the package-specific guides before changing
+code.

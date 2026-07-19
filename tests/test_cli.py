@@ -8,6 +8,9 @@ and ``parse_window_tag``) live in ``lance_etl.cliutil``.
 
 from __future__ import annotations
 
+from argparse import ArgumentParser, Namespace
+from collections.abc import Callable, Sequence
+
 import pytest
 
 import lance_etl.etl.cli as etl_cli
@@ -20,6 +23,8 @@ from lance_etl.cliutil import parse_hour_tag, parse_key_values, parse_window_tag
 
 def test_help_exits_zero() -> None:
     """Each per-job CLI exits with status 0 when passed ``--help``."""
+    cli_main: Callable[[Sequence[str] | None], int]
+    exc_info: pytest.ExceptionInfo[SystemExit]
     for cli_main in (etl_cli.main, indexing_cli.main, tools_cli.main):
         with pytest.raises(SystemExit) as exc_info:
             cli_main(["--help"])
@@ -55,25 +60,25 @@ def test_top_level_cli_exception_is_logged(monkeypatch: pytest.MonkeyPatch, caps
 
 def test_etl_parser_builds() -> None:
     """The ETL argument parser constructs without error."""
-    parser = etl_cli.build_parser()
+    parser: ArgumentParser = etl_cli.build_parser()
     assert parser is not None
 
 
 def test_maintenance_parser_builds() -> None:
     """The maintenance argument parser constructs without error."""
-    parser = maintenance_cli.build_parser()
+    parser: ArgumentParser = maintenance_cli.build_parser()
     assert parser is not None
 
 
 def test_indexing_parser_builds() -> None:
     """The indexing argument parser constructs without error."""
-    parser = indexing_cli.build_parser()
+    parser: ArgumentParser = indexing_cli.build_parser()
     assert parser is not None
 
 
 def test_tools_parser_builds() -> None:
     """The tools argument parser constructs without error."""
-    parser = tools_cli.build_parser()
+    parser: ArgumentParser = tools_cli.build_parser()
     assert parser is not None
 
 
@@ -97,19 +102,21 @@ REQUIRED_ETL_ARGV: list[str] = [
 
 def test_etl_has_no_ingested_at_flag() -> None:
     """No ``--ingested-at-col`` flag is exposed because the ingestion-timestamp column was removed in ADR 0016."""
-    args = etl_cli.build_parser().parse_args(REQUIRED_ETL_ARGV)
+    args: Namespace = etl_cli.build_parser().parse_args(REQUIRED_ETL_ARGV)
     assert not hasattr(args, "ingested_at_col")
 
 
 def test_etl_tag_stamp_defaults_off() -> None:
     """Without the flag, ``--tag-stamp`` is None so the ETL stamps no tags."""
-    args = etl_cli.build_parser().parse_args(REQUIRED_ETL_ARGV)
+    args: Namespace = etl_cli.build_parser().parse_args(REQUIRED_ETL_ARGV)
     assert args.tag_stamp is None
 
 
 def test_etl_tag_stamp_truncates_to_the_hour() -> None:
-    """``--tag-stamp`` converts an Airflow datetime through parse_hour_tag."""
-    args = etl_cli.build_parser().parse_args([*REQUIRED_ETL_ARGV, "--tag-stamp", "2026-06-11 12:34:56+00:00"])
+    """``--tag-stamp`` converts an ISO 8601 datetime through parse_hour_tag."""
+    args: Namespace = etl_cli.build_parser().parse_args(
+        [*REQUIRED_ETL_ARGV, "--tag-stamp", "2026-06-11 12:34:56+00:00"]
+    )
     assert args.tag_stamp == "20260611T120000Z"
 
 
@@ -122,21 +129,21 @@ REQUIRED_MAINTENANCE_RUN_ARGV: list[str] = [
 
 def test_maintenance_parses_required_args() -> None:
     """``maintenance run`` subcommand parses dataset selection."""
-    args = maintenance_cli.build_parser().parse_args(REQUIRED_MAINTENANCE_RUN_ARGV)
+    args: Namespace = maintenance_cli.build_parser().parse_args(REQUIRED_MAINTENANCE_RUN_ARGV)
     assert args.command == "run"
     assert args.base_uri == "/tmp/lance"
 
 
 def test_maintenance_ttl_defaults_off() -> None:
     """``maintenance run`` defaults: ttl_column=None (off), ts_column=event_timestamp."""
-    args = maintenance_cli.build_parser().parse_args(REQUIRED_MAINTENANCE_RUN_ARGV)
+    args: Namespace = maintenance_cli.build_parser().parse_args(REQUIRED_MAINTENANCE_RUN_ARGV)
     assert args.ttl_column is None
     assert args.ts_column == "event_timestamp"
 
 
 def test_maintenance_ttl_column_flag() -> None:
     """``--ttl-column`` turns on per-row TTL and ``--ts-column`` overrides the clock column."""
-    args = maintenance_cli.build_parser().parse_args(
+    args: Namespace = maintenance_cli.build_parser().parse_args(
         [*REQUIRED_MAINTENANCE_RUN_ARGV, "--ttl-column", "ttl", "--ts-column", "event_time"]
     )
     assert args.ttl_column == "ttl"
@@ -145,6 +152,7 @@ def test_maintenance_ttl_column_flag() -> None:
 
 def test_maintenance_tag_requires_explicit_version() -> None:
     """The HEAD publication command rejects an omitted target version."""
+    exc_info: pytest.ExceptionInfo[SystemExit]
     with pytest.raises(SystemExit) as exc_info:
         maintenance_cli.build_parser().parse_args(["tag", "--base-uri", "/tmp/lance"])
     assert exc_info.value.code != 0
@@ -152,6 +160,7 @@ def test_maintenance_tag_requires_explicit_version() -> None:
 
 def test_maintenance_tag_rejects_arbitrary_tag_name() -> None:
     """Production publication exposes HEAD only, never caller-selected tag names."""
+    exc_info: pytest.ExceptionInfo[SystemExit]
     with pytest.raises(SystemExit) as exc_info:
         maintenance_cli.build_parser().parse_args(
             ["tag", "--base-uri", "/tmp/lance", "--tag-version", "42", "--tag", "prod"]
@@ -165,6 +174,7 @@ def test_maintenance_cluster_rewrite_flags_removed(flag: str) -> None:
     argv: list[str] = [*REQUIRED_MAINTENANCE_RUN_ARGV, flag]
     if flag == "--cluster-column":
         argv.append("embedding")
+    exc_info: pytest.ExceptionInfo[SystemExit]
     with pytest.raises(SystemExit) as exc_info:
         maintenance_cli.build_parser().parse_args(argv)
     assert exc_info.value.code != 0
@@ -172,6 +182,7 @@ def test_maintenance_cluster_rewrite_flags_removed(flag: str) -> None:
 
 def test_ttl_subcommand_removed() -> None:
     """The standalone ``ttl`` subcommand no longer exists; TTL is folded into ``maintenance run``."""
+    exc_info: pytest.ExceptionInfo[SystemExit]
     with pytest.raises(SystemExit) as exc_info:
         maintenance_cli.build_parser().parse_args(["ttl", "--base-uri", "/tmp/lance"])
     assert exc_info.value.code != 0
@@ -190,7 +201,7 @@ REQUIRED_MIGRATE_NS_ARGV: list[str] = [
 
 def test_migrate_namespace_parses_required_args() -> None:
     """``migrate-namespace`` subcommand parses source, target, and base-uri."""
-    args = tools_cli.build_parser().parse_args(REQUIRED_MIGRATE_NS_ARGV)
+    args: Namespace = tools_cli.build_parser().parse_args(REQUIRED_MIGRATE_NS_ARGV)
     assert args.command == "migrate-namespace"
     assert args.source_namespace == "old-ns"
     assert args.target_namespace == "new-ns"
@@ -199,7 +210,7 @@ def test_migrate_namespace_parses_required_args() -> None:
 
 def test_migrate_namespace_defaults() -> None:
     """``migrate-namespace`` defaults: no_recompact=False, no_reindex=False, overwrite_target=False."""
-    args = tools_cli.build_parser().parse_args(REQUIRED_MIGRATE_NS_ARGV)
+    args: Namespace = tools_cli.build_parser().parse_args(REQUIRED_MIGRATE_NS_ARGV)
     assert args.no_recompact is False
     assert args.no_reindex is False
     assert args.overwrite_target is False
@@ -213,7 +224,7 @@ def test_migrate_namespace_defaults() -> None:
 
 def test_migrate_namespace_toggle_flags() -> None:
     """``--no-recompact``, ``--no-reindex``, and ``--overwrite-target`` toggle correctly."""
-    args = tools_cli.build_parser().parse_args(
+    args: Namespace = tools_cli.build_parser().parse_args(
         [*REQUIRED_MIGRATE_NS_ARGV, "--no-recompact", "--no-reindex", "--overwrite-target"]
     )
     assert args.no_recompact is True
@@ -223,7 +234,7 @@ def test_migrate_namespace_toggle_flags() -> None:
 
 def test_migrate_namespace_index_column_flags() -> None:
     """Index column flags are accepted and stored on the ``migrate-namespace`` namespace."""
-    args = tools_cli.build_parser().parse_args(
+    args: Namespace = tools_cli.build_parser().parse_args(
         [
             *REQUIRED_MIGRATE_NS_ARGV,
             "--vector-column",
@@ -247,6 +258,7 @@ def test_migrate_namespace_index_column_flags() -> None:
 
 def test_migrate_namespace_requires_source_namespace() -> None:
     """``migrate-namespace`` fails without ``--source-namespace``."""
+    exc_info: pytest.ExceptionInfo[SystemExit]
     with pytest.raises(SystemExit) as exc_info:
         tools_cli.build_parser().parse_args(
             ["migrate-namespace", "--target-namespace", "new", "--base-uri", "/tmp/lance"]
@@ -256,6 +268,7 @@ def test_migrate_namespace_requires_source_namespace() -> None:
 
 def test_migrate_namespace_requires_target_namespace() -> None:
     """``migrate-namespace`` fails without ``--target-namespace``."""
+    exc_info: pytest.ExceptionInfo[SystemExit]
     with pytest.raises(SystemExit) as exc_info:
         tools_cli.build_parser().parse_args(
             ["migrate-namespace", "--source-namespace", "old", "--base-uri", "/tmp/lance"]
@@ -265,6 +278,7 @@ def test_migrate_namespace_requires_target_namespace() -> None:
 
 def test_migrate_namespace_requires_base_uri() -> None:
     """``migrate-namespace`` fails without ``--base-uri``."""
+    exc_info: pytest.ExceptionInfo[SystemExit]
     with pytest.raises(SystemExit) as exc_info:
         tools_cli.build_parser().parse_args(
             ["migrate-namespace", "--source-namespace", "old", "--target-namespace", "new"]
@@ -281,12 +295,13 @@ REQUIRED_PIPELINE_RUN_ARGV: list[str] = [
 
 def test_pipeline_parser_builds() -> None:
     """The pipeline argument parser constructs without error."""
-    parser = pipeline_cli.build_parser()
+    parser: ArgumentParser = pipeline_cli.build_parser()
     assert parser is not None
 
 
 def test_pipeline_help_exits_zero() -> None:
     """The pipeline CLI exits with status 0 when passed ``--help``."""
+    exc_info: pytest.ExceptionInfo[SystemExit]
     with pytest.raises(SystemExit) as exc_info:
         pipeline_cli.main(["--help"])
     assert exc_info.value.code == 0
@@ -294,14 +309,14 @@ def test_pipeline_help_exits_zero() -> None:
 
 def test_pipeline_run_parses_required_args() -> None:
     """``pipeline run`` subcommand parses dataset selection."""
-    args = pipeline_cli.build_parser().parse_args(REQUIRED_PIPELINE_RUN_ARGV)
+    args: Namespace = pipeline_cli.build_parser().parse_args(REQUIRED_PIPELINE_RUN_ARGV)
     assert args.command == "run"
     assert args.base_uri == "/tmp/lance"
 
 
 def test_pipeline_run_defaults() -> None:
     """``pipeline run`` defaults to interval retention without publication or rebuild."""
-    args = pipeline_cli.build_parser().parse_args(REQUIRED_PIPELINE_RUN_ARGV)
+    args: Namespace = pipeline_cli.build_parser().parse_args(REQUIRED_PIPELINE_RUN_ARGV)
     assert args.tag_keep_last == 48
     assert args.tag_stamp is None
     assert args.rebuild is False
@@ -311,20 +326,21 @@ def test_pipeline_run_defaults() -> None:
 
 def test_pipeline_tag_keep_last_zero_disables() -> None:
     """``--tag-keep-last 0`` is accepted and later converted to None in run_run."""
-    args = pipeline_cli.build_parser().parse_args([*REQUIRED_PIPELINE_RUN_ARGV, "--tag-keep-last", "0"])
+    args: Namespace = pipeline_cli.build_parser().parse_args([*REQUIRED_PIPELINE_RUN_ARGV, "--tag-keep-last", "0"])
     assert args.tag_keep_last == 0
 
 
 def test_pipeline_serve_tag_flag_removed() -> None:
     """The temporary pipeline cannot publish an implicit latest version to HEAD."""
+    exc_info: pytest.ExceptionInfo[SystemExit]
     with pytest.raises(SystemExit) as exc_info:
         pipeline_cli.build_parser().parse_args([*REQUIRED_PIPELINE_RUN_ARGV, "--serve-tag"])
     assert exc_info.value.code != 0
 
 
 def test_pipeline_tag_stamp_converts_via_parse_window_tag() -> None:
-    """``--tag-stamp`` converts the Airflow datetime string through parse_window_tag."""
-    args = pipeline_cli.build_parser().parse_args(
+    """``--tag-stamp`` converts the ISO 8601 datetime string through parse_window_tag."""
+    args: Namespace = pipeline_cli.build_parser().parse_args(
         [*REQUIRED_PIPELINE_RUN_ARGV, "--tag-stamp", "2026-06-11 12:00:00+00:00"]
     )
     assert args.tag_stamp == "20260611T120000Z"
@@ -332,7 +348,7 @@ def test_pipeline_tag_stamp_converts_via_parse_window_tag() -> None:
 
 def test_pipeline_tag_stamp_t_separator() -> None:
     """``--tag-stamp`` accepts the T-separated ISO form."""
-    args = pipeline_cli.build_parser().parse_args(
+    args: Namespace = pipeline_cli.build_parser().parse_args(
         [*REQUIRED_PIPELINE_RUN_ARGV, "--tag-stamp", "2026-06-11T12:00:00+00:00"]
     )
     assert args.tag_stamp == "20260611T120000Z"
@@ -340,7 +356,7 @@ def test_pipeline_tag_stamp_t_separator() -> None:
 
 def test_pipeline_index_column_flags_present() -> None:
     """Index column flags are accepted by the pipeline run subcommand."""
-    args = pipeline_cli.build_parser().parse_args(
+    args: Namespace = pipeline_cli.build_parser().parse_args(
         [
             *REQUIRED_PIPELINE_RUN_ARGV,
             "--vector-column",
@@ -364,13 +380,13 @@ def test_pipeline_index_column_flags_present() -> None:
 
 def test_pipeline_rebuild_flag() -> None:
     """``--rebuild`` is accepted and stored as True."""
-    args = pipeline_cli.build_parser().parse_args([*REQUIRED_PIPELINE_RUN_ARGV, "--rebuild"])
+    args: Namespace = pipeline_cli.build_parser().parse_args([*REQUIRED_PIPELINE_RUN_ARGV, "--rebuild"])
     assert args.rebuild is True
 
 
 def test_pipeline_ttl_column_flag() -> None:
     """``--ttl-column`` and ``--ts-column`` are accepted by the pipeline run subcommand."""
-    args = pipeline_cli.build_parser().parse_args(
+    args: Namespace = pipeline_cli.build_parser().parse_args(
         [*REQUIRED_PIPELINE_RUN_ARGV, "--ttl-column", "ttl", "--ts-column", "event_time"]
     )
     assert args.ttl_column == "ttl"
@@ -378,7 +394,7 @@ def test_pipeline_ttl_column_flag() -> None:
 
 
 def test_parse_window_tag_space_separator() -> None:
-    """parse_window_tag handles Airflow-style space-separated datetimes."""
+    """parse_window_tag handles space-separated ISO 8601 datetimes."""
     result: str = parse_window_tag("2026-06-11 12:00:00+00:00")
     assert result == "20260611T120000Z"
 

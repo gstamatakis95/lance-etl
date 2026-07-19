@@ -52,10 +52,6 @@ from lance_etl.fanout import (
     report_fleet_failures,
 )
 from lance_etl.indexing.config import (
-    IVF_RQ_NUM_BITS,
-    MAX_STALE_REPLANS,
-    STREAMING_REFINE_PASSES,
-    STREAMING_SAMPLE_RATE,
     IndexJobConfig,
     bitmap_index_name,
     degrade_num_partitions,
@@ -181,16 +177,31 @@ def resolve_index_targets(dataset: lance.LanceDataset, config: IndexJobConfig) -
     )
     if explicit:
         targets: list[tuple[str, str, str]] = []
-        targets.extend((VECTOR_KIND, column, vector_index_name(column)) for column in config.vector_columns)
-        targets.extend((BTREE_KIND, column, scalar_index_name(column)) for column in config.scalar_columns)
-        targets.extend((BITMAP_KIND, column, bitmap_index_name(column)) for column in config.bitmap_columns)
-        targets.extend((ZONEMAP_KIND, column, zonemap_index_name(column)) for column in config.zonemap_columns)
-        targets.extend((FTS_KIND, column, fts_index_name(column)) for column in config.text_columns)
+        targets.extend(
+            (VECTOR_KIND, column, config.index_name(column, vector_index_name(column)))
+            for column in config.vector_columns
+        )
+        targets.extend(
+            (BTREE_KIND, column, config.index_name(column, scalar_index_name(column)))
+            for column in config.scalar_columns
+        )
+        targets.extend(
+            (BITMAP_KIND, column, config.index_name(column, bitmap_index_name(column)))
+            for column in config.bitmap_columns
+        )
+        targets.extend(
+            (ZONEMAP_KIND, column, config.index_name(column, zonemap_index_name(column)))
+            for column in config.zonemap_columns
+        )
+        targets.extend(
+            (FTS_KIND, column, config.index_name(column, fts_index_name(column))) for column in config.text_columns
+        )
         return targets
 
     roles: dict[str, str] = load_column_roles(dataset)
     columns: set[str] = set(dataset.schema.names)
     discovered: list[tuple[str, str, str]] = []
+    column: Any
     for column in sorted(name for name, role in roles.items() if role == VECTOR_ROLE and name in columns):
         discovered.append((VECTOR_KIND, column, vector_index_name(column)))
     for column in sorted(name for name, role in roles.items() if role == SCALAR_ROLE and name in columns):
@@ -200,7 +211,12 @@ def resolve_index_targets(dataset: lance.LanceDataset, config: IndexJobConfig) -
     return discovered
 
 
-def vector_index_needs_retrain(dataset: lance.LanceDataset, column: str, count_rows: Callable[[], int]) -> bool:
+def vector_index_needs_retrain(
+    dataset: lance.LanceDataset,
+    column: str,
+    count_rows: Callable[[], int],
+    retrain_growth_factor: float = 4.0,
+) -> bool:
     """Report whether an existing vector index needs a full retrain.
 
     The index needs work when its ``lance-etl.vector.{column}`` config entry is absent or carries
@@ -213,6 +229,7 @@ def vector_index_needs_retrain(dataset: lance.LanceDataset, column: str, count_r
         dataset: The already-open dataset handle.
         column: The indexed vector column.
         count_rows: Cached row-count supplier shared across the dataset's per-index checks.
+        retrain_growth_factor: Dataset growth multiple that forces artifact rotation.
 
     Returns:
         ``True`` when the vector index requires a retrain.
@@ -223,7 +240,7 @@ def vector_index_needs_retrain(dataset: lance.LanceDataset, column: str, count_r
     rows_at_train: int = int(cfg.get("rows_at_train") or 0)
     if rows_at_train <= 0:
         return True
-    return growth_exceeds_retrain_factor(count_rows(), rows_at_train)
+    return growth_exceeds_retrain_factor(count_rows(), rows_at_train, retrain_growth_factor)
 
 
 def index_needs_work(
@@ -262,7 +279,12 @@ def index_needs_work(
         return True
     if int(stats.get("num_indices") or 0) > config.max_index_deltas:
         return True
-    return kind == VECTOR_KIND and vector_index_needs_retrain(dataset, column, count_rows)
+    return kind == VECTOR_KIND and vector_index_needs_retrain(
+        dataset,
+        column,
+        count_rows,
+        config.retrain_growth_factor,
+    )
 
 
 def index_skip_reason(
@@ -302,6 +324,9 @@ def index_skip_reason(
             rows = dataset.count_rows()
         return rows
 
+    kind: Any
+    column: Any
+    name: Any
     for kind, column, name in targets:
         if index_needs_work(dataset, config, existing, kind, column, name, count_rows):
             return None
@@ -403,6 +428,9 @@ def plan_dataset_indexes(
     existing_names: set[str] = {description.name for description in dataset.describe_indices()}
     specs: list[dict[str, Any]] = []
     done: list[dict[str, Any]] = []
+    kind: Any
+    column: Any
+    index_name: Any
     for kind, column, index_name in targets:
         handler: IndexHandler = make_handler(kind, column, index_name, config)
         preflight: dict[str, Any] | None = index_preflight_outcome(handler, dataset, uri, column, index_name, telemetry)
@@ -509,9 +537,15 @@ def bootstrap_vector_index(
     handler: VectorIndexHandler = VectorIndexHandler(config, column, index_name)
     dimension: int = handler.dimension(dataset)
     rows: int = dataset.count_rows()
-    planned: int = derive_num_partitions(rows, config.num_partitions)
-    partitions: int = degrade_num_partitions(planned, rows, STREAMING_SAMPLE_RATE)
-    rabitq_model: str = native_indices.build_rq_model(dimension=dimension, num_bits=IVF_RQ_NUM_BITS)
+    planned: int = derive_num_partitions(
+        rows,
+        config.num_partitions,
+        config.minimum_partitions,
+        config.maximum_partitions,
+        config.target_rows_per_partition,
+    )
+    partitions: int = degrade_num_partitions(planned, rows, config.streaming_sample_rate)
+    rabitq_model: str = native_indices.build_rq_model(dimension=dimension, num_bits=config.num_bits)
 
     def action() -> lance.LanceDataset:
         """Re-open the dataset at the latest version and run the committed create_index."""
@@ -524,10 +558,10 @@ def bootstrap_vector_index(
                 metric=config.metric,
                 replace=True,
                 num_partitions=partitions,
-                num_bits=IVF_RQ_NUM_BITS,
+                num_bits=config.num_bits,
                 rabitq_model=rabitq_model,
-                streaming_sample_rate=STREAMING_SAMPLE_RATE,
-                streaming_refine_passes=STREAMING_REFINE_PASSES,
+                streaming_sample_rate=config.streaming_sample_rate,
+                streaming_refine_passes=config.streaming_refine_passes,
             )
         return fresh
 
@@ -543,7 +577,7 @@ def bootstrap_vector_index(
             "rows_at_train": rows,
             "dimension": dimension,
             "metric": config.metric,
-            "num_bits": IVF_RQ_NUM_BITS,
+            "num_bits": config.num_bits,
             "num_partitions": partitions,
             "rabitq_model": rabitq_model,
         },
@@ -586,7 +620,7 @@ def persist_bootstrap_centroids(
         telemetry: Telemetry facade for the current executor process.
     """
     try:
-        centroids = dataset.get_ivf_model(index_name).centroids
+        centroids: Any = dataset.get_ivf_model(index_name).centroids
         save_centroids(uri, index_name, centroids, config.metric, rows_at_train, config.storage_options)
         telemetry.incr("artifacts.centroid_sidecar_written")
     except Exception as exc:
@@ -646,6 +680,7 @@ def build_one_shard(
     dataset: lance.LanceDataset = lance.dataset(uri, version=task["version"], storage_options=config.storage_options)
     if kind == FTS_KIND:
         built: int = 0
+        fragment_id: Any
         for fragment_id in shard:
             with telemetry.timed("segment.build_ms", tags=tags):
                 dataset.create_scalar_index(
@@ -664,7 +699,7 @@ def build_one_shard(
     with telemetry.timed("segment.build_ms", tags=tags):
         handler: IndexHandler = make_handler(kind, column, index_name, config)
         artifacts: object | None = handler.prepare(dataset, uri, telemetry)
-        segment = handler.build_segment(dataset, shard, artifacts)
+        segment: Any = handler.build_segment(dataset, shard, artifacts)
     telemetry.incr("segment.built", tags=tags)
     return uri, index_name, {"segment": serialize_segment(segment)}
 
@@ -788,12 +823,16 @@ def flatten_shard_tasks(
         The flattened task specs across the fleet.
     """
     shard_tasks: list[dict[str, Any]] = []
+    uri: Any
+    specs: Any
     for uri, specs in specs_by_uri.items():
         version: int = version_by_uri[uri]
+        spec: Any
         for spec in specs:
             if not spec["shards"]:
                 shard_tasks.append(build_shard_task(spec, uri, version, []))
                 continue
+            shard: Any
             for shard in spec["shards"]:
                 shard_tasks.append(build_shard_task(spec, uri, version, list(shard)))
     return shard_tasks
@@ -824,6 +863,7 @@ def collect_round_specs(
         The buildable index specs, keyed by dataset URI.
     """
     specs_by_uri: dict[str, list[dict[str, Any]]] = {}
+    plan: Any
     for plan in plans:
         uri: str = plan["uri"]
         if "error" in plan:
@@ -839,6 +879,7 @@ def collect_round_specs(
         )
         if plan["specs"]:
             specs_by_uri[uri] = plan["specs"]
+            spec: Any
             for spec in plan["specs"]:
                 kind_by_index[(uri, spec["index_name"])] = spec["kind"]
             stats_by_uri[uri]["version"] = plan["version"]
@@ -867,6 +908,9 @@ def fold_build_payloads(
     """
     payloads_by_index: dict[tuple[str, str], list[dict[str, Any]]] = {}
     errored_indexes: set[tuple[str, str]] = set()
+    uri: Any
+    index_name: Any
+    payload: Any
     for uri, index_name, payload in built:
         build_key: tuple[str, str] = (uri, index_name)
         if "error" in payload:
@@ -909,6 +953,8 @@ def record_commit_outcomes(
         The datasets whose commit hit stale fragments, for the next stale-replan round.
     """
     stale_uris: set[str] = set()
+    uri: Any
+    stats: Any
     for uri, stats in outcomes:
         if stats.pop("stale", False):
             stale_uris.add(uri)
@@ -979,6 +1025,7 @@ class LanceIndexer:
             """
             executor_telemetry: Telemetry = Telemetry.create(config.telemetry)
             with executor_telemetry.span("lance.indexing.build_segment"):
+                task: Any
                 for task in items:
                     try:
                         yield build_one_shard(task, config, executor_telemetry)
@@ -1031,6 +1078,9 @@ class LanceIndexer:
                 One ``(uri, stats)`` pair per index, an error marker when the commit raised.
             """
             executor_telemetry: Telemetry = Telemetry.create(config.telemetry)
+            uri: Any
+            spec: Any
+            payloads: Any
             for uri, spec, payloads in items:
                 try:
                     yield uri, commit_one_index(uri, spec, payloads, config, executor_telemetry)
@@ -1081,6 +1131,8 @@ class LanceIndexer:
                 ``(uri, index_name, merged)`` per index, ``merged=False`` when the bound raised.
             """
             executor_telemetry: Telemetry = Telemetry.create(config.telemetry)
+            uri: Any
+            index_name: Any
             for uri, index_name in items:
                 try:
                     yield uri, index_name, merge_index_deltas(uri, index_name, config, executor_telemetry)
@@ -1155,17 +1207,22 @@ class LanceIndexer:
         logger.info(
             "indexing round %d/%d: %d datasets, %d build tasks",
             round_index + 1,
-            MAX_STALE_REPLANS,
+            config.max_stale_replans,
             len(specs_by_uri),
             len(shard_tasks),
         )
         with driver_telemetry.timed("run.build_ms"):
             built: list[tuple[str, str, dict[str, Any]]] = self.build_fleet_segments(spark, shard_tasks)
 
+        payloads_by_index: Any
+        errored_indexes: Any
         payloads_by_index, errored_indexes = fold_build_payloads(built, stats_by_uri)
 
         commit_entries: list[tuple[str, dict[str, Any], list[dict[str, Any]]]] = []
+        uri: Any
+        specs: Any
         for uri, specs in specs_by_uri.items():
+            spec: Any
             for spec in specs:
                 key: tuple[str, str] = (uri, spec["index_name"])
                 if key not in errored_indexes and key in payloads_by_index:
@@ -1209,22 +1266,24 @@ class LanceIndexer:
             pending_uris: list[str] = list(dataset_uris)
             kind_by_index: dict[tuple[str, str], str] = {}
 
-            for round_index in range(MAX_STALE_REPLANS):
+            round_index: Any
+            for round_index in range(config.max_stale_replans):
                 pending_uris = self.run_round(
                     spark, round_index, pending_uris, stats_by_uri, kind_by_index, driver_telemetry
                 )
                 if not pending_uris:
                     break
 
+            uri: Any
             for uri in pending_uris:
                 logger.warning(
                     "index build on %s still has uncovered fragments after %d stale-replan rounds; "
                     "marking the dataset failed so this run's exit code and metrics reflect it",
                     uri,
-                    MAX_STALE_REPLANS,
+                    config.max_stale_replans,
                 )
                 stats_by_uri[uri]["error"] = (
-                    f"stale-replan exhausted after {MAX_STALE_REPLANS} rounds: a concurrent compaction kept "
+                    f"stale-replan exhausted after {config.max_stale_replans} rounds: a concurrent compaction kept "
                     "invalidating the planned fragment set before every index could commit"
                 )
                 stats_by_uri[uri]["error_phase"] = STALE_REPLAN_EXHAUSTED_PHASE
@@ -1242,9 +1301,11 @@ class LanceIndexer:
                 }
             )
             merged_flags: dict[tuple[str, str], bool] = self.bound_fleet_deltas(spark, delta_entries)
+            stats: Any
             for uri, stats in stats_by_uri.items():
+                item: Any
                 for item in stats["indexes"]:
-                    key = (uri, item["index"])
+                    key: Any = (uri, item["index"])
                     if key in merged_flags:
                         item["deltas_merged"] = merged_flags[key]
                     item.pop("needs_delta_merge", None)

@@ -15,6 +15,7 @@ from lance_etl.etl.replay_sink import (
     WINDOW_SEQUENCE_COLUMN,
     ReplayConflict,
     replay_safe_merge,
+    replay_table_chunks,
     replay_update_condition,
 )
 from lance_etl.telemetry import Telemetry
@@ -65,29 +66,44 @@ def live_rows(uri: str) -> list[dict[str, object]]:
 
 def test_update_condition_matches_frozen_contract() -> None:
     """The sink advances its source watermark without using event time."""
-    condition = replay_update_condition()
+    condition: str = replay_update_condition()
     assert f"target.{SOURCE_SEQUENCE_COLUMN} < source.{SOURCE_SEQUENCE_COLUMN}" in condition
     assert EVENT_DIGEST_COLUMN not in condition
     assert "event_timestamp" not in condition
 
 
+def test_replay_table_chunks_applies_row_and_byte_limits() -> None:
+    """Replay chunking preserves rows while applying both PostgreSQL-owned limits."""
+    table: pa.Table = pa.table({"value": ["a" * 40, "b" * 40, "c", "d"]})
+    chunks: list[pa.Table] = replay_table_chunks(table, max_rows=3, max_bytes=50)
+    restored: pa.Table = pa.concat_tables(chunks)
+    assert restored.equals(table)
+    assert all(chunk.num_rows <= 3 for chunk in chunks)
+    assert all(chunk.nbytes <= 50 or chunk.num_rows == 1 for chunk in chunks)
+
+
 def test_one_hundred_retries_converge_without_duplicates(tmp_path: Path, telemetry: Telemetry) -> None:
     """Repeating one work item one hundred times leaves one physical logical key."""
-    uri = str(tmp_path / "retry.lance")
-    table = terminal_table("id", 1, b"a", "first")
-    for replay_table in [table] * 100:
+    uri: str = str(tmp_path / "retry.lance")
+    table: pa.Table = terminal_table("id", 1, b"a", "first")
+    replay_safe_merge(uri, table, telemetry, retry_backoff_seconds=0)
+    first_version: int = lance.dataset(uri).version
+    replay_table: pa.Table
+    for replay_table in [table] * 99:
         replay_safe_merge(uri, replay_table, telemetry, retry_backoff_seconds=0)
-    rows = lance.dataset(uri).to_table().to_pylist()
+    dataset: lance.LanceDataset = lance.dataset(uri)
+    rows: list[dict[str, object]] = dataset.to_table().to_pylist()
+    assert dataset.version == first_version
     assert len(rows) == 1
     assert rows[0]["text"] == "first"
 
 
 def test_older_source_work_cannot_overwrite_newer_state(tmp_path: Path, telemetry: Telemetry) -> None:
     """A lower Iceberg source sequence becomes a logical no-op."""
-    uri = str(tmp_path / "stale.lance")
+    uri: str = str(tmp_path / "stale.lance")
     replay_safe_merge(uri, terminal_table("id", 2, b"b", "new"), telemetry)
     replay_safe_merge(uri, terminal_table("id", 1, b"a", "old"), telemetry)
-    row = lance.dataset(uri).to_table().to_pylist()[0]
+    row: dict[str, object] = lance.dataset(uri).to_table().to_pylist()[0]
     assert row["text"] == "new"
     assert row[SOURCE_SEQUENCE_COLUMN] == 2
 
@@ -96,18 +112,18 @@ def test_later_exact_duplicate_advances_watermark_against_intermediate_zombie(
     tmp_path: Path, telemetry: Telemetry
 ) -> None:
     """A later redelivery prevents an expired intermediate worker from changing state."""
-    uri = str(tmp_path / "duplicate-watermark.lance")
+    uri: str = str(tmp_path / "duplicate-watermark.lance")
     replay_safe_merge(uri, terminal_table("id", 10, b"a", "stable"), telemetry)
     replay_safe_merge(uri, terminal_table("id", 12, b"a", "stable"), telemetry)
     replay_safe_merge(uri, terminal_table("id", 11, b"b", "zombie"), telemetry)
-    row = lance.dataset(uri).to_table().to_pylist()[0]
+    row: dict[str, object] = lance.dataset(uri).to_table().to_pylist()[0]
     assert row["text"] == "stable"
     assert row[SOURCE_SEQUENCE_COLUMN] == 12
 
 
 def test_same_sequence_different_digest_blocks_before_write(tmp_path: Path, telemetry: Telemetry) -> None:
     """An unordered equal-sequence conflict cannot alter stored state."""
-    uri = str(tmp_path / "conflict.lance")
+    uri: str = str(tmp_path / "conflict.lance")
     replay_safe_merge(uri, terminal_table("id", 4, b"a", "first"), telemetry)
     with pytest.raises(ReplayConflict, match="same source sequence"):
         replay_safe_merge(uri, terminal_table("id", 4, b"b", "second"), telemetry)
@@ -116,7 +132,7 @@ def test_same_sequence_different_digest_blocks_before_write(tmp_path: Path, tele
 
 def test_tombstone_blocks_old_replay_and_later_recreate_wins(tmp_path: Path, telemetry: Telemetry) -> None:
     """Delete, stale retry, and later recreate follow Iceberg arrival order."""
-    uri = str(tmp_path / "tombstone.lance")
+    uri: str = str(tmp_path / "tombstone.lance")
     replay_safe_merge(uri, terminal_table("id", 1, b"a", "first"), telemetry)
     replay_safe_merge(uri, terminal_table("id", 2, b"b", None, deleted=True), telemetry)
     assert live_rows(uri) == []
@@ -128,15 +144,15 @@ def test_tombstone_blocks_old_replay_and_later_recreate_wins(tmp_path: Path, tel
 
 def test_tombstone_requires_all_payload_fields_null(tmp_path: Path, telemetry: Telemetry) -> None:
     """A delete cannot retain stale payload data."""
-    uri = str(tmp_path / "bad-tombstone.lance")
+    uri: str = str(tmp_path / "bad-tombstone.lance")
     with pytest.raises(ValueError, match="explicitly clear"):
         replay_safe_merge(uri, terminal_table("id", 1, b"a", "not-cleared", deleted=True), telemetry)
 
 
 def test_schema_growth_is_rejected(tmp_path: Path, telemetry: Telemetry) -> None:
-    """A target cannot grow arbitrary fields outside its release-owned profile."""
-    uri = str(tmp_path / "schema.lance")
+    """A target cannot grow arbitrary fields outside its frozen dataset specification."""
+    uri: str = str(tmp_path / "schema.lance")
     replay_safe_merge(uri, terminal_table("id", 1, b"a", "first"), telemetry)
-    changed = terminal_table("id", 2, b"b", "second").append_column("surprise", pa.array(["value"]))
-    with pytest.raises(ValueError, match="release profile"):
+    changed: pa.Table = terminal_table("id", 2, b"b", "second").append_column("surprise", pa.array(["value"]))
+    with pytest.raises(ValueError, match="dataset specification"):
         replay_safe_merge(uri, changed, telemetry)

@@ -28,7 +28,7 @@
 //!   domain types. The transport ([`grpc::SearchGrpc`]) is generic over the trait, so it needs no
 //!   change. [`lance::LanceSearchBackend`] is the reference implementation.
 //! - New serving-catalog implementation: implement [`domain::ServingCatalog`]. It must resolve a
-//!   validated logical target to one URI, exact committed version, and code-owned profile.
+//!   validated logical target to one URI and exact committed version.
 //! - New dataset-opening strategy: implement [`lance::DatasetProvider`]. It owns route validation,
 //!   exact-version opening, and the open-handle cache. [`lance::CachingDatasetProvider`] is the
 //!   reference implementation.

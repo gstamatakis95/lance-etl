@@ -17,8 +17,7 @@ use crate::cache::janitor::CacheJanitor;
 use crate::cache::layout::prepare_cache_root;
 use crate::cache::redis_store::RedisEntryStore;
 use crate::cache::store_cache::MetadataByteCache;
-use crate::config::{CacheBackendKind, Config, PRODUCTION_PROFILE_ID, PRODUCTION_SERVE_TAG};
-use crate::domain::target::validate_path_segment;
+use crate::config::{CacheBackendKind, Config, PRODUCTION_SERVE_TAG};
 use crate::domain::{DatasetRef, DatasetTarget, SearchError, ServingCatalog, ServingRoute};
 use crate::lance::error::{classify_lance_error, is_definitive_open_absence};
 use crate::telemetry::{CacheName, Metrics, Tier};
@@ -364,11 +363,6 @@ impl CachingDatasetProvider {
             .await
             .map_err(|error| error.as_ref().clone())?;
         validate_serving_route(&self.base_uri, &route)?;
-        if route.profile_id != PRODUCTION_PROFILE_ID {
-            return Err(SearchError::internal(
-                "serving catalog profile is incompatible with this release",
-            ));
-        }
         Ok(route)
     }
 
@@ -500,8 +494,6 @@ fn validate_serving_route(base_uri: &str, route: &ServingRoute) -> Result<(), Se
     if route.lance_version == 0 {
         return Err(SearchError::internal("serving catalog contains Lance version zero"));
     }
-    validate_path_segment(&route.profile_id, "profile_id")
-        .map_err(|_| SearchError::internal("serving catalog contains an invalid profile_id"))?;
     let allowed_prefix = format!("{}/", base_uri.trim_end_matches('/'));
     if !route.lance_uri.starts_with(&allowed_prefix)
         || route.lance_uri[allowed_prefix.len()..]
