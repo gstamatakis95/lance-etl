@@ -1,7 +1,7 @@
 """Pure pivot and cast helpers for the Iceberg-to-Lance ingestion path.
 
-Provides the per-group pivot, FSL cast, and stats-batch helpers used by the executor
-closures in :mod:`lance_etl.etl.sink` and the reconciler workers. All functions operate on PyArrow
+Provides the per-group pivot and FSL cast helpers used by the executor closures in
+:mod:`lance_etl.etl.sink` and the reconciler workers. All functions operate on PyArrow
 tables and have no Spark dependency, so they can be unit-tested without a Spark context.
 
 Also owns :data:`ROUTING_COLS` and :class:`ETLConfig`, the shared routing contract and merge-sink
@@ -104,63 +104,6 @@ class ETLConfig:
     max_bulk_tasks_per_dataset: int = 1024
     max_keys_per_map: int = 4096
     tag_stamp: str | None = None
-
-
-def routing_stats_schema(extra_fields: list[tuple[str, pa.DataType]]) -> pa.Schema:
-    """Build a per-dataset stats schema: one string column per routing column plus extras.
-
-    Shared builder behind :func:`stats_schema`, so every stats schema agrees on the routing-column
-    prefix.
-
-    Args:
-        extra_fields: Additional ``(name, type)`` fields appended after the routing columns.
-
-    Returns:
-        A schema with one string column per :data:`ROUTING_COLS` entry, followed by ``extra_fields``
-        in order.
-    """
-    fields: list[tuple[str, pa.DataType]] = [(column, pa.string()) for column in ROUTING_COLS]
-    fields.extend(extra_fields)
-    return pa.schema(fields)
-
-
-def routing_stats_ddl(extra_columns: list[tuple[str, str]]) -> str:
-    """Return the Spark DDL string matching :func:`routing_stats_schema`.
-
-    Shared builder behind :func:`stats_spark_ddl`.
-
-    Args:
-        extra_columns: Additional ``(name, spark_type)`` columns appended after the routing columns.
-
-    Returns:
-        A DDL string with routing columns as string, followed by ``extra_columns`` in order.
-    """
-    columns: str = ", ".join(f"`{column}` string" for column in ROUTING_COLS)
-    extras: str = ", ".join(f"`{name}` {spark_type}" for name, spark_type in extra_columns)
-    return f"{columns}, {extras}" if extras else columns
-
-
-def stats_schema() -> pa.Schema:
-    """Build the per-dataset stats schema (routing columns + upserted/deleted/failed counters).
-
-    The ``failed`` counter is the merge path's isolated-failure channel: a dataset group whose
-    merge raised is reported as a ``failed`` stats row instead of failing the whole run, and the
-    driver surfaces the aggregate failed-dataset count through the partial-failure exit code.
-
-    Returns:
-        A schema with one string column per routing column plus ``upserted``, ``deleted``, and
-        ``failed``.
-    """
-    return routing_stats_schema([("upserted", pa.int64()), ("deleted", pa.int64()), ("failed", pa.int64())])
-
-
-def stats_spark_ddl() -> str:
-    """Return the Spark DDL string matching :func:`stats_schema` for use as ``mapInArrow`` output schema.
-
-    Returns:
-        A DDL string with routing columns as string plus upserted/deleted/failed as bigint.
-    """
-    return routing_stats_ddl([("upserted", "bigint"), ("deleted", "bigint"), ("failed", "bigint")])
 
 
 def enforce_map_key_bound(column: str, key_count: int, max_keys: int) -> None:
@@ -421,51 +364,3 @@ def stream_routing_groups(
             if flush_bytes is not None and buffered_bytes >= flush_bytes:
                 yield from flush()
     yield from flush()
-
-
-def align_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
-    """Conform a pivoted per-bucket slice to a driver-derived canonical schema.
-
-    Returns a table whose columns exactly match ``schema`` in name, order, and type. For each
-    field in ``schema`` the table's column is reused (cast to the field type when it differs and
-    the cast is safe), or a full-null column of the field type is synthesised when the table lacks
-    it. Columns present in the table but absent from ``schema`` are dropped.
-
-    This makes each parallel bulk-append task's pivoted slice union-compatible with every other
-    task's slice, so their ``write_fragments`` outputs share one schema and commit as a single
-    ``commit_batch`` append. Different slices see different subsets of map keys, so without this
-    alignment they would produce structurally incompatible fragments.
-
-    Args:
-        table: The pivoted-and-cast slice for one bucket of one dataset.
-        schema: The canonical schema for that dataset, derived on the driver.
-
-    Returns:
-        A table matching ``schema`` exactly.
-    """
-    present: set[str] = set(table.schema.names)
-    columns: list[pa.Array | pa.ChunkedArray] = []
-    for target in schema:
-        if target.name in present:
-            column: pa.ChunkedArray = table.column(target.name)
-            if not column.type.equals(target.type):
-                column = column.cast(target.type)
-            columns.append(column)
-        else:
-            columns.append(pa.nulls(table.num_rows, target.type))
-    return pa.table(columns, schema=schema)
-
-
-def build_stats_batch(rows: list[tuple[Any, ...]], schema: pa.Schema) -> pa.RecordBatch:
-    """Build the per-partition stats record batch.
-
-    Args:
-        rows: One tuple of values per dataset, matching the schema's column order — the routing
-            column values followed by the extra stat values in schema order.
-        schema: The stats schema the rows conform to, e.g. from :func:`stats_schema`.
-
-    Returns:
-        A record batch conforming to the given schema.
-    """
-    arrays: list[pa.Array] = [pa.array([row[index] for row in rows], field.type) for index, field in enumerate(schema)]
-    return pa.RecordBatch.from_arrays(arrays, schema=schema)

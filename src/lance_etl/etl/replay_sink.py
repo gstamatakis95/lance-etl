@@ -18,6 +18,7 @@ WINDOW_SEQUENCE_COLUMN: str = "lance_etl_window_seq"
 SOURCE_SEQUENCE_COLUMN: str = "lance_etl_source_sequence"
 EVENT_DIGEST_COLUMN: str = "lance_etl_event_digest"
 DELETED_COLUMN: str = "is_deleted"
+TS_COLUMN: str = "ts"
 VERIFY_KEY_BATCH: int = 512
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -58,6 +59,12 @@ def replay_update_condition() -> str:
 def validate_replay_table(table: pa.Table, key_column: str) -> list[str]:
     """Validate system fields, tombstones, and the release-fixed table shape.
 
+    The :data:`TS_COLUMN` event-time column is deliberately excluded from the set of payload
+    columns a tombstone must clear. A tombstone carries the delete mutation's event ``ts`` so the
+    retention pass can bound its lifetime against the record-retention window and the source replay
+    horizon (ADR 0018). Only true payload fields (vectors, text, metadata) must be null on a
+    tombstone.
+
     Args:
         table: Terminal mutation table to validate.
         key_column: Logical record key column.
@@ -85,7 +92,7 @@ def validate_replay_table(table: pa.Table, key_column: str) -> list[str]:
             raise ValueError(f"terminal mutation column {name!r} must be {expected_type}, got {field.type}")
         if table[name].null_count:
             raise ValueError(f"terminal mutation column {name!r} must not contain nulls")
-    payload_columns: list[str] = [name for name in table.column_names if name not in required]
+    payload_columns: list[str] = [name for name in table.column_names if name not in required and name != TS_COLUMN]
     tombstones: pa.ChunkedArray = table[DELETED_COLUMN]
     for name in payload_columns:
         invalid: pa.Array | pa.ChunkedArray = pc.and_(tombstones, pc.is_valid(table[name]))

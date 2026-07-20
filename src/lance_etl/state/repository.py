@@ -687,8 +687,15 @@ class ControlPlaneRepository:
             dataset_id: Existing logical dataset identity.
             revision_id: ACTIVE desired specification revision.
 
+        The desired revision pointer is always recorded. Immediate REBUILD convergence is
+        deferred (no work enqueued, ``None`` returned) when a publication generation is open,
+        because a REBUILD frozen against the current serving pointer would be stranded once
+        that publish advances it. The next INGEST freezes the desired revision and converges
+        naturally, so a deferred rollout still materializes without an orphaned work row.
+
         Returns:
-            Deterministic REBUILD work identity, or ``None`` when no materialized state needs convergence.
+            Deterministic REBUILD work identity, or ``None`` when no materialized state needs
+            convergence or convergence is deferred behind an open publication.
 
         Raises:
             StateTransitionError: If the dataset or active revision is absent or replayed work differs.
@@ -727,6 +734,8 @@ class ControlPlaneRepository:
                 return None
             if state_row["last_applied_source_snapshot_seq"] is None or state_row["ingest_lance_version"] is None:
                 return None
+            if self.has_open_publication(connection, dataset_id):
+                return None
             work_id: uuid.UUID = deterministic_rebuild_work_id(dataset_id, revision_id)
             source: IcebergSource = self.source_for_dataset(connection, dataset_id)
             candidate_uri: str = rebuild_uri(source.lance_base_uri, dataset_id, work_id)
@@ -740,9 +749,7 @@ class ControlPlaneRepository:
                 "state": WorkState.PENDING.value,
                 "phase": WorkPhase.COMPACT.value,
                 "next_attempt_at": current,
-                "expected_ingest_lance_uri": state_row["ingest_lance_uri"],
-                "expected_ingest_lance_version": state_row["ingest_lance_version"],
-                "expected_active_publication_id": state_row["active_publication_id"],
+                **self.frozen_expectations(state_row),
                 "candidate_lance_uri": candidate_uri,
                 "candidate_lance_version": 0,
             }
@@ -1100,9 +1107,7 @@ class ControlPlaneRepository:
             "kind": WorkKind.INGEST.value,
             "state": WorkState.PENDING.value,
             "phase": WorkPhase.INGEST.value,
-            "expected_ingest_lance_uri": state_row["ingest_lance_uri"],
-            "expected_ingest_lance_version": state_row["ingest_lance_version"],
-            "expected_active_publication_id": state_row["active_publication_id"],
+            **self.frozen_expectations(state_row),
         }
         connection.execute(
             postgresql.insert(dataset_work)
@@ -1256,7 +1261,13 @@ class ControlPlaneRepository:
         )
 
     def lane_order_predicate(self) -> sa.ColumnElement[bool]:
-        """Require all earlier source generations in a dataset lane to finish.
+        """Require all earlier still-reachable source generations in a lane to finish.
+
+        A non-ingest earlier work item whose frozen expectations no longer match the
+        current dataset state is permanently unclaimable, so it can never advance and
+        must not gate the lane. Excluding those rows keeps a superseded PUBLISH or
+        REBUILD from wedging every future ingest for the dataset. Correlation to the
+        outer ``datasets`` join makes the staleness comparison exact.
 
         Returns:
             Correlated SQL expression implementing source order.
@@ -1270,14 +1281,116 @@ class ControlPlaneRepository:
             earlier_seq < current_seq,
             sa.and_(earlier_seq == current_seq, earlier_kind_rank < current_kind_rank),
         )
+        earlier_reachable: Any = sa.or_(
+            earlier.c.kind == WorkKind.INGEST.value,
+            self.frozen_expectations_match_dataset(earlier),
+        )
         return ~sa.exists(
             sa.select(sa.literal(1)).where(
                 earlier.c.dataset_id == dataset_work.c.dataset_id,
                 earlier.c.work_id != dataset_work.c.work_id,
                 earlier.c.state != WorkState.SUCCEEDED.value,
+                earlier_reachable,
                 precedes,
             )
         )
+
+    def frozen_expectations_match_dataset(self, work: Any) -> sa.ColumnElement[bool]:
+        """The frozen expectations on a work row equal the current dataset state.
+
+        The three-column comparison against the outer ``datasets`` join is the exact
+        staleness test shared by the claim gate (:meth:`expected_state_predicate`), the
+        lane-order reachability filter (:meth:`lane_order_predicate`), and the orphan
+        sweep (:meth:`sweep_stale_work`). ``work`` is the ``dataset_work`` table or an
+        alias of it, so every caller emits byte-identical SQL against its own row.
+
+        Args:
+            work: The ``dataset_work`` table or an alias whose expectations are compared.
+
+        Returns:
+            SQL expression true when the work row's expectations match dataset state.
+        """
+        return sa.and_(
+            work.c.expected_ingest_lance_uri == datasets.c.ingest_lance_uri,
+            work.c.expected_ingest_lance_version.is_not_distinct_from(datasets.c.ingest_lance_version),
+            work.c.expected_active_publication_id.is_not_distinct_from(datasets.c.active_publication_id),
+        )
+
+    def frozen_expectations(self, state_row: RowMapping) -> dict[str, Any]:
+        """The frozen expectation columns a new or reclaimed work row copies from dataset state.
+
+        Every work row that freezes the serving pointer (INGEST insert, REBUILD enqueue, and the
+        INGEST re-freeze on reclaim) stores the same three expectation columns read from the live
+        dataset row. Centralizing the projection keeps the frozen contract defined in one place.
+
+        Args:
+            state_row: The live ``datasets`` row whose pointer is frozen onto the work item.
+
+        Returns:
+            The ``expected_*`` column mapping for a ``dataset_work`` insert or update.
+        """
+        return {
+            "expected_ingest_lance_uri": state_row["ingest_lance_uri"],
+            "expected_ingest_lance_version": state_row["ingest_lance_version"],
+            "expected_active_publication_id": state_row["active_publication_id"],
+        }
+
+    def assert_expectations_match(self, work_row: RowMapping, state_row: RowMapping, message: str) -> None:
+        """Raise when a work row's frozen expectations no longer match live dataset state.
+
+        Both terminal transitions re-check that the three frozen expectation columns still equal the
+        current dataset pointer under the taken locks, differing only in the message they raise. The
+        comparison is the runtime twin of :meth:`frozen_expectations_match_dataset`, which enforces
+        the same contract in SQL at claim time.
+
+        Args:
+            work_row: Locked work row carrying the frozen expectations.
+            state_row: Locked dataset row carrying the live pointer.
+            message: Transition-specific error surfaced on a mismatch.
+
+        Raises:
+            StateTransitionError: If any frozen expectation column changed.
+        """
+        expected: tuple[object, ...] = (
+            work_row["expected_ingest_lance_uri"],
+            work_row["expected_ingest_lance_version"],
+            work_row["expected_active_publication_id"],
+        )
+        actual: tuple[object, ...] = (
+            state_row["ingest_lance_uri"],
+            state_row["ingest_lance_version"],
+            state_row["active_publication_id"],
+        )
+        if expected != actual:
+            raise StateTransitionError(message)
+
+    def lock_work_and_state(self, connection: Connection, claim: WorkClaim) -> tuple[RowMapping, RowMapping] | None:
+        """Lock a claim's work row and its owning dataset row, or report an absent row.
+
+        Both terminal transitions (``complete_ingest`` and ``publish_dataset``) open by taking the
+        same ``FOR UPDATE`` locks on the work row and dataset row before re-checking the lease and
+        expectations. Centralizing the paired locked read keeps the fencing entry point identical.
+
+        Args:
+            connection: Current transaction.
+            claim: Live claim naming the work and dataset rows.
+
+        Returns:
+            The locked ``(work_row, state_row)`` pair, or ``None`` when either row is absent.
+        """
+        work_row: RowMapping | None = (
+            connection.execute(sa.select(dataset_work).where(dataset_work.c.work_id == claim.work_id).with_for_update())
+            .mappings()
+            .one_or_none()
+        )
+        state_row: RowMapping | None = (
+            connection.execute(sa.select(datasets).where(datasets.c.dataset_id == claim.dataset_id).with_for_update())
+            .mappings()
+            .one_or_none()
+        )
+        if work_row is None or state_row is None:
+            return None
+        return work_row, state_row
 
     def expected_state_predicate(self) -> sa.ColumnElement[bool]:
         """Require frozen work expectations to match current dataset state.
@@ -1285,12 +1398,10 @@ class ControlPlaneRepository:
         Returns:
             SQL expression protecting claims from stale generations.
         """
-        exact_state: Any = sa.and_(
-            dataset_work.c.expected_ingest_lance_uri == datasets.c.ingest_lance_uri,
-            dataset_work.c.expected_ingest_lance_version.is_not_distinct_from(datasets.c.ingest_lance_version),
-            dataset_work.c.expected_active_publication_id.is_not_distinct_from(datasets.c.active_publication_id),
+        return sa.or_(
+            dataset_work.c.kind == WorkKind.INGEST.value,
+            self.frozen_expectations_match_dataset(dataset_work),
         )
-        return sa.or_(dataset_work.c.kind == WorkKind.INGEST.value, exact_state)
 
     def claim_due_work(
         self,
@@ -1317,6 +1428,7 @@ class ControlPlaneRepository:
         work_provenance: WorkProvenance = (provenance or WorkProvenance()).validate()
         with self.engine.begin() as connection:
             self.release_expired_leases(connection, current)
+            self.sweep_stale_work(connection, current)
             rows: list[RowMapping] = list(
                 connection.execute(
                     sa.select(dataset_work)
@@ -1420,11 +1532,7 @@ class ControlPlaneRepository:
         lease_expires_at: datetime = current + lease_duration
         refreshed_expectations: dict[str, Any] = {}
         if work_row["kind"] == WorkKind.INGEST.value:
-            refreshed_expectations = {
-                "expected_ingest_lance_uri": state_row["ingest_lance_uri"],
-                "expected_ingest_lance_version": state_row["ingest_lance_version"],
-                "expected_active_publication_id": state_row["active_publication_id"],
-            }
+            refreshed_expectations = self.frozen_expectations(state_row)
         connection.execute(
             sa.update(datasets)
             .where(datasets.c.dataset_id == work_row["dataset_id"])
@@ -1781,22 +1889,10 @@ class ControlPlaneRepository:
             raise ValueError("ingest completion requires non-negative values and a 32-byte digest")
         current: datetime = now or utc_now()
         with self.engine.begin() as connection:
-            work_row: RowMapping | None = (
-                connection.execute(
-                    sa.select(dataset_work).where(dataset_work.c.work_id == claim.work_id).with_for_update()
-                )
-                .mappings()
-                .one_or_none()
-            )
-            state_row: RowMapping | None = (
-                connection.execute(
-                    sa.select(datasets).where(datasets.c.dataset_id == claim.dataset_id).with_for_update()
-                )
-                .mappings()
-                .one_or_none()
-            )
-            if work_row is None or state_row is None:
+            locked: tuple[RowMapping, RowMapping] | None = self.lock_work_and_state(connection, claim)
+            if locked is None:
                 return False
+            work_row, state_row = locked
             if self.completed_ingest_matches(
                 work_row,
                 state_row,
@@ -1807,18 +1903,9 @@ class ControlPlaneRepository:
                 return True
             if not self.locked_lease_matches(work_row, state_row, claim, current):
                 return False
-            expected: tuple[object, ...] = (
-                work_row["expected_ingest_lance_uri"],
-                work_row["expected_ingest_lance_version"],
-                work_row["expected_active_publication_id"],
+            self.assert_expectations_match(
+                work_row, state_row, "INGEST work expectations no longer match dataset state"
             )
-            actual: tuple[object, ...] = (
-                state_row["ingest_lance_uri"],
-                state_row["ingest_lance_version"],
-                state_row["active_publication_id"],
-            )
-            if expected != actual:
-                raise StateTransitionError("INGEST work expectations no longer match dataset state")
             connection.execute(
                 sa.update(datasets)
                 .where(datasets.c.dataset_id == claim.dataset_id)
@@ -1992,6 +2079,75 @@ class ControlPlaneRepository:
             .on_conflict_do_nothing(index_elements=[dataset_work.c.work_id])
         )
 
+    def has_open_publication(self, connection: Connection, dataset_id: uuid.UUID) -> bool:
+        """Report whether a non-terminal publication generation is in flight.
+
+        A REBUILD freezes the current serving pointer at enqueue time. Enqueuing one
+        while a PUBLISH is still open lets that publish advance the pointer, stranding
+        the REBUILD with expectations that can never match again. Callers use this to
+        reject or defer the REBUILD, mirroring the guard in ``enqueue_publish_work``.
+
+        Args:
+            connection: Current transaction.
+            dataset_id: Owning dataset.
+
+        Returns:
+            Whether an open PUBLISH generation exists for the dataset.
+        """
+        open_row: Any = (
+            connection.execute(
+                sa.select(sa.literal(1))
+                .where(
+                    dataset_work.c.dataset_id == dataset_id,
+                    dataset_work.c.kind == WorkKind.PUBLISH.value,
+                    dataset_work.c.state.in_(
+                        (WorkState.PENDING.value, WorkState.RUNNING.value, WorkState.RETRY_WAIT.value)
+                    ),
+                )
+                .with_for_update()
+                .limit(1)
+            )
+            .mappings()
+            .first()
+        )
+        return open_row is not None
+
+    def sweep_stale_work(self, connection: Connection, current: datetime) -> None:
+        """Block permanently unclaimable non-ingest work carrying stale expectations.
+
+        A pending PUBLISH or REBUILD whose frozen expectations no longer match the
+        dataset state can never be claimed and can never advance. Left pending it is an
+        invisible orphan. Moving it to BLOCKED with bounded error evidence makes it
+        visible to operators and to ``retry_blocked_work`` while ``lane_order_predicate``
+        already excludes stale non-ingest rows from gating the lane. Running work keeps
+        its lease untouched so the fencing discipline is preserved.
+
+        Args:
+            connection: Current transaction.
+            current: Transaction clock.
+        """
+        stale: Any = sa.not_(self.frozen_expectations_match_dataset(dataset_work))
+        connection.execute(
+            sa.update(dataset_work)
+            .where(
+                dataset_work.c.dataset_id == datasets.c.dataset_id,
+                dataset_work.c.kind != WorkKind.INGEST.value,
+                dataset_work.c.state.in_((WorkState.PENDING.value, WorkState.RETRY_WAIT.value)),
+                stale,
+            )
+            .values(
+                state=WorkState.BLOCKED.value,
+                lease_token=None,
+                lease_expires_at=None,
+                error_code=bounded_error("EXPECTATION_STALE", ERROR_CODE_LIMIT),
+                error_message=bounded_error(
+                    "work frozen expectations no longer match dataset state after a newer generation published",
+                    ERROR_MESSAGE_LIMIT,
+                ),
+                updated_at=current,
+            )
+        )
+
     def complete_snapshot_if_applied(
         self,
         connection: Connection,
@@ -2055,22 +2211,10 @@ class ControlPlaneRepository:
         index_evidence: Any
         current: datetime = now or utc_now()
         with self.engine.begin() as connection:
-            work_row: RowMapping | None = (
-                connection.execute(
-                    sa.select(dataset_work).where(dataset_work.c.work_id == claim.work_id).with_for_update()
-                )
-                .mappings()
-                .one_or_none()
-            )
-            state_row: RowMapping | None = (
-                connection.execute(
-                    sa.select(datasets).where(datasets.c.dataset_id == claim.dataset_id).with_for_update()
-                )
-                .mappings()
-                .one_or_none()
-            )
-            if work_row is None or state_row is None:
+            locked: tuple[RowMapping, RowMapping] | None = self.lock_work_and_state(connection, claim)
+            if locked is None:
                 return False
+            work_row, state_row = locked
             publication_id: uuid.UUID = deterministic_publication_id(claim.work_id)
             existing: RowMapping | None = (
                 connection.execute(
@@ -2196,18 +2340,7 @@ class ControlPlaneRepository:
         Raises:
             StateTransitionError: If frozen state or candidate identity changed.
         """
-        expected_state: tuple[object, ...] = (
-            work_row["expected_ingest_lance_uri"],
-            work_row["expected_ingest_lance_version"],
-            work_row["expected_active_publication_id"],
-        )
-        actual_state: tuple[object, ...] = (
-            state_row["ingest_lance_uri"],
-            state_row["ingest_lance_version"],
-            state_row["active_publication_id"],
-        )
-        if expected_state != actual_state:
-            raise StateTransitionError("publication expectations no longer match dataset state")
+        self.assert_expectations_match(work_row, state_row, "publication expectations no longer match dataset state")
         source_snapshot_seq: int = int(work_row["source_snapshot_seq"])
         source: IcebergSource = self.source_for_dataset(connection, claim.dataset_id)
         if not dataset_uri_matches_root(source.lance_base_uri, claim.dataset_id, candidate_lance_uri):
@@ -2454,6 +2587,8 @@ class ControlPlaneRepository:
             state_row: RowMapping = dataset_row
             if state_row["last_applied_source_snapshot_seq"] is None or state_row["ingest_lance_version"] is None:
                 raise StateTransitionError("dataset has no materialized source state to rebuild")
+            if self.has_open_publication(connection, dataset_row["dataset_id"]):
+                raise StateTransitionError("cannot enqueue rebuild while a publication generation is open")
             work_id: uuid.UUID = deterministic_rebuild_work_id(dataset_row["dataset_id"], request_id)
             source: IcebergSource = self.source_for_dataset(connection, dataset_row["dataset_id"])
             candidate_uri: str = rebuild_uri(source.lance_base_uri, dataset_row["dataset_id"], work_id)
@@ -2470,9 +2605,7 @@ class ControlPlaneRepository:
                     state=WorkState.PENDING.value,
                     phase=WorkPhase.COMPACT.value,
                     next_attempt_at=current,
-                    expected_ingest_lance_uri=state_row["ingest_lance_uri"],
-                    expected_ingest_lance_version=state_row["ingest_lance_version"],
-                    expected_active_publication_id=state_row["active_publication_id"],
+                    **self.frozen_expectations(state_row),
                     candidate_lance_uri=candidate_uri,
                     candidate_lance_version=0,
                 )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import struct
 import threading
 import uuid
@@ -48,7 +49,12 @@ from pyspark.sql.types import (
 )
 
 from lance_etl.cloud_storage import resolve_filesystem
-from lance_etl.etl.completion import CompletionMarker, finalize_completion_marker
+from lance_etl.etl.completion import (
+    CompletionMarker,
+    completion_is_desired,
+    finalize_completion_marker,
+    parse_completion_marker,
+)
 from lance_etl.etl.digest import SOURCE_DIGEST_HEADER, canonical_event_digest, encode_bytes
 from lance_etl.etl.mutation import DELETE_OPERATIONS, UPSERT_OPERATIONS, normalize_operation
 from lance_etl.etl.pivot import apply_fsl_cast
@@ -87,6 +93,8 @@ from lance_etl.state import (
     WorkKind,
 )
 from lance_etl.telemetry import Telemetry, TelemetryConfig
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 class ExecutionContextRepository(Protocol):
@@ -204,6 +212,15 @@ class DistributedIngestRunner:
                 source_digest: bytes
                 source_rows: int
                 source_digest, source_rows = self.compute_source_digest(collapsed)
+                applied: CompletionMarker | None = self.applied_completion_marker(context, source_digest)
+                if applied is not None:
+                    return WorkResult(
+                        claim=context.claim,
+                        kind=ResultKind.INGEST_SUCCEEDED,
+                        data_lance_version=applied.lance_version,
+                        source_row_count=source_rows,
+                        source_digest=source_digest,
+                    )
                 versions: list[int] = self.write_terminal(collapsed, context)
                 if source_rows > 0 and not versions:
                     raise RuntimeError("terminal write produced no verified executor result")
@@ -439,7 +456,7 @@ class DistributedIngestRunner:
                     deleted: bool = operation == "delete"
                     terminal_row: dict[str, object] = {
                         "record_id": row["record_id"],
-                        "ts": None if deleted else ts,
+                        "ts": ts,
                         **{name: None if deleted else payload[name] for name in payload_names},
                         WINDOW_SEQUENCE_COLUMN: window_seq,
                         SOURCE_SEQUENCE_COLUMN: source_sequence,
@@ -596,6 +613,62 @@ class DistributedIngestRunner:
 
         return self.spark.sparkContext.parallelize([(uri, window_seq, source_digest)], 1).map(finalize).collect()[0]
 
+    def applied_completion_marker(self, context: WorkExecutionContext, source_digest: bytes) -> CompletionMarker | None:
+        """Return the durable marker when this window is already applied, else ``None``.
+
+        Consulting the completion marker before the terminal merge makes a re-dispatched window
+        idempotent: once the first attempt durably wrote the marker, re-running the merge is not
+        just redundant but unsafe, because a later maintenance pass on the same dataset may have
+        physically removed rows the merge would re-insert. The probe opens the ingest dataset on one
+        executor and reads its config, so it is a single cheap object-store open. A marker whose
+        window sequence is at or beyond this claim's window proves the window is durable, and the
+        source digest is recomputed identically from the immutable source snapshot, so the returned
+        result carries the same exact evidence the first attempt produced.
+
+        Args:
+            context: Live INGEST context.
+            source_digest: Frozen digest recomputed from the immutable source snapshot.
+
+        Returns:
+            The durable marker proving this window is already applied, or ``None``.
+        """
+        telemetry_config: TelemetryConfig = self.telemetry_config
+        uri: str = context.claim.ingest_lance_uri
+        window_seq: int = int(context.claim.source_snapshot_seq or 0)
+
+        def probe(item: tuple[str, int, bytes]) -> CompletionMarker | None:
+            """Read the completion marker on one executor, tolerating an absent dataset.
+
+            Args:
+                item: URI, window sequence, and recomputed digest.
+
+            Returns:
+                The durable marker when the window is applied, otherwise ``None``.
+            """
+            target_uri: str
+            target_window: int
+            target_digest: bytes
+            target_uri, target_window, target_digest = item
+            Telemetry.create(telemetry_config)
+            error: FileNotFoundError | ValueError
+            try:
+                dataset: lance.LanceDataset = lance.dataset(target_uri)
+            except (FileNotFoundError, ValueError) as error:
+                if dataset_absent(error):
+                    return None
+                raise
+            marker: CompletionMarker | None = parse_completion_marker(dataset)
+            if completion_is_desired(marker, target_window, target_digest):
+                return marker
+            return None
+
+        results: list[CompletionMarker | None] = (
+            self.spark.sparkContext.parallelize([(uri, window_seq, source_digest)], 1).map(probe).collect()
+        )
+        if len(results) != 1:
+            raise RuntimeError("completion marker probe produced an invalid executor result")
+        return results[0]
+
 
 @dataclass(frozen=True, slots=True)
 class ConfiguredPublicationRunner:
@@ -636,6 +709,8 @@ class ConfiguredPublicationRunner:
                         telemetry=self.telemetry_config,
                         ts_column="ts",
                         retention_seconds=spec.record_retention_seconds,
+                        deleted_column=DELETED_COLUMN,
+                        replay_horizon_seconds=int(context.source.replay_horizon.total_seconds()),
                         target_rows_per_fragment=spec.target_rows_per_fragment,
                         materialize_deletions=spec.materialize_deletions,
                         materialize_deletions_threshold=spec.materialize_deletions_threshold,
@@ -1288,7 +1363,7 @@ class ConfiguredPublicationRunner:
                     )
                     continue
                 stats: dict[str, Any] = dataset.stats.index_stats(name)
-                uncovered: int = int(stats.get("num_unindexed_fragments") or 0)
+                uncovered: int = required_unindexed_fragments(stats, name)
                 actual_kind: str = resolved_actual_index_kind(
                     str(description.index_type).upper(), stats.get("index_type")
                 )
@@ -1577,11 +1652,14 @@ def publication_evidence(
         if not isinstance(raw, dict):
             raise ValueError("qualification index evidence must be a mapping")
         definition: IndexDefinition = definitions[str(raw["name"])]
+        observed_kind: object | None = raw.get("actual_kind")
+        if observed_kind is None:
+            raise ValueError("qualification index evidence lacks the observed index kind")
         digest_value: object | None = raw.get("artifact_generation_digest")
         index_evidence.append(
             PublicationIndexEvidence(
                 index_definition_id=definition.index_definition_id,
-                actual_index_type=definition.index_type,
+                actual_index_type=observed_index_type(str(observed_kind)),
                 indexed_fragment_count=int(raw.get("index_fragments") or 0),
                 unindexed_fragment_count=int(raw.get("unindexed_fragments") or 0),
                 artifact_generation_digest=bytes.fromhex(str(digest_value)) if digest_value is not None else None,
@@ -1599,35 +1677,40 @@ def publication_evidence(
 
 
 def lance_major_version() -> int:
-    """Return the installed pylance major version.
+    """Return the installed pylance major version, tolerating a malformed version string.
+
+    The value is used only for an operator diagnostic, never to gate correctness (the index-kind
+    fallback in :func:`resolved_actual_index_kind` is fully data-driven). A malformed
+    ``lance.__version__`` must therefore never fail a job: it is logged and reported as ``0`` (an
+    unknown/old major), which suppresses the "upstream bug persists" re-check warning rather than
+    asserting a specific version.
 
     Returns:
         The integer major component of ``lance.__version__`` (for example ``8`` for ``8.0.0`` and
-        ``9`` for ``9.0.0-beta.17``).
+        ``9`` for ``9.0.0-beta.17``), or ``0`` when the version string cannot be parsed.
     """
-    return int(lance.__version__.split(".", 1)[0])
-
-
-def describe_indices_omits_inverted_type() -> bool:
-    """Report whether ``describe_indices`` mislabels a segment-committed INVERTED index.
-
-    pylance 8.0.0 reports ``index_type`` as ``Unknown`` for an inverted index published through
-    the atomic ``CreateIndex`` swap the FTS build path uses, because that hand-built ``Index``
-    record carries no index details. ``stats.index_stats`` still reports the true ``Inverted``
-    type on the same version, so the qualification gate falls back to it. This is version-gated on
-    ``lance.__version__`` alone, never on attribute probing, per the repo compatibility rule. The
-    assumption that pylance 9 reports the type correctly is untested here (both the checkout and
-    the pinned wheel are 8.0.0), so the fallback is scoped to majors below 9 and must be re-checked
-    when the pin advances.
-
-    Returns:
-        ``True`` on pylance majors below 9, where the fallback is required.
-    """
-    return lance_major_version() < 9
+    raw: str = str(lance.__version__)
+    try:
+        return int(raw.split(".", 1)[0])
+    except ValueError:
+        logger.warning("could not parse a pylance major version from %r; treating it as unknown", raw)
+        return 0
 
 
 def resolved_actual_index_kind(description_kind: str, stats_kind: object | None) -> str:
-    """Resolve the effective index kind for the coverage gate under known pylance quirks.
+    """Resolve the effective index kind for the coverage gate under a known pylance quirk.
+
+    ``describe_indices`` reports ``index_type`` as ``Unknown`` for an inverted index published
+    through the atomic ``CreateIndex`` swap the FTS build path uses, because that hand-built
+    ``Index`` record carries no index details. ``stats.index_stats`` still reports the true
+    ``Inverted`` type. The resolution is data-driven and version-independent: whenever
+    ``describe_indices`` reports ``UNKNOWN``, the effective kind is taken from the stats type,
+    which carries the real kind, so genuinely wrong types are still rejected. This holds on every
+    pylance major (verified against the 9.x checkout, where ``index_stats`` derives ``index_type``
+    from the index's own plugin statistics). Consulting the returned stats value is data
+    inspection, not attribute probing, so the repo compatibility rule is respected. When the
+    describe kind is still ``UNKNOWN`` on a major at or beyond 9, an operator warning notes that
+    the upstream mislabeling persists, but the fallback still fires.
 
     Args:
         description_kind: Uppercased ``describe_indices`` index type for the index.
@@ -1635,12 +1718,75 @@ def resolved_actual_index_kind(description_kind: str, stats_kind: object | None)
 
     Returns:
         The uppercased describe kind, or the uppercased stats kind when the describe kind is the
-        placeholder ``UNKNOWN`` on a pylance major that mislabels segment-committed inverted
-        indexes. The stats kind carries the true type, so genuinely wrong types are still rejected.
+        placeholder ``UNKNOWN`` and a stats kind is available.
     """
-    if description_kind == "UNKNOWN" and describe_indices_omits_inverted_type() and stats_kind is not None:
+    if description_kind == "UNKNOWN" and stats_kind is not None:
+        if lance_major_version() >= 9:
+            logger.warning(
+                "describe_indices still reports UNKNOWN for a segment-committed inverted index on "
+                "pylance major %d; resolving the kind from index_stats",
+                lance_major_version(),
+            )
         return str(stats_kind).upper()
     return description_kind
+
+
+def required_unindexed_fragments(stats: dict[str, Any], name: str) -> int:
+    """Return the uncovered-fragment count from index stats, failing on a missing key.
+
+    A count of ``0`` means fully covered, which is a valid and common result. An absent
+    ``num_unindexed_fragments`` key is a different condition entirely: the stats payload does not
+    report coverage, so assuming zero would silently publish an index whose coverage is unknown.
+    The missing key is therefore a hard failure rather than a defaulted zero.
+
+    Args:
+        stats: The ``stats.index_stats`` payload for one index.
+        name: The stable index name, for the error message.
+
+    Returns:
+        The number of fragments the index does not yet cover.
+
+    Raises:
+        RuntimeError: If the coverage key is absent or null.
+    """
+    if stats.get("num_unindexed_fragments") is None:
+        raise RuntimeError(
+            f"index stats for {name!r} omit num_unindexed_fragments; a missing coverage key cannot "
+            "be assumed to be zero"
+        )
+    return int(stats["num_unindexed_fragments"])
+
+
+def observed_index_type(actual_kind: str) -> IndexType:
+    """Map an observed pylance index kind to its canonical control-plane index type.
+
+    ``describe_indices`` reports the vector family as ``IVF`` while the control plane names it
+    ``IVF_RQ``, so the observed alias is normalized here. The mapping is the single place a
+    resolved kind becomes durable publication evidence, which is what lets
+    ``validate_publication_indexes`` compare the observed kind against the frozen specification
+    instead of trivially re-checking the configured type against itself.
+
+    Args:
+        actual_kind: Resolved describe or stats kind from :func:`resolved_actual_index_kind`.
+
+    Returns:
+        The canonical :class:`IndexType` for the observed kind.
+
+    Raises:
+        ValueError: If the observed kind maps to no supported index type.
+    """
+    mapping: dict[str, IndexType] = {
+        "IVF": IndexType.IVF_RQ,
+        "IVF_RQ": IndexType.IVF_RQ,
+        "INVERTED": IndexType.INVERTED,
+        "BTREE": IndexType.BTREE,
+        "BITMAP": IndexType.BITMAP,
+        "ZONEMAP": IndexType.ZONEMAP,
+    }
+    resolved: IndexType | None = mapping.get(actual_kind.upper())
+    if resolved is None:
+        raise ValueError(f"observed index kind {actual_kind!r} maps to no supported index type")
+    return resolved
 
 
 def index_kind_matches(required: str, actual: str) -> bool:

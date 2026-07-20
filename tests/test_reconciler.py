@@ -8,12 +8,15 @@ from dataclasses import fields as dataclass_fields
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import lance
 import pyarrow as pa
 import pytest
+from conftest import FakeSpark
 
+from lance_etl.etl.completion import CompletionConflict, CompletionMarker, finalize_completion_marker
 from lance_etl.reconciler import (
     BoundedDispatcher,
     DispatchSummary,
@@ -37,11 +40,18 @@ from lance_etl.reconciler.config import RuntimeSettings
 from lance_etl.reconciler.iceberg import DurableSourcePlanProvider
 from lance_etl.reconciler.workers import (
     ConfiguredPublicationRunner,
+    DistributedIngestRunner,
     FencedWorkExecutor,
     index_kind_matches,
+    lance_major_version,
+    observed_index_type,
     persisted_arrow_schema,
     required_indexes,
+    required_unindexed_fragments,
     resolved_actual_index_kind,
+)
+from lance_etl.reconciler.workers import (
+    publication_evidence as build_publication_evidence,
 )
 from lance_etl.source import (
     BaselineProof,
@@ -73,6 +83,7 @@ from lance_etl.state import (
     WorkPhase,
     production_default_spec_revision,
 )
+from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 
 def source_registration(baseline_snapshot_id: int | None = 9) -> IcebergSource:
@@ -476,15 +487,171 @@ def test_index_kind_gate_accepts_pylance8_unknown_inverted(monkeypatch: pytest.M
     assert resolved_actual_index_kind("UNKNOWN", None) == "UNKNOWN"
 
 
-def test_index_kind_gate_does_not_fall_back_on_pylance9(monkeypatch: pytest.MonkeyPatch) -> None:
-    """On pylance 9 the describe type is authoritative and the Unknown fallback is disabled.
+def test_index_kind_gate_falls_back_on_pylance9(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On pylance 9 the Unknown fallback still fires because index_stats reports the true kind.
 
-    The fallback is scoped to pylance majors below 9 because that behaviour is untested against 9.x.
-    A future bump must re-check the assumption rather than silently accept Unknown as any type.
+    The 9.x checkout derives ``index_stats``'s ``index_type`` from the index's own plugin
+    statistics, so a segment-committed inverted index reported as ``Unknown`` by
+    ``describe_indices`` still resolves to ``Inverted``. The resolution is data-driven and
+    version-independent, and it still rejects a genuinely wrong stats type.
     """
     monkeypatch.setattr(lance, "__version__", "9.0.0-beta.17")
-    assert resolved_actual_index_kind("UNKNOWN", "Inverted") == "UNKNOWN"
-    assert not index_kind_matches("INVERTED", resolved_actual_index_kind("UNKNOWN", "Inverted"))
+    assert resolved_actual_index_kind("UNKNOWN", "Inverted") == "INVERTED"
+    assert index_kind_matches("INVERTED", resolved_actual_index_kind("UNKNOWN", "Inverted"))
+    assert not index_kind_matches("INVERTED", resolved_actual_index_kind("UNKNOWN", "BTree"))
+    assert resolved_actual_index_kind("UNKNOWN", None) == "UNKNOWN"
+
+
+def test_lance_major_version_tolerates_malformed_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A malformed pylance version string reports an unknown major instead of raising.
+
+    The major is used only for an operator diagnostic, never to gate correctness, so a version
+    string that cannot be parsed must not fail a publish. It is reported as ``0`` (unknown).
+    """
+    monkeypatch.setattr(lance, "__version__", "8.0.0")
+    assert lance_major_version() == 8
+    monkeypatch.setattr(lance, "__version__", "not-a-version")
+    assert lance_major_version() == 0
+
+
+def test_required_unindexed_fragments_rejects_missing_key() -> None:
+    """A missing coverage key is a hard failure, while a zero count is a valid full-coverage result."""
+    assert required_unindexed_fragments({"num_unindexed_fragments": 0}, "idx") == 0
+    assert required_unindexed_fragments({"num_unindexed_fragments": 3}, "idx") == 3
+    with pytest.raises(RuntimeError, match="num_unindexed_fragments"):
+        required_unindexed_fragments({"num_indexed_fragments": 2}, "idx")
+    with pytest.raises(RuntimeError, match="num_unindexed_fragments"):
+        required_unindexed_fragments({"num_unindexed_fragments": None}, "idx")
+
+
+def test_observed_index_type_normalizes_describe_aliases() -> None:
+    """The observed describe alias resolves to the canonical control-plane index type."""
+    assert observed_index_type("IVF") is IndexType.IVF_RQ
+    assert observed_index_type("IVF_RQ") is IndexType.IVF_RQ
+    assert observed_index_type("inverted") is IndexType.INVERTED
+    assert observed_index_type("BTREE") is IndexType.BTREE
+    with pytest.raises(ValueError, match="no supported index type"):
+        observed_index_type("HNSW")
+
+
+def qualification_evidence(spec: DatasetSpecRevision, observed: dict[IndexType, str]) -> dict[str, object]:
+    """Build a successful qualification dictionary with per-index observed kinds.
+
+    Args:
+        spec: Frozen dataset specification.
+        observed: Observed describe or stats kind per configured index type.
+
+    Returns:
+        Qualification evidence shaped like the executor gate output.
+    """
+    fields_by_id: dict[uuid.UUID, str] = {field.field_id: field.target_name for field in spec.fields}
+    indexes: list[dict[str, object]] = [
+        {
+            "kind": definition.index_type.value,
+            "column": fields_by_id[definition.field_id],
+            "name": definition.index_name,
+            "present": True,
+            "actual_kind": observed[definition.index_type],
+            "kind_matches": True,
+            "columns_match": True,
+            "fully_covered": True,
+            "unindexed_fragments": 0,
+            "index_fragments": 2,
+            "artifact_generation_digest": ("aa" * 32) if definition.index_type is IndexType.IVF_RQ else None,
+        }
+        for definition in spec.index_definitions
+    ]
+    return {
+        "schema_fingerprint": "ab" * 32,
+        "total_rows": 8,
+        "distinct_record_ids": 8,
+        "live_rows": 7,
+        "distinct_live_record_ids": 7,
+        "fragment_count": 2,
+        "indexes": indexes,
+    }
+
+
+def test_publication_evidence_records_observed_kind_not_configured() -> None:
+    """Evidence persists the resolved observed kind so the publish gate is a real cross-check.
+
+    Every configured index built correctly resolves back to its configured type through the
+    describe alias, and a mismatched observation is recorded verbatim rather than silently copying
+    the spec, which is what makes ``validate_publication_indexes`` able to fail.
+    """
+    spec: DatasetSpecRevision = production_default_spec_revision()
+    describe_alias: dict[IndexType, str] = {
+        IndexType.IVF_RQ: "IVF",
+        IndexType.BTREE: "BTREE",
+        IndexType.BITMAP: "BITMAP",
+        IndexType.ZONEMAP: "ZONEMAP",
+        IndexType.INVERTED: "INVERTED",
+    }
+    evidence: PublicationEvidence = build_publication_evidence(spec, qualification_evidence(spec, describe_alias))
+    resolved: dict[uuid.UUID, IndexType] = {
+        item.index_definition_id: item.actual_index_type for item in evidence.indexes
+    }
+    configured: dict[uuid.UUID, IndexType] = {
+        definition.index_definition_id: definition.index_type for definition in spec.index_definitions
+    }
+    assert resolved == configured
+
+    wrong: dict[IndexType, str] = dict(describe_alias)
+    wrong[IndexType.INVERTED] = "BTREE"
+    mismatched: PublicationEvidence = build_publication_evidence(spec, qualification_evidence(spec, wrong))
+    inverted_definition_id: uuid.UUID = next(
+        definition.index_definition_id
+        for definition in spec.index_definitions
+        if definition.index_type is IndexType.INVERTED
+    )
+    observed_kind: IndexType = next(
+        item.actual_index_type for item in mismatched.indexes if item.index_definition_id == inverted_definition_id
+    )
+    assert observed_kind is IndexType.BTREE
+
+
+def ingest_probe_context(uri: str, window_seq: int) -> SimpleNamespace:
+    """Build a minimal context exposing only the fields the marker probe reads.
+
+    Args:
+        uri: Ingest dataset URI.
+        window_seq: Source window sequence for the claim.
+
+    Returns:
+        A stand-in context whose claim carries the ingest URI and window sequence.
+    """
+    return SimpleNamespace(claim=SimpleNamespace(ingest_lance_uri=uri, source_snapshot_seq=window_seq))
+
+
+def test_applied_completion_marker_short_circuits_a_completed_window(tmp_path: Path) -> None:
+    """The ingest runner consults the completion marker before merging.
+
+    A window at or below the durable marker short-circuits with the marker, an unapplied later
+    window does not, an absent dataset resolves to no marker, and a same-window different-digest
+    surfaces the durable conflict instead of silently re-merging.
+    """
+    uri: str = str(tmp_path / "ingest.lance")
+    lance.write_dataset(pa.table({"record_id": pa.array(["a"], pa.string())}), uri)
+    telemetry: Telemetry = Telemetry.create(TelemetryConfig())
+    digest: bytes = b"d" * 32
+    finalize_completion_marker(uri, 3, digest, telemetry, retry_backoff_seconds=0.0)
+    runner: DistributedIngestRunner = DistributedIngestRunner(spark=FakeSpark(), telemetry_config=TelemetryConfig())
+
+    applied: CompletionMarker | None = runner.applied_completion_marker(ingest_probe_context(uri, 3), digest)
+    assert applied is not None
+    assert applied.window_seq == 3
+
+    superseded: CompletionMarker | None = runner.applied_completion_marker(ingest_probe_context(uri, 2), b"e" * 32)
+    assert superseded is not None
+
+    unapplied: CompletionMarker | None = runner.applied_completion_marker(ingest_probe_context(uri, 4), digest)
+    assert unapplied is None
+
+    missing_uri: str = str(tmp_path / "missing.lance")
+    assert runner.applied_completion_marker(ingest_probe_context(missing_uri, 3), digest) is None
+
+    with pytest.raises(CompletionConflict):
+        runner.applied_completion_marker(ingest_probe_context(uri, 3), b"x" * 32)
 
 
 class StopAfterQualify(RuntimeError):

@@ -23,10 +23,13 @@ from lance_etl.maintenance import (
     MaintenanceJob,
     build_retention_predicate,
     compute_cutoff,
+    retention_predicate,
     run_retention_on_open_dataset,
     validate_column_name,
 )
 from lance_etl.telemetry import Telemetry, TelemetryConfig
+
+DELETED_COLUMN: str = "is_deleted"
 
 TS_COLUMN: str = "ts"
 RETENTION_SECONDS: int = 10 * 24 * 3600
@@ -143,6 +146,101 @@ class TestPredicateSafety:
             uri,
         )
         validate_column_name("ts", ds.schema)
+
+
+class TestTombstoneAwarePredicate:
+    """retention_predicate expires live rows and tombstones on separate clocks when configured."""
+
+    def test_no_deleted_column_keeps_plain_predicate(self) -> None:
+        """Without a deleted column the predicate is the exact plain ts comparison."""
+        cutoff: datetime = datetime(2025, 3, 15, 12, 0, 0, tzinfo=UTC)
+        config: MaintenanceConfig = MaintenanceConfig(telemetry=TelemetryConfig(), retention_seconds=RETENTION_SECONDS)
+        assert retention_predicate(config, cutoff) == build_retention_predicate("ts", cutoff)
+
+    def test_unbounded_replay_horizon_never_expires_tombstones(self) -> None:
+        """With no replay horizon the predicate matches only live rows so tombstones are retained."""
+        cutoff: datetime = datetime(2025, 3, 15, 12, 0, 0, tzinfo=UTC)
+        config: MaintenanceConfig = MaintenanceConfig(
+            telemetry=TelemetryConfig(),
+            retention_seconds=RETENTION_SECONDS,
+            deleted_column=DELETED_COLUMN,
+            replay_horizon_seconds=None,
+        )
+        predicate: str = retention_predicate(config, cutoff)
+        assert predicate == f"(NOT {DELETED_COLUMN} AND {build_retention_predicate('ts', cutoff)})"
+
+    def test_replay_horizon_beyond_retention_uses_older_tombstone_cutoff(self) -> None:
+        """A tombstone clause compares ts against now minus the larger of the two windows."""
+        cutoff: datetime = datetime(2025, 3, 15, 12, 0, 0, tzinfo=UTC)
+        record_seconds: int = 10 * 24 * 3600
+        replay_seconds: int = 30 * 24 * 3600
+        config: MaintenanceConfig = MaintenanceConfig(
+            telemetry=TelemetryConfig(),
+            retention_seconds=record_seconds,
+            deleted_column=DELETED_COLUMN,
+            replay_horizon_seconds=replay_seconds,
+        )
+        tombstone_cutoff: datetime = cutoff - timedelta(seconds=replay_seconds - record_seconds)
+        expected: str = (
+            f"((NOT {DELETED_COLUMN} AND {build_retention_predicate('ts', cutoff)}) OR "
+            f"({DELETED_COLUMN} AND {build_retention_predicate('ts', tombstone_cutoff)}))"
+        )
+        assert retention_predicate(config, cutoff) == expected
+
+    def test_replay_horizon_within_retention_matches_record_cutoff(self) -> None:
+        """When the horizon is shorter than retention the tombstone clock equals the record clock."""
+        cutoff: datetime = datetime(2025, 3, 15, 12, 0, 0, tzinfo=UTC)
+        config: MaintenanceConfig = MaintenanceConfig(
+            telemetry=TelemetryConfig(),
+            retention_seconds=30 * 24 * 3600,
+            deleted_column=DELETED_COLUMN,
+            replay_horizon_seconds=5 * 24 * 3600,
+        )
+        base: str = build_retention_predicate("ts", cutoff)
+        expected: str = f"((NOT {DELETED_COLUMN} AND {base}) OR ({DELETED_COLUMN} AND {base}))"
+        assert retention_predicate(config, cutoff) == expected
+
+
+class TestTombstoneRetentionDelete:
+    """The tombstone-aware retention delete honors both the record window and the replay horizon."""
+
+    def test_expires_live_and_horizon_expired_tombstones_only(self, tmp_path: Path, telemetry: Telemetry) -> None:
+        """A live row past retention and a tombstone past the replay horizon are deleted; the rest survive."""
+        now: datetime = datetime.now(tz=UTC)
+        record_seconds: int = 10 * 24 * 3600
+        replay_seconds: int = 30 * 24 * 3600
+        table: pa.Table = pa.table(
+            {
+                "id": pa.array([0, 1, 2, 3], pa.int64()),
+                TS_COLUMN: pa.array(
+                    [
+                        now - timedelta(days=20),
+                        now - timedelta(days=5),
+                        now - timedelta(days=20),
+                        now - timedelta(days=40),
+                    ],
+                    pa.timestamp("us", tz="UTC"),
+                ),
+                DELETED_COLUMN: pa.array([False, False, True, True], pa.bool_()),
+            }
+        )
+        uri: str = str(tmp_path / "tombstone-retention.lance")
+        lance.write_dataset(table, uri)
+        config: MaintenanceConfig = MaintenanceConfig(
+            telemetry=TelemetryConfig(),
+            retention_seconds=record_seconds,
+            deleted_column=DELETED_COLUMN,
+            replay_horizon_seconds=replay_seconds,
+            ts_column=TS_COLUMN,
+            commit_backoff_seconds=0.0,
+        )
+        dataset: lance.LanceDataset = lance.dataset(uri)
+        result: dict[str, object] = run_retention_on_open_dataset(
+            dataset, uri, config, compute_cutoff(record_seconds), telemetry
+        )
+        assert result["retention_rows_deleted"] == 2
+        survivors: list[int] = sorted(int(row["id"]) for row in lance.dataset(uri).to_table().to_pylist())
+        assert survivors == [1, 2]
 
 
 class TestRetentionDelete:

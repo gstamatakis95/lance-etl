@@ -52,6 +52,21 @@ minus the window. `materialize_deletions` and `materialize_deletions_threshold` 
 physical deletion materialization occurs. The data model keeps source truth and physical cleanup
 separate.
 
+Tombstone rows carry the delete mutation's event `ts` and expire on a separate clock from live
+rows. A live row is deleted at `ts < now - record_retention_seconds` as above. A tombstone is
+deleted only once its `ts` is past both the record-retention window and the source replay horizon,
+that is `ts < now - max(record_retention_seconds, replay_horizon_seconds)`. A window that could
+resurrect a deleted row carries an older-or-equal source sequence, so keeping the tombstone until it
+is past the replay horizon preserves its source-sequence anti-resurrection watermark for every
+window a replay could still re-apply. This makes a tombstone strictly longer-lived than the live row
+it shadowed. The bound is exact only under the assumption that event `ts` tracks ingest time, since
+the replay horizon is enforced on the control-plane snapshot ingest time while retention runs on
+event `ts`. That divergence is a pre-existing property of event-`ts` retention and is not introduced
+here. When the replay horizon is unbounded the predicate never matches a tombstone, so tombstones
+are retained forever rather than risk a premature GC. Before this decision tombstones carried a null
+`ts` and never expired at all, so `record_retention_seconds` silently failed to bound storage on
+delete-heavy datasets.
+
 ## ADR 0023 — Iceberg source-table maintenance
 
 Status: Accepted as a reusable local library

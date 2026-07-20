@@ -1,8 +1,8 @@
 """Fleet-level manifest-migration, serving-tag, and interval-tag-retention helpers for Lance datasets.
 
 These operations are embarrassingly parallel one-call-per-dataset functions.
-Their fleet drivers (:func:`migrate_manifest_paths`, :func:`update_serving_tags`,
-:func:`prune_interval_tags_fleet`) are thin adapters over :func:`~lance_etl.fanout.run_fleet_fanout`,
+Their fleet drivers (:func:`migrate_manifest_paths`, :func:`update_serving_tags`)
+are thin adapters over :func:`~lance_etl.fanout.run_fleet_fanout`,
 which owns the shared span/tag/timer/gauge/log driver shell around
 :func:`~lance_etl.fanout.fan_out_per_dataset` and spreads the per-dataset work across Spark
 executors without any additional orchestration.
@@ -17,7 +17,7 @@ call regardless of how many tags are flipped. A tagged version is exempt from
 :func:`~lance_etl.maintenance.job.cleanup_dataset` pruning, so the version a serving
 layer reads stays readable until the tag moves to a newer one.
 
-:func:`prune_interval_tags` and :func:`prune_interval_tags_fleet` delete old interval
+:func:`prune_interval_tags` deletes old interval
 tags whose names are classified by :func:`datetime.strptime` against the
 ``%Y%m%dT%H%M%SZ`` format, keeping only the newest ``tag_keep_last`` tags.  Tags that
 do not match the format (``HEAD`` and other non-interval tags) are never touched.
@@ -432,57 +432,3 @@ def prune_interval_tags(
         len(to_delete),
     )
     return {"uri": uri, "tags_pruned": len(to_delete), "tags_kept": len(to_keep)}
-
-
-def prune_interval_tags_fleet(
-    spark: SparkSession,
-    dataset_uris: Iterable[str],
-    telemetry_config: TelemetryConfig,
-    storage_options: dict[str, Any] | None,
-    tag_keep_last: int,
-    partitions: int = TAG_FANOUT_PARTITIONS,
-) -> list[dict[str, Any]]:
-    """Prune old interval tags across a fleet of datasets, one task per executor partition.
-
-    Each dataset's tag pruning is an independent metadata operation, so the work fans
-    out across executors exactly like the manifest migration.  ``tag_keep_last`` is
-    broadcast implicitly through the closure captured by the per-dataset callable.
-
-    Args:
-        spark: Active Spark session.
-        dataset_uris: Datasets whose old interval tags should be pruned.
-        telemetry_config: Telemetry configuration created per executor process.
-        storage_options: Object-store options forwarded to pylance.
-        tag_keep_last: Number of newest interval tags to retain per dataset.
-        partitions: Maximum Spark partitions for the prune job.
-
-    Returns:
-        One statistics dictionary per dataset.
-    """
-
-    def per_dataset(uri: str, telemetry: Telemetry) -> dict[str, Any]:
-        """Prune one dataset's interval tags, closing over ``storage_options``/``tag_keep_last``."""
-        return prune_interval_tags(uri, storage_options, tag_keep_last, telemetry)
-
-    def pruned_total(results: list[dict[str, Any]]) -> int:
-        """Sum the pruned-tag counts across every dataset result."""
-        return sum(int(r.get("tags_pruned", 0)) for r in results)
-
-    def log_results(results: list[dict[str, Any]]) -> None:
-        """Log the interval-tag prune summary."""
-        logger.info("interval-tag prune: %d tags pruned across %d datasets", pruned_total(results), len(results))
-
-    return run_fleet_fanout(
-        spark,
-        dataset_uris,
-        telemetry_config,
-        per_dataset,
-        partitions,
-        span_name="lance.interval_tag_prune.run",
-        phase="prune",
-        timer_metric="run.prune_tags_ms",
-        gauge_metric="run.interval_tags_pruned",
-        gauge_value=pruned_total,
-        log_results=log_results,
-        span_tags={"tag_keep_last": tag_keep_last},
-    )

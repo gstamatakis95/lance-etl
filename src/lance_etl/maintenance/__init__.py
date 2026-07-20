@@ -17,6 +17,7 @@ from lance_etl.maintenance.job import (
     compaction_metrics_dict,
     compute_cutoff,
     plan_one_dataset,
+    retention_predicate,
     run_retention_on_open_dataset,
     validate_column_name,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "migrate_dataset_manifest_paths",
     "plan_cluster_rewrite",
     "plan_one_dataset",
+    "retention_predicate",
     "run_retention_on_open_dataset",
     "update_serving_tag",
     "validate_column_name",

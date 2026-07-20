@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import lance
@@ -147,6 +148,32 @@ def test_tombstone_requires_all_payload_fields_null(tmp_path: Path, telemetry: T
     uri: str = str(tmp_path / "bad-tombstone.lance")
     with pytest.raises(ValueError, match="explicitly clear"):
         replay_safe_merge(uri, terminal_table("id", 1, b"a", "not-cleared", deleted=True), telemetry)
+
+
+def test_tombstone_carries_delete_time_ts(tmp_path: Path, telemetry: Telemetry) -> None:
+    """A tombstone may carry the delete mutation's event ts, which the retention pass expires on.
+
+    The event-time column is not a payload column a tombstone must clear, so a delete stamped with
+    a real ts merges without raising and stores that ts, while true payload fields stay null.
+    """
+    uri: str = str(tmp_path / "ts-tombstone.lance")
+    delete_ts: datetime = datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)
+    table: pa.Table = pa.table(
+        {
+            "record_id": pa.array(["id"], type=pa.string()),
+            "ts": pa.array([delete_ts], type=pa.timestamp("us", tz="UTC")),
+            "text": pa.array([None], type=pa.string()),
+            WINDOW_SEQUENCE_COLUMN: pa.array([2], type=pa.int64()),
+            SOURCE_SEQUENCE_COLUMN: pa.array([2], type=pa.int64()),
+            EVENT_DIGEST_COLUMN: pa.array([b"a" * 32], type=pa.binary(32)),
+            DELETED_COLUMN: pa.array([True], type=pa.bool_()),
+        }
+    )
+    replay_safe_merge(uri, table, telemetry)
+    stored: dict[str, object] = lance.dataset(uri).to_table().to_pylist()[0]
+    assert stored[DELETED_COLUMN] is True
+    assert stored["ts"] == delete_ts
+    assert stored["text"] is None
 
 
 def test_schema_growth_is_rejected(tmp_path: Path, telemetry: Telemetry) -> None:

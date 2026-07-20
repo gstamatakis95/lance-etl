@@ -86,6 +86,20 @@ class MaintenanceConfig:
         retention_seconds: Retention window in seconds derived from the spec revision policy.
             ``None`` (default) turns record expiry off. When set, rows where
             ``ts_column < now - retention_seconds`` are deleted before compaction.
+        deleted_column: The boolean tombstone column, or ``None`` (default) for a tombstone-unaware
+            dataset. When set, the retention predicate expires live rows and tombstones on separate
+            clocks: a live row is deleted at ``ts < now - retention_seconds`` as usual, while a
+            tombstone is deleted only once its ``ts`` is past both the record-retention window and
+            the source replay horizon (see :attr:`replay_horizon_seconds`). A tombstone carries the
+            delete mutation's event ``ts`` precisely so it can be expired on this clock. Datasets
+            without a tombstone column (the operator-library and namespace-migration callers) leave
+            this ``None`` and keep the plain ``ts < cutoff`` predicate.
+        replay_horizon_seconds: The source replay horizon in seconds. Only consulted when
+            :attr:`deleted_column` is set. A tombstone is expired only when its ``ts`` is older than
+            ``max(retention_seconds, replay_horizon_seconds)`` so its source-sequence anti-resurrection
+            watermark outlives every window a replay could still re-apply. ``None`` means the horizon
+            is unbounded and tombstones are never expired, which keeps replay safe at the cost of
+            unbounded tombstone storage.
         ts_column: The ``ts`` column used as the retention clock; must match ``ETLConfig.ts_col``.
         target_rows_per_fragment: Desired rows per compacted fragment; matches lance's
             ``CompactionOptions`` default of ``1_048_576`` so the default is explicit and immune
@@ -124,6 +138,8 @@ class MaintenanceConfig:
     telemetry: TelemetryConfig
     storage_options: dict[str, Any] | None = None
     retention_seconds: int | None = None
+    deleted_column: str | None = None
+    replay_horizon_seconds: int | None = None
     ts_column: str = "ts"
     target_rows_per_fragment: int = 1_048_576
     materialize_deletions: bool = True
@@ -228,6 +244,58 @@ def build_retention_predicate(ts_column: str, cutoff: datetime) -> str:
     utc_ts: str = f"arrow_cast({ts_column}, 'Timestamp(Microsecond, \"UTC\")')"
     utc_cutoff: str = f"arrow_cast('{literal}', 'Timestamp(Microsecond, \"UTC\")')"
     return f"{utc_ts} < {utc_cutoff}"
+
+
+def retention_predicate(config: MaintenanceConfig, cutoff: datetime) -> str:
+    """Build the retention delete predicate, tombstone-aware when a deleted column is configured.
+
+    With no :attr:`MaintenanceConfig.deleted_column` the predicate is the plain
+    ``ts < cutoff`` clause, so operator-library and namespace-migration callers keep the exact
+    pre-existing behavior. When a deleted column is configured, live rows and tombstones expire on
+    separate clocks:
+
+    - A live row is deleted at ``ts < now - retention_seconds`` exactly as before (ADR 0018).
+    - A tombstone is deleted only when its ``ts`` is older than BOTH the record-retention window
+      AND the source replay horizon, that is ``ts < now - max(retention_seconds,
+      replay_horizon_seconds)``. Since a tombstone carries the delete mutation's event ``ts``, and
+      any window that could resurrect the deleted row carries an older or equal source sequence
+      (hence an equal-or-older event ``ts``), keeping the tombstone until it is past the replay
+      horizon guarantees its source-sequence anti-resurrection watermark outlives every window a
+      replay could still re-apply. The tombstone is therefore always strictly longer-lived than
+      the live row it shadowed.
+
+    Safety is relative, not absolute: the retention clock is the event ``ts`` while the replay
+    horizon is enforced on the control-plane snapshot ingest time (``source_snapshots.created_at``).
+    The bound is exact only under the assumption that event ``ts`` tracks ingest time, which is the
+    same assumption ADR 0018's event-``ts`` live-row retention already relies on. This change does
+    not introduce that divergence, it only makes tombstones at least as protected as the live rows
+    the system already expires.
+
+    When :attr:`MaintenanceConfig.replay_horizon_seconds` is ``None`` the horizon is unbounded and
+    the predicate never matches a tombstone, so tombstones are retained forever rather than risk a
+    premature GC that could resurrect a deleted row.
+
+    Args:
+        config: Maintenance configuration carrying the retention window, optional deleted column,
+            and optional replay horizon.
+        cutoff: The record-retention cutoff instant, ``now - retention_seconds``.
+
+    Returns:
+        A Lance SQL predicate string safe for passing to :meth:`lance.LanceDataset.delete`.
+    """
+    record_clause: str = build_retention_predicate(config.ts_column, cutoff)
+    if config.deleted_column is None:
+        return record_clause
+    live_clause: str = f"(NOT {config.deleted_column} AND {record_clause})"
+    if config.replay_horizon_seconds is None:
+        return live_clause
+    record_seconds: int = int(config.retention_seconds or 0)
+    extra_seconds: int = max(0, config.replay_horizon_seconds - record_seconds)
+    tombstone_cutoff: datetime = cutoff - timedelta(seconds=extra_seconds)
+    tombstone_clause: str = (
+        f"({config.deleted_column} AND {build_retention_predicate(config.ts_column, tombstone_cutoff)})"
+    )
+    return f"({live_clause} OR {tombstone_clause})"
 
 
 def compute_cutoff(retention_seconds: int) -> datetime:
@@ -336,12 +404,14 @@ def run_retention_on_open_dataset(
     """
     try:
         validate_column_name(config.ts_column, dataset.schema)
+        if config.deleted_column is not None:
+            validate_column_name(config.deleted_column, dataset.schema)
     except KeyError as exc:
         logger.warning("retention: ts column missing in %s, skipping expiration: %s", uri, exc)
         telemetry.incr("dataset.retention_column_missing")
         return {"uri": uri, "retention_rows_deleted": 0, "skipped": str(exc)}
 
-    predicate: str = build_retention_predicate(config.ts_column, cutoff)
+    predicate: str = retention_predicate(config, cutoff)
 
     def action() -> int:
         """Re-open the dataset and execute the delete on the latest version.

@@ -132,14 +132,29 @@ you are unsure whether an API exists or what its signature is, read that checkou
   non-sorted input`. The failure is loud (the merge errors and retries surface it, no silent
   corruption), and the coexistence stress test is marked xfail with this reason. Re-test and
   drop the marker when an upstream fix ships.
-- KNOWN pylance 8.0.0 BEHAVIOR: `describe_indices()` reports `index_type` as `Unknown` for an
+- KNOWN pylance BEHAVIOR: `describe_indices()` reports `index_type` as `Unknown` for an
   INVERTED index published through the FTS atomic `CreateIndex` swap, because that hand-built
   `Index` record carries no index details. `stats.index_stats(name)["index_type"]` still reports
-  the true `Inverted` type on the same version. The publication qualification gate
-  (`reconciler/workers.py`) therefore resolves the effective kind through `resolved_actual_index_kind`,
-  which falls back to the stats type only when `describe_indices` reports `Unknown` and only on
-  pylance majors below 9, gated on `lance.__version__`. Scalar and vector segments committed with
-  `commit_existing_index_segments` are not affected. Re-check the version gate when the pin advances.
+  the true `Inverted` type. This holds on every supported pylance major: on the 9.x checkout
+  `index_stats` derives `index_type` from the index's own plugin statistics, so it reports
+  `Inverted` there too. The publication qualification gate (`reconciler/workers.py`) therefore
+  resolves the effective kind through `resolved_actual_index_kind`, which is data-driven and
+  version-independent: whenever `describe_indices` reports `Unknown` it takes the kind from the
+  stats type, which carries the real kind, so genuinely wrong types are still rejected. Consulting
+  the returned stats value is data inspection, not attribute probing, so the compatibility rule is
+  respected. `lance_major_version()` is used only to emit an operator warning when the mislabeling
+  persists on a major at or beyond 9, never to gate correctness, so a malformed `lance.__version__`
+  is reported as an unknown major rather than failing a publish. Scalar and vector segments
+  committed with `commit_existing_index_segments` are not affected. The resolved observed kind (not
+  the configured type) is what `publication_evidence` persists, so `validate_publication_indexes`
+  is a real cross-check against the frozen specification.
+- KNOWN retention behavior: tombstone rows carry the delete mutation's event `ts` (not a null `ts`)
+  and the maintenance retention predicate expires a tombstone only when its `ts` is past both
+  `record_retention_seconds` and the source `replay_horizon_seconds`, so its source-sequence
+  anti-resurrection watermark outlives every replayable window. An unbounded replay horizon means
+  tombstones are never expired. `MaintenanceConfig.deleted_column` opts a dataset into this
+  tombstone-aware predicate. Operator-library and namespace-migration callers leave it unset and
+  keep the plain `ts < cutoff` predicate.
 - V2 manifest paths default on (`enable_v2_manifest_paths=True` at dataset creation). New datasets
   use V2. Existing datasets migrate via `migrate_manifest_paths_v2`. V2 makes every dataset open
   a single object-store request regardless of version-history depth.
