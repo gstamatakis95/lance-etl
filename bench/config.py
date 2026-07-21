@@ -35,6 +35,7 @@ SUBCOMMANDS: tuple[str, ...] = (
     "e2e",
     "experiment",
     "qualify",
+    "fuzz",
 )
 PHASE_NAMES: tuple[str, ...] = ("download", "prepare", "e2e", "search", "report")
 RECALL_CUTOFFS: tuple[int, ...] = (1, 10, 100)
@@ -104,6 +105,15 @@ class BenchConfig:
             numbers.
         qualification_rows: Rows in the bounded deterministic scale and fault cohort.
         allow_large_qualification: Explicit opt-in for a synthetic cohort above the local safety bound.
+        fuzz_ops: Total randomized CRUD ops distributed across the fuzz snapshots.
+        fuzz_snapshots: Iceberg append snapshots in a fuzz run; the first seeds every org.
+        fuzz_keyspace: Distinct randomized record-id pool shared across orgs in a fuzz run.
+        fuzz_mix: Insert, update, and delete relative weights as an ``i:u:d`` string.
+        fuzz_dup_probability: Chance an accepted upsert is redelivered verbatim into a later snapshot.
+        fuzz_retention_mode: Either ``off`` or ``short`` to enable retention and the three ts bands.
+        fuzz_retention_seconds: Retention window in the fuzz short retention mode.
+        fuzz_conflict: When set, inject a same-snapshot distinct-mutation pair and assert it blocks.
+        fuzz_dim: Synthetic fuzz vector dimension, divisible by eight.
     """
 
     command: str
@@ -150,6 +160,15 @@ class BenchConfig:
     baseline: str | None = None
     qualification_rows: int = 25_000
     allow_large_qualification: bool = False
+    fuzz_ops: int = 200
+    fuzz_snapshots: int = 4
+    fuzz_keyspace: int = 80
+    fuzz_mix: str = "60:25:15"
+    fuzz_dup_probability: float = 0.10
+    fuzz_retention_mode: str = "off"
+    fuzz_retention_seconds: int = 3600
+    fuzz_conflict: bool = False
+    fuzz_dim: int = 32
 
     def __post_init__(self) -> None:
         """Validate cross-field invariants after the dataclass fields are populated.
@@ -450,6 +469,48 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Allow a qualification cohort above the local one-million-row safety bound",
     )
+    parser.add_argument("--fuzz-ops", dest="fuzz_ops", type=int, default=200, help="Total randomized CRUD ops")
+    parser.add_argument(
+        "--fuzz-snapshots",
+        dest="fuzz_snapshots",
+        type=int,
+        default=4,
+        help="Iceberg append snapshots; first seeds orgs",
+    )
+    parser.add_argument(
+        "--fuzz-keyspace", dest="fuzz_keyspace", type=int, default=80, help="Distinct record-id pool across orgs"
+    )
+    parser.add_argument("--fuzz-mix", dest="fuzz_mix", default="60:25:15", help="Insert:update:delete weights")
+    parser.add_argument(
+        "--fuzz-dup-probability",
+        dest="fuzz_dup_probability",
+        type=float,
+        default=0.10,
+        help="Exact-redelivery chance into a later snapshot",
+    )
+    parser.add_argument(
+        "--fuzz-retention-mode",
+        dest="fuzz_retention_mode",
+        choices=("off", "short"),
+        default="off",
+        help="short enables retention and the three ts-band populations",
+    )
+    parser.add_argument(
+        "--fuzz-retention-seconds",
+        dest="fuzz_retention_seconds",
+        type=int,
+        default=3600,
+        help="Retention window in short mode",
+    )
+    parser.add_argument(
+        "--fuzz-conflict",
+        dest="fuzz_conflict",
+        action="store_true",
+        help="Inject a same-snapshot distinct-mutation pair and assert it blocks",
+    )
+    parser.add_argument(
+        "--fuzz-dim", dest="fuzz_dim", type=int, default=32, help="Synthetic vector dim, divisible by 8"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -469,6 +530,10 @@ def build_parser() -> argparse.ArgumentParser:
         "e2e": "Reconciler-driven e2e: per-batch ingest via the control plane, historical-tag verification, gRPC legs",
         "experiment": "One offline build iteration: prepare if needed, e2e, sizes, and metrics.json",
         "qualify": "Measure deterministic mutation collapse, skew, shuffle width, capacity, and external scale gates",
+        "fuzz": (
+            "Randomized CRUD fuzz: seeded op sequences reconciled end-to-end, verified against an "
+            "in-memory oracle with full row-content comparison"
+        ),
     }
     for name in SUBCOMMANDS:
         sub: argparse.ArgumentParser = subparsers.add_parser(name, help=help_texts[name])

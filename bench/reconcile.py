@@ -434,19 +434,27 @@ def bench_spec_index_names(config: BenchConfig) -> frozenset[str]:
     return frozenset(definition.index_name for definition in bench_spec_revision(config).indexes)
 
 
-def install_bench_spec(repository: ControlPlaneRepository, source: IcebergSource, config: BenchConfig) -> IcebergSource:
+def install_bench_spec(
+    repository: ControlPlaneRepository,
+    source: IcebergSource,
+    config: BenchConfig,
+    spec_revision: DatasetSpecRevision | None = None,
+) -> IcebergSource:
     """Install, activate, and select the bench-scale specification for the source.
 
     Args:
         repository: Migrated PostgreSQL repository.
         source: Registered Iceberg source pointing at the seeded default specification.
         config: Benchmark configuration.
+        spec_revision: Explicit DRAFT revision to install. ``None`` uses the default bench spec so
+            existing callers are unaffected.
 
     Returns:
         The source repointed at the activated bench specification.
     """
+    candidate: DatasetSpecRevision = spec_revision if spec_revision is not None else bench_spec_revision(config)
     draft: DatasetSpecRevision = repository.create_draft_spec_revision(
-        bench_spec_revision(config),
+        candidate,
         "bench-e2e",
         "Benchmark reconciler-driven end-to-end policy",
     )
@@ -460,6 +468,7 @@ def build_reconciler_application(
     table: str,
     baseline_snapshot_id: int,
     config: BenchConfig,
+    spec_revision: DatasetSpecRevision | None = None,
 ) -> ReconcilerApplication:
     """Register the source, install the bench spec, and wire the one-process reconciler.
 
@@ -476,6 +485,8 @@ def build_reconciler_application(
         table: Source Iceberg table identifier.
         baseline_snapshot_id: Canonical startup snapshot committed by the first append.
         config: Benchmark configuration owning the spec sizing and the Lance root.
+        spec_revision: Explicit DRAFT revision to install. ``None`` installs the default bench spec,
+            preserving the exact end-to-end wiring for existing callers.
 
     Returns:
         A fully wired reconciler application.
@@ -490,7 +501,7 @@ def build_reconciler_application(
         canonical_baseline_snapshot_id=baseline_snapshot_id,
         lance_base_uri=str(config.lance_root()),
     )
-    source = install_bench_spec(repository, source, config)
+    source = install_bench_spec(repository, source, config, spec_revision)
     settings: ReconcilerSettings = ReconcilerSettings.from_environment()
     catalog: SparkIcebergCatalog = SparkIcebergCatalog(
         spark,
@@ -527,19 +538,22 @@ def build_reconciler_application(
     )
 
 
-def drain_reconciler(application: ReconcilerApplication) -> dict[str, int]:
+def drain_reconciler(application: ReconcilerApplication, raise_on_blocked: bool = True) -> dict[str, int]:
     """Run reconciliation cycles until the source and work queues are quiescent.
 
     Args:
         application: Wired reconciler application.
+        raise_on_blocked: When true (the default, preserving existing behavior) any blocked cycle
+            raises immediately. When false, blocked cycles accumulate into the totals and the drain
+            proceeds to quiescence so a caller can inspect the blocked work row.
 
     Returns:
         Aggregate counts across every cycle: ``cycles``, ``enqueued``, ``claimed``, ``succeeded``,
         ``advanced``, ``retried``, and ``blocked``.
 
     Raises:
-        RuntimeError: If the queue does not reach quiescence within the cycle bound, or if any work
-            was blocked.
+        RuntimeError: If the queue does not reach quiescence within the cycle bound, or, when
+            ``raise_on_blocked`` is true, if any work was blocked.
     """
     totals: dict[str, int] = {
         "cycles": 0,
@@ -559,7 +573,7 @@ def drain_reconciler(application: ReconcilerApplication) -> dict[str, int]:
         totals["advanced"] += summary.dispatch.advanced
         totals["retried"] += summary.dispatch.retried
         totals["blocked"] += summary.dispatch.blocked
-        if summary.dispatch.blocked:
+        if summary.dispatch.blocked and raise_on_blocked:
             raise RuntimeError("reconciler blocked benchmark work; inspect dataset_work error evidence")
         if summary.planning.enqueued_snapshots == 0 and summary.dispatch.claimed == 0:
             return totals

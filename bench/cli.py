@@ -20,6 +20,7 @@ from bench.config import BenchConfig, build_parser
 from bench.download import run_download
 from bench.e2e import run_e2e
 from bench.experiment import run_experiment
+from bench.fuzz import run_fuzz
 from bench.prepare import run_prepare
 from bench.qualification import run_qualification
 from bench.report import run_report
@@ -36,6 +37,7 @@ PHASE_RUNNERS: dict[str, Callable[[BenchConfig], dict[str, Any]]] = {
     "e2e": run_e2e,
     "experiment": run_experiment,
     "qualify": run_qualification,
+    "fuzz": run_fuzz,
 }
 
 
