@@ -291,6 +291,23 @@ class SourceSnapshotPlan:
         return self
 
 
+def derive_source_id(source_name: str) -> uuid.UUID:
+    """Derive the deterministic source identity from a stable local source name.
+
+    The result is a pure hash of ``source_name``, independent of any database state, so any
+    caller holding the same name (the reconciler runbook, an integration test, a benchmark
+    harness) can compute one owning source's dataset identities offline, for example to locate
+    or clean up its physical Lance paths without a live control-plane connection.
+
+    Args:
+        source_name: Stable local source name.
+
+    Returns:
+        Stable source-scoped UUID.
+    """
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"lance-etl:{source_name}")
+
+
 def deterministic_dataset_id(source_id: uuid.UUID, identity: RoutingIdentity) -> uuid.UUID:
     """Derive one opaque dataset ID.
 

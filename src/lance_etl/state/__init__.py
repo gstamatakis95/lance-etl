@@ -108,6 +108,9 @@ from lance_etl.state.types import (
     WorkState as WorkState,
 )
 from lance_etl.state.types import (
+    derive_source_id as derive_source_id,
+)
+from lance_etl.state.types import (
     deterministic_dataset_id as deterministic_dataset_id,
 )
 from lance_etl.state.types import (

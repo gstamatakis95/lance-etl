@@ -27,6 +27,7 @@ export LANCE_MEM_POOL_SIZE=4294967296
 | `e2e` | Run the reconciler-driven end-to-end qualification path |
 | `experiment` | Run one local build, search, size, and parameter-sweep iteration |
 | `qualify` | Emit deterministic mutation-collapse, shuffle-width, and external scale-gate evidence |
+| `fuzz` | Randomized CRUD fuzz: seeded op sequences reconciled end-to-end, verified against an in-memory oracle with full row-content comparison |
 
 Use `python -m bench COMMAND --help` for the complete current flag set.
 
@@ -115,22 +116,78 @@ python -m bench e2e \
 
 ## Local search measurement
 
-Build and start `rust/search-api` in local mode when measuring the catalog-backed read path. Publish
-the benchmark datasets through the reconciler first so PostgreSQL contains an active publication
-for every route. The request cannot choose a version. The harness checks each response's
-`served_version` against the expected publication evidence.
+`e2e`'s control plane lives in a randomly named, ephemeral PostgreSQL schema for the duration of
+one run (`bench/reconcile.py:isolated_control_plane`), dropped when the run finishes. An externally
+started `search-api` server connects with the default `search_path` and can never see that schema's
+published rows. `e2e` therefore self-hosts its own `search-api` subprocess *inside* the isolation
+window instead of dialing an external one: it spawns the release binary pointed at the exact
+isolated schema, waits for gRPC health `SERVING`, measures recall/FTS/hybrid/latency, and tears the
+subprocess down before the schema is dropped (`bench/e2e.py:catalog_search_leg`,
+`bench/search_server.py:self_hosted_search_api`). There is no `--endpoint` flag on `e2e` at all —
+build the binary once and `e2e` handles the rest:
 
 ```bash
 cd rust/search-api
-SEARCH_API_LOCAL_MODE=true \
-LANCE_ETL_BASE_URI="$PWD/../../bench/workspace/lance" \
-LANCE_ETL_DATABASE_URL='postgresql://localhost/lance_etl' \
-SEARCH_API_TELEMETRY_DISABLED=true \
-cargo run --locked
+cargo build --release
+cd ../..
+
+python -m bench e2e \
+  --dataset sift1m --batches 2 --num-partitions 128 \
+  --workspace bench/workspace --results-root bench/results
 ```
 
-Run the search leg from the repository root with the local endpoint and the command's current
-expected-version options from `--help`.
+`--search-api-binary` (default `rust/search-api/target/release/search-api`) points `e2e` at the
+binary. Pass an empty string to disable the leg explicitly. An absent default binary also records
+`{"status": "NOT_RUN"}` on `final_catalog_grpc` without failing the run. `expected_versions` is
+resolved directly from the live control-plane repository inside the isolation window, so no
+`--search-expected-versions-path` evidence file is needed for `e2e`.
+
+### Standalone `search` (ad hoc, after `e2e`)
+
+The standalone `search` command needs a server resolved one of two ways, and does not itself create
+or drop any PostgreSQL schema:
+
+```bash
+# self-host against a control plane an e2e run kept alive
+python -m bench e2e --keep-control-plane --dataset sift1m --batches 2 \
+  --workspace bench/workspace --results-root bench/results
+python -m bench search \
+  --control-plane-url "$(python -c "import json,sys; print(json.load(open(sys.argv[1]))['database_url'])" \
+    bench/results/<run_id>/control_plane.json)" \
+  --workspace bench/workspace --results-root bench/results
+
+# or dial an already-running server started separately, pointed at the same schema
+LANCE_ETL_BASE_URI="$PWD/bench/workspace/lance" \
+LANCE_ETL_DATABASE_URL='<the kept schema URL>' \
+SEARCH_API_TELEMETRY_DISABLED=true \
+cargo run --locked --manifest-path rust/search-api/Cargo.toml &
+python -m bench search --endpoint 127.0.0.1:8080 \
+  --workspace bench/workspace --results-root bench/results
+```
+
+`--endpoint` wins when both are set. `--search-expected-versions-path` remains required for the
+`--endpoint` path (`bench/grpc_client.py:load_expected_versions`), since a dialed-in server has no
+in-process repository to resolve versions from. The self-hosting path does not need it. Both paths
+measure the same recall/FTS/hybrid/load legs (`bench/search.py:run_search_against_endpoint`).
+
+## Fuzz CRUD qualification
+
+`fuzz` reconciles a seeded, randomized sequence of insert/update/delete operations end to end
+through the same reconciler-driven control plane as `e2e`, then verifies the terminal state
+against an in-memory oracle with full row-content comparison rather than row counts alone.
+
+```bash
+python -m bench fuzz --seed 42 --workspace bench/workspace --results-root bench/results
+```
+
+Key flags and their defaults: `--seed` (no default, pass explicitly for reproducibility),
+`--fuzz-ops` (total randomized CRUD ops, default 200), `--fuzz-snapshots` (Iceberg append
+snapshots, first seeds every org, default 4), `--fuzz-keyspace` (distinct record-id pool shared
+across orgs, default 80), `--fuzz-mix` (insert:update:delete relative weights, default
+`60:25:15`), `--fuzz-dim` (synthetic vector dimension, divisible by 8, default 32). Additional
+flags cover exact-redelivery duplication (`--fuzz-dup-probability`), retention-window behavior
+(`--fuzz-retention-mode`, `--fuzz-retention-seconds`), and same-snapshot conflict injection
+(`--fuzz-conflict`). Run `python -m bench fuzz --help` for the complete current set.
 
 ## Artifacts
 

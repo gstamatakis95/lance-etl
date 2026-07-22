@@ -6,6 +6,7 @@ import numpy as np
 
 from bench.corpus import (
     assign_clusters,
+    batch_row_texts,
     build_vocabulary,
     row_text,
     tenant_for_index,
@@ -62,6 +63,50 @@ class TestRowText:
         allowed: set[str] = set(clusters[3]) | set(common)
         assert all(term in allowed for term in terms)
         assert sum(term in set(clusters[3]) for term in terms) == 6
+
+
+class TestBatchRowTexts:
+    """batch_row_texts is the vectorized per-batch equivalent of row_text."""
+
+    def test_same_seed_same_batch(self) -> None:
+        """The same seed and batch produce the same documents."""
+        clusters, common = build_vocabulary(4, 10, 5, seed=7)
+        cluster_ids: np.ndarray = np.array([0, 1, 2, 3, 0, 1], dtype=np.int64)
+        indices: np.ndarray = np.arange(100, 106, dtype=np.int64)
+        first: list[str] = batch_row_texts(clusters, common, cluster_ids, indices, seed=7)
+        second: list[str] = batch_row_texts(clusters, common, cluster_ids, indices, seed=7)
+        assert first == second
+
+    def test_different_batch_key_different_text(self) -> None:
+        """A different first global index (batch key) changes the generated documents."""
+        clusters, common = build_vocabulary(4, 10, 5, seed=7)
+        cluster_ids: np.ndarray = np.array([0, 1, 2, 3], dtype=np.int64)
+        first: list[str] = batch_row_texts(clusters, common, cluster_ids, np.arange(0, 4, dtype=np.int64), seed=7)
+        second: list[str] = batch_row_texts(
+            clusters, common, cluster_ids, np.arange(1000, 1004, dtype=np.int64), seed=7
+        )
+        assert first != second
+
+    def test_terms_come_from_each_rows_own_cluster_and_common_pools(self) -> None:
+        """Every row's cluster terms are drawn only from that row's own cluster vocabulary."""
+        clusters, common = build_vocabulary(4, 10, 5, seed=11)
+        cluster_ids: np.ndarray = np.array([0, 1, 2, 3, 2, 1, 0, 3], dtype=np.int64)
+        indices: np.ndarray = np.arange(200, 208, dtype=np.int64)
+        texts: list[str] = batch_row_texts(
+            clusters, common, cluster_ids, indices, seed=11, cluster_terms=6, common_terms=2
+        )
+        for cluster_id, text in zip(cluster_ids, texts, strict=True):
+            terms: list[str] = text.split()
+            allowed: set[str] = set(clusters[int(cluster_id)]) | set(common)
+            assert all(term in allowed for term in terms)
+            assert sum(term in set(clusters[int(cluster_id)]) for term in terms) == 6
+
+    def test_empty_batch_returns_empty_list(self) -> None:
+        """A zero-length batch returns an empty list without constructing a generator."""
+        clusters, common = build_vocabulary(4, 10, 5, seed=1)
+        assert (
+            batch_row_texts(clusters, common, np.array([], dtype=np.int64), np.array([], dtype=np.int64), seed=1) == []
+        )
 
 
 class TestTenantRouting:

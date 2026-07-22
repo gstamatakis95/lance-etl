@@ -100,16 +100,12 @@ class TestSubcommandFlags:
         assert config.fts_with_position is True
 
     def test_search_flags(self, tmp_path: Path) -> None:
-        """Search accepts an external authenticated endpoint and query cap."""
+        """Search accepts a plaintext endpoint, version evidence, and a query cap."""
         config: BenchConfig = config_for(
             [
                 "search",
                 "--endpoint",
                 "localhost:9999",
-                "--search-ca-path",
-                str(tmp_path / "ca.pem"),
-                "--search-token-dir",
-                str(tmp_path / "tokens"),
                 "--search-expected-versions-path",
                 str(tmp_path / "expected.json"),
                 "--max-queries",
@@ -117,8 +113,6 @@ class TestSubcommandFlags:
             ]
         )
         assert config.endpoint == "localhost:9999"
-        assert config.search_ca_path == (tmp_path / "ca.pem").resolve()
-        assert config.search_token_dir == (tmp_path / "tokens").resolve()
         assert config.search_expected_versions_path == (tmp_path / "expected.json").resolve()
         assert config.max_queries == 100
 

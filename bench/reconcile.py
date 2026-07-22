@@ -12,10 +12,14 @@ the benchmark reads the resulting publications back through
 
 Row generation runs inside Spark executors through ``mapInArrow`` so the driver never materializes
 the corpus. The source rows carry the production contract columns (the single ``ts`` timestamp and
-the routing columns) and always include a deterministic ``texts`` entry so the bundled active
-specification's INVERTED index builds regardless of the corpus text setting. Recall is measured only
-through the standalone authenticated search command, so the benchmark never depends on the generated
-text content.
+the routing columns) and always include a ``texts`` entry so the bundled active specification's
+INVERTED index builds regardless of the corpus text setting. The cluster assignment and, unless
+``--no-text`` is set, the per-row document text are drawn from the exact same seeded k-means
+centroids and cluster vocabularies :mod:`bench.prepare` trained and persisted, so the ingested
+corpus, the ``clusters.npy``/``vocab.json`` prepared artifacts, and the FTS/hybrid search legs in
+:mod:`bench.search` all agree on what each cluster means and which words belong to it. ``bench
+prepare`` must therefore have already produced artifacts for the configured corpus shape before an
+``e2e`` run.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pyarrow as pa
@@ -39,8 +44,10 @@ from sqlalchemy.engine import URL, Engine, make_url
 from sqlalchemy.schema import CreateSchema, DropSchema
 
 from bench.config import NAMESPACE, REPO_ROOT, TENANT_ID, BenchConfig
+from bench.corpus import assign_clusters, batch_row_texts
 from bench.datasets import DatasetAdapter, adapter_for
 from bench.prepare import BASE_DAY_EPOCH_US, MICROS_PER_MINUTE, MINUTES_PER_DAY, single_entry_map
+from bench.results import read_json
 from bench.spark_session import bench_telemetry_config, build_spark
 from lance_etl.reconciler.iceberg import (
     BaselineQualifier,
@@ -153,18 +160,27 @@ def source_table_identifier(config: BenchConfig) -> str:
 
 
 @contextmanager
-def isolated_control_plane(database_url: str) -> Iterator[tuple[ControlPlaneRepository, Engine]]:
-    """Create, migrate, and drop an isolated PostgreSQL schema for one benchmark run.
+def isolated_control_plane(
+    database_url: str, keep: bool = False
+) -> Iterator[tuple[ControlPlaneRepository, Engine, str]]:
+    """Create, migrate, and (usually) drop an isolated PostgreSQL schema for one benchmark run.
 
     The schema is created on the shared database, migrated to head through Alembic, and dropped
     with all objects when the benchmark finishes, mirroring the isolated-schema pattern the
-    integration tests use so a benchmark run never collides with other control-plane state.
+    integration tests use so a benchmark run never collides with other control-plane state. The
+    isolated URL is also yielded so a caller can point a self-hosted ``search-api`` subprocess at
+    the exact same schema through its own ``LANCE_ETL_DATABASE_URL`` while the window is open: the
+    Postgres ``options=-csearch_path=<schema>`` parameter this function sets on the SQLAlchemy side
+    is honored identically by ``tokio_postgres::Config``'s own URL parser on the Rust side.
 
     Args:
         database_url: A ``postgresql+psycopg`` control-plane URL.
+        keep: When true, skip dropping the schema on exit so a later process can reconnect to it
+            (paired with ``--keep-control-plane``, for ad hoc ``search`` runs after ``e2e``).
 
     Yields:
-        A migrated repository and its SQLAlchemy engine.
+        A migrated repository, its SQLAlchemy engine, and the isolated ``postgresql://`` URL
+        string (percent-encoded ``options=-csearch_path=<schema>``, password included).
     """
     base_url: URL = make_url(database_url)
     schema_name: str = f"lance_bench_e2e_{uuid.uuid4().hex}"
@@ -180,12 +196,15 @@ def isolated_control_plane(database_url: str) -> Iterator[tuple[ControlPlaneRepo
         alembic_config.set_main_option("sqlalchemy.url", isolated_url_string.replace("%", "%%"))
         command.upgrade(alembic_config, "head")
         engine = build_control_plane_engine(isolated_url_string)
-        yield ControlPlaneRepository(engine), engine
+        yield ControlPlaneRepository(engine), engine, isolated_url_string
     finally:
         if engine is not None:
             engine.dispose()
-        with admin_engine.begin() as connection:
-            connection.execute(DropSchema(schema_name, cascade=True))
+        if keep:
+            logger.info("keeping benchmark control-plane schema %s (schema is NOT dropped)", schema_name)
+        else:
+            with admin_engine.begin() as connection:
+                connection.execute(DropSchema(schema_name, cascade=True))
         admin_engine.dispose()
 
 
@@ -239,20 +258,58 @@ def production_arrow_schema() -> pa.Schema:
     )
 
 
+def load_prepared_vocab(config: BenchConfig) -> tuple[np.ndarray, list[list[str]] | None, list[str] | None]:
+    """Load the k-means centroids and cluster vocabularies :mod:`bench.prepare` persisted.
+
+    The production source generator draws cluster assignment and document text from exactly these
+    artifacts, so the ingested corpus, the ``clusters.npy`` array the search legs read back, and the
+    ``vocab.json`` words the FTS/hybrid legs query with never diverge.
+
+    Args:
+        config: Benchmark configuration.
+
+    Returns:
+        The trained centroids, and, unless ``config.no_text`` is set, the per-cluster and common
+        vocabularies (both ``None`` when ``config.no_text`` is True, since no vocabulary was built).
+
+    Raises:
+        FileNotFoundError: If ``bench prepare`` has not produced artifacts for this corpus shape.
+    """
+    prepared: Path = config.prepared_dir()
+    centroids_path: Path = prepared / "centroids.npy"
+    if not centroids_path.exists():
+        raise FileNotFoundError(f"no prepared centroids at {centroids_path}; run 'python -m bench prepare' first")
+    centroids: np.ndarray = np.load(centroids_path)
+    if config.no_text:
+        return centroids, None, None
+    vocab: dict[str, Any] = read_json(prepared / "vocab.json")
+    return centroids, vocab["clusters"], vocab["common"]
+
+
 def production_slice_batch(
     start: int,
     count: int,
     adapter: DatasetAdapter,
     corpus_root: Path,
     tenants: int,
-    num_clusters: int,
+    centroids: np.ndarray,
+    cluster_vocab: list[list[str]] | None,
+    common_vocab: list[str] | None,
+    seed: int,
+    words_per_text: int,
 ) -> pa.RecordBatch:
     """Build one production-contract source batch for a contiguous vector slice.
 
     Runs inside a Spark executor task: reads its own base-vector slice through the pickled dataset
     adapter and emits the fixed source columns. The vector rides in the ``vectors`` map under the
-    ``"vector"`` key, a deterministic document rides in the ``texts`` map under ``"text"``, and a
-    deterministic cluster bucket rides in the ``metadata`` map under ``"cluster"``.
+    ``"vector"`` key, the cluster bucket rides in the ``metadata`` map under ``"cluster"``, and the
+    document text rides in the ``texts`` map under ``"text"``. The cluster is assigned against the
+    same centroids :mod:`bench.prepare` trained (matching ``clusters.npy``), and, when
+    ``cluster_vocab`` is given, the whole slice's text is drawn from each row's own cluster
+    vocabulary in one vectorized pass through :func:`~bench.corpus.batch_row_texts` (matching what
+    the FTS/hybrid legs query for), which seeds one generator per task instead of one per row. When
+    ``cluster_vocab`` is ``None`` (``--no-text`` corpora, which build no vocabulary) the text falls
+    back to a cheap placeholder that still lets the INVERTED index build.
 
     Args:
         start: First global vector ordinal of the slice.
@@ -260,18 +317,28 @@ def production_slice_batch(
         adapter: Dataset adapter pickled into the task closure.
         corpus_root: Shared corpus cache directory readable from the executor.
         tenants: Round-robin organization count.
-        num_clusters: Deterministic cluster-bucket cardinality.
+        centroids: Broadcast-by-closure k-means centroids from :mod:`bench.prepare`.
+        cluster_vocab: Per-cluster vocabularies, or ``None`` for the no-text placeholder path.
+        common_vocab: Shared common-word pool, or ``None`` for the no-text placeholder path.
+        seed: Corpus seed driving the deterministic per-row text.
+        words_per_text: Cluster-specific words per document.
 
     Returns:
         One record batch conforming to :func:`production_arrow_schema`.
     """
     vectors: np.ndarray = adapter.base_vector_slice(corpus_root, start, count)
+    clusters: np.ndarray = assign_clusters(vectors, centroids)
     indices: np.ndarray = np.arange(start, start + count, dtype=np.int64)
     minutes: np.ndarray = (indices % MINUTES_PER_DAY).astype(np.int64)
     timestamps_us: np.ndarray = BASE_DAY_EPOCH_US + minutes * MICROS_PER_MINUTE
-    clusters: list[int] = [int(i) % num_clusters for i in indices]
     flat_offsets: pa.Array = pa.array(np.arange(count + 1, dtype=np.int32) * vectors.shape[1])
     vector_items: pa.ListArray = pa.ListArray.from_arrays(flat_offsets, pa.array(vectors.ravel(), pa.float32()))
+    if cluster_vocab is not None and common_vocab is not None:
+        texts: list[str] = batch_row_texts(
+            cluster_vocab, common_vocab, clusters, indices, seed, cluster_terms=words_per_text
+        )
+    else:
+        texts = [f"cluster {int(cluster)} document {int(i)}" for cluster, i in zip(clusters, indices, strict=True)]
     arrays: list[pa.Array] = [
         pa.array([TENANT_ID] * count, pa.string()),
         pa.array([NAMESPACE] * count, pa.string()),
@@ -280,11 +347,8 @@ def production_slice_batch(
         pa.array(["upsert"] * count, pa.string()),
         pa.array(timestamps_us),
         single_entry_map(["vector"] * count, vector_items),
-        single_entry_map(
-            ["text"] * count,
-            pa.array([f"cluster {cluster} document {int(i)}" for cluster, i in zip(clusters, indices, strict=True)]),
-        ),
-        single_entry_map(["cluster"] * count, pa.array([str(cluster) for cluster in clusters], pa.string())),
+        single_entry_map(["text"] * count, pa.array(texts, pa.string())),
+        single_entry_map(["cluster"] * count, pa.array([str(int(cluster)) for cluster in clusters], pa.string())),
     ]
     return pa.RecordBatch.from_arrays(arrays, schema=production_arrow_schema())
 
@@ -307,13 +371,18 @@ def append_production_batch(
 
     Returns:
         The Iceberg snapshot ID committed by the append.
+
+    Raises:
+        FileNotFoundError: If ``bench prepare`` has not produced artifacts for this corpus shape.
     """
     first: int
     last: int
     first, last = window
     corpus_root: Path = config.corpus_root
     tenants: int = config.tenants
-    num_clusters: int = config.num_clusters
+    seed: int = config.seed
+    words_per_text: int = config.words_per_text
+    centroids, cluster_vocab, common_vocab = load_prepared_vocab(config)
     slices: list[tuple[int, int]] = [
         (start, min(config.rows_per_slice, last - start)) for start in range(first, last, config.rows_per_slice)
     ]
@@ -331,7 +400,18 @@ def append_production_batch(
             starts: list[int] = batch.column("start").to_pylist()
             counts: list[int] = batch.column("count").to_pylist()
             for start, count in zip(starts, counts, strict=True):
-                yield production_slice_batch(int(start), int(count), adapter, corpus_root, tenants, num_clusters)
+                yield production_slice_batch(
+                    int(start),
+                    int(count),
+                    adapter,
+                    corpus_root,
+                    tenants,
+                    centroids,
+                    cluster_vocab,
+                    common_vocab,
+                    seed,
+                    words_per_text,
+                )
 
     specs = spark.createDataFrame(slices, "start long, count long").repartition(len(slices))
     rows = specs.mapInArrow(generate, schema=PRODUCTION_ROW_DDL)
@@ -469,6 +549,7 @@ def build_reconciler_application(
     baseline_snapshot_id: int,
     config: BenchConfig,
     spec_revision: DatasetSpecRevision | None = None,
+    source_name: str = "bench",
 ) -> ReconcilerApplication:
     """Register the source, install the bench spec, and wire the one-process reconciler.
 
@@ -479,6 +560,15 @@ def build_reconciler_application(
     enqueuer, a distributed ingest runner, a publication runner with a local exact-version
     prewarmer, a fenced executor, a bounded dispatcher, and a publication retention sweep.
 
+    The dataset identity every dataset URI derives from (``deterministic_dataset_id``) is a pure
+    hash of ``source_name`` plus the routing identity, independent of the spec revision or the
+    calling command. Two commands sharing one ``--workspace`` and one ``source_name`` therefore
+    resolve to the exact same physical Lance path even when their installed specifications carry
+    incompatible schemas (for example the standard bench spec's vector dimension against the fuzz
+    evaluator's narrowed dimension). ``source_name`` exists precisely so a caller whose spec can
+    diverge from the standard bench spec, such as the fuzz evaluator, can select a distinct source
+    identity and never collide with a plain ``bench e2e`` run over the same workspace.
+
     Args:
         spark: Local Iceberg and worker execution session.
         repository: Migrated PostgreSQL repository.
@@ -487,6 +577,8 @@ def build_reconciler_application(
         config: Benchmark configuration owning the spec sizing and the Lance root.
         spec_revision: Explicit DRAFT revision to install. ``None`` installs the default bench spec,
             preserving the exact end-to-end wiring for existing callers.
+        source_name: Stable local source name isolating the dataset identity namespace. Defaults to
+            the standard ``bench`` identity used by ``e2e``, ``qualify``, and ``experiment``.
 
     Returns:
         A fully wired reconciler application.
@@ -495,7 +587,7 @@ def build_reconciler_application(
     bootstrap_catalog: SparkIcebergCatalog = SparkIcebergCatalog(spark)
     table_metadata: TableMetadata = bootstrap_catalog.table_metadata(table)
     source: IcebergSource = repository.ensure_source_registration(
-        source_name="bench",
+        source_name=source_name,
         source_table=table,
         table_uuid=uuid.UUID(table_metadata.table_uuid),
         canonical_baseline_snapshot_id=baseline_snapshot_id,
@@ -610,6 +702,29 @@ def resolve_org_serving(repository: ControlPlaneRepository, org: str) -> Serving
     """
     identity: RoutingIdentity = RoutingIdentity(TENANT_ID, NAMESPACE, org)
     return repository.resolve_serving_dataset(identity)
+
+
+def expected_versions_from_repository(config: BenchConfig, repository: ControlPlaneRepository) -> dict[str, int]:
+    """Resolve the exact published Lance version of every organization directly from the catalog.
+
+    Lets a caller holding a live repository connection (``e2e``'s self-hosted search leg, or the
+    standalone ``search --control-plane-url`` self-hosting path) measure a search leg without an
+    external ``--search-expected-versions-path`` evidence file: the repository already has ground
+    truth.
+
+    Args:
+        config: Benchmark configuration.
+        repository: Migrated PostgreSQL repository.
+
+    Returns:
+        Exact published Lance version keyed by organization, omitting any unpublished org.
+    """
+    versions: dict[str, int] = {}
+    for org in config.org_ids():
+        serving: ServingDataset | None = resolve_org_serving(repository, org)
+        if serving is not None:
+            versions[org] = serving.lance_version
+    return versions
 
 
 def bench_workspace_spark(config: BenchConfig) -> SparkSession:

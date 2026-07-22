@@ -20,6 +20,7 @@ from lance_etl.state.types import (
     SourceLifecycleState,
     SourceSnapshotKind,
     SourceSnapshotPlan,
+    derive_source_id,
     deterministic_dataset_id,
     deterministic_ingest_work_id,
     deterministic_publication_id,
@@ -132,6 +133,25 @@ def test_dataset_work_and_publication_ids_are_stable_and_scoped() -> None:
     rebuild_id: uuid.UUID = deterministic_rebuild_work_id(dataset_id, request_id)
     assert publish_id != rebuild_id
     assert deterministic_publication_id(publish_id) == deterministic_publication_id(publish_id)
+
+
+def test_distinct_source_names_never_share_a_dataset_path() -> None:
+    """Distinct source names resolve to disjoint dataset identities for the same route.
+
+    This is the isolation invariant a benchmark harness relies on to keep an evaluator whose
+    installed specification can legitimately diverge from another command's specification (for
+    example the fuzz evaluator's narrowed vector dimension against the standard bench e2e
+    specification) from ever addressing the same physical Lance path. ``derive_source_id`` is a
+    pure hash of the source name, so it must produce distinct source identities, and
+    ``deterministic_dataset_id`` must carry that distinction through to the dataset identity for
+    one fixed route.
+    """
+    identity: RoutingIdentity = RoutingIdentity(tenant_id="tenant1", namespace="vectors", org_id="org0")
+    bench_source: uuid.UUID = derive_source_id("bench")
+    fuzz_source: uuid.UUID = derive_source_id("bench-fuzz")
+    assert bench_source != fuzz_source
+    assert derive_source_id("bench") == bench_source
+    assert deterministic_dataset_id(bench_source, identity) != deterministic_dataset_id(fuzz_source, identity)
 
 
 def test_dataset_uri_validation_accepts_only_owned_layouts() -> None:

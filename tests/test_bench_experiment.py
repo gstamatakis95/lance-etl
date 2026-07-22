@@ -1,8 +1,8 @@
 """Unit tests for the bench experiment loop pieces that need no Spark and no server.
 
-Covers on-disk size measurement, fail-closed external search configuration, headline
-distillation, experiment history, and baseline delta computation. The full offline experiment
-integration lives in ``tests/test_bench_e2e.py`` with the other heavy bench tests.
+Covers on-disk size measurement, unrestricted ``--endpoint`` parsing, headline distillation,
+experiment history, and baseline delta computation. The full offline experiment integration lives
+in ``tests/test_bench_e2e.py`` with the other heavy bench tests.
 """
 
 from __future__ import annotations
@@ -102,40 +102,35 @@ def test_experiment_flags_parse(tmp_path: Path) -> None:
     assert config.baseline == "r0"
 
 
-def test_external_search_configuration_fails_closed(tmp_path: Path) -> None:
-    """Partial credentials and obsolete local-server flags are rejected."""
-    with pytest.raises(ValueError, match="external search requires"):
-        experiment_config(tmp_path, "partial", ["--search-ca-path", str(tmp_path / "ca.pem")])
-    with pytest.raises(ValueError, match="--endpoint requires"):
-        experiment_config(tmp_path, "endpoint-only", ["--endpoint", "search.example:443"])
-    with pytest.raises(ValueError, match="standalone search command"):
-        experiment_config(
-            tmp_path,
-            "external",
+def test_endpoint_is_unrestricted_across_subcommands(tmp_path: Path) -> None:
+    """--endpoint takes a plaintext host:port and is not gated behind any subcommand or credential."""
+    config: BenchConfig = experiment_config(tmp_path, "with-endpoint", ["--endpoint", "127.0.0.1:50051"])
+    assert config.endpoint == "127.0.0.1:50051"
+    e2e_config: BenchConfig = BenchConfig.from_args(
+        build_parser().parse_args(
             [
+                "e2e",
+                "--workspace",
+                str(tmp_path / "workspace"),
+                "--results-root",
+                str(tmp_path / "results"),
                 "--endpoint",
-                "search.example:443",
-                "--search-ca-path",
-                str(tmp_path / "ca.pem"),
-                "--search-token-dir",
-                str(tmp_path / "tokens"),
+                "127.0.0.1:50051",
                 "--search-expected-versions-path",
                 str(tmp_path / "expected.json"),
-            ],
+            ]
         )
+    )
+    assert e2e_config.endpoint == "127.0.0.1:50051"
+    assert e2e_config.search_expected_versions_path == (tmp_path / "expected.json").resolve()
+
+
+def test_obsolete_local_server_flags_removed() -> None:
+    """The retired local-server spawn flags remain absent from the experiment parser."""
     with pytest.raises(SystemExit):
         build_parser().parse_args(["experiment", "--build-server"])
     with pytest.raises(SystemExit):
         build_parser().parse_args(["experiment", "--server-env", "SEARCH_API_CACHE_BACKEND=memory"])
-
-
-def test_benchmark_has_no_insecure_spawned_search_path() -> None:
-    """CI cannot interpret a local plaintext binary smoke as production search evidence."""
-    bench_root: Path = Path(__file__).resolve().parents[1] / "bench"
-    assert not (bench_root / "server.py").exists()
-    sources: str = "\n".join(path.read_text(encoding="utf-8") for path in bench_root.glob("*.py"))
-    assert "grpc.insecure_channel" not in sources
-    assert "SEARCH_API_CACHE_BACKEND" not in sources
 
 
 def test_headline_numbers_picks_best_and_knee() -> None:

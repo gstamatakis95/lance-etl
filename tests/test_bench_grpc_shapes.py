@@ -11,12 +11,12 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
+import grpc
 import numpy as np
 import pytest
 
 from bench.config import BenchConfig
 from bench.grpc_client import (
-    authorization_metadata,
     dataset_target,
     generate_stubs,
     load_expected_versions,
@@ -102,43 +102,8 @@ class TestDatasetTarget:
         assert (target.tenant_id, target.namespace) == ("t9", "other")
 
 
-class TestAuthentication:
-    """Bearer authentication is exact-target and rotation-safe."""
-
-    def test_token_is_read_for_every_request(self, tmp_path: Path) -> None:
-        """Replacing an org token changes the next RPC metadata without restarting the client."""
-        ca_path: Path = tmp_path / "ca.pem"
-        token_dir: Path = tmp_path / "tokens"
-        token_dir.mkdir()
-        ca_path.write_text("test-ca", encoding="utf-8")
-        token_path: Path = token_dir / "tenant0--ns--org3.jwt"
-        token_path.write_text("first.jwt.value", encoding="utf-8")
-        config = BenchConfig(
-            command="search",
-            endpoint="search.example:443",
-            search_ca_path=ca_path,
-            search_token_dir=token_dir,
-            search_expected_versions_path=tmp_path / "expected.json",
-        )
-
-        assert authorization_metadata(config, "org3") == (("authorization", "Bearer first.jwt.value"),)
-        token_path.write_text("rotated.jwt.value", encoding="utf-8")
-        assert authorization_metadata(config, "org3") == (("authorization", "Bearer rotated.jwt.value"),)
-
-    def test_token_file_cannot_be_reused_for_another_target(self, tmp_path: Path) -> None:
-        """A missing exact-target file fails instead of falling back to another organization's token."""
-        token_dir: Path = tmp_path / "tokens"
-        token_dir.mkdir()
-        (token_dir / "tenant0--ns--org0.jwt").write_text("org0.jwt", encoding="utf-8")
-        config = BenchConfig(
-            command="search",
-            endpoint="search.example:443",
-            search_ca_path=tmp_path / "ca.pem",
-            search_token_dir=token_dir,
-            search_expected_versions_path=tmp_path / "expected.json",
-        )
-        with pytest.raises(RuntimeError, match="org1"):
-            authorization_metadata(config, "org1")
+class TestVersionEvidence:
+    """Expected-version evidence is exact-target and decoupled from any credential."""
 
     def test_expected_publication_is_exact_and_version_mismatch_fails(self, tmp_path: Path) -> None:
         """Evidence must cover exactly every target and every response must match it."""
@@ -146,9 +111,7 @@ class TestAuthentication:
         expected_path.write_text('{"tenant0/ns/org0": 17}', encoding="utf-8")
         config = BenchConfig(
             command="search",
-            endpoint="search.example:443",
-            search_ca_path=tmp_path / "ca.pem",
-            search_token_dir=tmp_path / "tokens",
+            endpoint="127.0.0.1:50051",
             search_expected_versions_path=expected_path,
         )
         assert load_expected_versions(config) == {"org0": 17}
@@ -157,29 +120,27 @@ class TestAuthentication:
             validate_served_version(SimpleNamespace(served_version=16), "org0", 17)
 
     def test_every_rpc_has_a_client_deadline(self) -> None:
-        """The shared call helper passes authentication metadata and a bounded timeout."""
+        """The shared call helper passes a bounded timeout."""
         captured: dict[str, Any] = {}
 
-        def callable_rpc(request: Any, metadata: Any, timeout: float) -> str:
+        def callable_rpc(request: Any, timeout: float) -> str:
             """Capture invocation arguments.
 
             Args:
                 request: Request object.
-                metadata: Authentication metadata.
                 timeout: Client deadline.
 
             Returns:
                 Fixed response marker.
             """
-            captured.update(request=request, metadata=metadata, timeout=timeout)
+            captured.update(request=request, timeout=timeout)
             return "ok"
 
-        response, unused_latency = timed_call(callable_rpc, "request", (("authorization", "Bearer token"),))
+        response, unused_latency = timed_call(callable_rpc, "request")
         assert response == "ok"
         assert unused_latency >= 0
         assert captured == {
             "request": "request",
-            "metadata": (("authorization", "Bearer token"),),
             "timeout": 5.0,
         }
 
@@ -241,37 +202,50 @@ class TestSearchRequests:
         assert request.fusion_mode == pb2.HYBRID_FUSION_MODE_BALANCED
 
 
-class TestAuthenticatedLoad:
-    """The fixed in-process load profile preserves authentication and publication fencing."""
+class FakeRpcError(grpc.RpcError):
+    """A minimal ``grpc.RpcError`` stand-in carrying a fixed status code."""
 
-    def test_level_measures_authenticated_requests(
-        self, pb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def __init__(self, code: grpc.StatusCode) -> None:
+        """Store the fixed status code this fake error reports.
+
+        Args:
+            code: The gRPC status code :meth:`code` returns.
+        """
+        super().__init__("boom")
+        self.status_code = code
+
+    def code(self) -> grpc.StatusCode:
+        """Return the fixed status code.
+
+        Returns:
+            The status code passed to the constructor.
+        """
+        return self.status_code
+
+
+class TestLoad:
+    """The fixed in-process load profile preserves publication fencing over a plaintext channel."""
+
+    def test_level_measures_requests(self, pb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Every successful load response contributes latency and throughput evidence."""
-        token_dir: Path = tmp_path / "tokens"
-        token_dir.mkdir()
-        (token_dir / "tenant0--ns--org0.jwt").write_text("load.jwt", encoding="utf-8")
         config = BenchConfig(
             command="search",
-            endpoint="search.example:443",
-            search_ca_path=tmp_path / "ca.pem",
-            search_token_dir=token_dir,
+            endpoint="127.0.0.1:50051",
             search_expected_versions_path=tmp_path / "expected.json",
         )
         calls: list[Any] = []
 
-        def vector_search_rpc(request: Any, metadata: Any, timeout: float) -> Any:
-            """Capture one authenticated load request.
+        def vector_search_rpc(request: Any, timeout: float) -> Any:
+            """Capture one load request.
 
             Args:
                 request: Typed vector request.
-                metadata: Per-request bearer metadata.
                 timeout: Bounded RPC deadline.
 
             Returns:
                 Response fenced to the expected publication.
             """
-            calls.append((request, metadata, timeout))
+            calls.append((request, timeout))
             return SimpleNamespace(served_version=17)
 
         monkeypatch.setattr("bench.search.LOAD_DURATION_SECONDS", 0.001)
@@ -289,38 +263,98 @@ class TestAuthenticatedLoad:
         assert level["requests"] >= 2
         assert level["qps"] > 0
         assert all(call[0].target.org_id == "org0" for call in calls)
-        assert all(call[1] == (("authorization", "Bearer load.jwt"),) for call in calls)
-        assert all(call[2] == 5.0 for call in calls)
+        assert all(call[1] == 5.0 for call in calls)
 
     def test_version_failure_propagates(self, pb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """A load response from an unapproved version fails the benchmark."""
-        token_dir: Path = tmp_path / "tokens"
-        token_dir.mkdir()
-        (token_dir / "tenant0--ns--org0.jwt").write_text("load.jwt", encoding="utf-8")
         config = BenchConfig(
             command="search",
-            endpoint="search.example:443",
-            search_ca_path=tmp_path / "ca.pem",
-            search_token_dir=token_dir,
+            endpoint="127.0.0.1:50051",
             search_expected_versions_path=tmp_path / "expected.json",
         )
 
-        def vector_search_rpc(request: Any, metadata: Any, timeout: float) -> Any:
+        def vector_search_rpc(request: Any, timeout: float) -> Any:
             """Return an unfenced response.
 
             Args:
                 request: Typed vector request.
-                metadata: Per-request bearer metadata.
                 timeout: Bounded RPC deadline.
 
             Returns:
                 Response from the wrong publication.
             """
-            del request, metadata, timeout
+            del request, timeout
             return SimpleNamespace(served_version=16)
 
         monkeypatch.setattr("bench.search.LOAD_DURATION_SECONDS", 0.0)
         with pytest.raises(RuntimeError, match="expected published version 17"):
+            run_load_level(
+                SimpleNamespace(VectorSearch=vector_search_rpc),
+                pb2,
+                config,
+                np.asarray([1.0, 2.0], dtype=np.float32),
+                {"org0": 17},
+                1,
+            )
+
+    def test_resource_exhausted_is_recorded_as_failed(
+        self, pb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The server's admission rejection is recorded as a benign FAILED level."""
+        config = BenchConfig(
+            command="search",
+            endpoint="127.0.0.1:50051",
+            search_expected_versions_path=tmp_path / "expected.json",
+        )
+
+        def vector_search_rpc(request: Any, timeout: float) -> Any:
+            """Raise the server's admission rejection.
+
+            Args:
+                request: Typed vector request.
+                timeout: Bounded RPC deadline.
+
+            Raises:
+                FakeRpcError: Always, tagged ``RESOURCE_EXHAUSTED``.
+            """
+            del request, timeout
+            raise FakeRpcError(grpc.StatusCode.RESOURCE_EXHAUSTED)
+
+        monkeypatch.setattr("bench.search.LOAD_DURATION_SECONDS", 0.0)
+        level: dict[str, Any] = run_load_level(
+            SimpleNamespace(VectorSearch=vector_search_rpc),
+            pb2,
+            config,
+            np.asarray([1.0, 2.0], dtype=np.float32),
+            {"org0": 17},
+            1,
+        )
+        assert level["status"] == "FAILED"
+        assert "boom" in level["reason"]
+
+    def test_other_rpc_error_propagates(self, pb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A non-admission gRPC failure (for example a mid-load server crash) is never swallowed."""
+        config = BenchConfig(
+            command="search",
+            endpoint="127.0.0.1:50051",
+            search_expected_versions_path=tmp_path / "expected.json",
+        )
+
+        def vector_search_rpc(request: Any, timeout: float) -> Any:
+            """Raise a transport failure unrelated to admission control.
+
+            Args:
+                request: Typed vector request.
+                timeout: Bounded RPC deadline.
+
+            Raises:
+                FakeRpcError: Always, tagged ``UNAVAILABLE``.
+            """
+            del request, timeout
+            raise FakeRpcError(grpc.StatusCode.UNAVAILABLE)
+
+        monkeypatch.setattr("bench.search.LOAD_DURATION_SECONDS", 0.0)
+        with pytest.raises(FakeRpcError):
             run_load_level(
                 SimpleNamespace(VectorSearch=vector_search_rpc),
                 pb2,

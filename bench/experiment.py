@@ -5,7 +5,7 @@ download and prepare when the prepared shape is missing (cached across iteration
 Lance root so every iteration is a clean build of the configured knobs, run the reconciler-driven
 e2e body (real Iceberg ingest, indexing, validation, prewarm, and publication through the local
 PostgreSQL control plane), measure the on-disk data/index/metadata footprint (:mod:`bench.sizes`),
-optionally measure an externally managed authenticated production service, and write one
+optionally measure an externally managed production service, and write one
 machine-readable ``metrics.json`` plus a one-line summary appended to
 ``{results_root}/experiments.jsonl``. With ``--baseline RUN_ID`` the headline delta against a
 previous iteration is computed and logged.

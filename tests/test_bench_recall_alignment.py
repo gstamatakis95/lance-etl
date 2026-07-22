@@ -52,14 +52,13 @@ class TestOrgRecallAlignment:
         def fake_search(
             stub: Any,
             pb2: Any,
-            config: BenchConfig,
             org: str,
             query: np.ndarray,
             k: int,
             expected_version: int,
         ) -> tuple[Any, float]:
             """Return each query's own truth, failing on query index 1."""
-            del stub, pb2, config, org, query, k, expected_version
+            del stub, pb2, org, query, k, expected_version
             index: int = fake_search.calls
             fake_search.calls += 1
             if index == 1:

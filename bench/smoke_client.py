@@ -1,4 +1,4 @@
-"""Authenticated release smoke client that never places bearer tokens in process arguments."""
+"""Release smoke client for one plaintext exact-version search request."""
 
 from __future__ import annotations
 
@@ -12,41 +12,20 @@ from typing import Any
 import grpc
 from google.protobuf.json_format import ParseDict
 
-from bench.grpc_client import RPC_DEADLINE_SECONDS, generate_stubs, load_stubs
+from bench.grpc_client import RPC_DEADLINE_SECONDS, generate_and_load_stubs
 
 
 def parser() -> argparse.ArgumentParser:
     """Build the release smoke-client parser.
 
     Returns:
-        Parser for verified TLS, token-file, request-file, and version inputs.
+        Parser for the plaintext endpoint, request-file, and expected-version inputs.
     """
-    result = argparse.ArgumentParser(description="Run one authenticated exact-version search smoke request")
+    result = argparse.ArgumentParser(description="Run one exact-version search smoke request")
     result.add_argument("--endpoint", required=True)
-    result.add_argument("--server-name", required=True)
-    result.add_argument("--ca-path", required=True, type=Path)
-    result.add_argument("--token-path", required=True, type=Path)
     result.add_argument("--request-path", required=True, type=Path)
     result.add_argument("--expected-version", required=True, type=int)
     return result
-
-
-def read_token(path: Path) -> str:
-    """Read a non-empty bearer token from a file.
-
-    Args:
-        path: Short-lived token file.
-
-    Returns:
-        Token contents without surrounding whitespace.
-
-    Raises:
-        ValueError: If the token is empty or contains embedded whitespace.
-    """
-    token: str = path.read_text(encoding="utf-8").strip()
-    if not token or any(character.isspace() for character in token):
-        raise ValueError("smoke bearer token is empty or contains whitespace")
-    return token
 
 
 def load_request(path: Path, pb2: ModuleType) -> Any:
@@ -66,7 +45,7 @@ def load_request(path: Path, pb2: ModuleType) -> Any:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    """Execute one TLS-verified, authenticated smoke request.
+    """Execute one plaintext smoke request.
 
     Args:
         args: Parsed command-line arguments.
@@ -79,24 +58,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     """
     if args.expected_version <= 0:
         raise ValueError("expected version must be positive")
-    trusted_ca: bytes = args.ca_path.read_bytes()
-    if not trusted_ca:
-        raise ValueError("search CA file is empty")
     with tempfile.TemporaryDirectory(prefix="lance-etl-smoke-") as directory:
-        pb2, pb2_grpc = load_stubs(generate_stubs(Path(directory)))
+        pb2, pb2_grpc = generate_and_load_stubs(Path(directory))
         request: Any = load_request(args.request_path, pb2)
-        credentials: grpc.ChannelCredentials = grpc.ssl_channel_credentials(root_certificates=trusted_ca)
-        channel = grpc.secure_channel(
-            args.endpoint,
-            credentials,
-            options=(("grpc.ssl_target_name_override", args.server_name),),
-        )
+        channel = grpc.insecure_channel(args.endpoint)
         try:
             grpc.channel_ready_future(channel).result(timeout=RPC_DEADLINE_SECONDS)
-            token: str = read_token(args.token_path)
             response: Any = pb2_grpc.SearchServiceStub(channel).VectorSearch(
                 request,
-                metadata=(("authorization", f"Bearer {token}"),),
                 timeout=RPC_DEADLINE_SECONDS,
             )
         finally:

@@ -1,9 +1,10 @@
 """Command-line dispatch for the benchmark phases.
 
 Each subcommand maps to one phase runner imported at module load, per the repository rule that all imports live at the
-top of the file. ``e2e`` drives the production PostgreSQL reconciler path per batch then does historical-tag
-verification. The standalone ``search`` subcommand fails loudly when external TLS and bearer-token inputs or verified
-connectivity are absent.
+top of the file. ``e2e`` drives the production PostgreSQL reconciler path per batch, then self-hosts its own search
+leg inside the PostgreSQL isolation window (see ``bench/e2e.py:catalog_search_leg``). The standalone ``search``
+subcommand fails loudly when neither ``--endpoint`` nor ``--control-plane-url`` is configured, or when the resolved
+server is unreachable.
 """
 
 from __future__ import annotations
@@ -12,6 +13,8 @@ import argparse
 import json
 import logging
 import os
+import sys
+import traceback
 from collections.abc import Callable
 from typing import Any
 
@@ -57,6 +60,10 @@ def run_phase(config: BenchConfig, phase: str) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     """Parse arguments and run the selected benchmark subcommand.
 
+    A failure prints its traceback directly to stderr exactly once, independent of ``--log-level``,
+    rather than also going through the logger: the logger's own traceback would otherwise duplicate
+    the one printed here.
+
     Args:
         argv: Optional argument vector. Defaults to ``sys.argv``.
 
@@ -74,7 +81,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         outcome: dict[str, Any] = run_phase(config, config.command)
     except Exception:
-        logger.exception("benchmark phase %s failed", config.command)
+        print(f"benchmark phase {config.command} failed:", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
         return 1
     print(json.dumps({"run_dir": str(config.run_dir()), "command": config.command, "outcome": outcome}, default=str))
     return 0

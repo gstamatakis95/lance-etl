@@ -12,7 +12,9 @@ table. Asserts:
 - Every index the installed bench specification declares, including the INVERTED full-text index,
   is present on every published dataset.
 - The e2e phase artifact is saved as ``e2e.json`` in the run directory.
-- The gRPC legs are recorded as ``NOT_RUN`` because no authenticated search evidence is configured.
+- The gRPC legs are recorded as ``NOT_RUN`` because ``--search-api-binary ""`` explicitly disables
+  self-hosting the search leg (independent of whether a real release binary happens to be built on
+  the machine running this test).
 
 The test requires the isolated-schema integration database (``LANCE_ETL_TEST_DATABASE_URL``) and is
 skipped when it is unset, matching the other PostgreSQL-backed integration tests.
@@ -105,6 +107,8 @@ def reconciled_config(tmp_path: Path) -> BenchConfig:
         "local[2]",
         "--driver-memory",
         "2g",
+        "--search-api-binary",
+        "",
     ]
     return BenchConfig.from_args(build_parser().parse_args(argv))
 

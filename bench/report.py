@@ -247,7 +247,7 @@ def summary_sections(config: BenchConfig, phases: dict[str, dict[str, Any] | Non
         sections.append("## Hybrid leg (RRF)")
         sections.append(markdown_table(list(search["hybrid"].keys()), [list(search["hybrid"].values())]))
         load: dict[str, Any] = search.get("load", {})
-        sections.append("## Authenticated load profile")
+        sections.append("## Load profile")
         if "levels" in load:
             load_headers: list[str] = ["concurrency", "qps", "mean_ms", "p50_ms", "p95_ms", "p99_ms"]
             sections.append(

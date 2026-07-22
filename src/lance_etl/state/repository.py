@@ -55,6 +55,7 @@ from lance_etl.state.types import (
     WorkPhase,
     WorkProvenance,
     WorkState,
+    derive_source_id,
     deterministic_dataset_id,
     deterministic_ingest_work_id,
     deterministic_publication_id,
@@ -495,7 +496,7 @@ class ControlPlaneRepository:
             )
             if spec_id is None:
                 raise StateTransitionError("no active dataset specification exists")
-            source_id: uuid.UUID = uuid.uuid5(uuid.NAMESPACE_URL, f"lance-etl:{source_name}")
+            source_id: uuid.UUID = derive_source_id(source_name)
             connection.execute(
                 postgresql.insert(iceberg_sources)
                 .values(

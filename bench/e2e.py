@@ -11,10 +11,11 @@ resulting publications back through
 organization's published dataset opens at its exact version with the expected terminal row count
 and every index the installed specification declares present.
 
-This subcommand replaces the retired batch-major pipeline path. Search evidence is still explicitly
-gated: recall and first-query latency are measured only through the standalone authenticated
-``search`` command with verified TLS, per-target tokens, and expected-version evidence, so the
-end-to-end command records the catalog leg as ``NOT_RUN`` and never manufactures search coverage.
+This subcommand replaces the retired batch-major pipeline path. The catalog search leg (recall,
+first-query latency, FTS, and hybrid) self-hosts a search-api subprocess inside the PostgreSQL
+isolation window whenever ``config.search_api_binary`` exists, and is recorded as ``NOT_RUN``
+otherwise so a bare ``e2e`` run never manufactures search coverage. An externally started server
+cannot see the ephemeral control-plane schema, so ``e2e`` never dials ``--endpoint``.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -31,9 +33,7 @@ import numpy as np
 from bench.config import RECALL_CUTOFFS, BenchConfig
 from bench.groundtruth import recall_at
 from bench.grpc_client import (
-    generate_stubs,
-    load_expected_versions,
-    load_stubs,
+    generate_and_load_stubs,
     open_stub,
     result_record_ids,
     vector_search,
@@ -48,12 +48,15 @@ from bench.reconcile import (
     create_production_source_table,
     drain_reconciler,
     expected_org_rows,
+    expected_versions_from_repository,
     isolated_control_plane,
     resolve_database_url,
     resolve_org_serving,
     source_table_identifier,
 )
-from bench.results import ensure_dir, save_phase
+from bench.results import ensure_dir, save_phase, write_json
+from bench.search import load_artifacts, run_fts_leg, run_hybrid_leg
+from bench.search_server import self_hosted_search_api
 from bench.telemetry_capture import CaptureConfig, TelemetryCapture
 from lance_etl.state import ControlPlaneRepository, ServingDataset
 
@@ -199,7 +202,7 @@ def org_catalog_recall(
     kept_indices: list[int] = []
     for index, query in enumerate(queries):
         try:
-            response, elapsed_ms = vector_search(stub, pb2, config, org, query, config.search_k, expected_version)
+            response, elapsed_ms = vector_search(stub, pb2, org, query, config.search_k, expected_version)
         except Exception as exc:
             logger.warning("gRPC error during tag recall sweep for org %s: %s", org, exc)
             continue
@@ -224,38 +227,32 @@ def org_catalog_recall(
 
 def run_catalog_grpc_legs(
     config: BenchConfig,
+    expected_versions: dict[str, int],
     queries: np.ndarray,
     ground_truth: dict[str, np.ndarray],
-    grpc_gen_dir: Path,
+    stub: Any,
+    pb2: Any,
 ) -> dict[str, Any]:
     """Run first-query latency and recall through the final catalog publication.
 
-    Search evidence is explicitly not run unless a trusted CA and exact-target token directory
-    are configured. A configured endpoint that cannot establish verified TLS is recorded as a
-    failure and can never be mistaken for built-server benchmark coverage.
-
     Args:
         config: Benchmark configuration.
+        expected_versions: Operator-approved exact publication per organization, resolved directly
+            from the control-plane repository rather than an external evidence file.
         queries: The query matrix (capped by ``--max-queries`` if set).
         ground_truth: Per-org ground-truth global ids.
-        grpc_gen_dir: Directory holding the compiled gRPC stubs.
+        stub: The connected ``SearchServiceStub`` against the self-hosted server.
+        pb2: The generated protobuf module.
 
     Returns:
         Catalog recall and cold plus warm first-query latency.
     """
-    try:
-        expected_versions: dict[str, int] = load_expected_versions(config)
-        pb2, pb2_grpc = load_stubs(generate_stubs(grpc_gen_dir))
-        stub = open_stub(config, pb2_grpc, timeout_seconds=3.0)
-    except Exception as exc:
-        return {"status": "FAILED", "reason": str(exc)}
-
     first_latencies: dict[str, Any] = {}
     for org in config.org_ids():
         try:
-            resp, cold_ms = vector_search(stub, pb2, config, org, queries[0], 10, expected_versions[org])
+            resp, cold_ms = vector_search(stub, pb2, org, queries[0], 10, expected_versions[org])
             del resp
-            _, warm_ms = vector_search(stub, pb2, config, org, queries[0], 10, expected_versions[org])
+            _, warm_ms = vector_search(stub, pb2, org, queries[0], 10, expected_versions[org])
             first_latencies[org] = {"cold_ms": round(cold_ms, 3), "warm_ms": round(warm_ms, 3)}
         except Exception as exc:
             first_latencies[org] = {"error": str(exc)[:500]}
@@ -286,41 +283,80 @@ def run_catalog_grpc_legs(
     }
 
 
-def load_queries_and_gt(config: BenchConfig) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """Load the query matrix and per-org ground truth from the prepared artifact directory.
+def catalog_search_leg(
+    config: BenchConfig,
+    repository: ControlPlaneRepository,
+    database_url: str,
+    grpc_gen_dir: Path,
+) -> dict[str, Any]:
+    """Self-host search-api inside the isolation window and measure recall, FTS, and hybrid.
+
+    An externally started server can never see ``e2e``'s ephemeral control-plane schema, so this
+    is the only way ``e2e`` can measure a real search leg: the release binary named by
+    ``config.search_api_binary`` is spawned as a subprocess from inside the still-open PostgreSQL
+    isolation window, pointed at the exact isolated ``database_url``, and torn down before this
+    function returns so the caller's ``with isolated_control_plane(...)`` block can safely drop the
+    schema afterwards. Must be called from inside that block.
 
     Args:
         config: Benchmark configuration.
-
-    Returns:
-        The query matrix (possibly capped by ``--max-queries``) and per-org ground-truth arrays.
-    """
-    prepared: Path = config.prepared_dir()
-    queries: np.ndarray = np.load(prepared / "queries.npy")
-    ground_truth_file = np.load(prepared / "ground_truth.npz")
-    ground_truth: dict[str, np.ndarray] = {org: ground_truth_file[org] for org in ground_truth_file.files}
-    if config.max_queries is not None:
-        queries = queries[: config.max_queries]
-    return queries, ground_truth
-
-
-def catalog_search_leg(config: BenchConfig, grpc_gen_dir: Path) -> dict[str, Any]:
-    """Run the gated catalog search leg when authenticated evidence is configured.
-
-    Args:
-        config: Benchmark configuration.
+        repository: Migrated PostgreSQL repository, still inside its isolation window.
+        database_url: The isolated control-plane URL yielded by ``isolated_control_plane``.
         grpc_gen_dir: Directory holding the compiled gRPC stubs.
 
     Returns:
-        A measured catalog result, or a ``NOT_RUN`` record when search evidence is absent.
+        A measured catalog result (recall, first-query latency, FTS, hybrid), a ``NOT_RUN`` record
+        when no search-api binary is configured, or a ``FAILED`` record on any startup or RPC
+        error. Never fabricates coverage: any failure is reported, not swallowed. The prepared
+        query, ground-truth, cluster, and vocabulary artifacts are loaded exactly once through
+        :func:`~bench.search.load_artifacts` and shared by the recall, FTS, and hybrid legs.
     """
-    if not config.search_credentials_configured():
+    binary: Path | None = config.search_api_binary
+    if binary is None or not binary.exists():
         return {
             "status": "NOT_RUN",
-            "reason": "run the standalone search command with TLS, token, and expected-version evidence",
+            "reason": (
+                f"no search-api binary at {binary}; build rust/search-api with "
+                "`cargo build --release`, or pass --search-api-binary, or an empty string to "
+                "disable the leg explicitly"
+            ),
         }
-    queries, ground_truth = load_queries_and_gt(config)
-    return run_catalog_grpc_legs(config, queries, ground_truth, grpc_gen_dir)
+    expected_versions: dict[str, int] = expected_versions_from_repository(config, repository)
+    if not expected_versions:
+        return {"status": "FAILED", "reason": "no organization has an active publication to search"}
+    try:
+        artifacts: dict[str, Any] = load_artifacts(config)
+    except (OSError, ValueError) as exc:
+        return {"status": "FAILED", "reason": f"cannot load prepared query artifacts: {exc}"}
+    queries: np.ndarray = artifacts["queries"]
+    if config.max_queries is not None:
+        queries = queries[: config.max_queries]
+    ground_truth: dict[str, np.ndarray] = artifacts["ground_truth"]
+
+    log_path: Path = config.telemetry_dir() / "search-api.log"
+    try:
+        pb2, pb2_grpc = generate_and_load_stubs(grpc_gen_dir)
+        with self_hosted_search_api(
+            binary=binary,
+            database_url=database_url,
+            base_uri=config.lance_root(),
+            port=config.search_api_port,
+            log_path=log_path,
+        ) as endpoint:
+            hosted_config: BenchConfig = replace(config, endpoint=endpoint)
+            stub = open_stub(hosted_config, pb2_grpc, timeout_seconds=5.0)
+            result: dict[str, Any] = run_catalog_grpc_legs(
+                hosted_config, expected_versions, queries, ground_truth, stub, pb2
+            )
+            if config.no_text:
+                result["fts"] = {"skipped": "no_text mode; FTS leg disabled"}
+                result["hybrid"] = {"skipped": "no_text mode; hybrid leg disabled"}
+            else:
+                result["fts"] = run_fts_leg(stub, pb2, hosted_config, artifacts, expected_versions)
+                result["hybrid"] = run_hybrid_leg(stub, pb2, hosted_config, artifacts, expected_versions)
+            return result
+    except Exception as exc:
+        return {"status": "FAILED", "reason": str(exc)}
 
 
 def run_e2e(config: BenchConfig) -> dict[str, Any]:
@@ -417,6 +453,13 @@ def run_reconciled_batches(config: BenchConfig, repository: ControlPlaneReposito
 def run_e2e_body(config: BenchConfig) -> dict[str, Any]:
     """Execute the reconciler-driven benchmark body without managing capture lifecycle.
 
+    The catalog search leg runs *inside* the PostgreSQL isolation window, immediately after
+    publication verification and before the ephemeral schema is dropped: a self-hosted search-api
+    subprocess is spawned against the exact isolated schema, queried, and torn down before the
+    ``with`` block exits. Passing ``--keep-control-plane`` skips dropping that schema afterwards so
+    a later standalone ``search --control-plane-url`` run can self-host against the same published
+    catalog; its URL is then written to ``control_plane.json`` in the run directory.
+
     Args:
         config: Benchmark configuration.
 
@@ -424,21 +467,33 @@ def run_e2e_body(config: BenchConfig) -> dict[str, Any]:
         The phase result document saved as ``e2e.json`` in the run directory.
 
     Raises:
-        RuntimeError: If publication verification fails, or if a configured external search leg
-            could not be measured.
+        RuntimeError: If publication verification fails, or if a configured search-api binary
+            could not be self-hosted or measured (an absent binary is not an error: it records
+            ``NOT_RUN``).
     """
     ensure_dir(config.run_dir())
     grpc_gen_dir: Path = config.workspace / "grpc_gen"
-    database_url: str = resolve_database_url()
-    with isolated_control_plane(database_url) as (repository, engine):
+    base_database_url: str = resolve_database_url()
+    with isolated_control_plane(base_database_url, keep=config.keep_control_plane) as (
+        repository,
+        engine,
+        isolated_url,
+    ):
         del engine
         batch_records: list[dict[str, Any]] = run_reconciled_batches(config, repository)
         publications: list[dict[str, Any]] = verify_publications(config, repository)
-    all_ok: bool = all(check["ok"] for check in publications)
-    if not all_ok:
-        logger.warning("publication verification: some organizations did not converge (see e2e.json)")
+        all_ok: bool = all(check["ok"] for check in publications)
+        if not all_ok:
+            logger.warning("publication verification: some organizations did not converge (see e2e.json)")
+        catalog_grpc: dict[str, Any] = catalog_search_leg(config, repository, isolated_url, grpc_gen_dir)
 
-    catalog_grpc: dict[str, Any] = catalog_search_leg(config, grpc_gen_dir)
+    if config.keep_control_plane:
+        write_json(
+            config.run_dir() / "control_plane.json",
+            {"database_url": isolated_url, "base_uri": str(config.lance_root())},
+        )
+        logger.info("control plane kept alive; see %s for --control-plane-url", config.run_dir() / "control_plane.json")
+
     final_recall: dict[str, Any] = catalog_grpc if catalog_grpc.get("status") == "MEASURED" else {}
 
     result: dict[str, Any] = save_phase(
@@ -450,10 +505,11 @@ def run_e2e_body(config: BenchConfig) -> dict[str, Any]:
             "publication_verification": {"ok": all_ok, "checks": publications},
             "final_catalog_grpc": catalog_grpc,
             "final_catalog_recall": final_recall,
+            "control_plane_kept": config.keep_control_plane,
         },
     )
     if not all_ok:
         raise RuntimeError("benchmark publication verification failed")
-    if config.search_credentials_configured() and catalog_grpc.get("status") != "MEASURED":
-        raise RuntimeError(f"configured external search failed: {catalog_grpc.get('reason', catalog_grpc)}")
+    if catalog_grpc.get("status") == "FAILED":
+        raise RuntimeError(f"self-hosted search leg failed: {catalog_grpc.get('reason', catalog_grpc)}")
     return result

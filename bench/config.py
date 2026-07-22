@@ -20,6 +20,7 @@ DEFAULT_CORPUS_ROOT: Path = PACKAGE_DIR / "corpora"
 DEFAULT_RESULTS_ROOT: Path = PACKAGE_DIR / "results"
 DEFAULT_ICEBERG_PACKAGE: str = "org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0"
 PROTO_PATH: Path = REPO_ROOT / "rust" / "search-api" / "proto" / "lance_etl" / "v1" / "lance_etl.proto"
+DEFAULT_SEARCH_API_BINARY: Path = REPO_ROOT / "rust" / "search-api" / "target" / "release" / "search-api"
 SIFT_DIM: int = 128
 SIFT_BASE_COUNT: int = 1_000_000
 SIFT_QUERY_COUNT: int = 10_000
@@ -83,10 +84,22 @@ class BenchConfig:
         driver_memory: Spark driver memory for the local-mode JVM.
         catalog: Name of the local Hadoop Iceberg catalog.
         table_name: Bare Iceberg table name under ``<catalog>.db``.
-        endpoint: gRPC endpoint of the external production search service.
-        search_ca_path: PEM certificate authority used to verify the external service.
-        search_token_dir: Directory holding one bearer-token file per benchmark organization.
+        endpoint: gRPC endpoint of an already-running search-api server, plaintext, no TLS or authentication. Only
+            meaningful for the standalone ``search`` command: an external server cannot see ``e2e``'s ephemeral
+            control-plane schema, so ``e2e`` always self-hosts instead of reading this field.
+        search_api_binary: Path to the search-api release binary self-hosted by ``e2e`` (and by ``search`` when
+            ``control_plane_url`` is set instead of ``endpoint``). ``None`` explicitly disables self-hosting; the
+            search leg then records ``NOT_RUN`` instead of measuring anything.
+        search_api_port: Search gRPC port bound by a self-hosted server. The health port is the binary's own fixed
+            8081 and is not configurable.
+        keep_control_plane: When True, ``e2e`` does not drop its ephemeral PostgreSQL schema on exit, so a later
+            standalone ``search --control-plane-url`` run can self-host against the same published catalog.
+        control_plane_url: An isolated control-plane URL (as printed by an ``e2e --keep-control-plane`` run) the
+            standalone ``search`` command self-hosts a fresh search-api subprocess against. Ignored when
+            ``endpoint`` is set.
         search_expected_versions_path: JSON mapping every exact benchmark target to its expected published version.
+            Optional version evidence, independent of ``endpoint``. When set alongside ``endpoint`` the catalog
+            search leg validates every response's ``served_version`` against it.
         search_k: Neighbors requested per query. Must cover the deepest recall cut-off.
         max_queries: Cap on query vectors per sweep point. ``None`` sends all 10k.
         fts_query_count: Deterministic full-text queries drawn from cluster vocabularies in the FTS leg.
@@ -143,8 +156,10 @@ class BenchConfig:
     catalog: str = "bench"
     table_name: str = "sift"
     endpoint: str = ""
-    search_ca_path: Path | None = None
-    search_token_dir: Path | None = None
+    search_api_binary: Path | None = None
+    search_api_port: int = 8080
+    keep_control_plane: bool = False
+    control_plane_url: str | None = None
     search_expected_versions_path: Path | None = None
     search_k: int = SIFT_GT_DEPTH
     max_queries: int | None = None
@@ -174,8 +189,7 @@ class BenchConfig:
         """Validate cross-field invariants after the dataclass fields are populated.
 
         Raises:
-            ValueError: If ``search_k`` is smaller than the deepest :data:`RECALL_CUTOFFS` depth or external search
-                credentials are only partially configured.
+            ValueError: If ``search_k`` is smaller than the deepest :data:`RECALL_CUTOFFS` depth.
                 ``recall_at`` slices the retrieved-id array to the cut-off width, so a shorter
                 array silently caps recall below its true value instead of raising, which would
                 make ``search_k`` misconfiguration masquerade as a real recall drop.
@@ -187,25 +201,6 @@ class BenchConfig:
                 f"(RECALL_CUTOFFS={RECALL_CUTOFFS}); recall_at_{deepest_cutoff} would be silently "
                 f"deflated by the shorter retrieved-id array. Pass --search-k >= {deepest_cutoff}."
             )
-        credential_fields: tuple[Path | None, Path | None, Path | None] = (
-            self.search_ca_path,
-            self.search_token_dir,
-            self.search_expected_versions_path,
-        )
-        if any(value is not None for value in credential_fields) and not all(
-            value is not None for value in credential_fields
-        ):
-            raise ValueError(
-                "external search requires --search-ca-path, --search-token-dir, and --search-expected-versions-path"
-            )
-        if self.endpoint and not self.search_credentials_configured():
-            raise ValueError(
-                "--endpoint requires --search-ca-path, --search-token-dir, and --search-expected-versions-path"
-            )
-        if self.search_credentials_configured() and not self.endpoint:
-            raise ValueError("external search requires --endpoint")
-        if self.search_credentials_configured() and self.command != "search":
-            raise ValueError("external search evidence must use the standalone search command")
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> BenchConfig:
@@ -226,8 +221,6 @@ class BenchConfig:
                 "sha256",
                 "statsd_port",
                 "otlp_port",
-                "search_ca_path",
-                "search_token_dir",
                 "search_expected_versions_path",
             }
         )
@@ -239,9 +232,10 @@ class BenchConfig:
         values["workspace"] = Path(args.workspace).resolve()
         values["corpus_root"] = Path(args.corpus_root).resolve()
         values["results_root"] = Path(args.results_root).resolve()
-        for path_field in ("search_ca_path", "search_token_dir", "search_expected_versions_path"):
-            if values.get(path_field) is not None:
-                values[path_field] = Path(values[path_field]).resolve()
+        if values.get("search_expected_versions_path") is not None:
+            values["search_expected_versions_path"] = Path(values["search_expected_versions_path"]).resolve()
+        raw_binary: str | None = values.get("search_api_binary")
+        values["search_api_binary"] = Path(raw_binary) if raw_binary else None
         return cls(**values)
 
     def table(self) -> str:
@@ -326,34 +320,6 @@ class BenchConfig:
         """
         return self.workspace / "telemetry"
 
-    def search_credentials_configured(self) -> bool:
-        """Return whether the benchmark can authenticate to an external search service.
-
-        Returns:
-            True only when both the trusted CA and token directory are configured.
-        """
-        return (
-            self.search_ca_path is not None
-            and self.search_token_dir is not None
-            and self.search_expected_versions_path is not None
-        )
-
-    def search_token_path(self, org_id: str) -> Path:
-        """Return the bearer-token file for one exact logical benchmark target.
-
-        Args:
-            org_id: Organization identity carried in the public request and JWT claims.
-
-        Returns:
-            ``{search_token_dir}/{tenant}--{namespace}--{org}.jwt``.
-
-        Raises:
-            ValueError: If external search credentials are not configured.
-        """
-        if self.search_token_dir is None:
-            raise ValueError("external search credentials are not configured")
-        return self.search_token_dir / f"{TENANT_ID}--{NAMESPACE}--{org_id}.jwt"
-
 
 def add_flags(parser: argparse.ArgumentParser) -> None:
     """Add the full benchmark flag set to a subcommand parser.
@@ -395,19 +361,39 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--endpoint",
         default="",
-        help="External production search endpoint as host:port. Search is not measured when omitted",
+        help="Standalone `search` only: gRPC endpoint of an already-running search-api server, "
+        "plaintext, no TLS or authentication. `e2e` always self-hosts instead (an external server "
+        "cannot see its ephemeral control-plane schema) and ignores this flag",
     )
     parser.add_argument(
-        "--search-ca-path",
-        type=Path,
-        default=None,
-        help="PEM CA file that verifies the external search service certificate",
+        "--search-api-binary",
+        dest="search_api_binary",
+        default=str(DEFAULT_SEARCH_API_BINARY),
+        help="search-api release binary self-hosted by `e2e` (and by `search` when "
+        "--control-plane-url is set). Pass an empty string to disable the search leg explicitly; "
+        "the leg also skips with NOT_RUN when the default path does not exist",
     )
     parser.add_argument(
-        "--search-token-dir",
-        type=Path,
+        "--search-api-port",
+        dest="search_api_port",
+        type=int,
+        default=8080,
+        help="Search gRPC port bound by a self-hosted server; the health port is the binary's own "
+        "fixed 8081 and is not configurable",
+    )
+    parser.add_argument(
+        "--keep-control-plane",
+        dest="keep_control_plane",
+        action="store_true",
+        help="e2e only: do not drop the ephemeral control-plane schema on exit, so a later "
+        "`search --control-plane-url` run can self-host against the same published catalog",
+    )
+    parser.add_argument(
+        "--control-plane-url",
+        dest="control_plane_url",
         default=None,
-        help="Directory of tenant0--ns--ORG.jwt bearer-token files with exact target claims",
+        help="search only: isolated control-plane URL (as printed by `e2e --keep-control-plane`) "
+        "to self-host a fresh search-api subprocess against. Ignored when --endpoint is set",
     )
     parser.add_argument(
         "--search-expected-versions-path",
@@ -525,7 +511,7 @@ def build_parser() -> argparse.ArgumentParser:
     help_texts: dict[str, str] = {
         "download": "Fetch and verify the SIFT1M corpus",
         "prepare": "Write the Iceberg source table, cluster-seeded text corpus, and ground truth",
-        "search": "Run recall, FTS, hybrid, and the fixed authenticated load profile against the gRPC server",
+        "search": "Run recall, FTS, hybrid, and the fixed load profile against the plaintext gRPC server",
         "report": "Aggregate run artifacts into summary.md, results.csv, and pareto.png",
         "e2e": "Reconciler-driven e2e: per-batch ingest via the control plane, historical-tag verification, gRPC legs",
         "experiment": "One offline build iteration: prepare if needed, e2e, sizes, and metrics.json",

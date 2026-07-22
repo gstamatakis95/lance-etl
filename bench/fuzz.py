@@ -19,10 +19,13 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import shutil
 import time
+import uuid
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import lance
@@ -62,7 +65,17 @@ from bench.reconcile import (
 from bench.results import ensure_dir, save_phase
 from lance_etl.etl.mutation import normalize_operation
 from lance_etl.reconciler.iceberg import SparkIcebergCatalog
-from lance_etl.state import ControlPlaneRepository, DatasetSpecRevision, FieldRole, ServingDataset, WorkState
+from lance_etl.state import (
+    ControlPlaneRepository,
+    DatasetSpecRevision,
+    FieldRole,
+    RoutingIdentity,
+    ServingDataset,
+    WorkState,
+    derive_source_id,
+    deterministic_dataset_id,
+    ingest_uri,
+)
 from lance_etl.state.tables import dataset_work, datasets
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -82,6 +95,62 @@ VERIFY_COLUMNS: tuple[str, ...] = (
 
 SAME_SNAPSHOT_CONFLICT: str = "SAME_SNAPSHOT_CONFLICT"
 """Error code the reconciler stamps on a work row carrying distinct unordered mutations."""
+
+FUZZ_SOURCE_NAME: str = "bench-fuzz"
+"""Distinct source identity isolating fuzz dataset URIs from the standard ``bench`` e2e/qualify/
+experiment source. Dataset identity is a pure hash of source name plus routing identity
+(``deterministic_dataset_id``), independent of the installed spec revision, so a fuzz run sharing
+the standard ``bench`` name with a prior ``bench e2e`` run over the same ``--workspace`` would
+resolve to the exact same physical Lance path while carrying an incompatible narrowed vector
+dimension, corrupting the shared dataset schema on ingest and blocking publication with
+``CANDIDATE_SCHEMA_MISMATCH``."""
+
+
+def fuzz_dataset_paths(config: BenchConfig) -> list[Path]:
+    """Return every physical Lance path the fuzz evaluator's own source can ever address.
+
+    The fuzz evaluator regenerates its entire op program, every payload, and its oracle from
+    ``(seed, knobs, now_us)`` alone, so its Lance datasets are pure derived state that must not
+    outlive one run. Dataset identity is a deterministic hash of ``FUZZ_SOURCE_NAME`` plus the
+    routing identity (``deterministic_dataset_id``) and is independent of the installed spec
+    revision, so two fuzz runs sharing one ``--workspace`` with different knobs (for example a
+    different ``--fuzz-dim``) resolve to the exact same physical path even though their PostgreSQL
+    control-plane state is freshly isolated per run. Computing these paths offline from the fixed
+    ``FUZZ_SOURCE_NAME`` lets a run reset only its own namespace before it starts, never touching
+    the standard ``bench`` source's paths used by ``e2e``, ``qualify``, and ``experiment``.
+
+    Args:
+        config: Benchmark configuration.
+
+    Returns:
+        One Lance dataset path per configured organization.
+    """
+    source_id: uuid.UUID = derive_source_id(FUZZ_SOURCE_NAME)
+    base_uri: str = str(config.lance_root())
+    paths: list[Path] = []
+    org: str
+    for org in config.org_ids():
+        identity: RoutingIdentity = RoutingIdentity(TENANT_ID, NAMESPACE, org)
+        dataset_id: uuid.UUID = deterministic_dataset_id(source_id, identity)
+        paths.append(Path(ingest_uri(base_uri, dataset_id)))
+    return paths
+
+
+def reset_fuzz_datasets(config: BenchConfig) -> None:
+    """Delete every stale physical Lance dataset the fuzz evaluator's own source can address.
+
+    Runs before any Iceberg or reconciler state is touched. Removing the dataset directory and its
+    ``.artifacts`` sidecar (index-build and publication-manifest artifacts keyed off the same
+    prefix) guarantees each fuzz invocation starts from an empty dataset regardless of what a prior
+    fuzz run, at any seed or knob combination, left behind at the same deterministic path.
+
+    Args:
+        config: Benchmark configuration.
+    """
+    path: Path
+    for path in fuzz_dataset_paths(config):
+        shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(Path(f"{path}.artifacts"), ignore_errors=True)
 
 
 def fuzz_spec_revision(config: BenchConfig, settings: FuzzSettings) -> DatasetSpecRevision:
@@ -324,7 +393,13 @@ def drive_fuzz_snapshots(
         baseline_id: int = append_fuzz_snapshot(spark, config, settings, table, workload.ops_for_snapshot(0))
         snapshot_ids.append(baseline_id)
         application = build_reconciler_application(
-            spark, repository, table, baseline_id, config, spec_revision=fuzz_spec_revision(config, settings)
+            spark,
+            repository,
+            table,
+            baseline_id,
+            config,
+            spec_revision=fuzz_spec_revision(config, settings),
+            source_name=FUZZ_SOURCE_NAME,
         )
         for snapshot in range(settings.snapshots):
             final: bool = snapshot == settings.snapshots - 1
@@ -768,6 +843,11 @@ def knobs_document(settings: FuzzSettings) -> dict[str, Any]:
 def run_fuzz(config: BenchConfig) -> dict[str, Any]:
     """Run the randomized CRUD fuzz evaluation end-to-end and verify against the oracle.
 
+    Deletes every stale physical Lance path the fuzz evaluator's own source can address
+    (``reset_fuzz_datasets``) before touching Iceberg or the reconciler, so the run is hermetic:
+    its published state depends only on ``(seed, knobs, now_us)``, never on what an earlier fuzz
+    invocation, at any seed or knob combination, left on disk at the same deterministic path.
+
     Args:
         config: Benchmark configuration.
 
@@ -781,8 +861,10 @@ def run_fuzz(config: BenchConfig) -> dict[str, Any]:
     now_us: int = int(time.time() * 1_000_000)
     workload: FuzzWorkload = generate_workload(settings, now_us)
     ensure_dir(config.run_dir())
+    reset_fuzz_datasets(config)
     database_url: str = resolve_database_url()
-    with isolated_control_plane(database_url) as (repository, engine):
+    with isolated_control_plane(database_url) as (repository, engine, isolated_url):
+        del isolated_url
         records: list[dict[str, Any]]
         sequence_by_ordinal: dict[int, int]
         pre_final: dict[str, int | None]

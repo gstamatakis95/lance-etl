@@ -72,7 +72,7 @@ bench/                  Benchmark package (python -m bench). See bench/README.md
   reconcile.py          Source and spec registration plus reconciler invocation for the e2e run
   experiment.py         Agent loop iteration: prepare + spawn server + e2e + sizes + sweep -> metrics.json + experiments.jsonl
   qualification.py      Deterministic mutation-collapse, shuffle-width, and external scale-gate evidence
-  server.py             ServerHandle: build/spawn/health-check/restart/stop the search-api binary
+  search_server.py      self_hosted_search_api: spawn/health-check/stop a search-api subprocess
   sizes.py              On-disk data/index/meta byte measurement across the Lance fleet
   config.py             BenchConfig dataclass + full flag set
   datasets.py           DatasetAdapter registry: Sift1mAdapter, BigannAdapter
