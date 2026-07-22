@@ -42,6 +42,7 @@ from pyspark.sql import SparkSession
 from lance_etl.cloud_storage import discover_datasets
 from lance_etl.etl import ROUTING_COLS
 from lance_etl.etl.sink import DATA_STORAGE_VERSION
+from lance_etl.fanout import count_failed
 from lance_etl.indexing import IndexJobConfig, LanceIndexer, split_evenly
 from lance_etl.maintenance import MaintenanceConfig, MaintenanceJob, fan_out_per_dataset
 from lance_etl.telemetry import DEFAULT_COMMIT_RETRIES, Telemetry, TelemetryConfig, commit_with_retries
@@ -166,8 +167,11 @@ class MigrateReport:
         target_namespace: The namespace that was copied to.
         datasets_found: Number of source datasets in the namespace.
         copied: Target dataset URIs successfully written.
-        compacted: Number of targets compacted in the recompact step.
-        indexed: Number of targets processed by the reindex step.
+        compacted: Number of targets that completed the recompact step without an isolated failure.
+        indexed: Number of targets that completed the reindex step without an isolated failure.
+        failed: Number of targets whose recompact or reindex step failed in isolation (per
+            :func:`~lance_etl.fanout.dataset_result_failed`) and are therefore excluded from
+            ``compacted``/``indexed`` above.
         skipped: One ``{"source", "target", "reason"}`` mapping per source dataset not copied.
     """
 
@@ -177,6 +181,7 @@ class MigrateReport:
     copied: list[str] = field(default_factory=list)
     compacted: int = 0
     indexed: int = 0
+    failed: int = 0
     skipped: list[dict[str, str]] = field(default_factory=list)
 
 
@@ -627,8 +632,13 @@ class NamespaceMigrator:
                 )
         return [outcome["target"] for outcome in outcomes]
 
-    def optimize(self, spark: SparkSession, copied: list[str], telemetry: Telemetry) -> tuple[int, int]:
+    def optimize(self, spark: SparkSession, copied: list[str], telemetry: Telemetry) -> tuple[int, int, int]:
         """Recompact and reindex the copied targets, in pipeline order.
+
+        A target whose recompact or reindex step fails in isolation (per
+        :func:`~lance_etl.fanout.dataset_result_failed`) is excluded from the returned
+        compacted/indexed counts and tallied in the returned failed count instead, so a dataset
+        that failed to optimize is never reported as if it had succeeded.
 
         Args:
             spark: Active Spark session.
@@ -636,14 +646,17 @@ class NamespaceMigrator:
             telemetry: Driver telemetry facade.
 
         Returns:
-            The counts of datasets compacted and indexed.
+            The counts of datasets compacted, indexed, and failed in isolation.
         """
         config: MigrateConfig = self.config
         compacted: int = 0
         indexed: int = 0
+        failed: int = 0
         if config.recompact:
             with telemetry.timed("run.recompact_ms"):
-                compacted = len(MaintenanceJob(config.compaction_config()).run(spark, copied))
+                compaction_results: list[dict[str, Any]] = MaintenanceJob(config.compaction_config()).run(spark, copied)
+            failed += count_failed(compaction_results)
+            compacted = len(compaction_results) - count_failed(compaction_results)
         if config.reindex:
             if config.index is None:
                 logger.warning(
@@ -651,8 +664,10 @@ class NamespaceMigrator:
                 )
             else:
                 with telemetry.timed("run.reindex_ms"):
-                    indexed = len(LanceIndexer(config.index).run(spark, copied))
-        return compacted, indexed
+                    index_results: list[dict[str, Any]] = LanceIndexer(config.index).run(spark, copied)
+                failed += count_failed(index_results)
+                indexed = len(index_results) - count_failed(index_results)
+        return compacted, indexed, failed
 
     def run(self, spark: SparkSession) -> MigrateReport:
         """Migrate the namespace: discover, copy, optimize, and report.
@@ -716,8 +731,13 @@ class NamespaceMigrator:
                 config.target_namespace,
             )
 
-            report.compacted, report.indexed = self.optimize(spark, copied, telemetry)
+            report.compacted, report.indexed, report.failed = self.optimize(spark, copied, telemetry)
             telemetry.gauge("run.datasets_copied", len(copied))
             telemetry.gauge("run.datasets_compacted", report.compacted)
             telemetry.gauge("run.datasets_indexed", report.indexed)
+            telemetry.gauge("run.datasets_failed", report.failed)
+            if report.failed:
+                logger.warning(
+                    "namespace migrate: %d targets failed to optimize and will be retried next run", report.failed
+                )
             return report

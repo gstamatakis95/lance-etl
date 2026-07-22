@@ -199,15 +199,22 @@ def run_recall(args: argparse.Namespace) -> None:
     run_with_spark(spark, "recall", logger, work)
 
 
-def run_migrate_namespace(args: argparse.Namespace) -> None:
+def run_migrate_namespace(args: argparse.Namespace) -> int:
     """Execute the namespace-migration subcommand.
 
     Copies every dataset whose namespace component equals ``--source-namespace`` to the same
     address with the namespace component replaced by ``--target-namespace``.  Source datasets are
-    never deleted.
+    never deleted. A target that fails to recompact or reindex in isolation is excluded from the
+    report's compacted/indexed counts and tallied instead in the count this function returns, so
+    :func:`~lance_etl.cliutil.run_cli_main` maps a partial failure to
+    :data:`~lance_etl.cliutil.EXIT_PARTIAL_FAILURE` instead of exit ``0``.
 
     Args:
         args: Parsed command-line arguments.
+
+    Returns:
+        The number of targets that failed to optimize in isolation, ``0`` when every target
+        succeeded.
     """
     index_config: IndexJobConfig | None = None
     has_index_columns: bool = bool(
@@ -230,12 +237,13 @@ def run_migrate_namespace(args: argparse.Namespace) -> None:
     )
     spark = build_spark()
 
-    def work() -> None:
-        """Run the namespace migration and log its report."""
+    def work() -> int:
+        """Run the namespace migration, log its report, and return the failed-target count."""
         report = NamespaceMigrator(config).run(spark)
         logger.info("migrate-namespace report: %s", report)
+        return report.failed
 
-    run_with_spark(spark, "migrate-namespace", logger, work)
+    return run_with_spark(spark, "migrate-namespace", logger, work)
 
 
 def run_optimize_iceberg(args: argparse.Namespace) -> None:

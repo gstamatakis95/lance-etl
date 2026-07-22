@@ -22,6 +22,7 @@ from lance_etl.reconciler import (
     DispatchSummary,
     EnqueueSummary,
     ReconcilerApplication,
+    ReconcilerOperator,
     ReconcilerSettings,
     ReconcileSummary,
     ResultKind,
@@ -35,9 +36,10 @@ from lance_etl.reconciler import (
     evaluate_slo,
     retention_decision,
 )
-from lance_etl.reconciler.cli import build_parser, execute_command
+from lance_etl.reconciler.cli import EXIT_UNHEALTHY_STATUS, build_parser, execute_command, main
 from lance_etl.reconciler.config import RuntimeSettings
 from lance_etl.reconciler.iceberg import DurableSourcePlanProvider
+from lance_etl.reconciler.service import execute_isolated
 from lance_etl.reconciler.workers import (
     ConfiguredPublicationRunner,
     DistributedIngestRunner,
@@ -78,7 +80,9 @@ from lance_etl.state import (
     SourceSnapshotKind,
     SourceSnapshotPlan,
     SourceSnapshotState,
+    StateTransitionError,
     WorkClaim,
+    WorkExecutionContext,
     WorkKind,
     WorkPhase,
     production_default_spec_revision,
@@ -449,6 +453,72 @@ def test_bounded_dispatcher_isolates_worker_failures_and_stale_results() -> None
     assert first_result.error_code == "UNEXPECTED_WORKER_FAILURE"
 
 
+def test_bounded_dispatcher_isolates_divergent_reconciliation() -> None:
+    """A StateTransitionError from reconciling one claim never aborts the rest of the batch."""
+    repository: MagicMock = MagicMock()
+    claims: list[WorkClaim] = [work_claim(), work_claim()]
+    repository.claim_due_work.side_effect = [claims, []]
+    repository.block_work.return_value = True
+    executor: MagicMock = MagicMock()
+    executor.execute.side_effect = [
+        WorkResult(
+            claims[0], ResultKind.INGEST_SUCCEEDED, data_lance_version=1, source_row_count=0, source_digest=b"a" * 32
+        ),
+        WorkResult(
+            claims[1], ResultKind.INGEST_SUCCEEDED, data_lance_version=2, source_row_count=0, source_digest=b"b" * 32
+        ),
+    ]
+    results: MagicMock = MagicMock()
+    results.reconcile.side_effect = [StateTransitionError("digest mismatch on replay"), True]
+    summary: DispatchSummary = BoundedDispatcher(
+        repository, executor, results, reconciler_settings(claim_batch_size=2)
+    ).run()
+    assert summary == DispatchSummary(claimed=2, succeeded=1, advanced=0, retried=0, blocked=1, stale=0)
+    assert results.reconcile.call_count == 2
+    repository.block_work.assert_called_once_with(claims[0], "STATE_DIVERGENCE", "digest mismatch on replay")
+
+
+def test_dispatcher_isolates_a_real_reconciler_state_divergence_on_complete_ingest() -> None:
+    """The PR-01 acceptance scenario: a real reconciler isolates one divergent claim.
+
+    A real ``ResultReconciler`` whose ``repository.complete_ingest`` raises
+    ``StateTransitionError`` for claim 1 of a 2-claim batch never aborts claim 2. Unlike the
+    stubbed-``ResultReconciler`` test above, this drives the actual
+    ``ResultReconciler.reconcile`` implementation so a regression that swallowed
+    ``StateTransitionError`` inside ``reconcile`` itself (rather than the dispatcher's wrapper)
+    would also be caught.
+    """
+    repository: MagicMock = MagicMock()
+    claims: list[WorkClaim] = [work_claim(), work_claim()]
+    repository.claim_due_work.side_effect = [claims, []]
+    repository.complete_ingest.side_effect = [
+        StateTransitionError("replayed digest disagrees with persisted evidence"),
+        True,
+    ]
+    repository.block_work.return_value = True
+    executor: MagicMock = MagicMock()
+    executor.execute.side_effect = [
+        WorkResult(
+            claims[0], ResultKind.INGEST_SUCCEEDED, data_lance_version=1, source_row_count=0, source_digest=b"a" * 32
+        ),
+        WorkResult(
+            claims[1], ResultKind.INGEST_SUCCEEDED, data_lance_version=2, source_row_count=0, source_digest=b"b" * 32
+        ),
+    ]
+    settings: ReconcilerSettings = reconciler_settings(claim_batch_size=2)
+    dispatcher: BoundedDispatcher = BoundedDispatcher(
+        repository, executor, ResultReconciler(repository, settings), settings
+    )
+
+    summary: DispatchSummary = dispatcher.run()
+
+    assert summary == DispatchSummary(claimed=2, succeeded=1, advanced=0, retried=0, blocked=1, stale=0)
+    assert repository.complete_ingest.call_count == 2
+    repository.block_work.assert_called_once_with(
+        claims[0], "STATE_DIVERGENCE", "replayed digest disagrees with persisted evidence"
+    )
+
+
 def test_fenced_executor_rejects_stale_context_without_external_work() -> None:
     """A lost database fence prevents any Spark or Lance operation."""
     repository: MagicMock = MagicMock()
@@ -652,6 +722,373 @@ def test_applied_completion_marker_short_circuits_a_completed_window(tmp_path: P
 
     with pytest.raises(CompletionConflict):
         runner.applied_completion_marker(ingest_probe_context(uri, 3), b"x" * 32)
+
+
+class FakeColumn:
+    """Minimal stand-in for a pyspark ``Column``, inert outside of an active SparkContext."""
+
+    def isNull(self) -> FakeColumn:
+        """Return self, standing in for a real null-check expression.
+
+        Returns:
+            This column.
+        """
+        return self
+
+    def alias(self, name: str) -> FakeColumn:
+        """Return self, ignoring the requested alias.
+
+        Args:
+            name: Ignored alias name.
+
+        Returns:
+            This column.
+        """
+        del name
+        return self
+
+    def __gt__(self, other: object) -> FakeColumn:
+        """Return self, standing in for a real greater-than comparison.
+
+        Args:
+            other: Ignored comparison operand.
+
+        Returns:
+            This column.
+        """
+        del other
+        return self
+
+
+def fake_column(name: object) -> FakeColumn:
+    """Return an inert column stand-in regardless of the requested name.
+
+    Args:
+        name: Ignored column or expression name.
+
+    Returns:
+        A fresh fake column.
+    """
+    del name
+    return FakeColumn()
+
+
+def patch_inert_columns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch ``col`` and ``countDistinct`` in the workers module to context-free stand-ins.
+
+    The real pyspark ``col``/``countDistinct`` require an active ``SparkContext`` even to
+    construct an inert ``Column``, which a ``FakeSpark``-driven unit test never starts. The
+    null-record_id and same-snapshot conflict checks in ``DistributedIngestRunner.run`` only ever
+    feed their result into :class:`FakeTerminalFrame`'s own inert chain, so a context-free stand-in
+    is behaviorally exact for these tests.
+
+    Args:
+        monkeypatch: Active pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr("lance_etl.reconciler.workers.col", fake_column)
+    monkeypatch.setattr("lance_etl.reconciler.workers.countDistinct", fake_column)
+
+
+class FakeTerminalFrame:
+    """Minimal stand-in for the persisted terminal DataFrame consumed by run()'s contract checks."""
+
+    def persist(self, storage_level: object) -> FakeTerminalFrame:
+        """Return self, ignoring the requested storage level.
+
+        Args:
+            storage_level: Ignored persistence level.
+
+        Returns:
+            This frame.
+        """
+        del storage_level
+        return self
+
+    def where(self, condition: object) -> FakeTerminalFrame:
+        """Return self, ignoring the filter condition.
+
+        Args:
+            condition: Ignored filter expression.
+
+        Returns:
+            This frame.
+        """
+        del condition
+        return self
+
+    def limit(self, count: int) -> FakeTerminalFrame:
+        """Return self, ignoring the requested row limit.
+
+        Args:
+            count: Ignored row limit.
+
+        Returns:
+            This frame.
+        """
+        del count
+        return self
+
+    def count(self) -> int:
+        """Return zero so neither the null-record_id nor the conflict check ever trips.
+
+        Returns:
+            Zero.
+        """
+        return 0
+
+    def groupBy(self, *columns: object) -> FakeTerminalFrame:
+        """Return self, ignoring the grouping columns.
+
+        Args:
+            columns: Ignored grouping columns.
+
+        Returns:
+            This frame.
+        """
+        del columns
+        return self
+
+    def agg(self, *aggregations: object) -> FakeTerminalFrame:
+        """Return self, ignoring the requested aggregations.
+
+        Args:
+            aggregations: Ignored aggregation expressions.
+
+        Returns:
+            This frame.
+        """
+        del aggregations
+        return self
+
+    def dropDuplicates(self, columns: object) -> FakeTerminalFrame:
+        """Return self, ignoring the deduplication columns.
+
+        Args:
+            columns: Ignored deduplication columns.
+
+        Returns:
+            This frame.
+        """
+        del columns
+        return self
+
+    def unpersist(self) -> None:
+        """Record no-op release of the fake persisted frame."""
+
+
+def fake_execute_spark_scan(spark: object, plan: object) -> object:
+    """Return an opaque scan result without touching a real Spark session.
+
+    Args:
+        spark: Ignored Spark session.
+        plan: Ignored scan plan.
+
+    Returns:
+        An opaque scan-result stand-in, forwarded unchanged by the stubbed phase methods.
+    """
+    del spark, plan
+    return object()
+
+
+def ingest_run_context(claim: WorkClaim) -> WorkExecutionContext:
+    """Build a minimal live INGEST execution context for one claim.
+
+    Args:
+        claim: Fenced INGEST claim carrying its own source_snapshot_seq.
+
+    Returns:
+        Execution context satisfying every guard `DistributedIngestRunner.run` checks before
+        dispatching to the overridable phase methods.
+    """
+    return WorkExecutionContext(
+        claim=claim,
+        identity=RoutingIdentity("tenant", "ns", "org").validate(),
+        source_table="db.events",
+        source=source_registration(),
+        spec_revision=production_default_spec_revision(),
+        snapshot_id=100,
+        parent_snapshot_id=None,
+        iceberg_sequence_number=10,
+        partition_spec_id=0,
+        source_snapshot_kind=SourceSnapshotKind.BASELINE,
+        candidate_lance_uri=None,
+        candidate_lance_version=None,
+        artifact_manifest_uri=None,
+        artifact_digest=None,
+    )
+
+
+class StubbedPhasesIngestRunner(DistributedIngestRunner):
+    """Ingest runner whose scan/validate/select/normalize phases are trivial stand-ins.
+
+    Only the phases after the contract-violation boundary (`compute_source_digest`,
+    `applied_completion_marker`, `write_terminal`, `finalize_marker`) are left to each test to
+    override or fail, isolating exactly the boundary PR-03 narrows.
+    """
+
+    def canonical_source(self, source: object, context: object) -> object:
+        """Return the scan output unchanged.
+
+        Args:
+            source: Fake upstream scan result.
+            context: Ignored execution context.
+
+        Returns:
+            The unchanged source.
+        """
+        del context
+        return source
+
+    def validate_source_profile(self, source: object, spec: object) -> None:
+        """Accept any source without inspection.
+
+        Args:
+            source: Ignored source.
+            spec: Ignored dataset specification.
+        """
+        del source, spec
+
+    def select_profile_fields(self, source: object, spec: object) -> object:
+        """Return the source unchanged.
+
+        Args:
+            source: Ignored source.
+            spec: Ignored dataset specification.
+
+        Returns:
+            The unchanged source.
+        """
+        del spec
+        return source
+
+    def normalize_terminal(self, source: object, context: object) -> FakeTerminalFrame:
+        """Return a fake terminal frame that never trips the null or conflict checks.
+
+        Args:
+            source: Ignored source.
+            context: Ignored execution context.
+
+        Returns:
+            A fresh fake terminal frame.
+        """
+        del source, context
+        return FakeTerminalFrame()
+
+
+def test_ingest_runner_write_phase_failure_propagates_as_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A driver-side failure in the write phase becomes a RETRY, not a terminal contract BLOCKED.
+
+    Only the scan/validation phases through the null-record_id and same-snapshot conflict checks
+    are genuine contract violations. A ``ValueError`` raised later, from the write phase, must
+    propagate out of ``run()`` (proving the narrowed try) so ``execute_isolated`` converts it into
+    an ``UNEXPECTED_WORKER_FAILURE`` retry instead of a misleading terminal
+    ``SOURCE_PROFILE_VIOLATION`` block.
+    """
+    monkeypatch.setattr("lance_etl.reconciler.workers.execute_spark_scan", fake_execute_spark_scan)
+    patch_inert_columns(monkeypatch)
+
+    class FailingWriteIngestRunner(StubbedPhasesIngestRunner):
+        """Ingest runner whose write phase always fails with a non-contract ``ValueError``."""
+
+        def compute_source_digest(self, terminal: object) -> tuple[bytes, int]:
+            """Return a fixed digest and row count.
+
+            Args:
+                terminal: Ignored terminal frame.
+
+            Returns:
+                A fixed digest and row count.
+            """
+            del terminal
+            return b"d" * 32, 3
+
+        def applied_completion_marker(self, context: object, source_digest: bytes) -> CompletionMarker | None:
+            """Report the window as not yet applied.
+
+            Args:
+                context: Ignored execution context.
+                source_digest: Ignored digest.
+
+            Returns:
+                ``None``.
+            """
+            del context, source_digest
+            return None
+
+        def write_terminal(self, terminal: object, context: object) -> list[int]:
+            """Simulate a driver-side write failure unrelated to the source contract.
+
+            Args:
+                terminal: Ignored terminal frame.
+                context: Ignored execution context.
+
+            Raises:
+                ValueError: Always, simulating an executor write-task failure.
+            """
+            del terminal, context
+            raise ValueError("executor write task failed")
+
+    claim: WorkClaim = work_claim()
+    context: WorkExecutionContext = ingest_run_context(claim)
+    runner: FailingWriteIngestRunner = FailingWriteIngestRunner(spark=FakeSpark(), telemetry_config=TelemetryConfig())
+    with pytest.raises(ValueError, match="executor write task failed"):
+        runner.run(context)
+
+    class SingleContextExecutor:
+        """Adapter satisfying `WorkExecutor` by running one fixed context regardless of claim."""
+
+        def execute(self, claim: WorkClaim) -> WorkResult:
+            """Run the fixed context, ignoring the passed claim identity.
+
+            Args:
+                claim: Ignored claim (the fixed context already carries one).
+
+            Returns:
+                The runner's result.
+            """
+            del claim
+            return runner.run(context)
+
+    result: WorkResult = execute_isolated(SingleContextExecutor(), claim)
+    assert result.kind is ResultKind.RETRY
+    assert result.error_code == "UNEXPECTED_WORKER_FAILURE"
+
+
+def test_ingest_runner_validate_phase_failure_still_blocks_as_contract_violation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `ValueError` from the validation phase still becomes a terminal contract block.
+
+    Regression guard for the narrowed try: the scan/validate/select/normalize phases must stay
+    inside the `SOURCE_PROFILE_VIOLATION` boundary even after PR-03 narrows what comes after them.
+    """
+    monkeypatch.setattr("lance_etl.reconciler.workers.execute_spark_scan", fake_execute_spark_scan)
+    patch_inert_columns(monkeypatch)
+
+    class InvalidProfileIngestRunner(StubbedPhasesIngestRunner):
+        """Ingest runner whose validation phase always raises a contract `ValueError`."""
+
+        def validate_source_profile(self, source: object, spec: object) -> None:
+            """Reject every source as a contract violation.
+
+            Args:
+                source: Ignored source.
+                spec: Ignored dataset specification.
+
+            Raises:
+                ValueError: Always, simulating a genuine contract violation.
+            """
+            del source, spec
+            raise ValueError("source contains an unsupported mutation operation")
+
+    claim: WorkClaim = work_claim()
+    context: WorkExecutionContext = ingest_run_context(claim)
+    runner: InvalidProfileIngestRunner = InvalidProfileIngestRunner(
+        spark=FakeSpark(), telemetry_config=TelemetryConfig()
+    )
+    result: WorkResult = runner.run(context)
+    assert result.kind is ResultKind.BLOCKED
+    assert result.error_code == "SOURCE_PROFILE_VIOLATION"
 
 
 class StopAfterQualify(RuntimeError):
@@ -891,3 +1328,54 @@ def test_cli_exposes_only_local_control_plane_actions() -> None:
     migrator.migrate.assert_called_once_with()
     with pytest.raises(SystemExit):
         parser.parse_args(["rollback"])
+
+
+def slo_status(healthy: bool) -> SloStatus:
+    """Return a minimal SLO status fixture with the requested health.
+
+    Args:
+        healthy: Whether the fixture reports a healthy control plane.
+
+    Returns:
+        Low-cardinality SLO status fixture.
+    """
+    return SloStatus(
+        healthy=healthy,
+        reasons=() if healthy else ("blocked_work",),
+        due_work=0,
+        blocked_work=0 if healthy else 3,
+        blocked_source_snapshots=0,
+        oldest_open_age_seconds=0.0,
+        retention_age_seconds=0.0,
+    )
+
+
+def test_cli_main_status_exits_zero_when_healthy() -> None:
+    """`lance-etl-reconcile status` exits 0 when the evaluated control plane is healthy."""
+    application: MagicMock = MagicMock(spec=ReconcilerOperator)
+    application.emit_slo_status.return_value = slo_status(healthy=True)
+    assert main(["status"], application=application) == 0
+
+
+def test_cli_main_status_exits_nonzero_when_unhealthy() -> None:
+    """`lance-etl-reconcile status` exits nonzero when the evaluated control plane is unhealthy.
+
+    A shell-level health check or cron wrapper must not see success (`0`) on a `status` invocation
+    that itself reports `healthy: false`.
+    """
+    application: MagicMock = MagicMock(spec=ReconcilerOperator)
+    application.emit_slo_status.return_value = slo_status(healthy=False)
+    assert main(["status"], application=application) == EXIT_UNHEALTHY_STATUS
+
+
+def test_cli_main_run_once_exits_zero_regardless_of_blocked_work() -> None:
+    """`run-once` semantics are unchanged: retries and blocks are normal operation, not a CLI failure."""
+    application: MagicMock = MagicMock(spec=ReconcilerApplication)
+    application.run_once.return_value = RunOnceSummary(
+        planning=EnqueueSummary(None, 0, 0, (), False),
+        dispatch=DispatchSummary(claimed=0, succeeded=0, advanced=0, retried=0, blocked=1, stale=0),
+        reconciliation=ReconcileSummary(inspected=0, reconciled=0, deferred=0),
+        retention=RetentionDecision(False, None, None, None),
+        slo=slo_status(healthy=False),
+    )
+    assert main(["run-once"], application=application) == 0

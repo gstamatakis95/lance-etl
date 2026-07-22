@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -17,10 +18,12 @@ from lance_etl.state import (
     PublicationEvidence,
     RoutingIdentity,
     SourceSnapshotState,
+    StateTransitionError,
     WorkClaim,
     WorkPhase,
-    WorkProvenance,
 )
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 class WorkRepository(Protocol):
@@ -31,7 +34,6 @@ class WorkRepository(Protocol):
         limit: int,
         lease_duration: timedelta,
         now: datetime | None = None,
-        provenance: WorkProvenance | None = None,
     ) -> list[WorkClaim]:
         """Claim a bounded dataset-disjoint batch.
 
@@ -39,7 +41,6 @@ class WorkRepository(Protocol):
             limit: Maximum claims.
             lease_duration: PostgreSQL-backed lease duration.
             now: Optional deterministic clock.
-            provenance: Optional process launch provenance.
 
         Returns:
             Fenced claims.
@@ -289,21 +290,6 @@ class ResultReconciler:
                 required_publication_evidence(result.publication_evidence),
                 now,
             )
-        if result.kind is ResultKind.PHASE_ADVANCED:
-            advanced: bool = self.repository.advance_phase(
-                result.claim,
-                required_phase(result.next_phase),
-                candidate_lance_uri=result.candidate_lance_uri,
-                candidate_lance_version=result.indexed_lance_version,
-                artifact_manifest_uri=result.manifest_uri,
-                artifact_digest=result.manifest_digest,
-                now=now,
-            )
-            if not advanced:
-                return False
-            return self.repository.retry_work(
-                result.claim, timedelta(0), "PHASE_CHECKPOINTED", "", self.settings.max_attempts, now
-            )
         if result.kind is ResultKind.RETRY:
             return self.repository.retry_work(
                 result.claim,
@@ -361,16 +347,21 @@ class BoundedDispatcher:
     executor: WorkExecutor
     results: ResultReconciler
     settings: ReconcilerSettings
-    provenance: WorkProvenance = WorkProvenance()
 
     def run(self) -> DispatchSummary:
         """Claim, execute, and reconcile a bounded amount of due work.
+
+        Result reconciliation runs inside the same per-claim failure-isolation boundary as
+        execution: a divergent replay (``StateTransitionError`` from the repository) or any other
+        unexpected reconciliation exception blocks the offending claim on a best-effort basis and
+        moves on to the next claim, rather than escaping and abandoning the rest of the batch.
 
         Returns:
             Constant-size outcome counts.
         """
         counts: dict[ResultKind, int] = {kind: 0 for kind in ResultKind}
         stale: int = 0
+        diverged: int = 0
         claimed: int = 0
         batch_number: int
         for batch_number in range(self.settings.max_drain_batches):
@@ -378,7 +369,6 @@ class BoundedDispatcher:
             claims: list[WorkClaim] = self.repository.claim_due_work(
                 self.settings.claim_batch_size,
                 self.settings.lease_duration,
-                provenance=self.provenance,
             )
             if not claims:
                 break
@@ -386,19 +376,54 @@ class BoundedDispatcher:
             claim: WorkClaim
             for claim in claims:
                 result: WorkResult = execute_isolated(self.executor, claim)
+                exc: StateTransitionError | Exception
+                try:
+                    accepted: bool = self.results.reconcile(result)
+                except StateTransitionError as exc:
+                    diverged += 1
+                    self.block_diverged_claim(claim, exc)
+                    continue
+                except Exception as exc:
+                    diverged += 1
+                    logger.warning(
+                        "reconciler: result reconciliation raised for claim %s, isolating: %s",
+                        claim.work_id,
+                        exc,
+                    )
+                    continue
                 counts[result.kind] += 1
-                if not self.results.reconcile(result):
+                if not accepted:
                     stale += 1
             if len(claims) < self.settings.claim_batch_size:
                 break
         return DispatchSummary(
             claimed=claimed,
             succeeded=counts[ResultKind.INGEST_SUCCEEDED] + counts[ResultKind.PUBLISH_SUCCEEDED],
-            advanced=counts[ResultKind.PHASE_ADVANCED],
+            advanced=0,
             retried=counts[ResultKind.RETRY],
-            blocked=counts[ResultKind.BLOCKED],
+            blocked=counts[ResultKind.BLOCKED] + diverged,
             stale=stale,
         )
+
+    def block_diverged_claim(self, claim: WorkClaim, exc: Exception) -> None:
+        """Best-effort block one claim whose result reconciliation found a state divergence.
+
+        The block attempt itself may return ``False`` if the fence has already moved on (for
+        example a concurrent reclaim after lease expiry); that is tolerated silently since the
+        durable row is no longer this dispatcher's concern either way.
+
+        Args:
+            claim: The fenced claim whose reconciliation raised.
+            exc: The divergence exception the repository raised.
+        """
+        try:
+            self.repository.block_work(claim, "STATE_DIVERGENCE", str(exc))
+        except Exception as block_exc:
+            logger.warning(
+                "reconciler: best-effort block failed for diverged claim %s: %s",
+                claim.work_id,
+                block_exc,
+            )
 
 
 def execute_isolated(executor: WorkExecutor, claim: WorkClaim) -> WorkResult:
@@ -754,20 +779,6 @@ def required_str(value: str | None) -> str:
     """
     if not value:
         raise ValueError("required string result field is absent")
-    return value
-
-
-def required_phase(value: WorkPhase | None) -> WorkPhase:
-    """Narrow a result field already validated as a phase.
-
-    Args:
-        value: Optional phase.
-
-    Returns:
-        Required phase.
-    """
-    if value is None:
-        raise ValueError("required phase result field is absent")
     return value
 
 

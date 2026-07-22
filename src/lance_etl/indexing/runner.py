@@ -394,12 +394,13 @@ def plan_dataset_indexes(
 ) -> dict[str, Any]:
     """Run the plan phase for one dataset on an executor.
 
-    Opens the dataset once (failure isolation: an unreadable dataset returns a skip record),
-    resolves the index targets, applies the fleet-level and per-index skip checks, and shards
-    each index's target fragments into build tasks. A vector index whose artifacts are absent,
-    mismatched, or growth-stale (or a ``rebuild`` run) plans one ``bootstrap`` task: a committed
-    ``create_index`` whose internal streaming k-means trains the centroids (ADR 0030). A vector
-    index with reusable artifacts plans incremental ``segments`` shards as usual.
+    Opens the dataset once (failure isolation: an unreadable dataset returns a counted ``error``
+    record, since it cannot be planned at all, not benign "nothing to do"), resolves the index
+    targets, applies the fleet-level and per-index skip checks, and shards each index's target
+    fragments into build tasks. A vector index whose artifacts are absent, mismatched, or
+    growth-stale (or a ``rebuild`` run) plans one ``bootstrap`` task: a committed ``create_index``
+    whose internal streaming k-means trains the centroids (ADR 0030). A vector index with reusable
+    artifacts plans incremental ``segments`` shards as usual.
 
     Args:
         uri: Dataset URI.
@@ -407,17 +408,17 @@ def plan_dataset_indexes(
         telemetry: Telemetry facade for the current executor process.
 
     Returns:
-        A dict with ``uri`` and either ``skipped`` or ``version`` plus per-index ``specs``.
-        Each spec carries ``kind``, ``column``, ``index_name``, ``mode``, ``shards``, and the
-        FTS rebuild extra ``index_uuid``. Indexes with nothing to do land in ``done`` as
+        A dict with ``uri`` and either ``error``, ``skipped``, or ``version`` plus per-index
+        ``specs``. Each spec carries ``kind``, ``column``, ``index_name``, ``mode``, ``shards``,
+        and the FTS rebuild extra ``index_uuid``. Indexes with nothing to do land in ``done`` as
         finished stats.
     """
     try:
         dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
     except (FileNotFoundError, OSError, ValueError) as exc:
-        logger.warning("indexing: cannot open dataset %s, skipping: %s", uri, exc)
+        logger.warning("indexing: cannot open dataset %s, failing: %s", uri, exc)
         telemetry.incr("dataset.index_open_error")
-        return {"uri": uri, "indexes": [], "skipped": str(exc)}
+        return {"uri": uri, "indexes": [], "error": str(exc), "phase": "open"}
 
     targets: list[tuple[str, str, str]] = resolve_index_targets(dataset, config)
     skip: str | None = index_skip_reason(dataset, config, targets)

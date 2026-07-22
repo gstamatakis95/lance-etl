@@ -23,7 +23,6 @@ from lance_etl.state import (
     ControlPlaneRepository,
     IcebergSource,
     SourceLifecycleState,
-    WorkProvenance,
     build_control_plane_engine,
 )
 from lance_etl.telemetry import Telemetry, TelemetryConfig
@@ -153,13 +152,11 @@ def build_runtime_application() -> ReconcilerApplication:
         publisher: ConfiguredPublicationRunner = ConfiguredPublicationRunner(spark, telemetry_config, prewarmer)
         executor: FencedWorkExecutor = FencedWorkExecutor(repository, ingest, publisher, reconciler_settings)
         result_reconciler: ResultReconciler = ResultReconciler(repository, reconciler_settings)
-        work_provenance: WorkProvenance = WorkProvenance()
         dispatcher: BoundedDispatcher = BoundedDispatcher(
             repository,
             executor,
             result_reconciler,
             reconciler_settings,
-            work_provenance,
         )
         retention: PublicationRetentionSweep = PublicationRetentionSweep(
             repository, spark, reconciler_settings, telemetry_config

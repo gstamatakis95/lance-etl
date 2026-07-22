@@ -190,6 +190,9 @@ class DistributedIngestRunner:
             self.validate_source_profile(source, spec)
             selected: DataFrame = self.select_profile_fields(source, spec)
             terminal: DataFrame = self.normalize_terminal(selected, context).persist(StorageLevel.MEMORY_AND_DISK)
+        except (AnalysisException, ValueError) as exc:
+            return blocked_result(context.claim, "SOURCE_PROFILE_VIOLATION", str(exc))
+        try:
             try:
                 if terminal.where(col("record_id").isNull()).limit(1).count():
                     return blocked_result(context.claim, "NULL_RECORD_ID", "source contains a null record_id")
@@ -206,36 +209,36 @@ class DistributedIngestRunner:
                         "SAME_SNAPSHOT_CONFLICT",
                         "source snapshot contains distinct unordered mutations for one record_id",
                     )
-                collapsed: DataFrame = terminal.dropDuplicates(["record_id", EVENT_DIGEST_COLUMN]).dropDuplicates(
-                    ["record_id"]
-                )
-                source_digest: bytes
-                source_rows: int
-                source_digest, source_rows = self.compute_source_digest(collapsed)
-                applied: CompletionMarker | None = self.applied_completion_marker(context, source_digest)
-                if applied is not None:
-                    return WorkResult(
-                        claim=context.claim,
-                        kind=ResultKind.INGEST_SUCCEEDED,
-                        data_lance_version=applied.lance_version,
-                        source_row_count=source_rows,
-                        source_digest=source_digest,
-                    )
-                versions: list[int] = self.write_terminal(collapsed, context)
-                if source_rows > 0 and not versions:
-                    raise RuntimeError("terminal write produced no verified executor result")
-                marker: CompletionMarker = self.finalize_marker(context, source_digest)
+            except (AnalysisException, ValueError) as exc:
+                return blocked_result(context.claim, "SOURCE_PROFILE_VIOLATION", str(exc))
+            collapsed: DataFrame = terminal.dropDuplicates(["record_id", EVENT_DIGEST_COLUMN]).dropDuplicates(
+                ["record_id"]
+            )
+            source_digest: bytes
+            source_rows: int
+            source_digest, source_rows = self.compute_source_digest(collapsed)
+            applied: CompletionMarker | None = self.applied_completion_marker(context, source_digest)
+            if applied is not None:
                 return WorkResult(
                     claim=context.claim,
                     kind=ResultKind.INGEST_SUCCEEDED,
-                    data_lance_version=marker.lance_version,
+                    data_lance_version=applied.lance_version,
                     source_row_count=source_rows,
                     source_digest=source_digest,
                 )
-            finally:
-                terminal.unpersist()
-        except (AnalysisException, ValueError) as exc:
-            return blocked_result(context.claim, "SOURCE_PROFILE_VIOLATION", str(exc))
+            versions: list[int] = self.write_terminal(collapsed, context)
+            if source_rows > 0 and not versions:
+                raise RuntimeError("terminal write produced no verified executor result")
+            marker: CompletionMarker = self.finalize_marker(context, source_digest)
+            return WorkResult(
+                claim=context.claim,
+                kind=ResultKind.INGEST_SUCCEEDED,
+                data_lance_version=marker.lance_version,
+                source_row_count=source_rows,
+                source_digest=source_digest,
+            )
+        finally:
+            terminal.unpersist()
 
     def canonical_source(self, source: DataFrame, context: WorkExecutionContext) -> DataFrame:
         """Project PostgreSQL-configured source columns into the canonical worker contract.

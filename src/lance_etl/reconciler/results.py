@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from lance_etl.state import PublicationEvidence, WorkClaim, WorkPhase
+from lance_etl.state import PublicationEvidence, WorkClaim
 
 
 class ResultKind(StrEnum):
@@ -13,7 +13,6 @@ class ResultKind(StrEnum):
 
     INGEST_SUCCEEDED = "INGEST_SUCCEEDED"
     PUBLISH_SUCCEEDED = "PUBLISH_SUCCEEDED"
-    PHASE_ADVANCED = "PHASE_ADVANCED"
     RETRY = "RETRY"
     BLOCKED = "BLOCKED"
 
@@ -24,7 +23,6 @@ class WorkResult:
 
     claim: WorkClaim
     kind: ResultKind
-    next_phase: WorkPhase | None = None
     data_lance_version: int | None = None
     indexed_lance_version: int | None = None
     source_row_count: int | None = None
@@ -71,8 +69,6 @@ class WorkResult:
                     "PUBLISH success requires candidate URI, exact version, manifest, and publication evidence"
                 )
             self.publication_evidence.validate()
-        elif self.kind is ResultKind.PHASE_ADVANCED and self.next_phase is None:
-            raise ValueError("phase advancement requires next_phase")
         elif self.kind in (ResultKind.RETRY, ResultKind.BLOCKED) and not self.error_code:
             raise ValueError("failure result requires a bounded error_code")
         return self

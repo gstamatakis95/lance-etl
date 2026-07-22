@@ -52,8 +52,8 @@ from lance_etl.state.types import (
     WorkClaim,
     WorkExecutionContext,
     WorkKind,
+    WorkLauncherKind,
     WorkPhase,
-    WorkProvenance,
     WorkState,
     derive_source_id,
     deterministic_dataset_id,
@@ -1409,7 +1409,6 @@ class ControlPlaneRepository:
         limit: int,
         lease_duration: timedelta,
         now: datetime | None = None,
-        provenance: WorkProvenance | None = None,
     ) -> list[WorkClaim]:
         """Claim a bounded dataset-disjoint batch with monotonic fences.
 
@@ -1417,7 +1416,6 @@ class ControlPlaneRepository:
             limit: Maximum returned claims.
             lease_duration: Positive lease duration.
             now: Optional deterministic transaction clock.
-            provenance: Optional process launch provenance stored on claimed rows.
 
         Returns:
             Fenced claims.
@@ -1426,7 +1424,6 @@ class ControlPlaneRepository:
             raise ValueError("claim limit and lease duration must be positive")
         row: RowMapping
         current: datetime = now or utc_now()
-        work_provenance: WorkProvenance = (provenance or WorkProvenance()).validate()
         with self.engine.begin() as connection:
             self.release_expired_leases(connection, current)
             self.sweep_stale_work(connection, current)
@@ -1472,7 +1469,6 @@ class ControlPlaneRepository:
                     state_row,
                     current,
                     lease_duration,
-                    work_provenance,
                 )
                 if claim is not None:
                     claims.append(claim)
@@ -1510,7 +1506,6 @@ class ControlPlaneRepository:
         state_row: RowMapping,
         current: datetime,
         lease_duration: timedelta,
-        provenance: WorkProvenance,
     ) -> WorkClaim | None:
         """Fence and claim one already locked due row.
 
@@ -1520,7 +1515,6 @@ class ControlPlaneRepository:
             state_row: Locked dataset-state row.
             current: Transaction clock.
             lease_duration: Positive lease duration.
-            provenance: Validated local or Airflow launch provenance.
 
         Returns:
             Claim or ``None`` if the row ceased to be due.
@@ -1552,7 +1546,7 @@ class ControlPlaneRepository:
                 attempt_count=attempt_count,
                 error_code=None,
                 error_message=None,
-                launcher_kind=provenance.launcher_kind.value,
+                launcher_kind=WorkLauncherKind.LOCAL.value,
                 updated_at=current,
                 **refreshed_expectations,
             )

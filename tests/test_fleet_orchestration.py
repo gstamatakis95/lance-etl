@@ -86,7 +86,8 @@ def test_plan_terminal_records_for_no_work_datasets(
 
     assert compact_result["tasks"] == 0
     assert "task_jsons" not in compact_result
-    assert missing_result["skipped"]
+    assert missing_result["error"]
+    assert missing_result["phase"] == "open"
 
 
 def test_fleet_run_compacts_mixed_sizes_in_one_flat_job(

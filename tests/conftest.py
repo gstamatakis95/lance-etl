@@ -260,3 +260,6 @@ class FakeSpark:
     def __init__(self) -> None:
         """Initialize the fake session with its fake context."""
         self.sparkContext: FakeSparkContext = FakeSparkContext()
+
+    def stop(self) -> None:
+        """No-op session teardown, so callers built around a real SparkSession's lifecycle work unchanged."""

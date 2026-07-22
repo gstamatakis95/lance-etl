@@ -6,6 +6,9 @@ from lance_etl.state.repository import (
     ControlPlaneRepository as ControlPlaneRepository,
 )
 from lance_etl.state.repository import (
+    StateTransitionError as StateTransitionError,
+)
+from lance_etl.state.repository import (
     build_control_plane_engine as build_control_plane_engine,
 )
 from lance_etl.state.specs import (
@@ -100,9 +103,6 @@ from lance_etl.state.types import (
 )
 from lance_etl.state.types import (
     WorkPhase as WorkPhase,
-)
-from lance_etl.state.types import (
-    WorkProvenance as WorkProvenance,
 )
 from lance_etl.state.types import (
     WorkState as WorkState,

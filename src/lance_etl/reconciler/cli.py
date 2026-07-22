@@ -14,10 +14,18 @@ from typing import Any, Protocol
 
 from lance_etl.reconciler.migrations import build_runtime_migrator
 from lance_etl.reconciler.runtime import build_runtime_application, build_runtime_operator
-from lance_etl.reconciler.service import ReconcilerApplication, ReconcilerOperator, RunOnceSummary
+from lance_etl.reconciler.service import ReconcilerApplication, ReconcilerOperator, RunOnceSummary, SloStatus
 from lance_etl.state import RoutingIdentity
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+EXIT_UNHEALTHY_STATUS: int = 3
+"""Process exit code for `status` when `SloStatus.healthy` is `False`.
+
+Matches the fleet CLIs' partial-failure convention (`lance_etl.cliutil.EXIT_PARTIAL_FAILURE`) so a
+shell-level health check or cron wrapper can treat both the same way, without this package taking a
+direct dependency on the Spark-fleet CLI helper module.
+"""
 
 
 class MigrationRunner(Protocol):
@@ -186,7 +194,10 @@ def main(
         sleep: Interruptible wait operation for continuous execution.
 
     Returns:
-        Process exit code.
+        Process exit code: ``0`` for every command's normal outcome, except that ``status``
+        returns :data:`EXIT_UNHEALTHY_STATUS` when the evaluated `SloStatus.healthy` is `False`, so
+        a shell-level health check or cron wrapper cannot see success on an unhealthy control plane.
+        ``run``/``run-once`` semantics are unchanged: retries and blocks are normal operation there.
     """
     args: argparse.Namespace = build_parser().parse_args(argv)
     resolved: ReconcilerApplication | ReconcilerOperator | None = application
@@ -204,6 +215,8 @@ def main(
         result: Any = execute_command(resolved, args, resolved_migrator, sleep)
         payload: Any = asdict(result) if is_dataclass(result) else result
         print(json.dumps(payload, sort_keys=True, default=str))
+        if args.command == "status" and isinstance(result, SloStatus) and not result.healthy:
+            return EXIT_UNHEALTHY_STATUS
         return 0
     finally:
         if owns_runtime and resolved is not None:

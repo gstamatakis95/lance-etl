@@ -78,9 +78,11 @@ repeated claim attempts converge on the same row instead of duplicating it:
 `WorkClaim` is the fenced lease handed to a worker (work and dataset identity, kind, phase, lease
 token, fence epoch, attempt count). `WorkExecutionContext` is the richer, read-only bundle a worker
 actually executes against — claim plus resolved routing identity, source, and spec revision.
-`WorkProvenance`/`WorkLauncherKind` record who launched a claimed attempt for audit purposes only:
-`WorkLauncherKind` currently defines a single value, `LOCAL`, and the label never participates in
-claim eligibility, ordering, retries, leases, or fencing.
+`WorkLauncherKind` records who launched a claimed attempt on the `dataset_work.launcher_kind`
+column for audit purposes only: it currently defines a single value, `LOCAL`, stamped as a constant
+by `claim_locked_row`, and the label never participates in claim eligibility, ordering, retries,
+leases, or fencing. There is no separate launch-provenance parameter or type — a second launcher
+kind, if ever needed, is a fresh addition rather than plumbing already in place.
 
 ## `settings.py`: process bootstrap, not a table
 
@@ -129,8 +131,8 @@ invariant.
 
 ### Work claiming: `FOR UPDATE SKIP LOCKED`, lease, and fence
 
-`claim_due_work(limit, lease_duration, now, provenance)` is the only way a worker acquires
-dataset-scoped work, and it is dataset-disjoint by construction:
+`claim_due_work(limit, lease_duration, now)` is the only way a worker acquires dataset-scoped work,
+and it is dataset-disjoint by construction:
 
 1. `release_expired_leases` returns any `RUNNING` row whose `lease_expires_at` has passed to
    `RETRY_WAIT`.

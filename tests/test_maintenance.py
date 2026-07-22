@@ -17,7 +17,10 @@ import pyarrow as pa
 import pytest
 from conftest import FakeSpark
 
+import lance_etl.maintenance.cli as maintenance_cli
 import lance_etl.maintenance.job as maintenance_job
+from lance_etl.cliutil import EXIT_PARTIAL_FAILURE
+from lance_etl.fanout import count_failed
 from lance_etl.maintenance import (
     MaintenanceConfig,
     MaintenanceJob,
@@ -28,6 +31,21 @@ from lance_etl.maintenance import (
     validate_column_name,
 )
 from lance_etl.telemetry import Telemetry, TelemetryConfig
+
+
+def fake_build_spark(*args: object, **kwargs: object) -> FakeSpark:
+    """Return a fake session regardless of the requested Spark configuration.
+
+    Args:
+        args: Ignored positional arguments.
+        kwargs: Ignored keyword arguments.
+
+    Returns:
+        A fresh fake Spark session.
+    """
+    del args, kwargs
+    return FakeSpark()
+
 
 DELETED_COLUMN: str = "is_deleted"
 
@@ -260,7 +278,7 @@ class TestRetentionDelete:
             dataset, uri, config, compute_cutoff(RETENTION_SECONDS), telemetry
         )
         assert result["retention_rows_deleted"] == expired_count
-        assert result["skipped"] == ""
+        assert "error" not in result
         assert lance.dataset(uri).count_rows() == alive_count
 
     def test_keeps_rows_inside_window(self, tmp_path: Path, telemetry: Telemetry) -> None:
@@ -281,8 +299,8 @@ class TestRetentionDelete:
         assert result["retention_rows_deleted"] == 0
         assert lance.dataset(uri).count_rows() == 8
 
-    def test_skips_dataset_without_ts_column(self, tmp_path: Path, telemetry: Telemetry) -> None:
-        """A dataset lacking the ts column is skipped rather than failing."""
+    def test_fails_dataset_without_ts_column(self, tmp_path: Path, telemetry: Telemetry) -> None:
+        """A dataset lacking the configured ts column is a counted contract-violation failure."""
         uri: str = str(tmp_path / "no_ts.lance")
         dataset: lance.LanceDataset = lance.write_dataset(pa.table({"id": pa.array([1, 2], pa.int64())}), uri)
         config: MaintenanceConfig = MaintenanceConfig(
@@ -295,7 +313,52 @@ class TestRetentionDelete:
             dataset, uri, config, compute_cutoff(RETENTION_SECONDS), telemetry
         )
         assert result["retention_rows_deleted"] == 0
-        assert result["skipped"] != ""
+        assert result["error"]
+        assert result["phase"] == "retention-config"
+
+    def test_fleet_run_counts_missing_ts_column_as_failed(self, tmp_path: Path) -> None:
+        """A fleet-level MaintenanceJob.run counts a missing-ts-column dataset as failed.
+
+        Regression guard for PR-02 finding 3: the configured ``ts`` column being absent from a
+        dataset's schema is a contract violation, not benign "nothing to do", so it must be
+        visible to :func:`~lance_etl.fanout.count_failed` and, in turn, to the maintenance CLI's
+        exit code.
+        """
+        uri: str = str(tmp_path / "no_ts_fleet.lance")
+        lance.write_dataset(pa.table({"id": pa.array([1, 2], pa.int64())}), uri)
+        config: MaintenanceConfig = MaintenanceConfig(
+            telemetry=TelemetryConfig(),
+            retention_seconds=RETENTION_SECONDS,
+            ts_column=TS_COLUMN,
+            commit_backoff_seconds=0.0,
+        )
+        results: list[dict[str, object]] = MaintenanceJob(config).run(FakeSpark(), [uri])
+        assert count_failed(results) == 1
+
+    def test_fleet_run_counts_unopenable_dataset_as_failed(self, tmp_path: Path) -> None:
+        """A fleet-level MaintenanceJob.run counts a nonexistent dataset URI as failed.
+
+        Regression guard for PR-02 finding 1: an unopenable dataset must be visible to
+        :func:`~lance_etl.fanout.count_failed`, not silently reported as a benign skip.
+        """
+        missing_uri: str = str(tmp_path / "does_not_exist.lance")
+        config: MaintenanceConfig = MaintenanceConfig(telemetry=TelemetryConfig(), commit_backoff_seconds=0.0)
+        results: list[dict[str, object]] = MaintenanceJob(config).run(FakeSpark(), [missing_uri])
+        assert count_failed(results) == 1
+
+    def test_cli_exits_partial_failure_on_unopenable_dataset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The maintenance CLI's exit code reflects a fleet run over one unopenable dataset.
+
+        Regression guard for PR-02: the maintenance ``run`` subcommand must map an isolated open
+        failure to :data:`~lance_etl.cliutil.EXIT_PARTIAL_FAILURE`, not exit ``0`` as if the whole
+        fleet run succeeded.
+        """
+        monkeypatch.setattr(maintenance_cli, "build_spark", fake_build_spark)
+        missing_uri: str = str(tmp_path / "does_not_exist.lance")
+        exit_code: int = maintenance_cli.main(["run", "--dataset-uri", missing_uri])
+        assert exit_code == EXIT_PARTIAL_FAILURE
 
 
 class TestRetentionOffIsNoop:

@@ -16,20 +16,23 @@ from pathlib import Path
 
 import lance
 import pytest
-from conftest import make_vector_table
+from conftest import FakeSpark, make_vector_table
 from pyspark.sql import SparkSession
 
 import lance_etl.migrate_namespace as migrate_namespace_module
+import lance_etl.tools.cli as tools_cli
+from lance_etl.cliutil import EXIT_PARTIAL_FAILURE
 from lance_etl.indexing import IndexJobConfig, bitmap_index_name
 from lance_etl.migrate_namespace import (
     MigrateConfig,
+    MigrateReport,
     NamespaceMigrator,
     build_dataset_uri,
     source_dataset_uris,
     target_uri_for,
     validate_config,
 )
-from lance_etl.telemetry import TelemetryConfig
+from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 
 @pytest.fixture(scope="module")
@@ -244,3 +247,84 @@ class TestEndToEnd:
         target = lance.dataset(f"{base}/org1/tenant1/nsB.lance")
         names: set[str] = {description.name for description in target.describe_indices()}
         assert bitmap_index_name("category") in names
+
+    def test_optimize_excludes_isolated_failures_from_compacted_and_indexed_counts(
+        self, spark: SparkSession, tmp_path: Path, telemetry_config: TelemetryConfig
+    ) -> None:
+        """A target that fails to open during optimize is counted as failed, not compacted/indexed.
+
+        Regression guard for PR-02: `NamespaceMigrator.optimize` previously used `len(results)` for
+        both the compacted and indexed counts, so an isolated per-dataset failure (an unopenable
+        target) was reported as a success. `report.failed` must surface it instead.
+        """
+        base: str = str(tmp_path)
+        index: IndexJobConfig = IndexJobConfig(telemetry=telemetry_config, bitmap_columns=["category"])
+        config: MigrateConfig = base_config(base, telemetry_config, recompact=True, reindex=True, index=index)
+        missing_target: str = f"{base}/org1/tenant1/does_not_exist.lance"
+
+        migrator: NamespaceMigrator = NamespaceMigrator(config)
+        telemetry: Telemetry = Telemetry.create(telemetry_config)
+        compacted, indexed, failed = migrator.optimize(spark, [missing_target], telemetry)
+
+        assert (compacted, indexed, failed) == (0, 0, 2)
+
+
+def fake_build_spark(*args: object, **kwargs: object) -> FakeSpark:
+    """Return a fake session regardless of the requested Spark configuration.
+
+    Args:
+        args: Ignored positional arguments.
+        kwargs: Ignored keyword arguments.
+
+    Returns:
+        A fresh fake Spark session.
+    """
+    del args, kwargs
+    return FakeSpark()
+
+
+class TestToolsCliExitCode:
+    """The uninstalled operator tools CLI maps a migrate-namespace report's failed count to exit 3."""
+
+    def test_run_migrate_namespace_returns_report_failed_count(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`run_migrate_namespace` returns `report.failed` so `run_cli_main` maps it to exit 3.
+
+        Regression guard for PR-02: the tools CLI previously returned `None` unconditionally,
+        so `run_cli_main` always mapped a migrate-namespace run to exit 0 even when targets failed
+        to optimize. Stubs `NamespaceMigrator.run` so this test does not need a real Spark session
+        or dataset fleet, isolating the exit-code wiring from the migration logic already covered
+        above.
+        """
+        stub_report: MigrateReport = MigrateReport(
+            source_namespace="old-ns", target_namespace="new-ns", datasets_found=1, compacted=0, indexed=0, failed=2
+        )
+
+        def fake_run(migrator: NamespaceMigrator, spark: object) -> MigrateReport:
+            """Return the fixed stub report regardless of the migrator or session.
+
+            Args:
+                migrator: Ignored migrator instance.
+                spark: Ignored Spark session.
+
+            Returns:
+                The fixed stub report.
+            """
+            del migrator, spark
+            return stub_report
+
+        monkeypatch.setattr(tools_cli, "build_spark", fake_build_spark)
+        monkeypatch.setattr(tools_cli.NamespaceMigrator, "run", fake_run)
+        exit_code: int = tools_cli.main(
+            [
+                "migrate-namespace",
+                "--source-namespace",
+                "old-ns",
+                "--target-namespace",
+                "new-ns",
+                "--base-uri",
+                str(tmp_path),
+            ]
+        )
+        assert exit_code == EXIT_PARTIAL_FAILURE

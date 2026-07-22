@@ -95,29 +95,9 @@ class WorkPhase(StrEnum):
 
 
 class WorkLauncherKind(StrEnum):
-    """Launch origins recorded on the latest durable work claim."""
+    """Launch origins recorded on the latest durable work claim as an audit label only."""
 
     LOCAL = "LOCAL"
-
-
-@dataclass(frozen=True, slots=True)
-class WorkProvenance:
-    """Optional launch provenance that never participates in work ordering."""
-
-    launcher_kind: WorkLauncherKind = WorkLauncherKind.LOCAL
-
-    def validate(self) -> WorkProvenance:
-        """Validate the recorded launcher kind.
-
-        Returns:
-            This validated provenance.
-
-        Raises:
-            ValueError: If the launcher kind is unsupported.
-        """
-        if not isinstance(self.launcher_kind, WorkLauncherKind):
-            raise ValueError("work launcher kind is unsupported")
-        return self
 
 
 def validate_routing_segment(value: str, field_name: str) -> str:

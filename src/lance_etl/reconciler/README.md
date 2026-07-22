@@ -116,20 +116,29 @@ iterations. Each iteration claims up to `settings.claim_batch_size` dataset-disj
 `repository.claim_due_work`, executes every claim through `execute_isolated` (which converts an
 unexpected exception in the worker into an `UNEXPECTED_WORKER_FAILURE` retry result rather than
 letting it escape and abort the whole batch — the per-dataset failure isolation from ADR 0035), and
-reconciles each result through `ResultReconciler.reconcile`. The loop stops early once a batch
-returns fewer claims than requested (the queue is drained) or the batch limit is reached, and
+reconciles each result through `ResultReconciler.reconcile`. **Failure isolation covers
+reconciliation too, not just execution**: the `reconcile` call for each claim is itself wrapped.
+A `StateTransitionError` (a divergent replay — the same claim's durable evidence disagrees with
+what is already persisted) makes the dispatcher attempt a best-effort `block_work(claim,
+"STATE_DIVERGENCE", ...)` for that one row and count it in `blocked`; any other unexpected exception
+from reconciliation is logged and counted in `blocked` the same way. Either way the loop continues
+with the next claim in the batch instead of raising out of `run()`. The loop stops early once a
+batch returns fewer claims than requested (the queue is drained) or the batch limit is reached, and
 returns a constant-size `DispatchSummary` (claimed/succeeded/advanced/retried/blocked/stale) rather
-than per-work-item detail, keeping the summary safe to log at any cardinality.
+than per-work-item detail, keeping the summary safe to log at any cardinality. `advanced` is always
+`0` — no producer constructs a standalone phase-advancement result any more (see below) — and the
+field is kept only because `bench/reconcile.py`'s drain totals still read `summary.dispatch.advanced`.
 
 `ResultReconciler.reconcile` maps each `ResultKind` to the matching fenced repository transition:
 `INGEST_SUCCEEDED` -> `complete_ingest`, `PUBLISH_SUCCEEDED` -> first `advance_publish_phases`
 (checkpoints every fixed phase from the claim's current phase through `PREWARM` so a crash after a
-long-running publish still resumes past completed work) then `publish_dataset`, `PHASE_ADVANCED` ->
-`advance_phase` followed by a zero-delay `retry_work` (so a phase checkpoint alone does not block
-the claim, it just yields it back to the queue), `RETRY` -> `retry_work` with the code-owned
-jittered backoff delay, and `BLOCKED` -> `block_work`. Any transition whose fence has moved on
-(a stale claim) returns `False` and the dispatcher counts it as `stale` rather than raising, since a
-stale result is expected under concurrent reclaim and not a bug.
+long-running publish still resumes past completed work) then `publish_dataset`, `RETRY` ->
+`retry_work` with the code-owned jittered backoff delay, and `BLOCKED` -> `block_work`. Any
+transition whose fence has moved on (a stale claim) returns `False` and the dispatcher counts it as
+`stale` rather than raising, since a stale result is expected under concurrent reclaim and not a
+bug. There is no standalone phase-advancement result kind: `ConfiguredPublicationRunner` only ever
+checkpoints phases through `advance_publish_phases` on the `PUBLISH_SUCCEEDED` path above, so that
+standalone result was dead code and has been removed.
 
 ## Restricted repair and status
 
@@ -154,9 +163,11 @@ rebuild. Both repairs accept `--dry-run` to validate input without mutating any 
   weaken `ConfiguredPublicationRunner`'s qualification gate to accept partial index coverage.
 - **The heartbeat renews the lease, never the fence.** Only `claim_due_work`'s `claim_locked_row`
   path may advance `fence_epoch`.
-- **Failure isolation stays per-claim.** `execute_isolated` must keep converting an unexpected
-  worker exception into a retry result for that one claim, not letting it abort the whole dispatch
-  batch.
+- **Failure isolation stays per-claim, for both execution and reconciliation.** `execute_isolated`
+  must keep converting an unexpected worker exception into a retry result for that one claim, and
+  `BoundedDispatcher.run`'s own try/except around `self.results.reconcile(result)` must keep
+  isolating a divergent-replay `StateTransitionError` (or any other reconciliation exception) to
+  that one claim — never letting either failure abort the whole dispatch batch.
 - **Segment-API indexing only**, per hard rule 6 — `ConfiguredPublicationRunner`'s index build path
   must keep using the sanctioned segment-API and streaming-bootstrap recipes documented in the root
   `AGENTS.md` and `src/lance_etl/AGENTS.md`.

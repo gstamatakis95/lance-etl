@@ -389,8 +389,10 @@ def run_retention_on_open_dataset(
 
     Validates the ``ts`` column name against the schema of the supplied open handle, then delegates
     the actual delete to a re-opening retry action so each commit attempt operates against the
-    latest version (required for rebase correctness). A dataset that lacks the ``ts`` column is
-    skipped with a warning and a metric rather than failing the task.
+    latest version (required for rebase correctness). A dataset whose configured ``ts`` or
+    ``deleted`` column is absent from its schema is a genuine contract violation between the
+    supplied :class:`MaintenanceConfig` and the dataset, not benign "nothing to do", so it is
+    reported as a counted failure rather than a silent skip.
 
     Args:
         dataset: An already-open Lance dataset handle used only for schema validation.
@@ -400,16 +402,17 @@ def run_retention_on_open_dataset(
         telemetry: Telemetry facade for the current executor process.
 
     Returns:
-        A result dictionary with keys ``uri``, ``retention_rows_deleted``, and ``skipped``.
+        A result dictionary with keys ``uri``, ``retention_rows_deleted``, and, on a missing
+        configured column, ``error`` and ``phase``.
     """
     try:
         validate_column_name(config.ts_column, dataset.schema)
         if config.deleted_column is not None:
             validate_column_name(config.deleted_column, dataset.schema)
     except KeyError as exc:
-        logger.warning("retention: ts column missing in %s, skipping expiration: %s", uri, exc)
+        logger.warning("retention: configured column missing in %s, failing retention: %s", uri, exc)
         telemetry.incr("dataset.retention_column_missing")
-        return {"uri": uri, "retention_rows_deleted": 0, "skipped": str(exc)}
+        return {"uri": uri, "retention_rows_deleted": 0, "error": str(exc), "phase": "retention-config"}
 
     predicate: str = retention_predicate(config, cutoff)
 
@@ -433,7 +436,7 @@ def run_retention_on_open_dataset(
     telemetry.distribution("dataset.retention_rows_deleted", float(rows_deleted))
     if rows_deleted:
         telemetry.incr("dataset.retention_expired")
-    return {"uri": uri, "retention_rows_deleted": rows_deleted, "skipped": ""}
+    return {"uri": uri, "retention_rows_deleted": rows_deleted}
 
 
 def compaction_metrics_dict(metrics: CompactionMetrics) -> dict[str, int]:
@@ -633,12 +636,14 @@ def plan_one_dataset(
     default) always cleans, preserving the exact pre-rotation behavior for direct callers such as
     unit tests that do not thread a fleet-wide rotation slot.
 
-    Failure isolation: a missing, corrupt, or unreadable dataset returns a skip dict and never
-    aborts the fleet run. When retention is active and a cutoff is supplied, expired rows are deleted
-    first because the delete creates compaction work. The derived-state
+    Failure isolation: a missing, corrupt, or unreadable dataset returns a counted ``error`` marker
+    and never aborts the fleet run. When retention is active and a cutoff is supplied, expired rows
+    are deleted first because the delete creates compaction work; a missing configured retention
+    column is likewise a counted ``error`` (a real contract violation), while compaction still
+    proceeds against the same open handle since the dataset itself is readable. The derived-state
     :func:`compaction_skip_reason` check and an empty ``Compaction.plan`` both end the dataset's
-    run early with a cleanup pass. Otherwise the plan's rewrite tasks are serialized for the
-    fleet-wide execute phase.
+    run early with a cleanup pass and a genuine ``skipped`` marker (nothing to compact). Otherwise
+    the plan's rewrite tasks are serialized for the fleet-wide execute phase.
 
     The same function serves every dataset size: a small dataset yields one rewrite task and a
     large one yields many, so no separate in-process compaction path exists.
@@ -653,23 +658,24 @@ def plan_one_dataset(
             clean idle datasets (the pre-rotation behavior direct callers rely on).
 
     Returns:
-        A terminal result dict (``skipped`` or ``tasks: 0``), or a planned dict carrying
-        ``read_version`` and ``task_jsons`` for the execute phase.
+        A terminal result dict (``error``, ``skipped``, or ``tasks: 0``), or a planned dict
+        carrying ``read_version`` and ``task_jsons`` for the execute phase.
     """
     try:
         dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
     except (FileNotFoundError, OSError, ValueError) as exc:
-        logger.warning("maintenance: cannot open dataset %s, skipping: %s", uri, exc)
+        logger.warning("maintenance: cannot open dataset %s, failing: %s", uri, exc)
         telemetry.incr("dataset.maintenance_open_error")
-        return {"uri": uri, "skipped": str(exc), "bytes_removed": 0}
+        return {"uri": uri, "error": str(exc), "phase": "open", "bytes_removed": 0}
 
     result: dict[str, Any] = {"uri": uri}
 
     if config.retention_active() and cutoff is not None:
         retention_result: dict[str, Any] = run_retention_on_open_dataset(dataset, uri, config, cutoff, telemetry)
         result["retention_rows_deleted"] = retention_result.get("retention_rows_deleted", 0)
-        if retention_result.get("skipped"):
-            result["retention_skipped"] = retention_result["skipped"]
+        if retention_result.get("error"):
+            result["error"] = retention_result["error"]
+            result["phase"] = retention_result.get("phase", "retention-config")
         if int(result["retention_rows_deleted"]) > 0:
             dataset = lance.dataset(uri, storage_options=config.storage_options)
 
@@ -930,7 +936,7 @@ class MaintenanceJob:
             uri: str = plan["uri"]
             if round_index == 0:
                 base_by_uri[uri] = {
-                    field: plan[field] for field in ("retention_rows_deleted", "retention_skipped") if field in plan
+                    field: plan[field] for field in ("retention_rows_deleted", "error", "phase") if field in plan
                 }
             if plan.get("task_jsons"):
                 planned.append(plan)

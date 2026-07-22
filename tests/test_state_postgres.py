@@ -55,6 +55,7 @@ from lance_etl.state.types import (
     WorkClaim,
     WorkExecutionContext,
     WorkKind,
+    WorkLauncherKind,
     WorkPhase,
     WorkState,
     deterministic_dataset_id,
@@ -444,6 +445,45 @@ def test_migration_creates_exact_entities_and_seeded_typed_configuration(
     assert len(revision.indexes) == 6
 
 
+def test_alembic_downgrade_drops_every_trigger_function_so_upgrade_recreates_cleanly() -> None:
+    """A full upgrade -> downgrade base -> upgrade head cycle succeeds without any leftover object.
+
+    Regression guard for PR-05: `create_lifecycle_triggers` installs five PostgreSQL functions
+    (`require_draft_spec_revision`, `enforce_spec_revision_lifecycle`,
+    `enforce_direct_spec_child_lifecycle`, `enforce_active_dataset_revision`,
+    `enforce_source_default_active`). If `downgrade()` ever again dropped fewer than all five, the
+    second `upgrade head` below would fail with "function already exists" (the migration uses
+    `CREATE FUNCTION`, not `CREATE OR REPLACE`), since a downgrade only drops the plain schema
+    tables and leaves session-global functions behind.
+    """
+    raw_url: str | None = os.environ.get(POSTGRES_URL_ENV)
+    if raw_url is None:
+        pytest.skip(f"set {POSTGRES_URL_ENV} to run real-PostgreSQL control-plane tests")
+    base_url: URL = psycopg_url(raw_url)
+    schema_name: str = f"lance_etl_test_{uuid.uuid4().hex}"
+    admin_engine: Engine = sa.create_engine(base_url)
+    with admin_engine.begin() as connection:
+        connection.execute(CreateSchema(schema_name))
+    isolated_url: URL = schema_url(base_url, schema_name)
+    isolated_url_string: str = isolated_url.render_as_string(hide_password=False)
+    try:
+        alembic_config: Config = Config(str(REPOSITORY_ROOT / "alembic.ini"))
+        alembic_config.set_main_option("script_location", str(REPOSITORY_ROOT / "migrations"))
+        alembic_config.set_main_option("sqlalchemy.url", isolated_url_string.replace("%", "%%"))
+        command.upgrade(alembic_config, "head")
+        command.downgrade(alembic_config, "base")
+        command.upgrade(alembic_config, "head")
+        engine: Engine = sa.create_engine(isolated_url_string)
+        try:
+            assert set(sa.inspect(engine).get_table_names()) == APPLICATION_TABLES | {"alembic_version"}
+        finally:
+            engine.dispose()
+    finally:
+        with admin_engine.begin() as connection:
+            connection.execute(DropSchema(schema_name, cascade=True))
+        admin_engine.dispose()
+
+
 def test_specification_lifecycle_freezes_history_and_enqueues_revision_convergence(
     postgres_repository: tuple[ControlPlaneRepository, Engine],
 ) -> None:
@@ -813,6 +853,7 @@ def test_snapshot_enqueue_is_idempotent_and_fenced_claims_expire_safely(
         running_work: RowMapping = connection.execute(sa.select(dataset_work)).mappings().one()
     assert running_work["state"] == WorkState.RUNNING.value
     assert running_work["lease_token"] == first_claim.lease_token
+    assert running_work["launcher_kind"] == WorkLauncherKind.LOCAL.value
     context: WorkExecutionContext | None = repository.work_execution_context(
         first_claim,
         claimed_at + timedelta(seconds=1),
