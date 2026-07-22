@@ -183,6 +183,19 @@ pub struct CachingDatasetProvider {
     store_cache: Option<Arc<MetadataByteCache>>,
     disk_stores: Option<(Arc<DiskEntryStore>, Arc<DiskEntryStore>)>,
     metrics: Arc<Metrics>,
+    /// The redis index tier's registry hygiene loop handle, owned so [`Drop`] can abort it. `None`
+    /// for the disk and memory backends.
+    registry_hygiene_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for CachingDatasetProvider {
+    /// Aborts the redis registry hygiene loop, if one is running, so it does not outlive the
+    /// provider that owns its `RedisEntryStore`.
+    fn drop(&mut self) {
+        if let Some(task) = self.registry_hygiene_task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl CachingDatasetProvider {
@@ -244,6 +257,7 @@ impl CachingDatasetProvider {
             index_cache,
             store_cache,
             disk_stores,
+            registry_hygiene_task,
         } = caches;
         let mut wrappers: Vec<Arc<dyn WrappingObjectStore>> = Vec::new();
         if let Some(inner) = inner_wrapper {
@@ -296,6 +310,7 @@ impl CachingDatasetProvider {
             store_cache,
             disk_stores,
             metrics,
+            registry_hygiene_task,
         }
     }
 
@@ -458,6 +473,10 @@ struct BuiltCaches {
     store_cache: Option<Arc<MetadataByteCache>>,
     /// The two disk stores for janitor construction. `None` for the redis and memory backends.
     disk_stores: Option<(Arc<DiskEntryStore>, Arc<DiskEntryStore>)>,
+    /// The redis index tier's registry hygiene loop handle. `None` for the disk and memory
+    /// backends. Owned by the provider so it can be aborted on drop instead of leaking for the
+    /// life of the process.
+    registry_hygiene_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl BuiltCaches {
@@ -467,6 +486,7 @@ impl BuiltCaches {
             index_cache: None,
             store_cache: None,
             disk_stores: None,
+            registry_hygiene_task: None,
         }
     }
 }
@@ -517,6 +537,7 @@ fn build_disk_caches(config: &Config, metrics: Arc<Metrics>) -> std::io::Result<
         index_cache: Some(Arc::new(index_backend)),
         store_cache: Some(Arc::new(store_cache)),
         disk_stores: Some((index_store, metadata_store)),
+        registry_hygiene_task: None,
     })
 }
 
@@ -555,7 +576,8 @@ async fn build_redis_caches(config: &Config, metrics: Arc<Metrics>) -> Result<Bu
         )
         .await?,
     );
-    drop(index_store.spawn_registry_hygiene(Duration::from_secs(crate::config::REDIS_REGISTRY_HYGIENE_SECS)));
+    let registry_hygiene_task =
+        index_store.spawn_registry_hygiene(Duration::from_secs(crate::config::REDIS_REGISTRY_HYGIENE_SECS));
     let index_backend = HybridIndexCacheBackend::new(index_store, config.index_cache_bytes, metrics.clone());
     let store_cache = MetadataByteCache::new(
         metadata_store,
@@ -566,6 +588,7 @@ async fn build_redis_caches(config: &Config, metrics: Arc<Metrics>) -> Result<Bu
         index_cache: Some(Arc::new(index_backend)),
         store_cache: Some(Arc::new(store_cache)),
         disk_stores: None,
+        registry_hygiene_task: Some(registry_hygiene_task),
     })
 }
 

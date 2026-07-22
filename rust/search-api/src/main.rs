@@ -7,18 +7,15 @@ use std::time::Duration;
 
 use search_api::catalog::PostgresServingCatalog;
 use search_api::config::Config;
-use search_api::domain::DatasetTarget;
 use search_api::grpc::admin::AdminGrpc;
 use search_api::grpc::admission::AdmissionController;
-use search_api::grpc::auth::{JwtAuthorizer, RequestAuthorizer, RequiredRole};
 use search_api::grpc::{RouteTimeoutLayer, SearchGrpc};
 use search_api::internal_pb::admin_service_server::AdminServiceServer;
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
 use search_api::pb::search_service_server::SearchServiceServer;
 use search_api::telemetry::{self, Metrics, RecallCapture};
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::{Identity, Server, ServerTlsConfig};
-use tonic::{Status, metadata::MetadataMap};
+use tonic::transport::Server;
 use tonic_health::ServingStatus;
 use tonic_tracing_opentelemetry::middleware::filters::reject_healthcheck;
 use tonic_tracing_opentelemetry::middleware::server::OtelGrpcLayer;
@@ -93,22 +90,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.block_on(serve(config))
 }
 
-struct LocalAuthorizer;
-
-#[async_trait::async_trait]
-impl RequestAuthorizer for LocalAuthorizer {
-    async fn authorize(
-        &self,
-        metadata: &MetadataMap,
-        target: &DatasetTarget,
-        required_role: RequiredRole,
-    ) -> Result<(), Status> {
-        let _ = (metadata, target, required_role);
-        Ok(())
-    }
-}
-
 /// Runs the async service body on the already-built runtime and serves search plus health.
+///
+/// The server always binds plaintext gRPC to loopback and accepts every request without
+/// authentication: this is the local read process for a single-operator local system, and it has
+/// exactly one runtime mode.
 async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(if config.telemetry_disabled {
         Metrics::disabled()
@@ -116,59 +102,31 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         Metrics::dogstatsd(&config.statsd_addr)
     });
     let telemetry_guard = telemetry::init_tracing(config.telemetry_disabled, metrics.clone());
-    let bind_ip = if config.local_mode {
-        [127, 0, 0, 1]
-    } else {
-        [0, 0, 0, 0]
-    };
+    let bind_ip = [127, 0, 0, 1];
     let addr: SocketAddr = (bind_ip, config.port).into();
     let health_addr: SocketAddr = (bind_ip, search_api::config::DEFAULT_HEALTH_PORT).into();
-    let database_ca_path = (!config.local_mode).then_some(config.database_ca_path.as_path());
-    let catalog = Arc::new(PostgresServingCatalog::connect(&config.database_url, database_ca_path).await?);
-    let (authorizer, readiness_authorizer): (Arc<dyn RequestAuthorizer>, Option<Arc<JwtAuthorizer>>) =
-        if config.local_mode {
-            tracing::warn!("explicit local mode enabled, binding plaintext unauthenticated gRPC to loopback");
-            (Arc::new(LocalAuthorizer), None)
-        } else {
-            let jwt_authorizer = Arc::new(
-                JwtAuthorizer::connect(
-                    config.jwt_issuer.clone(),
-                    config.jwt_audience.clone(),
-                    config.jwks_uri.clone(),
-                )
-                .await?,
-            );
-            (jwt_authorizer.clone(), Some(jwt_authorizer))
-        };
+    let catalog = Arc::new(PostgresServingCatalog::connect(&config.database_url).await?);
     let admission = Arc::new(AdmissionController::new(
         search_api::config::DEFAULT_GLOBAL_SEARCH_CONCURRENCY,
         search_api::config::DEFAULT_PER_TENANT_SEARCH_CONCURRENCY,
     )?);
     let provider = CachingDatasetProvider::with_catalog_and_telemetry(&config, catalog.clone(), metrics.clone()).await;
-    if let Some(janitor) = provider.janitor(&config) {
+    let janitor_task: Option<tokio::task::JoinHandle<()>> = provider.janitor(&config).map(|janitor| {
         janitor.spawn(std::time::Duration::from_secs(
             search_api::config::DEFAULT_DISK_CACHE_SWEEP_SECS,
-        ));
-    }
+        ))
+    });
     let backend = Arc::new(LanceSearchBackend::new(provider).with_metrics(metrics.clone()));
 
     let recall = RecallCapture::new(search_api::config::DEFAULT_RECALL_SAMPLE_RATE, metrics.clone());
-    let service =
-        SearchGrpc::with_metrics(backend.clone(), metrics.clone(), authorizer.clone(), admission).with_recall(recall);
-    let admin_service = AdminGrpc::new(backend, authorizer.clone(), config.replica_id.clone());
+    let service = SearchGrpc::with_metrics(backend.clone(), metrics.clone(), admission).with_recall(recall);
+    let admin_service = AdminGrpc::new(backend, config.replica_id.clone());
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter.set_service_status("", ServingStatus::Serving).await;
     let search_listener = tokio::net::TcpListener::bind(addr).await?;
     let health_listener = tokio::net::TcpListener::bind(health_addr).await?;
-    tracing::info!(address = %addr, health_address = %health_addr, "search-api listening");
-    let mut server_builder = Server::builder();
-    if !config.local_mode {
-        let certificate = tokio::fs::read(&config.tls_cert_path).await?;
-        let private_key = tokio::fs::read(&config.tls_key_path).await?;
-        let tls = ServerTlsConfig::new().identity(Identity::from_pem(certificate, private_key));
-        server_builder = server_builder.tls_config(tls)?;
-    }
-    let server_builder = server_builder
+    tracing::info!(address = %addr, health_address = %health_addr, "search-api listening (plaintext, unauthenticated)");
+    let server_builder = Server::builder()
         .concurrency_limit_per_connection(search_api::config::DEFAULT_CONCURRENCY_LIMIT_PER_CONNECTION)
         .max_concurrent_streams(search_api::config::DEFAULT_MAX_CONCURRENT_STREAMS);
     let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
@@ -199,29 +157,27 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 wait_for_shutdown(shutdown_receiver.clone()),
             ),
     );
-    let mut readiness_task = tokio::spawn(monitor_readiness(
-        catalog,
-        readiness_authorizer,
-        health_reporter.clone(),
-        shutdown_receiver,
-    ));
+    let mut readiness_task = tokio::spawn(monitor_readiness(catalog, health_reporter.clone(), shutdown_receiver));
     tokio::select! {
         _ = shutdown_signal() => {}
         result = &mut search_task => {
             health_task.abort();
             readiness_task.abort();
+            abort_janitor_task(&janitor_task);
             result??;
             return Err(std::io::Error::other("search server stopped before shutdown").into());
         }
         result = &mut health_task => {
             search_task.abort();
             readiness_task.abort();
+            abort_janitor_task(&janitor_task);
             result??;
             return Err(std::io::Error::other("health server stopped before shutdown").into());
         }
         result = &mut readiness_task => {
             search_task.abort();
             health_task.abort();
+            abort_janitor_task(&janitor_task);
             result?;
             return Err(std::io::Error::other("readiness monitor stopped before shutdown").into());
         }
@@ -249,9 +205,21 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             "graceful drain deadline exceeded"
         );
     }
+    abort_janitor_task(&janitor_task);
     tracing::info!("in-flight requests drained, flushing telemetry and exiting");
     drop(telemetry_guard);
     Ok(())
+}
+
+/// Aborts the disk-cache janitor's sweep loop, if one was spawned for the configured backend.
+///
+/// The janitor loop never resolves on its own, so it must be aborted explicitly as part of the
+/// same shutdown sequence that aborts `search_task`/`health_task`/`readiness_task` rather than
+/// left to the runtime to reclaim on process exit.
+fn abort_janitor_task(janitor_task: &Option<tokio::task::JoinHandle<()>>) {
+    if let Some(task) = janitor_task {
+        task.abort();
+    }
 }
 
 /// Resolves after the shared shutdown flag becomes true.
@@ -263,10 +231,9 @@ async fn wait_for_shutdown(mut receiver: tokio::sync::watch::Receiver<bool>) {
     }
 }
 
-/// Keeps readiness synchronized with catalog and optional JWKS health until drain begins.
+/// Keeps readiness synchronized with catalog health until drain begins.
 async fn monitor_readiness(
     catalog: Arc<PostgresServingCatalog>,
-    authorizer: Option<Arc<JwtAuthorizer>>,
     reporter: tonic_health::server::HealthReporter,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -279,11 +246,7 @@ async fn monitor_readiness(
                 }
             }
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                let authentication_healthy = match &authorizer {
-                    Some(authorizer) => authorizer.health().await.is_ok(),
-                    None => true,
-                };
-                let status = if catalog.health().await.is_ok() && authentication_healthy {
+                let status = if catalog.health().await.is_ok() {
                     ServingStatus::Serving
                 } else {
                     ServingStatus::NotServing

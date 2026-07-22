@@ -196,7 +196,7 @@ impl CacheBackend for HybridIndexCacheBackend {
 
     /// Single-flights the loader per key through the `inflight` map of per-key mutexes.
     ///
-    /// The map entry's lifetime is owned by [`InflightGuard`]: every waiter holds one guard, and
+    /// The map entry's lifetime is owned by `InflightGuard`: every waiter holds one guard, and
     /// the last guard to drop removes the entry. Because the cleanup lives in `Drop`, a request
     /// future cancelled at any await point (lock acquisition, cache read, the loader itself)
     /// still releases its claim instead of leaking the entry forever.

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{AllowTestAuthorizer, test_admission};
+use common::test_admission;
 use search_api::domain::{
     DatasetTarget, HybridQuery, HybridSearchOutcome, SearchBackend, SearchError, TextQuery, TextSearchOutcome,
     VectorQuery, VectorSearchOutcome,
@@ -62,12 +62,7 @@ impl SearchBackend for SlowBackend {
 /// a connected channel.
 async fn serve_slow(backend: SlowBackend) -> Channel {
     drop(telemetry::init_tracing(true, Arc::new(Metrics::disabled())));
-    let service = SearchGrpc::with_metrics(
-        Arc::new(backend),
-        Arc::new(Metrics::disabled()),
-        Arc::new(AllowTestAuthorizer),
-        test_admission(),
-    );
+    let service = SearchGrpc::with_metrics(Arc::new(backend), Arc::new(Metrics::disabled()), test_admission());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(

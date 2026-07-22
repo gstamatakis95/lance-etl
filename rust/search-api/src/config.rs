@@ -242,33 +242,12 @@ pub const DEFAULT_SEARCH_MAX_K: usize = 10_000;
 /// Runtime configuration for the search API.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Enables loopback-only plaintext PostgreSQL and gRPC with no request authentication.
-    /// Env: `SEARCH_API_LOCAL_MODE`.
-    pub local_mode: bool,
     /// Base URI under which all datasets live, e.g. `s3://bucket/lance`. Each dataset resolves to
     /// `{base}/{org_id}/{tenant_id}/{namespace}.lance`.
     pub base_uri: String,
-    /// PostgreSQL control-plane URL used to resolve exact published serving tuples.
-    /// Env: `LANCE_ETL_DATABASE_URL`.
+    /// PostgreSQL control-plane URL used to resolve exact published serving tuples, connected
+    /// as given with no TLS. Env: `LANCE_ETL_DATABASE_URL`.
     pub database_url: String,
-    /// PEM root certificate used to verify the PostgreSQL server certificate and hostname.
-    /// Empty only when explicit local mode disables database TLS. Env: `SEARCH_API_DATABASE_CA_PATH`.
-    pub database_ca_path: PathBuf,
-    /// PEM certificate chain used by the public gRPC TLS listener.
-    /// Empty only when explicit local mode uses loopback plaintext. Env: `SEARCH_API_TLS_CERT_PATH`.
-    pub tls_cert_path: PathBuf,
-    /// PEM private key used by the public gRPC TLS listener.
-    /// Empty only when explicit local mode uses loopback plaintext. Env: `SEARCH_API_TLS_KEY_PATH`.
-    pub tls_key_path: PathBuf,
-    /// Exact trusted JWT issuer, empty only in explicit local mode.
-    /// Env: `SEARCH_API_JWT_ISSUER`.
-    pub jwt_issuer: String,
-    /// Exact trusted JWT audience, empty only in explicit local mode.
-    /// Env: `SEARCH_API_JWT_AUDIENCE`.
-    pub jwt_audience: String,
-    /// HTTPS JWKS location used for signing-key rotation, empty only in explicit local mode.
-    /// Env: `SEARCH_API_JWKS_URI`.
-    pub jwks_uri: String,
     /// Stable non-secret identity returned by replica-local administration.
     /// Env: `SEARCH_API_REPLICA_ID`.
     pub replica_id: String,
@@ -315,15 +294,14 @@ impl Config {
     /// Builds a configuration from environment variables.
     ///
     /// `LANCE_ETL_BASE_URI` and `LANCE_ETL_DATABASE_URL` are required. The base URI is the only
-    /// object-store prefix catalog routes may use. `SEARCH_API_LOCAL_MODE=true` explicitly selects
-    /// unauthenticated plaintext listeners and a plaintext loopback database connection. Without
-    /// it, verified database TLS, gRPC TLS, and JWKS-backed JWT validation remain mandatory.
-    /// Optional overrides: `SEARCH_API_PORT`,
+    /// object-store prefix catalog routes may use. The gRPC server always binds plaintext to
+    /// loopback and the PostgreSQL catalog connection is always plaintext, using the connection
+    /// string as given. There is exactly one runtime mode. Optional overrides: `SEARCH_API_PORT`,
     /// `SEARCH_API_CACHE_DIR`, `SEARCH_API_CACHE_BACKEND` (`disk`, `redis`, or `memory`),
     /// `SEARCH_API_REDIS_URL` (required for the `redis` backend), `SEARCH_API_REDIS_NAMESPACE`
     /// (default `search-api`), `SEARCH_API_STATSD_ADDR` (default honors `DD_AGENT_HOST`),
-    /// and `SEARCH_API_TELEMETRY_DISABLED`. Production serving always resolves an exact catalog
-    /// URI and version from the active dataset publication.
+    /// `SEARCH_API_TELEMETRY_DISABLED`, and `SEARCH_API_REPLICA_ID` (default `local`). Serving
+    /// always resolves an exact catalog URI and version from the active dataset publication.
     ///
     /// Every other knob — dataset-handle cache sizing, index/metadata/disk cache budgets,
     /// serve-tag TTL, IO concurrency, ANN probe/refine/fast-search defaults, gRPC timeout and
@@ -331,7 +309,6 @@ impl Config {
     /// ceiling — is a fixed constant (see [`DEFAULT_DISK_CACHE_TTL_SECS`] and siblings) and is no
     /// longer env-configurable.
     pub fn from_env() -> Result<Self, String> {
-        let local_mode = env_bool("SEARCH_API_LOCAL_MODE", false)?;
         let base_uri = std::env::var("LANCE_ETL_BASE_URI")
             .map_err(|_| "LANCE_ETL_BASE_URI must be set".to_string())?
             .trim_end_matches('/')
@@ -344,20 +321,7 @@ impl Config {
         if database_url.is_empty() {
             return Err("LANCE_ETL_DATABASE_URL must be non-empty".to_string());
         }
-        let database_ca_path = required_path_unless_local("SEARCH_API_DATABASE_CA_PATH", local_mode)?;
-        let tls_cert_path = required_path_unless_local("SEARCH_API_TLS_CERT_PATH", local_mode)?;
-        let tls_key_path = required_path_unless_local("SEARCH_API_TLS_KEY_PATH", local_mode)?;
-        let jwt_issuer = required_string_unless_local("SEARCH_API_JWT_ISSUER", local_mode)?;
-        let jwt_audience = required_string_unless_local("SEARCH_API_JWT_AUDIENCE", local_mode)?;
-        let jwks_uri = required_string_unless_local("SEARCH_API_JWKS_URI", local_mode)?;
-        if !local_mode && !jwks_uri.starts_with("https://") {
-            return Err("SEARCH_API_JWKS_URI must use https".to_owned());
-        }
-        let replica_id = if local_mode {
-            env_string("SEARCH_API_REPLICA_ID", "local")
-        } else {
-            required_string("SEARCH_API_REPLICA_ID")?
-        };
+        let replica_id = env_string("SEARCH_API_REPLICA_ID", "local");
         if replica_id.len() > 128
             || !replica_id
                 .bytes()
@@ -371,15 +335,8 @@ impl Config {
             return Err("SEARCH_API_REDIS_URL must be set when SEARCH_API_CACHE_BACKEND=redis".to_string());
         }
         Ok(Self {
-            local_mode,
             base_uri,
             database_url,
-            database_ca_path,
-            tls_cert_path,
-            tls_key_path,
-            jwt_issuer,
-            jwt_audience,
-            jwks_uri,
             replica_id,
             dataset_cache_capacity: DEFAULT_DATASET_CACHE_CAPACITY,
             index_cache_bytes: DEFAULT_INDEX_CACHE_BYTES,
@@ -395,40 +352,6 @@ impl Config {
             telemetry_disabled: env_bool("SEARCH_API_TELEMETRY_DISABLED", false)?,
             serve_tag_ttl_secs: DEFAULT_SERVE_TAG_TTL_SECS,
         })
-    }
-}
-
-/// Reads one required non-empty string environment variable.
-fn required_string(name: &str) -> Result<String, String> {
-    std::env::var(name)
-        .map_err(|_| format!("{name} must be set"))
-        .and_then(|value| {
-            (!value.is_empty())
-                .then_some(value)
-                .ok_or_else(|| format!("{name} must be non-empty"))
-        })
-}
-
-/// Reads one required non-empty filesystem path environment variable.
-fn required_path(name: &str) -> Result<PathBuf, String> {
-    required_string(name).map(PathBuf::from)
-}
-
-/// Reads a required string in secure mode and returns an empty value in explicit local mode.
-fn required_string_unless_local(name: &str, local_mode: bool) -> Result<String, String> {
-    if local_mode {
-        Ok(String::new())
-    } else {
-        required_string(name)
-    }
-}
-
-/// Reads a required path in secure mode and returns an empty value in explicit local mode.
-fn required_path_unless_local(name: &str, local_mode: bool) -> Result<PathBuf, String> {
-    if local_mode {
-        Ok(PathBuf::new())
-    } else {
-        required_path(name)
     }
 }
 
@@ -494,23 +417,7 @@ mod tests {
         let guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut effective = vars.to_vec();
         if !effective.iter().any(|(name, _)| *name == "LANCE_ETL_DATABASE_URL") {
-            effective.push((
-                "LANCE_ETL_DATABASE_URL",
-                Some("postgresql://catalog/test?sslmode=verify-full"),
-            ));
-        }
-        for (name, value) in [
-            ("SEARCH_API_DATABASE_CA_PATH", "/tmp/search-api-test-database-ca.pem"),
-            ("SEARCH_API_TLS_CERT_PATH", "/tmp/search-api-test-cert.pem"),
-            ("SEARCH_API_TLS_KEY_PATH", "/tmp/search-api-test-key.pem"),
-            ("SEARCH_API_JWT_ISSUER", "https://issuer.test"),
-            ("SEARCH_API_JWT_AUDIENCE", "search-api"),
-            ("SEARCH_API_JWKS_URI", "https://issuer.test/.well-known/jwks.json"),
-            ("SEARCH_API_REPLICA_ID", "search-api-0"),
-        ] {
-            if !effective.iter().any(|(candidate, _)| *candidate == name) {
-                effective.push((name, Some(value)));
-            }
+            effective.push(("LANCE_ETL_DATABASE_URL", Some("postgresql://catalog/test")));
         }
         let previous: Vec<(String, Option<String>)> = effective
             .iter()
@@ -533,38 +440,27 @@ mod tests {
     }
 
     /// Env var names cleared so defaults apply in tests.
-    const OPTIONAL_VARS: [&str; 10] = [
-        "SEARCH_API_LOCAL_MODE",
+    const OPTIONAL_VARS: [&str; 6] = [
         "SEARCH_API_CACHE_BACKEND",
         "SEARCH_API_REDIS_URL",
         "SEARCH_API_REDIS_NAMESPACE",
         "SEARCH_API_PORT",
         "SEARCH_API_CACHE_DIR",
         "SEARCH_API_STATSD_ADDR",
-        "SEARCH_API_TELEMETRY_DISABLED",
-        "DD_AGENT_HOST",
-        "SEARCH_API_PREWARM_TARGETS_PATH",
     ];
 
     #[test]
     fn defaults_apply_when_env_unset() {
         let mut vars: Vec<(&str, Option<&str>)> = vec![("LANCE_ETL_BASE_URI", Some("/data/lance/"))];
         vars.extend(OPTIONAL_VARS.iter().map(|name| (*name, None)));
+        vars.push(("SEARCH_API_TELEMETRY_DISABLED", None));
+        vars.push(("DD_AGENT_HOST", None));
+        vars.push(("SEARCH_API_REPLICA_ID", None));
         with_env(&vars, || {
             let config = Config::from_env().unwrap();
-            assert!(!config.local_mode);
             assert_eq!(config.base_uri, "/data/lance", "trailing slash must be stripped");
-            assert_eq!(config.database_url, "postgresql://catalog/test?sslmode=verify-full");
-            assert_eq!(
-                config.database_ca_path,
-                PathBuf::from("/tmp/search-api-test-database-ca.pem")
-            );
-            assert_eq!(config.tls_cert_path, PathBuf::from("/tmp/search-api-test-cert.pem"));
-            assert_eq!(config.tls_key_path, PathBuf::from("/tmp/search-api-test-key.pem"));
-            assert_eq!(config.jwt_issuer, "https://issuer.test");
-            assert_eq!(config.jwt_audience, "search-api");
-            assert_eq!(config.jwks_uri, "https://issuer.test/.well-known/jwks.json");
-            assert_eq!(config.replica_id, "search-api-0");
+            assert_eq!(config.database_url, "postgresql://catalog/test");
+            assert_eq!(config.replica_id, "local");
             assert_eq!(config.dataset_cache_capacity, DEFAULT_DATASET_CACHE_CAPACITY);
             assert_eq!(config.index_cache_bytes, DEFAULT_INDEX_CACHE_BYTES);
             assert_eq!(config.metadata_cache_bytes, DEFAULT_METADATA_CACHE_BYTES);
@@ -581,46 +477,25 @@ mod tests {
     }
 
     #[test]
-    fn explicit_local_mode_needs_no_tls_or_jwks_configuration() {
+    fn replica_id_defaults_to_local_and_accepts_an_override() {
         with_env(
             &[
-                ("SEARCH_API_LOCAL_MODE", Some("true")),
                 ("LANCE_ETL_BASE_URI", Some("/tmp/lance")),
-                ("LANCE_ETL_DATABASE_URL", Some("postgresql://localhost/lance_etl")),
-                ("SEARCH_API_DATABASE_CA_PATH", None),
-                ("SEARCH_API_TLS_CERT_PATH", None),
-                ("SEARCH_API_TLS_KEY_PATH", None),
-                ("SEARCH_API_JWT_ISSUER", None),
-                ("SEARCH_API_JWT_AUDIENCE", None),
-                ("SEARCH_API_JWKS_URI", None),
                 ("SEARCH_API_REPLICA_ID", None),
             ],
             || {
                 let config = Config::from_env().unwrap();
-                assert!(config.local_mode);
-                assert_eq!(config.database_url, "postgresql://localhost/lance_etl");
-                assert!(config.database_ca_path.as_os_str().is_empty());
-                assert!(config.tls_cert_path.as_os_str().is_empty());
-                assert!(config.tls_key_path.as_os_str().is_empty());
-                assert!(config.jwt_issuer.is_empty());
-                assert!(config.jwt_audience.is_empty());
-                assert!(config.jwks_uri.is_empty());
                 assert_eq!(config.replica_id, "local");
             },
         );
-    }
-
-    #[test]
-    fn secure_mode_still_requires_transport_and_authentication_configuration() {
         with_env(
             &[
-                ("SEARCH_API_LOCAL_MODE", None),
-                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
-                ("SEARCH_API_DATABASE_CA_PATH", None),
+                ("LANCE_ETL_BASE_URI", Some("/tmp/lance")),
+                ("SEARCH_API_REPLICA_ID", Some("search-api-0")),
             ],
             || {
-                let error = Config::from_env().unwrap_err();
-                assert!(error.contains("SEARCH_API_DATABASE_CA_PATH"));
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.replica_id, "search-api-0");
             },
         );
     }

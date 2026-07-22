@@ -310,8 +310,6 @@ pub fn fused_hit_to_proto(hit: FusedHit) -> Result<pb::HybridSearchResult, Searc
 pub fn warning_to_proto(warning: SearchWarning) -> i32 {
     match warning {
         SearchWarning::ResultsUnderfilled => pb::SearchWarning::ResultsUnderfilled as i32,
-        SearchWarning::VectorLegUnavailable => pb::SearchWarning::VectorLegUnavailable as i32,
-        SearchWarning::TextLegUnavailable => pb::SearchWarning::TextLegUnavailable as i32,
     }
 }
 

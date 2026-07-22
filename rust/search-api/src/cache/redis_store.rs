@@ -127,8 +127,9 @@ impl RedisEntryStore {
 
     /// Spawns the hourly registry hygiene loop: probes every registered dir key and deletes
     /// registry rows whose dir has expired or been evicted, so index-UUID churn cannot grow the
-    /// registry unboundedly. Dropping the handle aborts nothing, callers `abort()` on shutdown
-    /// if needed.
+    /// registry unboundedly. Dropping the returned handle aborts nothing. The
+    /// `CachingDatasetProvider` that owns the calling `RedisEntryStore` stores the handle and
+    /// aborts it from its `Drop` impl, so the loop never outlives the provider.
     pub fn spawn_registry_hygiene(self: &Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
         let store = self.clone();
         tokio::spawn(async move {
@@ -311,7 +312,7 @@ impl EntryStore for RedisEntryStore {
     }
 
     /// A process-local seen-set caps the cost at one `HSETNX` per prefix per
-    /// [`REGISTER_REFRESH`] window instead of one per insert. The entries are time-bounded
+    /// `REGISTER_REFRESH` window instead of one per insert. The entries are time-bounded
     /// rather than kept for the process lifetime because a sibling replica's hygiene pass can
     /// delete the shared row while this replica still remembers registering it — re-issuing the
     /// idempotent `HSETNX` on each refresh restores the row for warm prefixes. On an errored

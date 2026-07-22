@@ -39,7 +39,7 @@
 //!   reference implementations, selected by `SEARCH_API_CACHE_BACKEND`.
 //! - New hybrid fusion strategy: add a variant to [`domain::FusionSpec`] and a match arm to its
 //!   `fuse` method. Fusion is a pure function of the leg lists, so it is unit-testable with no
-//!   engine or server. Map it from proto in [`grpc::convert::fusion_from_proto`].
+//!   engine or server. Map it from proto in [`grpc::convert::fusion_mode_from_proto`].
 //! - New transport (e.g. HTTP/JSON): add a sibling of [`grpc`] that converts its wire types to and
 //!   from domain types and delegates to the same backend traits. The domain and engine layers are
 //!   untouched.

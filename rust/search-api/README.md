@@ -82,14 +82,16 @@ physical row identifier as a public compatibility contract.
 
 ## Local configuration
 
-Use explicit local mode. It binds search and health listeners to loopback, allows a loopback
-PostgreSQL connection without TLS, and disables bearer-token checks.
+The service has exactly one runtime mode. It binds the search and health listeners to loopback in
+plaintext and answers every request without authentication. It also connects to PostgreSQL in
+plaintext, using the connection string as given. There is no TLS and no bearer-token check
+anywhere in the process.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `SEARCH_API_LOCAL_MODE` | `false` | Set to `true` for the supported local runtime |
 | `LANCE_ETL_BASE_URI` | required | Allowlisted Lance storage namespace |
-| `LANCE_ETL_DATABASE_URL` | required | Loopback PostgreSQL catalog URL |
+| `LANCE_ETL_DATABASE_URL` | required | Plaintext PostgreSQL catalog URL |
+| `SEARCH_API_REPLICA_ID` | `local` | Stable non-secret identity returned by replica-local administration |
 | `SEARCH_API_PORT` | `8080` | Local search port |
 | `SEARCH_API_CACHE_BACKEND` | `disk` | `disk`, `redis`, or `memory` |
 | `SEARCH_API_CACHE_DIR` | `/tmp/rust-search/cache` | Local disk cache root |
@@ -113,7 +115,6 @@ cargo build --locked
 Start the service against the same local database and Lance namespace as the reconciler:
 
 ```bash
-SEARCH_API_LOCAL_MODE=true \
 LANCE_ETL_BASE_URI="$PWD/../../.lance-etl/lance" \
 LANCE_ETL_DATABASE_URL='postgresql://lance_etl:lance_etl@localhost/lance_etl' \
 SEARCH_API_TELEMETRY_DISABLED=true \

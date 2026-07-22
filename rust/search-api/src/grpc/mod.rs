@@ -16,7 +16,6 @@
 
 pub mod admin;
 pub mod admission;
-pub mod auth;
 pub mod convert;
 pub mod timeout;
 
@@ -30,7 +29,6 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::domain::{DatasetTarget, SearchBackend, SearchError};
 use crate::grpc::admission::AdmissionController;
-use crate::grpc::auth::{RequestAuthorizer, RequiredRole};
 use crate::grpc::convert::{
     dataset_target_from_proto, fused_hit_to_proto, fused_to_hit, hybrid_query_from_proto, text_hit_to_proto,
     text_query_from_proto, time_range_from_proto, vector_hit_to_proto, vector_query_from_proto, warning_to_proto,
@@ -47,24 +45,17 @@ pub struct SearchGrpc<B> {
     backend: Arc<B>,
     metrics: Arc<Metrics>,
     recall: RecallCapture,
-    authorizer: Arc<dyn RequestAuthorizer>,
     admission: Arc<AdmissionController>,
 }
 
 impl<B> SearchGrpc<B> {
     /// Creates the adapter emitting per-RPC metrics through the given facade, with recall
     /// capture disabled.
-    pub fn with_metrics(
-        backend: Arc<B>,
-        metrics: Arc<Metrics>,
-        authorizer: Arc<dyn RequestAuthorizer>,
-        admission: Arc<AdmissionController>,
-    ) -> Self {
+    pub fn with_metrics(backend: Arc<B>, metrics: Arc<Metrics>, admission: Arc<AdmissionController>) -> Self {
         Self {
             backend,
             metrics,
             recall: RecallCapture::disabled(),
-            authorizer,
             admission,
         }
     }
@@ -75,12 +66,11 @@ impl<B> SearchGrpc<B> {
         self
     }
 
-    /// Shared per-RPC scaffold: validates and authorizes the target, runs the handler body, and
-    /// records the outcome (status span attribute, metrics, failure log).
+    /// Shared per-RPC scaffold: validates the target, admits the request, runs the handler body,
+    /// and records the outcome (status span attribute, metrics, failure log).
     async fn handle<T>(
         &self,
         rpc: Rpc,
-        metadata: &tonic::metadata::MetadataMap,
         target: Option<crate::pb::DatasetTarget>,
         run: impl AsyncFnOnce(&DatasetTarget) -> Result<T, Status>,
     ) -> Result<Response<T>, Status> {
@@ -88,16 +78,13 @@ impl<B> SearchGrpc<B> {
         let target = take_target(target);
         let result = match &target {
             Err(status) => Err(status.clone()),
-            Ok(target) => match self.authorizer.authorize(metadata, target, RequiredRole::Search).await {
+            Ok(target) => match self.admission.admit(target) {
                 Err(status) => Err(status),
-                Ok(()) => match self.admission.admit(target) {
-                    Err(status) => Err(status),
-                    Ok(permit) => {
-                        let result = run(target).await.map(Response::new);
-                        drop(permit);
-                        result
-                    }
-                },
+                Ok(permit) => {
+                    let result = run(target).await.map(Response::new);
+                    drop(permit);
+                    result
+                }
             },
         };
         record_outcome(&self.metrics, rpc, started, &result);
@@ -165,9 +152,8 @@ impl<B: SearchBackend> SearchService for SearchGrpc<B> {
         &self,
         request: Request<VectorSearchRequest>,
     ) -> Result<Response<VectorSearchResponse>, Status> {
-        let metadata = request.metadata().clone();
         let request = request.into_inner();
-        self.handle(Rpc::VectorSearch, &metadata, request.target, async |target| {
+        self.handle(Rpc::VectorSearch, request.target, async |target| {
             let time_range = time_range_from_proto(request.time_range);
             let query =
                 vector_query_from_proto(request.query, request.k, request.filter, request.projection, time_range)
@@ -199,9 +185,8 @@ impl<B: SearchBackend> SearchService for SearchGrpc<B> {
 
     /// Full-text search via the INVERTED index.
     async fn text_search(&self, request: Request<TextSearchRequest>) -> Result<Response<TextSearchResponse>, Status> {
-        let metadata = request.metadata().clone();
         let request = request.into_inner();
-        self.handle(Rpc::TextSearch, &metadata, request.target, async |target| {
+        self.handle(Rpc::TextSearch, request.target, async |target| {
             let time_range = time_range_from_proto(request.time_range);
             let query = text_query_from_proto(request.query, request.k, request.filter, request.projection, time_range)
                 .map_err(status_from_error)?;
@@ -235,11 +220,10 @@ impl<B: SearchBackend> SearchService for SearchGrpc<B> {
         &self,
         request: Request<HybridSearchRequest>,
     ) -> Result<Response<HybridSearchResponse>, Status> {
-        let metadata = request.metadata().clone();
         let mut request = request.into_inner();
         let target = request.target.take();
         tracing::Span::current().set_attribute("search.hybrid", true);
-        self.handle(Rpc::HybridSearch, &metadata, target, async |target| {
+        self.handle(Rpc::HybridSearch, target, async |target| {
             let query = hybrid_query_from_proto(request).map_err(status_from_error)?;
             tracing::Span::current().set_attribute("search.k", query.k as i64);
             let pending = self.recall.begin_hybrid(target, &query);

@@ -90,7 +90,7 @@ pub type ScanStatsHook = Arc<dyn Fn(&ScanIoStats) + Send + Sync>;
 
 /// Server-side ANN defaults applied when the corresponding request field is unset.
 ///
-/// Kept in a small struct so they can be passed as one argument to [`run_vector_query`] without
+/// Kept in a small struct so they can be passed as one argument to `run_vector_query` without
 /// extending that function's parameter list every time a new knob is added.
 #[derive(Debug, Clone, Copy)]
 pub struct AnnDefaults {

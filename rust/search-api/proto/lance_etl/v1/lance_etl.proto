@@ -265,14 +265,12 @@ enum HybridFusionMode {
 
 // Closed warning codes for bounded partial responses.
 enum SearchWarning {
+  reserved 2, 3;
+  reserved "SEARCH_WARNING_VECTOR_LEG_UNAVAILABLE", "SEARCH_WARNING_TEXT_LEG_UNAVAILABLE";
   // Invalid value.
   SEARCH_WARNING_UNSPECIFIED = 0;
   // Deduplication left fewer than k logical results.
   SEARCH_WARNING_RESULTS_UNDERFILLED = 1;
-  // The vector leg was unavailable.
-  SEARCH_WARNING_VECTOR_LEG_UNAVAILABLE = 2;
-  // The text leg was unavailable.
-  SEARCH_WARNING_TEXT_LEG_UNAVAILABLE = 3;
 }
 
 // Explicit null projection value.

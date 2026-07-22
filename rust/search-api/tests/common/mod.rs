@@ -291,15 +291,8 @@ pub async fn build_indexed_dataset(uri: &str) {
 /// optimized paths that bypass them).
 pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) -> Config {
     Config {
-        local_mode: false,
         base_uri: format!("file-object-store://{}", dataset_root.display()),
         database_url: "postgresql://unused/test".to_string(),
-        database_ca_path: "/tmp/search-api-test-database-ca.pem".into(),
-        tls_cert_path: "/tmp/search-api-test-cert.pem".into(),
-        tls_key_path: "/tmp/search-api-test-key.pem".into(),
-        jwt_issuer: "https://issuer.test".to_owned(),
-        jwt_audience: "search-api".to_owned(),
-        jwks_uri: "https://issuer.test/.well-known/jwks.json".to_owned(),
         replica_id: "search-api-test-0".to_owned(),
         dataset_cache_capacity: 16,
         index_cache_bytes: 64 * 1024 * 1024,
@@ -314,21 +307,6 @@ pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) 
         statsd_addr: "127.0.0.1:8125".to_string(),
         telemetry_disabled: true,
         serve_tag_ttl_secs: search_api::config::DEFAULT_SERVE_TAG_TTL_SECS,
-    }
-}
-
-/// Test authorizer that permits every already-validated logical target.
-pub struct AllowTestAuthorizer;
-
-#[async_trait::async_trait]
-impl search_api::grpc::auth::RequestAuthorizer for AllowTestAuthorizer {
-    async fn authorize(
-        &self,
-        _metadata: &tonic::metadata::MetadataMap,
-        _target: &DatasetTarget,
-        _required_role: search_api::grpc::auth::RequiredRole,
-    ) -> Result<(), tonic::Status> {
-        Ok(())
     }
 }
 

@@ -161,7 +161,8 @@ variable table. These finer-grained normative facts are recorded here so they ar
   and immutable publication row. The result contains only an allowlisted URI and exact committed
   version. URI, version, tag, prewarm, and IVF-cluster inspection are not public search surfaces.
   The publication retains its immutable dataset specification revision for audit.
-- **Local transport.** Set `SEARCH_API_LOCAL_MODE=true` for this repository's supported runtime. It
-  binds search and health to loopback, permits only a loopback PostgreSQL URL, and disables TLS and
-  JWT checks. Fixed port 8081 exposes only standard gRPC health. It contains no search or
-  administration methods.
+- **Transport.** The service has exactly one runtime mode: it binds search and health to loopback
+  in plaintext and answers every request without authentication. The PostgreSQL catalog connection
+  is also plaintext, using the connection string as given. There is no TLS and no auth path
+  anywhere in the process. Fixed port 8081 exposes only standard gRPC health. It contains no search
+  or administration methods.

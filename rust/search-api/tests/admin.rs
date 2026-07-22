@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use search_api::domain::{DatasetTarget, ExactPrewarmer, PrewarmReport, PrewarmedIndex, SearchError, ServingRoute};
 use search_api::grpc::admin::AdminGrpc;
-use search_api::grpc::auth::{RequestAuthorizer, RequiredRole};
 use search_api::internal_pb::PrewarmExactRequest;
 use search_api::internal_pb::admin_service_client::AdminServiceClient;
 use search_api::internal_pb::admin_service_server::AdminServiceServer;
@@ -37,35 +36,9 @@ impl ExactPrewarmer for FakeExactPrewarmer {
     }
 }
 
-/// Test authorizer with an explicit allow or deny decision.
-struct AdminTestAuthorizer {
-    allow: bool,
-}
-
-#[async_trait::async_trait]
-impl RequestAuthorizer for AdminTestAuthorizer {
-    async fn authorize(
-        &self,
-        _metadata: &tonic::metadata::MetadataMap,
-        _target: &DatasetTarget,
-        required_role: RequiredRole,
-    ) -> Result<(), tonic::Status> {
-        assert_eq!(required_role, RequiredRole::Admin);
-        if self.allow {
-            Ok(())
-        } else {
-            Err(tonic::Status::permission_denied("denied by test policy"))
-        }
-    }
-}
-
 /// Starts an internal-only server and returns its client channel.
-async fn serve(allow: bool, calls: Arc<AtomicU64>) -> Channel {
-    let service = AdminGrpc::new(
-        Arc::new(FakeExactPrewarmer { calls }),
-        Arc::new(AdminTestAuthorizer { allow }),
-        "search-api-2".to_owned(),
-    );
+async fn serve(calls: Arc<AtomicU64>) -> Channel {
+    let service = AdminGrpc::new(Arc::new(FakeExactPrewarmer { calls }), "search-api-2".to_owned());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(
@@ -96,7 +69,7 @@ fn request() -> PrewarmExactRequest {
 #[tokio::test]
 async fn exact_prewarm_returns_local_replica_and_candidate_proof() {
     let calls = Arc::new(AtomicU64::new(0));
-    let response = AdminServiceClient::new(serve(true, calls.clone()).await)
+    let response = AdminServiceClient::new(serve(calls.clone()).await)
         .prewarm_exact(request())
         .await
         .unwrap()
@@ -106,15 +79,4 @@ async fn exact_prewarm_returns_local_replica_and_candidate_proof() {
     assert_eq!(response.resolved_version, 17);
     assert_eq!(response.indexes_warmed, 1);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn denied_admin_request_never_reaches_prewarm() {
-    let calls = Arc::new(AtomicU64::new(0));
-    let status = AdminServiceClient::new(serve(false, calls.clone()).await)
-        .prewarm_exact(request())
-        .await
-        .unwrap_err();
-    assert_eq!(status.code(), tonic::Code::PermissionDenied);
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }

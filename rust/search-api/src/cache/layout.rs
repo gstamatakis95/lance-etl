@@ -61,7 +61,7 @@ fn is_stamp_dir_name(name: &str) -> bool {
 /// (stale layouts from lance upgrades or our own format changes). Returns the stamp path.
 ///
 /// Deletion is restricted to entries matching the versioned stamp naming pattern
-/// ([`is_stamp_dir_name`]). Anything else in the cache directory is left untouched, so pointing
+/// (`is_stamp_dir_name`). Anything else in the cache directory is left untouched, so pointing
 /// `SEARCH_API_CACHE_DIR` at a directory that also holds unrelated data can never destroy it.
 pub fn prepare_cache_root(cache_dir: &Path) -> std::io::Result<PathBuf> {
     let stamp = stamp_dir_name();
@@ -450,5 +450,37 @@ mod tests {
         assert_eq!(hash_hex("abc", 16).len(), 16);
         assert_eq!(hash_hex("abc", 16), hash_hex("abc", 16));
         assert_ne!(hash_hex("abc", 16), hash_hex("abd", 16));
+    }
+
+    /// Scans a `Cargo.lock` for the resolved version of the crates.io `lance` package.
+    ///
+    /// Looks for the `[[package]]` block whose `name = "lance"` line matches exactly (not
+    /// `lance-core` or another `lance-*` sibling) and returns the `version` line that follows it.
+    fn resolved_lance_crate_version(lock_contents: &str) -> Option<String> {
+        let mut lines = lock_contents.lines();
+        while let Some(line) = lines.next() {
+            if line.trim() != "name = \"lance\"" {
+                continue;
+            }
+            let version_line = lines.next()?;
+            let version = version_line.trim().strip_prefix("version = \"")?.strip_suffix('"')?;
+            return Some(version.to_string());
+        }
+        None
+    }
+
+    #[test]
+    fn lance_cache_stamp_matches_resolved_lance_crate_version() {
+        let lock_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock");
+        let lock_contents = std::fs::read_to_string(&lock_path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", lock_path.display()));
+        let resolved_version = resolved_lance_crate_version(&lock_contents)
+            .unwrap_or_else(|| panic!("no `lance` package found in {}", lock_path.display()));
+        assert_eq!(
+            resolved_version, LANCE_CACHE_STAMP,
+            "LANCE_CACHE_STAMP in src/cache/layout.rs must be bumped in lockstep with the `lance` \
+             crate version pinned in Cargo.toml/Cargo.lock (see AGENTS.md's lance-crate \
+             version-bump coupling)"
+        );
     }
 }

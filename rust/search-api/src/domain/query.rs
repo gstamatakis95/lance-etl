@@ -264,10 +264,6 @@ pub struct HybridQuery {
 pub enum SearchWarning {
     /// Deduplication left fewer than the requested number of logical results.
     ResultsUnderfilled,
-    /// The vector leg was unavailable.
-    VectorLegUnavailable,
-    /// The text leg was unavailable.
-    TextLegUnavailable,
 }
 
 /// The result of one vector search: ranked hits plus dataset provenance for recall capture.
@@ -320,7 +316,7 @@ pub struct Hit {
     pub row: Map<String, Value>,
 }
 
-/// One fused hit produced by a [`crate::domain::fusion::Fusion`] strategy.
+/// One fused hit produced by a [`crate::domain::fusion::FusionSpec`] strategy.
 #[derive(Debug, Clone)]
 pub struct FusedHit {
     /// Stable logical record identifier.
