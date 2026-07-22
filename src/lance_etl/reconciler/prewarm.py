@@ -89,7 +89,7 @@ class LocalExactVersionPrewarmer:
             )
             validate_prewarm(results, candidate_uri, candidate_version)
         except Exception as error:
-            raise RuntimeError("local exact-version prewarm failed") from error
+            raise RuntimeError(f"local exact-version prewarm failed: {error}") from error
         if len(results) != 1:
             raise RuntimeError("local exact-version prewarm returned invalid evidence")
         return results

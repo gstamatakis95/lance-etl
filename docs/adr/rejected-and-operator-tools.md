@@ -40,11 +40,10 @@ Status: Accepted
 V1 names manifests so that finding the latest version costs a directory LIST that grows with
 version count — a large avoidable cost across 30k datasets opened repeatedly. Every dataset is
 therefore created with `enable_v2_manifest_paths=True`, making every open one object-store
-request regardless of history depth. The flag is honored only at bootstrap. Existing datasets
-migrate one-shot through `migrate_dataset_manifest_paths` / `migrate_manifest_paths`
-(non-transactional — run quiesced). Unlike stable row IDs this is a creation-time naming choice
-with no concurrency caveat, so it defaults on. The one serving-side consequence: the byte cache
-must never cache the V2 latest-version hint file (see `caching-and-observability.md`).
+request regardless of history depth. The flag is honored only at bootstrap and is mandatory.
+Legacy V1 datasets are rebuild-only because durable source state can reproduce them. The former
+non-transactional in-place migration command was removed. The serving-side consequence is that the
+byte cache must never cache the V2 latest-version hint file (see `caching-and-observability.md`).
 
 ## ADR 0015 — CLI and config knob reduction: opinionated defaults
 
@@ -81,15 +80,9 @@ and reconciliation semantics before any public write RPC is added.
 
 ## ADR 0019 — Namespace copy/migrate utility
 
-Status: Accepted
+Status: Superseded (2026-07-22)
 
-`migrate_namespace.py` (`NamespaceMigrator`, `MigrateConfig`, run via
-`python -m lance_etl.tools.cli migrate-namespace`) migrates a whole namespace by copy-plus-optimize, keeping the source: every
-dataset whose namespace path component matches the source is copied to the same address with
-the component swapped, then optimized in production order — write, recompact (reusing
-`MaintenanceJob`), reindex (reusing `LanceIndexer` and its segment flows, skipped when no index
-columns are supplied because they cannot be guessed). Every path component is validated against
-the same allowlist the ETL uses, a pre-existing target fails the run unless `overwrite_target`
-is set, and the source is never deleted, so a wrong new layout has a trivial rollback. The copy
-itself scales with its own small/large dataset tiers (whole-dataset tasks versus fragment-shard
-fan-outs), independent of the unified maintenance orchestration.
+The copy-plus-optimize namespace migration library and CLI were removed. Namespace changes now
+create a new immutable specification revision and rebuild targets from the durable Iceberg source.
+This keeps one ingestion, compaction, and indexing path and avoids a second data-copy engine with
+its own overwrite, sharding, and partial-failure semantics.

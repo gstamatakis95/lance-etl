@@ -27,11 +27,11 @@ pub enum DatasetRef {
 /// The target names the single dataset at `{base}/{org_id}/{tenant_id}/{namespace}.lance`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DatasetTarget {
-    /// Organization id. Must match `[A-Za-z0-9_-]+`.
+    /// Organization id. Must match `[A-Za-z0-9_-]{1,128}`.
     pub org_id: String,
-    /// Tenant id. Must match `[A-Za-z0-9_-]+`.
+    /// Tenant id. Must match `[A-Za-z0-9_-]{1,128}`.
     pub tenant_id: String,
-    /// Namespace. Must match `[A-Za-z0-9_-]+`.
+    /// Namespace. Must match `[A-Za-z0-9_-]{1,128}`.
     pub namespace: String,
 }
 
@@ -53,14 +53,16 @@ impl DatasetTarget {
     }
 }
 
-/// Rejects path segments that are empty or contain characters outside `[A-Za-z0-9_-]`.
+/// Rejects path segments outside the shared bounded `[A-Za-z0-9_-]{1,128}` contract.
 pub fn validate_path_segment(value: &str, field: &str) -> Result<(), SearchError> {
-    let valid = !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
     if valid {
         Ok(())
     } else {
         Err(SearchError::invalid_argument(format!(
-            "{field} must be non-empty and match [A-Za-z0-9_-]+"
+            "{field} must match [A-Za-z0-9_-]{{1,128}}"
         )))
     }
 }
@@ -75,6 +77,8 @@ mod tests {
             assert!(validate_path_segment(bad, "org_id").is_err(), "accepted {bad:?}");
         }
         assert!(validate_path_segment("org-1_A", "org_id").is_ok());
+        assert!(validate_path_segment(&"a".repeat(128), "org_id").is_ok());
+        assert!(validate_path_segment(&"a".repeat(129), "org_id").is_err());
         let mut target = DatasetTarget::new("org1", "tenant1", "ns1");
         assert!(target.validate().is_ok());
         target.namespace = "../x".to_string();

@@ -18,6 +18,7 @@ from lance_etl.state import (
     PublicationEvidence,
     RoutingIdentity,
     SourceSnapshotState,
+    StaleSourcePlanError,
     StateTransitionError,
     WorkClaim,
     WorkPhase,
@@ -177,6 +178,40 @@ class WorkRepository(Protocol):
         """
         ...
 
+    def can_retry_blocked_work(self, work_id: uuid.UUID) -> bool:
+        """Check whether one blocked work identity is eligible for explicit retry.
+
+        Args:
+            work_id: Existing durable work identity.
+
+        Returns:
+            Whether a dry-run repair would currently transition the row.
+        """
+        ...
+
+    def retry_blocked_source_snapshot(self, source_snapshot_seq: int, now: datetime | None = None) -> bool:
+        """Reopen one explicitly selected blocked accepted source checkpoint.
+
+        Args:
+            source_snapshot_seq: Durable source-snapshot sequence selected by an operator.
+            now: Optional deterministic clock.
+
+        Returns:
+            Whether a blocked accepted checkpoint was reopened.
+        """
+        ...
+
+    def can_retry_blocked_source_snapshot(self, source_snapshot_seq: int) -> bool:
+        """Check whether one blocked accepted checkpoint is eligible for repair.
+
+        Args:
+            source_snapshot_seq: Durable source-snapshot sequence selected by an operator.
+
+        Returns:
+            Whether a dry-run repair would currently transition the checkpoint.
+        """
+        ...
+
     def enqueue_rebuild(self, identity: RoutingIdentity, request_id: uuid.UUID) -> uuid.UUID:
         """Enqueue one idempotent canonical duplicate-recovery generation.
 
@@ -204,8 +239,11 @@ class WorkRepository(Protocol):
 class SourcePlanProvider(Protocol):
     """Read-only provider of one plan pinned to an Iceberg head."""
 
-    def plan(self) -> SourcePlan:
+    def plan(self, max_snapshots: int = 32) -> SourcePlan:
         """Build the next side-effect-free source plan.
+
+        Args:
+            max_snapshots: Maximum accepted windows the current cycle may enqueue.
 
         Returns:
             Pinned source plan.
@@ -581,30 +619,17 @@ class ReconcilerApplication:
         self.shutdown()
 
     def plan_and_enqueue_snapshots(self) -> EnqueueSummary:
-        """Classify and enqueue a bounded source backlog one snapshot at a time.
+        """Classify and enqueue one bounded source-backlog prefix from a pinned view.
 
         Returns:
             Durable enqueue summary.
         """
-        pinned_head: int | None = None
-        planned: int = 0
-        enqueued: int = 0
-        sequences: list[int] = []
-        truncated: bool = False
-        planner_pass: int
-        for planner_pass in range(self.settings.max_snapshots_per_plan):
-            del planner_pass
-            summary: EnqueueSummary = self.plan_enqueuer.enqueue(self.plan_provider.plan())
-            pinned_head = summary.pinned_head_snapshot_id
-            planned += summary.planned_snapshots
-            enqueued += summary.enqueued_snapshots
-            sequences.extend(summary.source_snapshot_sequences)
-            truncated = truncated or summary.truncated
-            if summary.enqueued_snapshots == 0 or summary.truncated:
-                break
-        else:
-            truncated = True
-        return EnqueueSummary(pinned_head, planned, enqueued, tuple(sequences), truncated)
+        try:
+            source_plan: SourcePlan = self.plan_provider.plan(self.settings.max_snapshots_per_plan)
+            return self.plan_enqueuer.enqueue(source_plan)
+        except StaleSourcePlanError:
+            logger.info("source planning observation became stale and will retry on the next cycle")
+            return EnqueueSummary(None, 0, 0, (), True)
 
     def run_due_dataset_work(self) -> DispatchSummary:
         """Drain a bounded amount of due work.
@@ -661,9 +686,27 @@ class ReconcilerApplication:
             dry_run: Validate without mutating state.
 
         Returns:
-            True for a dry run or when the blocked row transitioned.
+            Whether the repair would currently transition or did transition the row.
         """
-        return True if dry_run else self.repository.retry_blocked_work(work_id)
+        return (
+            self.repository.can_retry_blocked_work(work_id) if dry_run else self.repository.retry_blocked_work(work_id)
+        )
+
+    def repair_blocked_source_snapshot(self, source_snapshot_seq: int, dry_run: bool) -> bool:
+        """Retry one explicit blocked accepted source checkpoint.
+
+        Args:
+            source_snapshot_seq: Durable source-snapshot sequence selected by an operator.
+            dry_run: Validate without mutating state.
+
+        Returns:
+            Whether the repair would currently transition or did transition the checkpoint.
+        """
+        return (
+            self.repository.can_retry_blocked_source_snapshot(source_snapshot_seq)
+            if dry_run
+            else self.repository.retry_blocked_source_snapshot(source_snapshot_seq)
+        )
 
     def repair_rebuild(
         self,
@@ -716,9 +759,27 @@ class ReconcilerOperator:
             dry_run: Validate without mutating state.
 
         Returns:
-            True for a dry run or when the blocked row transitioned.
+            Whether the repair would currently transition or did transition the row.
         """
-        return True if dry_run else self.repository.retry_blocked_work(work_id)
+        return (
+            self.repository.can_retry_blocked_work(work_id) if dry_run else self.repository.retry_blocked_work(work_id)
+        )
+
+    def repair_blocked_source_snapshot(self, source_snapshot_seq: int, dry_run: bool) -> bool:
+        """Retry one explicit blocked accepted source checkpoint without starting Spark.
+
+        Args:
+            source_snapshot_seq: Durable source-snapshot sequence selected by an operator.
+            dry_run: Validate without mutating state.
+
+        Returns:
+            Whether the repair would currently transition or did transition the checkpoint.
+        """
+        return (
+            self.repository.can_retry_blocked_source_snapshot(source_snapshot_seq)
+            if dry_run
+            else self.repository.retry_blocked_source_snapshot(source_snapshot_seq)
+        )
 
     def repair_rebuild(
         self,

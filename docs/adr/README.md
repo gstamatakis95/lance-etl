@@ -14,7 +14,7 @@ The seven documents:
 | [indexing.md](indexing.md) | Segment-API flows, vector artifact storage, role auto-indexing, the streaming k-means bootstrap, the object-store centroid cache |
 | [serving-filters-and-tags.md](serving-filters-and-tags.md) | Crate layering, the typed filter AST, time ranges, blue-green serving, per-query version pinning |
 | [caching-and-observability.md](caching-and-observability.md) | The persistent cache and its pluggable backends, Prewarm, the Lance trace bridge, recall auditing |
-| [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | The stable-row-id rejection, V2 manifest paths, knob reduction, the retired intake decision, namespace migration |
+| [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | The stable-row-id rejection, V2 manifest paths, knob reduction, and retired operator paths |
 | [postgresql-dataset-control-plane.md](postgresql-dataset-control-plane.md) | Exact 9-table control plane, immutable dataset specifications, durable work, immutable publications, and the local runtime |
 
 Index of every original ADR number:
@@ -39,7 +39,7 @@ Index of every original ADR number:
 | 0016 | Event-time canonical clock | [etl-and-data-model.md](etl-and-data-model.md) | Accepted |
 | 0017 | Rust intake service with a pluggable record sink | [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | Superseded |
 | 0018 | Retention-window expiry inside maintenance | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
-| 0019 | Namespace copy/migrate utility | [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | Accepted |
+| 0019 | Namespace copy/migrate utility | [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | Superseded |
 | 0020 | Static declared-field map pivot | [etl-and-data-model.md](etl-and-data-model.md) | Superseded by 0024 |
 | 0021 | Event-time range on the search RPCs | [serving-filters-and-tags.md](serving-filters-and-tags.md) | Accepted |
 | 0022 | Lance trace-event bridge | [caching-and-observability.md](caching-and-observability.md) | Accepted |

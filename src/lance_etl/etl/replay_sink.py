@@ -11,7 +11,7 @@ import lance
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from lance_etl.etl.sink import DATA_STORAGE_VERSION, dataset_absent
+from lance_etl.etl.storage import DATA_STORAGE_VERSION, dataset_absent
 from lance_etl.telemetry import DEFAULT_RETRY_TIMEOUT, Telemetry, commit_with_retries
 
 WINDOW_SEQUENCE_COLUMN: str = "lance_etl_window_seq"
@@ -92,6 +92,9 @@ def validate_replay_table(table: pa.Table, key_column: str) -> list[str]:
             raise ValueError(f"terminal mutation column {name!r} must be {expected_type}, got {field.type}")
         if table[name].null_count:
             raise ValueError(f"terminal mutation column {name!r} must not contain nulls")
+    for name in (WINDOW_SEQUENCE_COLUMN, SOURCE_SEQUENCE_COLUMN):
+        if bool(pc.any(pc.less(table[name], 0)).as_py()):
+            raise ValueError(f"terminal mutation column {name!r} must be non-negative")
     payload_columns: list[str] = [name for name in table.column_names if name not in required and name != TS_COLUMN]
     tombstones: pa.ChunkedArray = table[DELETED_COLUMN]
     for name in payload_columns:
@@ -99,18 +102,6 @@ def validate_replay_table(table: pa.Table, key_column: str) -> list[str]:
         if bool(pc.any(invalid).as_py()):
             raise ValueError(f"tombstone rows must explicitly clear payload column {name!r}")
     return payload_columns
-
-
-def quote_filter_value(value: str) -> str:
-    """Quote one string literal for a Lance scanner filter.
-
-    Args:
-        value: String literal value.
-
-    Returns:
-        Single-quoted value with embedded quotes doubled.
-    """
-    return "'" + value.replace("'", "''") + "'"
 
 
 def key_batches(values: list[str]) -> list[list[str]]:
@@ -135,20 +126,23 @@ def load_key_states(dataset: lance.LanceDataset, key_column: str, keys: list[str
 
     Returns:
         Mapping from key to stored source sequence and event digest.
+
+    Raises:
+        ReplayConflict: If the dataset contains more than one physical row for an affected key.
     """
     states: dict[str, tuple[int, bytes]] = {}
-    batch: Any
     for batch in key_batches(keys):
         if not batch:
             continue
-        literals: str = ", ".join(quote_filter_value(value) for value in batch)
         table: pa.Table = dataset.to_table(
             columns=[key_column, SOURCE_SEQUENCE_COLUMN, EVENT_DIGEST_COLUMN],
-            filter=f"{key_column} IN ({literals})",
+            filter=pc.field(key_column).isin(batch),
         )
-        row: Any
         for row in table.to_pylist():
-            states[str(row[key_column])] = (int(row[SOURCE_SEQUENCE_COLUMN]), bytes(row[EVENT_DIGEST_COLUMN]))
+            key: str = str(row[key_column])
+            if key in states:
+                raise ReplayConflict(f"dataset contains duplicate stored key {key!r}")
+            states[key] = (int(row[SOURCE_SEQUENCE_COLUMN]), bytes(row[EVENT_DIGEST_COLUMN]))
     return states
 
 
@@ -163,17 +157,18 @@ def expected_key_states(table: pa.Table, key_column: str) -> dict[str, tuple[int
         Mapping from key to source sequence and event digest.
 
     Raises:
-        ReplayConflict: If the table itself contains inconsistent duplicate keys.
+        ReplayConflict: If the terminal input contains any duplicate key.
     """
     states: dict[str, tuple[int, bytes]] = {}
     columns: pa.Table = table.select([key_column, SOURCE_SEQUENCE_COLUMN, EVENT_DIGEST_COLUMN])
-    row: Any
     for row in columns.to_pylist():
         key: str = str(row[key_column])
         candidate: tuple[int, bytes] = int(row[SOURCE_SEQUENCE_COLUMN]), bytes(row[EVENT_DIGEST_COLUMN])
         previous: tuple[int, bytes] | None = states.get(key)
-        if previous is not None and previous != candidate:
-            raise ReplayConflict(f"terminal merge input contains inconsistent duplicate key {key!r}")
+        if previous is not None:
+            if previous != candidate:
+                raise ReplayConflict(f"terminal merge input contains inconsistent duplicate key {key!r}")
+            raise ReplayConflict(f"terminal merge input contains duplicate key {key!r}")
         states[key] = candidate
     return states
 

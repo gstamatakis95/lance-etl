@@ -83,8 +83,8 @@ An Iceberg cleanup must retain the oldest snapshot required by unfinished `sourc
 Status: Superseded for invocation
 
 The ETL, indexing, maintenance, and recall packages remain separable libraries with focused tests.
-The installed write-path command is now only `lance-etl-reconcile`. Legacy library CLIs do not own
-durable progress and are not scheduled independently.
+The only write-path command is `lance-etl-reconcile`. Standalone ETL, indexing, and maintenance
+write CLIs were removed so every mutation runs under PostgreSQL leases and dataset fences.
 
 ## ADR 0027 — Unified pipeline
 

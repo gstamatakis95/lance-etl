@@ -132,8 +132,12 @@ def collapse_snapshot_mutations(
 
     Raises:
         MutationConflict: If one key has more than one distinct event digest.
-        ValueError: If a row carries an unsupported operation.
+        ValueError: If a sequence is invalid or a row carries an unsupported operation.
     """
+    if window_seq < 0 or window_seq >= 1 << 63:
+        raise ValueError(f"window sequence is outside non-negative signed 64-bit range: {window_seq}")
+    if source_sequence < 0 or source_sequence >= 1 << 63:
+        raise ValueError(f"source sequence is outside non-negative signed 64-bit range: {source_sequence}")
     terminal_by_key: dict[tuple[tuple[str, str, str], str], TerminalMutation] = {}
     row: Any
     for row in rows:

@@ -1,7 +1,7 @@
 # `tests/`
 
 The pytest suite for the whole repository: `src/lance_etl/`, `bench/`, and (through the
-Postgres-gated tests) `migrations/`. It is one flat directory of 73 `test_*.py` modules plus
+Postgres-gated tests) `migrations/`. It is one flat directory of 77 `test_*.py` modules plus
 `conftest.py` — no subpackages, no per-source-package test directories. A module's name names its
 subject rather than mirroring a package path (`test_replay_sink.py`, not
 `etl/test_replay_sink.py`), which keeps every test file one `grep` away regardless of which
@@ -66,7 +66,6 @@ environment variable before a plain `pytest -m "not integration"` run still exer
 | `make_vector_table` | Builds a small `id`/`vector`/`category`/`text` PyArrow table with reproducible random vectors |
 | `write_fragmented_dataset` | Writes a table as a Lance dataset split into multiple fragments via `max_rows_per_file` |
 | `compact_dataset_inline` | Runs one full `Compaction.execute`/commit/cleanup cycle in-process (no Spark), the harness the concurrency suites race against merges and index builds from a plain thread |
-| `group_by_routing` | A non-streaming equivalence oracle for `lance_etl.etl.pivot.stream_routing_groups`, test-only per hard rule 1 — never a production symbol |
 | `FakeBroadcast`, `FakeRdd`, `FakeSparkContext`, `FakeSpark` | An in-process stand-in for `SparkContext.parallelize().map()`/`mapPartitions()`/`partitionBy()`/`collect()` and broadcast variables, used throughout the suite (recall, fanout, and fleet-orchestration tests) to drive real driver-side fan-out code without a JVM |
 
 Individual test modules add narrower fakes and fixtures next to the tests that need them
@@ -77,14 +76,14 @@ classes, for example) rather than growing `conftest.py` further.
 
 | Area | Representative modules |
 |---|---|
-| ETL mutation, replay, and merge | `test_mutation_identity.py`, `test_completion_marker.py`, `test_replay_sink.py`, `test_replay_sink_faults.py`, `test_etl_streaming_merge.py`, `test_etl_concurrency.py`, `test_merge_conflict_metric.py`, `test_btree_delta_coexistence.py`, `test_v2_manifest_paths.py`, `test_column_roles.py`, `test_partition_routing.py`, `test_schema_evolution.py` |
+| ETL mutation, replay, and merge | `test_mutation_identity.py`, `test_completion_marker.py`, `test_replay_sink.py`, `test_replay_sink_faults.py`, `test_arrow_normalization.py`, `test_dataset_storage.py`, `test_merge_conflict_metric.py`, `test_btree_delta_coexistence.py`, `test_v2_manifest_paths.py`, `test_schema_evolution.py` |
 | Iceberg source planning | `test_source_planner.py` |
 | Indexing (segment API) | `test_centroid_sidecar.py`, `test_cluster_assignment.py`, `test_cluster_rewrite.py`, `test_index_bootstrap_retry.py`, `test_index_maintenance.py`, `test_index_plan_phase.py`, `test_index_replan_guard.py`, `test_index_segment_paths.py`, `test_zonemap_handler.py`, `test_rebuild_integration.py`, `test_size_policy.py` |
 | Maintenance (compaction, cleanup, tags, retention) | `test_maintenance.py`, `test_maintenance_fri.py`, `test_maintenance_replan.py`, `test_compaction_deletion_skip.py`, `test_cleanup_rotation.py`, `test_prune_interval_tags.py`, `test_validate_cleanup_horizon.py`, `test_serving_tag.py`, `test_serving_tag_idempotency.py`, `test_fleet_orchestration.py`, `test_fanout.py` |
 | Reconciler and PostgreSQL control plane | `test_reconciler.py`, `test_reconciler_classifier.py`, `test_reconciler_prewarm.py`, `test_reconciler_retention.py`, `test_state_postgres.py`, `test_state_specs.py`, `test_state_types.py`, `test_state_rebuild_publish_wedge.py`, `test_postgres_queue_load.py`, `test_local_runtime.py`, `test_local_e2e.py`, `test_release_assets.py` |
 | Publication | `test_publication.py` |
 | Recall audit | `test_recall.py`, `test_recall_quality.py`, `test_recall_scoring.py`, `test_recall_tiering.py` |
-| Operator tools CLI | `test_tools_cli_parsing.py`, `test_migrate_namespace.py`, `test_iceberg_optimize.py` |
+| Operator tools CLI | `test_tools_cli_parsing.py`, `test_iceberg_optimize.py` |
 | Telemetry | `test_telemetry_bridge.py`, `test_telemetry_capture.py`, `test_telemetry_retries.py` |
 | Storage/discovery helpers | `test_dataset_discovery.py` |
 | Bench package (`python -m bench`) | `test_bench_capacity.py`, `test_bench_cli.py`, `test_bench_corpus.py`, `test_bench_datasets.py`, `test_bench_e2e_tagged.py`, `test_bench_experiment.py`, `test_bench_fvecs.py`, `test_bench_groundtruth.py`, `test_bench_grpc_shapes.py`, `test_bench_recall_alignment.py`, `test_bench_reconcile.py`, `test_bench_run_experiment.py`, `test_bigann_io.py` |

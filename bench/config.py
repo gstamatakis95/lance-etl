@@ -13,12 +13,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lance_etl.spark_process import DEFAULT_ICEBERG_PACKAGE
+
 PACKAGE_DIR: Path = Path(__file__).resolve().parent
 REPO_ROOT: Path = PACKAGE_DIR.parent
 DEFAULT_WORKSPACE: Path = PACKAGE_DIR / "workspace"
 DEFAULT_CORPUS_ROOT: Path = PACKAGE_DIR / "corpora"
 DEFAULT_RESULTS_ROOT: Path = PACKAGE_DIR / "results"
-DEFAULT_ICEBERG_PACKAGE: str = "org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0"
 PROTO_PATH: Path = REPO_ROOT / "rust" / "search-api" / "proto" / "lance_etl" / "v1" / "lance_etl.proto"
 DEFAULT_SEARCH_API_BINARY: Path = REPO_ROOT / "rust" / "search-api" / "target" / "release" / "search-api"
 SIFT_DIM: int = 128
@@ -50,6 +51,24 @@ def default_run_id() -> str:
         A UTC timestamp string usable as a directory name.
     """
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def validate_search_k(search_k: int) -> None:
+    """Require search depth to cover every reported recall cutoff.
+
+    Args:
+        search_k: Number of neighbors requested per query.
+
+    Raises:
+        ValueError: If the search depth is smaller than the deepest recall cutoff.
+    """
+    deepest_cutoff: int = max(RECALL_CUTOFFS)
+    if search_k < deepest_cutoff:
+        raise ValueError(
+            f"search_k={search_k} is below the deepest recall cutoff {deepest_cutoff} "
+            f"(RECALL_CUTOFFS={RECALL_CUTOFFS}); recall_at_{deepest_cutoff} would be silently "
+            f"deflated by the shorter retrieved-id array. Pass --search-k >= {deepest_cutoff}."
+        )
 
 
 @dataclass
@@ -185,23 +204,6 @@ class BenchConfig:
     fuzz_conflict: bool = False
     fuzz_dim: int = 32
 
-    def __post_init__(self) -> None:
-        """Validate cross-field invariants after the dataclass fields are populated.
-
-        Raises:
-            ValueError: If ``search_k`` is smaller than the deepest :data:`RECALL_CUTOFFS` depth.
-                ``recall_at`` slices the retrieved-id array to the cut-off width, so a shorter
-                array silently caps recall below its true value instead of raising, which would
-                make ``search_k`` misconfiguration masquerade as a real recall drop.
-        """
-        deepest_cutoff: int = max(RECALL_CUTOFFS)
-        if self.search_k < deepest_cutoff:
-            raise ValueError(
-                f"search_k={self.search_k} is below the deepest recall cutoff {deepest_cutoff} "
-                f"(RECALL_CUTOFFS={RECALL_CUTOFFS}); recall_at_{deepest_cutoff} would be silently "
-                f"deflated by the shorter retrieved-id array. Pass --search-k >= {deepest_cutoff}."
-            )
-
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> BenchConfig:
         """Build a configuration from parsed command-line arguments.
@@ -236,7 +238,9 @@ class BenchConfig:
             values["search_expected_versions_path"] = Path(values["search_expected_versions_path"]).resolve()
         raw_binary: str | None = values.get("search_api_binary")
         values["search_api_binary"] = Path(raw_binary) if raw_binary else None
-        return cls(**values)
+        config = cls(**values)
+        validate_search_k(config.search_k)
+        return config
 
     def table(self) -> str:
         """Return the fully qualified Iceberg table name.
@@ -307,7 +311,7 @@ class BenchConfig:
         """Return the per-tenant Lance dataset URIs the ETL routing produces.
 
         Returns:
-            One dataset URI per org, matching ``lance_etl.etl.dataset_uri``.
+            One dataset URI per organization in the fixed target layout.
         """
         base: str = str(self.lance_root())
         return [f"{base}/{org}/{TENANT_ID}/{NAMESPACE}.lance" for org in self.org_ids()]

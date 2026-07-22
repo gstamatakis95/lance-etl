@@ -13,29 +13,6 @@ REQUIRED_PARTITION_FIELDS: tuple[PartitionField, ...] = (
 )
 
 
-def required_partition_fields(
-    tenant_column: str,
-    namespace_column: str,
-    org_column: str,
-) -> tuple[PartitionField, ...]:
-    """Build the expected partition contract from PostgreSQL source mappings.
-
-    Args:
-        tenant_column: Physical tenant source column.
-        namespace_column: Physical namespace source column.
-        org_column: Physical organization source column.
-
-    Returns:
-        Canonically named routing partitions plus the fixed ts hour.
-    """
-    return (
-        PartitionField("tenant_id", tenant_column, "identity"),
-        PartitionField("namespace", namespace_column, "identity"),
-        PartitionField("org_id", org_column, "identity"),
-        PartitionField("ts_hour", "ts", "hour"),
-    )
-
-
 def validate_partition_contract(
     spec: PartitionSpec,
     required_fields: tuple[PartitionField, ...] = REQUIRED_PARTITION_FIELDS,

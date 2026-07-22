@@ -1,13 +1,9 @@
-"""The commit-conflict metric wiring on the production merge paths.
+"""The commit-conflict metric wiring on the replay-safe production merge path.
 
 ``commit_with_retries`` invokes its ``on_conflict`` callback once per retried commit conflict, and
 this is already covered directly in ``tests/test_telemetry_retries.py``. What those tests do not
-cover is that the two production merge paths actually pass an ``on_conflict`` that increments the
-``dataset.merge_conflict_retries`` counter:
-
-- ``lance_etl.etl.sink.commit_table_chunks`` (sink.py:441), the chunked idempotent merge sink.
-- ``lance_etl.etl.replay_sink.replay_safe_merge`` (replay_sink.py:350), the source-sequenced
-  replay-safe merge.
+cover is that ``replay_safe_merge`` passes an ``on_conflict`` callback that increments the
+``dataset.merge_conflict_retries`` counter.
 
 Each test replaces the module-level ``commit_with_retries`` with a seam that fires ``on_conflict``
 a fixed number of times and then runs the wrapped action once, so the metric emission is exercised
@@ -18,16 +14,15 @@ stand-in captures the emitted metric names.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TypeVar
 
 import lance
 import pyarrow as pa
 import pytest
 
 import lance_etl.etl.replay_sink as replay_sink
-import lance_etl.etl.sink as sink
-from lance_etl.etl.pivot import ETLConfig
 from lance_etl.etl.replay_sink import (
     DELETED_COLUMN,
     EVENT_DIGEST_COLUMN,
@@ -42,12 +37,11 @@ MERGE_CONFLICT_METRIC: str = "dataset.merge_conflict_retries"
 ResultT = TypeVar("ResultT")
 
 
+@dataclass
 class RecordingStatsd:
     """A DogStatsD stand-in that records every increment by metric name."""
 
-    def __init__(self) -> None:
-        """Initialize the empty increment log."""
-        self.increments: list[str] = []
+    increments: list[str] = field(default_factory=list)
 
     def increment(self, name: str, value: float = 1, tags: list[str] | None = None) -> None:
         """Record one counter increment.
@@ -127,45 +121,6 @@ def fire_conflicts_then_run(count: int) -> Callable[..., ResultT]:
         return action()
 
     return replacement
-
-
-def test_sink_commit_table_chunks_emits_metric_on_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``commit_table_chunks`` increments the conflict metric once per retried conflict."""
-    telemetry, recorder = recording_telemetry()
-    config: ETLConfig = ETLConfig(
-        base_uri="memory://bench",
-        telemetry=TelemetryConfig(service="lance-etl-tests", env="test"),
-        merge_batch_bytes=None,
-        conflict_retries=10,
-        retry_backoff_seconds=0.0,
-    )
-    monkeypatch.setattr(sink, "commit_with_retries", fire_conflicts_then_run(2))
-    table: pa.Table = pa.table({"id": pa.array([1, 2, 3], pa.int64())})
-
-    def run_chunk(chunk: pa.Table, index: int, total: int) -> dict[str, Any]:
-        """Return a fixed insert-count statistics dictionary for one chunk.
-
-        Args:
-            chunk: The chunk being committed.
-            index: The chunk index.
-            total: The total chunk count.
-
-        Returns:
-            A statistics dictionary reporting the chunk's row count as inserts.
-        """
-        del index, total
-        return {"num_inserted_rows": chunk.num_rows}
-
-    total_rows: int = sink.commit_table_chunks(
-        config,
-        telemetry,
-        table,
-        run_chunk,
-        lambda stats: int(stats.get("num_inserted_rows", 0)),
-    )
-
-    assert total_rows == 3
-    assert recorder.increments.count(MERGE_CONFLICT_METRIC) == 2
 
 
 def test_replay_safe_merge_emits_metric_on_conflict(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

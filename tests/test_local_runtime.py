@@ -17,7 +17,6 @@ import pytest
 
 import lance_etl.reconciler.runtime as reconciler_runtime
 from lance_etl.publication.workflow import PrewarmResult
-from lance_etl.reconciler import ReconcilerApplication
 from lance_etl.reconciler.cli import build_parser, execute_command
 from lance_etl.reconciler.config import (
     DEFAULT_DATABASE_URL,
@@ -26,6 +25,7 @@ from lance_etl.reconciler.config import (
     RuntimeSettings,
 )
 from lance_etl.reconciler.prewarm import LocalExactVersionPrewarmer
+from lance_etl.reconciler.service import ReconcilerApplication
 from lance_etl.state import IcebergSource, RoutingIdentity, SourceLifecycleState
 
 RUNTIME_ENVIRONMENT_NAMES: tuple[str, ...] = (
@@ -149,6 +149,7 @@ def test_runtime_spark_builds_local_iceberg_catalog(
     builder.master.return_value = builder
     builder.config.return_value = builder
     session: MagicMock = MagicMock()
+    session.sparkContext.getConf.return_value.get.return_value = "false"
     builder.getOrCreate.return_value = session
     spark_type: SimpleNamespace = SimpleNamespace(builder=builder)
     monkeypatch.setattr(reconciler_runtime, "SparkSession", spark_type)
@@ -165,6 +166,48 @@ def test_runtime_spark_builds_local_iceberg_catalog(
     assert configuration["spark.sql.catalog.local.warehouse"] == settings.spark_warehouse_path.as_uri()
     assert configuration["spark.sql.session.timeZone"] == "UTC"
     assert configuration["spark.sql.shuffle.partitions"] == "8"
+    assert configuration["spark.speculation"] == "false"
+    assert configuration["spark.python.use.daemon"] == "false"
+    assert configuration["spark.python.worker.faulthandler.enabled"] == "true"
+    assert configuration["spark.sql.execution.pyspark.udf.faulthandler.enabled"] == "true"
+    assert configuration["spark.sql.adaptive.enabled"] == "true"
+    assert configuration["spark.sql.adaptive.advisoryPartitionSizeInBytes"] == "64m"
+    assert configuration["spark.sql.adaptive.coalescePartitions.initialPartitionNum"] == "8"
+    assert configuration["spark.sql.execution.arrow.maxRecordsPerBatch"] == "4096"
+
+
+def test_runtime_spark_rejects_unsafe_reused_context(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A pre-existing speculative context cannot run commit-producing reconciler jobs.
+
+    Args:
+        monkeypatch: Scoped Spark builder fixture.
+        tmp_path: Isolated local warehouse.
+    """
+    builder: MagicMock = MagicMock()
+    builder.appName.return_value = builder
+    builder.master.return_value = builder
+    builder.config.return_value = builder
+    session: MagicMock = MagicMock()
+    session.sparkContext.getConf.return_value.get.return_value = "true"
+    builder.getOrCreate.return_value = session
+    monkeypatch.setattr(reconciler_runtime, "SparkSession", SimpleNamespace(builder=builder))
+
+    with pytest.raises(RuntimeError, match="spark.speculation enabled"):
+        reconciler_runtime.build_runtime_spark(local_settings(tmp_path))
+
+    session.stop.assert_called_once_with()
+
+
+def test_runtime_cleanup_disposes_engine_when_spark_stop_fails() -> None:
+    """PostgreSQL connections are released even when local Spark shutdown raises."""
+    spark: MagicMock = MagicMock()
+    engine: MagicMock = MagicMock()
+    spark.stop.side_effect = RuntimeError("Spark shutdown failed")
+
+    with pytest.raises(RuntimeError, match="Spark shutdown failed"):
+        reconciler_runtime.close_runtime_resources(spark, engine)
+
+    engine.dispose.assert_called_once_with()
 
 
 def test_local_prewarmer_opens_exact_lance_version(tmp_path: Path) -> None:
@@ -294,13 +337,68 @@ def test_runtime_bootstraps_source_then_uses_postgres_truth(
         canonical_baseline_snapshot_id=41,
         lance_base_uri=runtime_settings.lance_base_uri,
     )
-    assert catalog_factory.call_args_list[1].args == (spark, 41, "tenant_id", "namespace", "org_id")
+    assert catalog_factory.call_args_list[1].args == (spark, 41)
     assert application.settings is reconciler_settings
     assert application.plan_provider.source is source
     assert application.plan_enqueuer.source is source
     application.close()
     spark.stop.assert_called_once_with()
     engine.dispose.assert_called_once_with()
+
+
+def test_runtime_reuses_registered_source_without_bootstrap_catalog_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A registered source can start while its Iceberg table is durably gated.
+
+    Args:
+        monkeypatch: Scoped dependency fixture.
+        tmp_path: Isolated local storage root.
+    """
+    runtime_settings: RuntimeSettings = replace(local_settings(tmp_path), canonical_baseline_snapshot_id=41)
+    source: IcebergSource = IcebergSource(
+        source_id=uuid.uuid4(),
+        source_name="local",
+        spark_catalog="local",
+        table_namespace="db",
+        table_name="events",
+        table_uuid=uuid.uuid4(),
+        lance_base_uri=runtime_settings.lance_base_uri,
+        lifecycle_state=SourceLifecycleState.ACTIVE,
+        default_spec_id=uuid.uuid4(),
+        canonical_baseline_snapshot_id=41,
+        replay_horizon=timedelta(days=30),
+    )
+    spark: MagicMock = MagicMock()
+    engine: MagicMock = MagicMock()
+    repository: MagicMock = MagicMock()
+    repository.source_by_name.return_value = source
+    catalog: MagicMock = MagicMock()
+    catalog_factory: MagicMock = MagicMock(return_value=catalog)
+    monkeypatch.setattr(
+        reconciler_runtime.RuntimeSettings,
+        "from_environment",
+        MagicMock(return_value=runtime_settings),
+    )
+    monkeypatch.setattr(
+        reconciler_runtime.ReconcilerSettings,
+        "from_environment",
+        MagicMock(return_value=ReconcilerSettings().validate()),
+    )
+    monkeypatch.setattr(reconciler_runtime, "build_runtime_spark", MagicMock(return_value=spark))
+    monkeypatch.setattr(reconciler_runtime.Telemetry, "create", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(reconciler_runtime, "build_control_plane_engine", MagicMock(return_value=engine))
+    monkeypatch.setattr(reconciler_runtime, "ControlPlaneRepository", MagicMock(return_value=repository))
+    monkeypatch.setattr(reconciler_runtime, "SparkIcebergCatalog", catalog_factory)
+    monkeypatch.setattr(reconciler_runtime, "build_runtime_prewarmer", MagicMock(return_value=MagicMock()))
+
+    application: ReconcilerApplication = reconciler_runtime.build_runtime_application()
+
+    repository.ensure_source_registration.assert_not_called()
+    catalog_factory.assert_called_once_with(spark, 41)
+    catalog.table_metadata.assert_not_called()
+    application.close()
 
 
 def test_runtime_bootstrap_failure_stops_spark_and_disposes_engine(

@@ -15,6 +15,9 @@ from lance_etl.source.errors import (
     SourceBaselineError as SourceBaselineError,
 )
 from lance_etl.source.errors import (
+    SourceConfigurationError as SourceConfigurationError,
+)
+from lance_etl.source.errors import (
     SourceContractError as SourceContractError,
 )
 from lance_etl.source.errors import (
@@ -70,7 +73,7 @@ from lance_etl.source.models import (
     SourcePlan as SourcePlan,
 )
 from lance_etl.source.models import (
-    SparkScanPlan as SparkScanPlan,
+    SourceSnapshotRejection as SourceSnapshotRejection,
 )
 from lance_etl.source.models import (
     TableMetadata as TableMetadata,
@@ -79,19 +82,10 @@ from lance_etl.source.models import (
     TargetKey as TargetKey,
 )
 from lance_etl.source.models import (
-    TouchedTarget as TouchedTarget,
-)
-from lance_etl.source.models import (
     WindowKind as WindowKind,
 )
 from lance_etl.source.models import (
     WindowPlan as WindowPlan,
 )
-from lance_etl.source.planner import (
-    SourceCatalog as SourceCatalog,
-)
-from lance_etl.source.planner import (
-    SourcePlanner as SourcePlanner,
-)
-from lance_etl.source.scans import build_spark_scan as build_spark_scan
 from lance_etl.source.scans import execute_spark_scan as execute_spark_scan
+from lance_etl.source.scans import snapshot_scan_options as snapshot_scan_options

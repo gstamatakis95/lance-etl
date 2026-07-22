@@ -9,14 +9,12 @@ from pathlib import Path
 
 from sqlalchemy.engine import URL, make_url
 
+from lance_etl.spark_process import DEFAULT_ICEBERG_PACKAGE
 from lance_etl.state.settings import ReconcilerSettings as ReconcilerSettings
 from lance_etl.state.settings import default_reconciler_settings as default_reconciler_settings
 
 DEFAULT_DATABASE_URL: str = "postgresql+psycopg://lance_etl:lance_etl@localhost/lance_etl"
 """Local PostgreSQL control-plane URL used when no environment override exists."""
-
-DEFAULT_ICEBERG_PACKAGE: str = "org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0"
-"""Iceberg runtime compatible with the pinned local PySpark release."""
 
 DEFAULT_LOCAL_SHUFFLE_PARTITIONS: int = 8
 """Small process-wide Spark default. Dataset ingestion fan-out is PostgreSQL-owned."""

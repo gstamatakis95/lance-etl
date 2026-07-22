@@ -11,7 +11,8 @@ import lance
 import pyarrow as pa
 
 from lance_etl.publication.manifest import candidate_pin_name, tag_version
-from lance_etl.reconciler import ReconcilerSettings, ReconcileSummary
+from lance_etl.reconciler.config import ReconcilerSettings
+from lance_etl.reconciler.results import ReconcileSummary
 from lance_etl.reconciler.retention import PublicationRetentionSweep
 from lance_etl.state import PublicationCleanup
 from lance_etl.telemetry import TelemetryConfig
@@ -148,6 +149,31 @@ def test_retention_defers_a_mismatched_immutable_pin(tmp_path: Path) -> None:
     assert artifact.exists()
     repository.finalize_publication_cleanup.assert_not_called()
     assert summary == type(summary)(inspected=1, reconciled=0, deferred=1)
+
+
+def test_retention_finalizes_when_retired_dataset_is_already_absent(tmp_path: Path) -> None:
+    """An already-absent candidate proves its pin is gone and cannot wedge cleanup.
+
+    Args:
+        tmp_path: Local absent dataset and artifact root.
+    """
+    dataset_uri: str = str(tmp_path / "absent-candidate.lance")
+    artifact: Path = tmp_path / "manifest.json"
+    artifact.write_text("{}", encoding="utf-8")
+    cleanup: PublicationCleanup = cleanup_claim(dataset_uri, 4, str(artifact), uuid.uuid4())
+    repository: MagicMock = MagicMock()
+    repository.claim_publication_cleanup.return_value = [cleanup]
+    repository.finalize_publication_cleanup.return_value = True
+    repository.delete_completed_audit.return_value = (0, 0)
+    sweep: PublicationRetentionSweep = PublicationRetentionSweep(
+        repository, eager_spark(), retention_settings(), TelemetryConfig()
+    )
+
+    summary: ReconcileSummary = sweep.reconcile()
+
+    assert not artifact.exists()
+    repository.finalize_publication_cleanup.assert_called_once_with(cleanup)
+    assert summary == type(summary)(inspected=1, reconciled=1, deferred=0)
 
 
 def test_retention_prunes_old_audit_without_external_claims() -> None:

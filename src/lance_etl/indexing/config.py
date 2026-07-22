@@ -75,7 +75,7 @@ class IndexJobConfig:
     """Configuration for :class:`lance_etl.indexing.runner.LanceIndexer`.
 
     Every semantic indexing option is an instance field so one frozen PostgreSQL specification
-    reproduces the same index generation. Module constants provide backward-compatible defaults.
+    reproduces the same index generation. Module constants provide opinionated defaults.
     The four fine-grained FTS tokenizer toggles (lowercase, stemming, stop words, and ASCII folding)
     are always omitted from ``fts_params()`` because pylance does not expose them independently.
 

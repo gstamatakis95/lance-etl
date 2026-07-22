@@ -7,6 +7,10 @@ class SourcePlanningError(RuntimeError):
     """Base class for deterministic source-planning failures."""
 
 
+class SourceConfigurationError(SourcePlanningError):
+    """Indicate that source bootstrap cannot produce trustworthy snapshot evidence."""
+
+
 class SourceContractError(SourcePlanningError):
     """Indicate that table identity or partition metadata violates the source contract."""
 

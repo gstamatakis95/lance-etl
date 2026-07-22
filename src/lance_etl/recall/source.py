@@ -11,6 +11,7 @@ with malformed records counted by a bounded-cardinality reason key rather than r
 from __future__ import annotations
 
 import json
+import math
 import os
 import urllib.request
 from collections import Counter
@@ -18,9 +19,29 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from lance_etl.recall.config import DISTANCE_TYPES, PATH_COMPONENT_PATTERN, QUERY_TYPES, SPANS_SEARCH_PATH
+from lance_etl.recall.config import DISTANCE_TYPES, QUERY_TYPES, SPANS_SEARCH_PATH
+from lance_etl.routing import validate_routing_segment
+
+MAX_DATASET_VERSION: int = (1 << 63) - 1
+"""Largest Lance version safely represented by the signed tracing attribute contract."""
+
+MAX_RECALL_K: int = 10_000
+"""Largest captured result count accepted by the search service and exact audit reducers."""
+
+MAX_QUERY_VECTOR_DIMENSION: int = 16_384
+"""Largest query-vector dimension accepted from one captured span."""
+
+MAX_RESULT_ID_STRING_BYTES: int = 4_096
+"""Largest UTF-8 result-id string accepted from one captured span."""
+
+MIN_RESULT_ID_INTEGER: int = -(1 << 63)
+"""Smallest integer result id representable by the supported signed Arrow id type."""
+
+MAX_RESULT_ID_INTEGER: int = (1 << 64) - 1
+"""Largest integer result id representable by the supported unsigned Arrow id type."""
 
 
+@dataclass
 class SampleParseError(ValueError):
     """A recall span failed to parse into a :class:`RecallSample`.
 
@@ -28,14 +49,7 @@ class SampleParseError(ValueError):
         reason: A bounded-cardinality reason key used for skip counting.
     """
 
-    def __init__(self, reason: str) -> None:
-        """Initialize the error.
-
-        Args:
-            reason: The bounded-cardinality reason key.
-        """
-        super().__init__(reason)
-        self.reason: str = reason
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -302,9 +316,11 @@ def attr_int(attrs: dict[str, Any], key: str) -> int:
     value: Any = attrs.get(key)
     if value is None:
         raise SampleParseError(f"missing:{key}")
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise SampleParseError(f"invalid:{key}")
     try:
         return int(value)
-    except (TypeError, ValueError) as exc:
+    except (OverflowError, TypeError, ValueError) as exc:
         raise SampleParseError(f"invalid:{key}") from exc
 
 
@@ -327,11 +343,7 @@ def attr_optional_int(attrs: dict[str, Any], key: str) -> int | None:
 
 
 def attr_path_component(attrs: dict[str, Any], key: str) -> str:
-    """Read a required routing-path component, validated against the path allowlist.
-
-    The character allowlist alone permits the literal components ``.`` and ``..``, which are valid path segments
-    that walk up the directory tree instead of naming a routing key, so both are rejected explicitly in addition to
-    the regex match.
+    """Read a required component under the shared bounded routing contract.
 
     Args:
         attrs: The flat attribute dictionary.
@@ -341,13 +353,13 @@ def attr_path_component(attrs: dict[str, Any], key: str) -> str:
         The validated component.
 
     Raises:
-        SampleParseError: If the attribute is missing, fails path-component validation, or is a directory-traversal
-            component (``.`` or ``..``).
+        SampleParseError: If the attribute is missing or fails routing-segment validation.
     """
     value: str = attr_string(attrs, key)
-    if not PATH_COMPONENT_PATTERN.match(value) or value in {".", ".."}:
-        raise SampleParseError(f"invalid:{key}")
-    return value
+    try:
+        return validate_routing_segment(value, key)
+    except ValueError as error:
+        raise SampleParseError(f"invalid:{key}") from error
 
 
 def parse_query_vector(attrs: dict[str, Any]) -> tuple[float, ...]:
@@ -364,13 +376,19 @@ def parse_query_vector(attrs: dict[str, Any]) -> tuple[float, ...]:
     """
     raw: str = attr_string(attrs, "recall.query_vector")
     parsed: Any = decode_json_attr(raw, "recall.query_vector")
-    if not isinstance(parsed, list) or not parsed:
+    if not isinstance(parsed, list) or not parsed or len(parsed) > MAX_QUERY_VECTOR_DIMENSION:
         raise SampleParseError("invalid:recall.query_vector")
     values: list[float] = []
     for item in parsed:
         if isinstance(item, bool) or not isinstance(item, (int, float)):
             raise SampleParseError("invalid:recall.query_vector")
-        values.append(float(item))
+        try:
+            value: float = float(item)
+        except (OverflowError, ValueError) as error:
+            raise SampleParseError("invalid:recall.query_vector") from error
+        if not math.isfinite(value):
+            raise SampleParseError("invalid:recall.query_vector")
+        values.append(value)
     return tuple(values)
 
 
@@ -393,12 +411,13 @@ def decode_json_attr(raw: Any, key: str) -> Any:
         raise SampleParseError(f"invalid:{key}") from exc
 
 
-def parse_float_tuple_attr(attrs: dict[str, Any], key: str) -> tuple[float, ...]:
+def parse_float_tuple_attr(attrs: dict[str, Any], key: str, max_items: int) -> tuple[float, ...]:
     """Parse an optional JSON number-array attribute into a float tuple.
 
     Args:
         attrs: The flat attribute dictionary.
         key: The attribute key.
+        max_items: Maximum accepted array length.
 
     Returns:
         The values in rank order, empty when the attribute is absent.
@@ -410,25 +429,55 @@ def parse_float_tuple_attr(attrs: dict[str, Any], key: str) -> tuple[float, ...]
     if raw is None:
         return ()
     parsed: Any = decode_json_attr(raw, key)
-    if not isinstance(parsed, list):
+    if not isinstance(parsed, list) or len(parsed) > max_items:
         raise SampleParseError(f"invalid:{key}")
-    try:
-        return tuple(float(item) for item in parsed)
-    except (TypeError, ValueError) as exc:
-        raise SampleParseError(f"invalid:{key}") from exc
+    values: list[float] = []
+    for item in parsed:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise SampleParseError(f"invalid:{key}")
+        try:
+            value: float = float(item)
+        except (OverflowError, ValueError) as error:
+            raise SampleParseError(f"invalid:{key}") from error
+        if not math.isfinite(value):
+            raise SampleParseError(f"invalid:{key}")
+        values.append(value)
+    return tuple(values)
 
 
-def parse_result_ids(attrs: dict[str, Any]) -> tuple[Any, ...] | None:
+def result_id_is_valid(value: Any) -> bool:
+    """Return whether one decoded result id is a bounded, hashable JSON scalar.
+
+    Args:
+        value: Decoded JSON value from a served result-id array.
+
+    Returns:
+        True for bounded strings, supported-range integers, and finite floats.
+    """
+    if isinstance(value, str):
+        try:
+            return len(value.encode("utf-8")) <= MAX_RESULT_ID_STRING_BYTES
+        except UnicodeEncodeError:
+            return False
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return MIN_RESULT_ID_INTEGER <= value <= MAX_RESULT_ID_INTEGER
+    return isinstance(value, float) and math.isfinite(value)
+
+
+def parse_result_ids(attrs: dict[str, Any], max_items: int) -> tuple[Any, ...] | None:
     """Parse the JSON-encoded served result ids, which may be null.
 
     Args:
         attrs: The flat attribute dictionary.
+        max_items: Maximum accepted result count.
 
     Returns:
         The served ids in rank order, or None when the capture recorded null or omitted the attribute.
 
     Raises:
-        SampleParseError: If the attribute is present but is neither a JSON array nor null.
+        SampleParseError: If the attribute is present but is not null or a bounded array of scalar ids.
     """
     raw: Any = attrs.get("recall.result_ids")
     if raw is None:
@@ -436,7 +485,7 @@ def parse_result_ids(attrs: dict[str, Any]) -> tuple[Any, ...] | None:
     parsed: Any = decode_json_attr(raw, "recall.result_ids")
     if parsed is None:
         return None
-    if not isinstance(parsed, list):
+    if not isinstance(parsed, list) or len(parsed) > max_items or not all(result_id_is_valid(item) for item in parsed):
         raise SampleParseError("invalid:recall.result_ids")
     return tuple(parsed)
 
@@ -555,7 +604,7 @@ def parse_recall_sample(attrs: dict[str, Any]) -> RecallSample:
     if query_type not in QUERY_TYPES:
         raise SampleParseError("invalid:recall.query_type")
     k: int = attr_int(attrs, "recall.k")
-    if k < 1:
+    if not 1 <= k <= MAX_RECALL_K:
         raise SampleParseError("invalid:recall.k")
     query_vector: tuple[float, ...] = ()
     if query_type in ("vector", "hybrid"):
@@ -568,19 +617,22 @@ def parse_recall_sample(attrs: dict[str, Any]) -> RecallSample:
     fusion: dict[str, Any] | None = None
     if query_type == "hybrid":
         fusion = parse_fusion(attrs)
+    dataset_version: int = attr_int(attrs, "recall.dataset_version")
+    if not 1 <= dataset_version <= MAX_DATASET_VERSION:
+        raise SampleParseError("invalid:recall.dataset_version")
     return RecallSample(
         sample_id=attr_string(attrs, "recall.sample_id"),
         captured_at_unix_ms=attr_int(attrs, "recall.captured_at_unix_ms"),
         org_id=attr_path_component(attrs, "recall.org_id"),
         tenant_id=attr_path_component(attrs, "recall.tenant_id"),
         namespace=attr_path_component(attrs, "recall.namespace"),
-        dataset_version=attr_int(attrs, "recall.dataset_version"),
+        dataset_version=dataset_version,
         k=k,
         query_type=query_type,
         query_vector=query_vector,
-        result_ids=parse_result_ids(attrs),
-        result_distances=parse_float_tuple_attr(attrs, "recall.result_distances"),
-        result_scores=parse_float_tuple_attr(attrs, "recall.result_scores"),
+        result_ids=parse_result_ids(attrs, k),
+        result_distances=parse_float_tuple_attr(attrs, "recall.result_distances", k),
+        result_scores=parse_float_tuple_attr(attrs, "recall.result_scores", k),
         text_query=text_query,
         text_columns=text_columns,
         fusion=fusion,

@@ -1,12 +1,13 @@
 """Tests for recall brute-force scoring, version pinning, recall math, aggregation, and the job driver.
 
-Spark is replaced with the minimal in-process fake used elsewhere in the suite since the recall job only exercises
-``parallelize().map().collect()``. All span input goes through :class:`InMemorySpanSource`, so no network is touched.
+Spark is replaced with the minimal in-process fake used elsewhere in the suite. All span input goes through
+:class:`InMemorySpanSource`, so no network is touched.
 """
 
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ import pyarrow as pa
 import pytest
 from conftest import FakeSpark
 
+import lance_etl.recall.scoring as recall_scoring
 from lance_etl.recall import (
     AggregateRow,
     InMemorySpanSource,
@@ -221,7 +223,7 @@ class TestBruteForce:
 
 
 class TestVersionPinning:
-    """Scoring replays against the recorded dataset version and flags drift on fallback."""
+    """Scoring replays only against the exact recorded dataset version."""
 
     def test_pinned_version_ignores_later_appends(
         self, dataset_setup: tuple[str, list[int], np.ndarray], job_config: RecallJobConfig
@@ -232,9 +234,8 @@ class TestVersionPinning:
         closer: np.ndarray = np.tile(make_vectors(1, DIM, 21)[0], (50, 1))
         lance.write_dataset(vectors_table(list(range(ROWS, ROWS + 50)), closer), uri, mode="append")
         query: np.ndarray = make_vectors(1, DIM, 21)[0].astype(np.float64)
-        dataset, drift = resolve_dataset(uri, pinned_version, None)
+        dataset = resolve_dataset(uri, pinned_version, None)
         assert dataset is not None
-        assert drift is False
         top_ids, count = brute_force_top_k(dataset, query, 10, "l2", "record_id", "vector", None, 16)
         assert count == ROWS
         assert all(top_id < ROWS for top_id in top_ids)
@@ -244,27 +245,146 @@ class TestVersionPinning:
         )
         scores: list[SampleScore] = score_version_group(uri, pinned_version, [sample], job_config)
         assert scores[0].recall == pytest.approx(1.0)
-        assert scores[0].version_drift is False
 
-    def test_invalid_version_falls_back_to_latest_with_drift(
+    def test_cleaned_version_is_skipped(
         self, dataset_setup: tuple[str, list[int], np.ndarray], job_config: RecallJobConfig
     ) -> None:
-        """A cleaned-up version falls back to latest and flags the score as drifted."""
+        """A cleaned-up version cannot be replaced by latest for scoring."""
         uri, ids, vectors = dataset_setup
+        recorded_version: int = lance.dataset(uri).version
+        appended_vectors: np.ndarray = make_vectors(1, DIM, 29)
+        lance.write_dataset(vectors_table([ROWS], appended_vectors), uri, mode="append")
+        lance.dataset(uri).cleanup_old_versions(older_than=timedelta(0), retain_versions=1, delete_unverified=True)
         query: np.ndarray = make_vectors(1, DIM, 23)[0].astype(np.float64)
-        served: list[int] = oracle_top_k(ids, vectors, query, 10, "l2")
-        sample: RecallSample = make_sample(dataset_version=9999, query_vector=tuple(query), result_ids=tuple(served))
-        scores: list[SampleScore] = score_version_group(uri, 9999, [sample], job_config)
-        assert scores[0].version_drift is True
-        assert scores[0].skip_reason is None
-        assert scores[0].recall == pytest.approx(1.0)
+        served: list[int] = oracle_top_k(ids + [ROWS], np.vstack([vectors, appended_vectors]), query, 10, "l2")
+        sample: RecallSample = make_sample(
+            dataset_version=recorded_version, query_vector=tuple(query), result_ids=tuple(served)
+        )
+        scores: list[SampleScore] = score_version_group(uri, recorded_version, [sample], job_config)
+        assert scores[0].skip_reason == "version_missing"
+        assert scores[0].recall is None
+
+    def test_future_version_is_unavailable_instead_of_drifted(
+        self, dataset_setup: tuple[str, list[int], np.ndarray], job_config: RecallJobConfig
+    ) -> None:
+        """A capture newer than the latest manifest cannot be scored as retention drift."""
+        uri, ids, vectors = dataset_setup
+        del ids, vectors
+
+        scores: list[SampleScore] = score_version_group(
+            uri,
+            9999,
+            [make_sample(dataset_version=9999)],
+            job_config,
+        )
+
+        assert scores[0].skip_reason == "version_missing"
+
+    @pytest.mark.parametrize("version", [0, -1])
+    def test_nonpositive_version_is_unavailable(self, version: int, job_config: RecallJobConfig) -> None:
+        """An invalid Lance version cannot be reinterpreted as retention drift.
+
+        Args:
+            version: Invalid recorded version.
+            job_config: Recall job configuration.
+        """
+        scores: list[SampleScore] = score_version_group(
+            "/tmp/not-opened.lance",
+            version,
+            [make_sample(dataset_version=version)],
+            job_config,
+        )
+
+        assert scores[0].skip_reason == "dataset_unavailable"
 
     def test_missing_dataset_skips_group(self, job_config: RecallJobConfig) -> None:
-        """A nonexistent dataset skips every sample in the group with dataset_missing."""
+        """A nonexistent exact version skips every sample without opening latest."""
         uri: str = sample_dataset_uri(job_config.base_uri, make_sample(org_id="ghost"))
         scores: list[SampleScore] = score_version_group(uri, 1, [make_sample(org_id="ghost")], job_config)
-        assert [score.skip_reason for score in scores] == ["dataset_missing"]
+        assert [score.skip_reason for score in scores] == ["version_missing"]
         assert scores[0].recall is None
+
+    def test_transient_exact_open_does_not_fall_forward(
+        self,
+        job_config: RecallJobConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A storage failure cannot be relabeled as retention and scored at latest.
+
+        Args:
+            job_config: Recall configuration fixture.
+            monkeypatch: Scoped Lance open failure.
+        """
+        calls: list[dict[str, object]] = []
+
+        def failing_open(uri: str, **kwargs: object) -> lance.LanceDataset:
+            """Record the exact open and fail with a transient error.
+
+            Args:
+                uri: Requested dataset URI.
+                **kwargs: Lance open options.
+
+            Returns:
+                Never returns.
+
+            Raises:
+                RuntimeError: Always.
+            """
+            del uri
+            calls.append(kwargs)
+            raise RuntimeError("object store returned 503 Slow Down")
+
+        monkeypatch.setattr(recall_scoring.lance, "dataset", failing_open)
+        scores: list[SampleScore] = score_version_group(
+            "/tmp/unavailable.lance",
+            7,
+            [make_sample(dataset_version=7)],
+            job_config,
+        )
+
+        assert [score.skip_reason for score in scores] == ["dataset_unavailable"]
+        assert len(calls) == 1
+        assert calls[0]["version"] == 7
+
+    def test_missing_exact_manifest_is_skipped_without_latest_open(
+        self,
+        job_config: RecallJobConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A missing exact manifest is skipped without attempting a latest-version open.
+
+        Args:
+            job_config: Recall configuration fixture.
+            monkeypatch: Scoped Lance open failure.
+        """
+        failures: list[BaseException] = [
+            ValueError("Dataset at path /tmp/x.lance/_versions/3.manifest was not found: Not found")
+        ]
+
+        def failing_open(uri: str, **kwargs: object) -> lance.LanceDataset:
+            """Raise the exact manifest failure.
+
+            Args:
+                uri: Ignored dataset URI.
+                **kwargs: Ignored open options.
+
+            Returns:
+                Never returns.
+            """
+            del uri, kwargs
+            raise failures.pop(0)
+
+        monkeypatch.setattr(recall_scoring.lance, "dataset", failing_open)
+
+        scores: list[SampleScore] = score_version_group(
+            "/tmp/x.lance",
+            3,
+            [make_sample(dataset_version=3)],
+            job_config,
+        )
+
+        assert scores[0].skip_reason == "version_missing"
+        assert not failures
 
 
 class TestRecallMath:
@@ -354,7 +474,6 @@ def score(recall: float | None, **overrides: Any) -> SampleScore:
         "recall": recall,
         "ndcg": recall,
         "mrr": recall,
-        "version_drift": False,
         "skip_reason": None if recall is not None else "null_result_ids",
     }
     fields.update(overrides)
@@ -370,19 +489,18 @@ class TestAggregationAndReport:
             score(1.0, nprobes_min=8, nprobes_max=32, refine_factor=2),
             score(0.5, nprobes_min=8, nprobes_max=32, refine_factor=2),
             score(0.8, org_id="beta"),
-            score(None, org_id="beta", version_drift=True),
+            score(None, org_id="beta"),
         ]
         rows: list[AggregateRow] = aggregate_scores(scores)
         assert rows[0].bucket == "overall"
         assert rows[0].samples == 3
         assert rows[0].mean_recall == pytest.approx((1.0 + 0.5 + 0.8) / 3)
-        assert rows[0].drift_count == 1
         assert rows[0].skip_count == 1
         labels: list[str] = [row.bucket for row in rows]
-        assert "rpc nprobes=8..32 refine=2" in labels
+        assert "rpc nprobes=5-8..17-32 refine=2" in labels
         assert "rpc nprobes=default..default refine=unset" in labels
         assert labels[-2:] == ["org acme", "org beta"]
-        rpc_row: AggregateRow = next(row for row in rows if row.bucket == "rpc nprobes=8..32 refine=2")
+        rpc_row: AggregateRow = next(row for row in rows if row.bucket == "rpc nprobes=5-8..17-32 refine=2")
         assert rpc_row.is_rpc_bucket is True
         assert rpc_row.samples == 2
         assert rpc_row.mean_recall == pytest.approx(0.75)
@@ -392,7 +510,19 @@ class TestAggregationAndReport:
         assert org_row.is_rpc_bucket is False
         assert org_row.samples == 1
         assert org_row.skip_count == 1
-        assert org_row.drift_count == 1
+
+    def test_arbitrary_rpc_values_collapse_into_bounded_ranges(self) -> None:
+        """Adjacent and very large raw parameters share stable finite RPC buckets."""
+        rows: list[AggregateRow] = aggregate_scores(
+            [
+                score(1.0, nprobes_min=3, nprobes_max=4, refine_factor=65),
+                score(0.5, nprobes_min=4, nprobes_max=3, refine_factor=999_999),
+            ]
+        )
+        rpc_rows: list[AggregateRow] = [row for row in rows if row.is_rpc_bucket]
+        assert len(rpc_rows) == 1
+        assert rpc_rows[0].bucket == "rpc nprobes=3-4..3-4 refine=65+"
+        assert rpc_rows[0].samples == 2
 
     def test_empty_scores_aggregate_to_empty_overall(self) -> None:
         """No scores still produce a well-formed overall row with no statistics."""
@@ -440,8 +570,8 @@ class TestAggregationAndReport:
         names: set[str] = {name for name, value, tags in emitted}
         assert names == {"recall.measured", "recall.ndcg", "recall.mrr"}
         all_tags: list[str] = [tag for name, value, tags in emitted for tag in tags]
-        assert "nprobes_min:8" in all_tags
-        assert "nprobes_max:32" in all_tags
+        assert "nprobes_min:5-8" in all_tags
+        assert "nprobes_max:17-32" in all_tags
         assert "refine_factor:2" in all_tags
         assert "nprobes_min:default" in all_tags
         assert "refine_factor:unset" in all_tags

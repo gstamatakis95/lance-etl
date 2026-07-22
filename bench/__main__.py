@@ -1,8 +1,8 @@
-"""Module entry point for ``python -m bench``."""
+"""Import-light module entry point for ``python -m bench``."""
 
 from __future__ import annotations
 
-from bench.cli import main
+from bench.launcher import main
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

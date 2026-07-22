@@ -6,6 +6,7 @@ dependencies = [
     "pylance==8.0.0",
     "pyarrow>=23",
     "pyspark==4.0.1",
+    "psutil>=7,<8",
     "pandas>=2.2.0",
     "numpy",
     "datadog",
@@ -16,7 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-lance-etl-reconcile = "lance_etl.reconciler.cli:main"
+lance-etl-reconcile = "lance_etl.reconciler.launcher:main"
 
 [build-system]
 requires = ["hatchling"]

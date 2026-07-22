@@ -11,6 +11,7 @@ import pyarrow.fs as pa_fs
 from pyspark.sql import SparkSession
 
 from lance_etl.cloud_storage import resolve_filesystem
+from lance_etl.etl.storage import dataset_absent
 from lance_etl.publication.manifest import candidate_pin_name, tag_version
 from lance_etl.reconciler.config import ReconcilerSettings
 from lance_etl.reconciler.results import ReconcileSummary
@@ -56,9 +57,50 @@ class RetentionRepository(Protocol):
             limit: Per-table deletion bound.
 
         Returns:
-            Deleted work and source-snapshot counts.
+            Deleted publication work count and a zero source-snapshot count.
         """
         ...
+
+
+def remove_publication_external(
+    cleanup: PublicationCleanup,
+    telemetry_config: TelemetryConfig,
+) -> tuple[PublicationCleanup, str | None]:
+    """Delete one immutable publication pin and artifact on an executor.
+
+    Args:
+        cleanup: Durable retired publication.
+        telemetry_config: Serializable executor telemetry configuration.
+
+    Returns:
+        Cleanup identity and optional bounded error text.
+    """
+    telemetry: Telemetry = Telemetry.create(telemetry_config)
+    try:
+        open_error: FileNotFoundError | ValueError
+        try:
+            dataset: lance.LanceDataset | None = lance.dataset(cleanup.lance_uri)
+        except (FileNotFoundError, ValueError) as open_error:
+            if not dataset_absent(open_error):
+                raise
+            dataset = None
+        if dataset is not None:
+            pin: str = cleanup.pin_name or candidate_pin_name(cleanup.work_id)
+            pinned_version: int | None = tag_version(dataset, pin)
+            if pinned_version is not None and int(pinned_version) != cleanup.lance_version:
+                raise RuntimeError("retired publication pin names a different exact version")
+            if pinned_version is not None:
+                dataset.tags.delete(pin)
+                telemetry.incr("publication.pin_deleted")
+        filesystem: pa_fs.FileSystem
+        path: str
+        filesystem, path = resolve_filesystem(cleanup.manifest_uri, None)
+        if filesystem.get_file_info(path).type != pa_fs.FileType.NotFound:
+            filesystem.delete_file(path)
+            telemetry.incr("publication.artifact_deleted")
+    except Exception as error:
+        return cleanup, str(error)[:1000]
+    return cleanup, None
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,25 +135,7 @@ class PublicationRetentionSweep:
             Returns:
                 Cleanup identity and optional bounded error text.
             """
-            telemetry: Telemetry = Telemetry.create(telemetry_config)
-            try:
-                dataset: lance.LanceDataset = lance.dataset(cleanup.lance_uri)
-                pin: str = cleanup.pin_name or candidate_pin_name(cleanup.work_id)
-                pinned_version: int | None = tag_version(dataset, pin)
-                if pinned_version is not None and int(pinned_version) != cleanup.lance_version:
-                    raise RuntimeError("retired publication pin names a different exact version")
-                if pinned_version is not None:
-                    dataset.tags.delete(pin)
-                    telemetry.incr("publication.pin_deleted")
-                filesystem: pa_fs.FileSystem
-                path: str
-                filesystem, path = resolve_filesystem(cleanup.manifest_uri, None)
-                if filesystem.get_file_info(path).type != pa_fs.FileType.NotFound:
-                    filesystem.delete_file(path)
-                    telemetry.incr("publication.artifact_deleted")
-            except Exception as error:
-                return cleanup, str(error)[:1000]
-            return cleanup, None
+            return remove_publication_external(cleanup, telemetry_config)
 
         if claims:
             outcomes: list[tuple[PublicationCleanup, str | None]] = (

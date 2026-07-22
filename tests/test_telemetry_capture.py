@@ -9,7 +9,7 @@ Covers:
   loopback UDP socket, verifying that the JSON-lines file is populated.
 - :class:`~bench.telemetry_capture.OtlpGrpcReceiver`: start/Export/stop round-trip using a
   synthetic ``ExportTraceServiceRequest``, verifying that span JSON lines are written.
-- :class:`~bench.telemetry_capture.TelemetryCapture`: context-manager integration test
+- :func:`~bench.telemetry_capture.telemetry_capture_session`: context-manager integration test
   verifying that ``env_overrides`` is populated and listeners are stopped cleanly on exit.
 
 All network communication is loopback-only.  No external services are required.
@@ -35,8 +35,8 @@ from bench.telemetry_capture import (
     CaptureConfig,
     DogStatsDListener,
     OtlpGrpcReceiver,
-    TelemetryCapture,
     parse_dogstatsd_datagram,
+    telemetry_capture_session,
 )
 
 
@@ -292,7 +292,7 @@ class TestOtlpGrpcReceiver:
 
 
 class TestTelemetryCapture:
-    """Integration tests for :class:`~bench.telemetry_capture.TelemetryCapture`."""
+    """Integration tests for :func:`~bench.telemetry_capture.telemetry_capture_session`."""
 
     def test_env_overrides_populated_on_entry(self, tmp_path: Path) -> None:
         """env_overrides contains the expected keys after capture start."""
@@ -301,7 +301,7 @@ class TestTelemetryCapture:
             statsd_port=19300,
             otlp_port=14500,
         )
-        with TelemetryCapture(cfg) as capture:
+        with telemetry_capture_session(cfg) as capture:
             overrides = capture.env_overrides
             assert "SEARCH_API_STATSD_ADDR" in overrides
             assert overrides["SEARCH_API_STATSD_ADDR"] == "127.0.0.1:19300"
@@ -318,7 +318,7 @@ class TestTelemetryCapture:
             statsd_port=19301,
             otlp_port=14501,
         )
-        with TelemetryCapture(cfg):
+        with telemetry_capture_session(cfg):
             assert (tmp_path / "metrics.jsonl").exists()
             assert (tmp_path / "traces.jsonl").exists()
 
@@ -329,7 +329,7 @@ class TestTelemetryCapture:
             statsd_port=19302,
             otlp_port=14502,
         )
-        with pytest.raises(RuntimeError, match="intentional"), TelemetryCapture(cfg):
+        with pytest.raises(RuntimeError, match="intentional"), telemetry_capture_session(cfg):
             raise RuntimeError("intentional")
 
     def test_metrics_only_mode(self, tmp_path: Path) -> None:
@@ -341,7 +341,7 @@ class TestTelemetryCapture:
             capture_metrics=True,
             capture_traces=False,
         )
-        with TelemetryCapture(cfg) as capture:
+        with telemetry_capture_session(cfg) as capture:
             assert "SEARCH_API_STATSD_ADDR" in capture.env_overrides
             assert "OTEL_EXPORTER_OTLP_ENDPOINT" not in capture.env_overrides
 
@@ -354,7 +354,7 @@ class TestTelemetryCapture:
             capture_metrics=False,
             capture_traces=True,
         )
-        with TelemetryCapture(cfg) as capture:
+        with telemetry_capture_session(cfg) as capture:
             assert "SEARCH_API_STATSD_ADDR" not in capture.env_overrides
             assert "OTEL_EXPORTER_OTLP_ENDPOINT" in capture.env_overrides
 
@@ -365,7 +365,7 @@ class TestTelemetryCapture:
             statsd_port=19305,
             otlp_port=14505,
         )
-        with TelemetryCapture(cfg):
+        with telemetry_capture_session(cfg):
             send_udp("127.0.0.1", 19305, b"pipeline.etl.rows:1000|c|#env:bench")
             span = trace_pb2.Span(
                 trace_id=b"\xab" * 16,

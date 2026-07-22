@@ -9,6 +9,7 @@ import pytest
 from bench.config import BenchConfig
 from bench.qualification import (
     MAX_SHUFFLE_PARTITIONS,
+    QualificationSizing,
     bucket_count,
     external_scale_gates,
     generate_qualification_cohort,
@@ -17,22 +18,18 @@ from bench.qualification import (
     shuffle_partition_count,
     validate_capacity_evidence,
 )
-from lance_etl.etl import ETLConfig
-from lance_etl.telemetry import TelemetryConfig
 
 
-def plan_config(tmp_path: Path, telemetry_config: TelemetryConfig, **overrides: object) -> ETLConfig:
-    """Build an ETLConfig carrying the shuffle-sizing tunables the qualification math exercises.
+def plan_config(**overrides: object) -> QualificationSizing:
+    """Build qualification-only shuffle sizing inputs.
 
     Args:
-        tmp_path: Pytest-provided temporary directory.
-        telemetry_config: The test telemetry configuration.
-        **overrides: Sizing-tunable keyword overrides forwarded to :class:`ETLConfig`.
+        **overrides: Sizing inputs forwarded to :class:`QualificationSizing`.
 
     Returns:
-        An ETLConfig rooted at ``tmp_path`` carrying the overrides.
+        Qualification sizing inputs carrying the overrides.
     """
-    return ETLConfig(base_uri=str(tmp_path), telemetry=telemetry_config, **overrides)
+    return QualificationSizing(**overrides)
 
 
 def test_cohort_is_reproducible_and_covers_required_adversarial_shapes() -> None:
@@ -168,38 +165,34 @@ class TestBucketCount:
 class TestShufflePartitionCount:
     """shuffle_partition_count sizes the shuffle by the larger of the row and dataset floors."""
 
-    def test_partition_count_row_floor_dominates(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
+    def test_partition_count_row_floor_dominates(self) -> None:
         """Many rows over few trios lets the row floor set the width."""
-        config: ETLConfig = plan_config(tmp_path, telemetry_config, bucket_rows=2_000_000, datasets_per_task=64)
+        config: QualificationSizing = plan_config(bucket_rows=2_000_000, datasets_per_task=64)
         assert shuffle_partition_count(total_rows=100_000_000, trio_count=2, config=config) == 50
 
-    def test_partition_count_dataset_floor_dominates(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
+    def test_partition_count_dataset_floor_dominates(self) -> None:
         """30_000 trios with datasets_per_task=64 pins the width to ceil(30000/64)=469.
 
         This is the long-tail scaling law: a fleet of tens of thousands of tiny datasets must not
         serialize into a handful of tasks even when the total row count is small.
         """
-        config: ETLConfig = plan_config(tmp_path, telemetry_config, bucket_rows=2_000_000, datasets_per_task=64)
+        config: QualificationSizing = plan_config(bucket_rows=2_000_000, datasets_per_task=64)
         assert shuffle_partition_count(total_rows=100, trio_count=30_000, config=config) == 469
 
-    def test_partition_count_clamps_to_max(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
+    def test_partition_count_clamps_to_max(self) -> None:
         """A row floor beyond MAX_SHUFFLE_PARTITIONS is clamped to the ceiling."""
-        config: ETLConfig = plan_config(tmp_path, telemetry_config, bucket_rows=1)
+        config: QualificationSizing = plan_config(bucket_rows=1)
         assert (
             shuffle_partition_count(total_rows=MAX_SHUFFLE_PARTITIONS + 1_000, trio_count=1, config=config)
             == MAX_SHUFFLE_PARTITIONS
         )
 
-    def test_partition_count_num_partitions_override_wins(
-        self, tmp_path: Path, telemetry_config: TelemetryConfig
-    ) -> None:
+    def test_partition_count_num_partitions_override_wins(self) -> None:
         """An explicit num_partitions is returned verbatim regardless of rows or trios."""
-        config: ETLConfig = plan_config(tmp_path, telemetry_config, num_partitions=7)
+        config: QualificationSizing = plan_config(num_partitions=7)
         assert shuffle_partition_count(total_rows=10_000_000_000, trio_count=99_999, config=config) == 7
 
-    def test_partition_count_empty_increment_is_at_least_one(
-        self, tmp_path: Path, telemetry_config: TelemetryConfig
-    ) -> None:
+    def test_partition_count_empty_increment_is_at_least_one(self) -> None:
         """An increment with no rows and no trios still gets one partition."""
-        config: ETLConfig = plan_config(tmp_path, telemetry_config)
+        config: QualificationSizing = plan_config()
         assert shuffle_partition_count(total_rows=0, trio_count=0, config=config) == 1

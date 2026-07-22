@@ -100,7 +100,7 @@ def test_local_prewarm_rejects_different_resolved_candidate(monkeypatch: pytest.
         MagicMock(return_value=MagicMock(version=8, uri="/tmp/other.lance")),
     )
     prewarmer: LocalExactVersionPrewarmer = LocalExactVersionPrewarmer(executing_spark())
-    with pytest.raises(RuntimeError, match="local exact-version prewarm failed"):
+    with pytest.raises(RuntimeError, match="local prewarm resolved a different candidate"):
         prewarmer.prewarm(
             RoutingIdentity("tenant1", "namespace1", "org1"),
             "/tmp/candidate.lance",

@@ -1,15 +1,11 @@
-"""Fleet-level manifest-migration, serving-tag, and interval-tag-retention helpers for Lance datasets.
+"""Fleet-level serving-tag and interval-tag-retention helpers for Lance datasets.
 
 These operations are embarrassingly parallel one-call-per-dataset functions.
-Their fleet drivers (:func:`migrate_manifest_paths`, :func:`update_serving_tags`)
+Their fleet driver (:func:`update_serving_tags`)
 are thin adapters over :func:`~lance_etl.fanout.run_fleet_fanout`,
 which owns the shared span/tag/timer/gauge/log driver shell around
 :func:`~lance_etl.fanout.fan_out_per_dataset` and spreads the per-dataset work across Spark
 executors without any additional orchestration.
-
-:func:`migrate_dataset_manifest_paths` and :func:`migrate_manifest_paths` upgrade
-existing V1 manifest paths to the V2 naming scheme, which makes every dataset open
-cost one object-store request instead of a version-count-proportional LIST.
 
 :func:`update_serving_tag` and :func:`update_serving_tags` flip one or more named serving
 tags to a target version for blue-green promotion, opening the dataset exactly once per
@@ -52,92 +48,6 @@ TAG_EXISTS_MARKER: str = "already exists"
 TAG_MISSING_MARKER: str = "does not exist"
 MAX_TAG_RACE_ATTEMPTS: int = 3
 TAG_RACE_BACKOFF_SECONDS: float = 0.05
-
-
-def migrate_dataset_manifest_paths(
-    uri: str, storage_options: dict[str, Any] | None, telemetry: Telemetry
-) -> dict[str, Any]:
-    """Migrate one existing dataset's manifest paths to the V2 naming scheme in place.
-
-    Datasets bootstrapped by the ETL are always created with V2 manifest paths, which
-    makes every open one object-store request instead of a version-count-proportional
-    LIST. Datasets created before that default still carry V1 names. This helper calls
-    ``LanceDataset.migrate_manifest_paths_v2``, which renames every V1 manifest to the
-    V2 inverted-version name. The call is idempotent, so re-running it on an
-    already-migrated or freshly-bootstrapped dataset is a cheap no-op. It needs no
-    lost-race resolver of its own: a manifest-path rename has no commit-conflict
-    surface to lose a race against, so a retried task simply converges instead of
-    corrupting state, the same idempotency the fleet-level fan-out in
-    :func:`migrate_manifest_paths` already relies on. A single dataset's migration failure is
-    isolated by that fan-out into a ``{"uri", "error", "phase": "migrate"}`` marker and does not
-    abort the run, so the other datasets still migrate.
-
-    DANGER: this is not transactional. Lance documents that it must not run while other
-    operations touch the dataset and must run to completion before any resume. Schedule
-    it in a maintenance window with ingestion, compaction, and indexing paused for the
-    targeted datasets.
-
-    Args:
-        uri: Dataset URI.
-        storage_options: Object-store options forwarded to pylance.
-        telemetry: Telemetry facade for the current process.
-
-    Returns:
-        A statistics dictionary with keys ``uri`` and ``migrated`` set to ``True``.
-    """
-    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
-    with telemetry.timed("dataset.migrate_manifest_ms"):
-        dataset.migrate_manifest_paths_v2()
-    telemetry.incr("dataset.manifest_migrated")
-    return {"uri": uri, "migrated": True}
-
-
-def migrate_manifest_paths(
-    spark: SparkSession,
-    dataset_uris: Iterable[str],
-    telemetry_config: TelemetryConfig,
-    storage_options: dict[str, Any] | None,
-    partitions: int = TAG_FANOUT_PARTITIONS,
-) -> list[dict[str, Any]]:
-    """Migrate a fleet of datasets to V2 manifest paths, one task per executor partition.
-
-    Each dataset is independent, so the migration fans out across executors through the
-    shared per-dataset fan-out. The per-dataset call is idempotent, so a retried task
-    converges instead of corrupting state. This is a maintenance operation: run it only
-    with the targeted datasets quiesced.
-
-    Args:
-        spark: Active Spark session.
-        dataset_uris: Datasets whose manifest paths should be migrated to V2.
-        telemetry_config: Telemetry configuration created per executor process.
-        storage_options: Object-store options forwarded to pylance.
-        partitions: Maximum Spark partitions for the migration job.
-
-    Returns:
-        One statistics dictionary per dataset.
-    """
-
-    def per_dataset(uri: str, telemetry: Telemetry) -> dict[str, Any]:
-        """Migrate one dataset's manifest paths, closing over ``storage_options``."""
-        return migrate_dataset_manifest_paths(uri, storage_options, telemetry)
-
-    def log_results(results: list[dict[str, Any]]) -> None:
-        """Log the manifest migration summary."""
-        logger.info("manifest migration: %d datasets migrated to V2 paths", len(results))
-
-    return run_fleet_fanout(
-        spark,
-        dataset_uris,
-        telemetry_config,
-        per_dataset,
-        partitions,
-        span_name="lance.manifest_migration.run",
-        phase="migrate",
-        timer_metric="run.migrate_manifest_ms",
-        gauge_metric="run.manifests_migrated",
-        gauge_value=len,
-        log_results=log_results,
-    )
 
 
 def resolve_serving_tag(dataset: lance.LanceDataset, tag: str, version: int, created: bool) -> bool:
@@ -322,7 +232,7 @@ def update_serving_tags(
     """Flip one or more serving tags across a fleet of datasets, one task per executor partition.
 
     Each dataset's tag flip is an independent cheap metadata commit, so the work fans
-    out across executors exactly like the manifest migration. Every tag in ``tags`` is flipped
+    out across executors. Every tag in ``tags`` is flipped
     against the same single dataset open (see :func:`update_serving_tag`). With
     ``target_version`` set, every dataset is pointed at that same version number, which
     only makes sense when every selected dataset has the intended version number. With

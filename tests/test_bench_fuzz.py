@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import MagicMock
 
-from bench.fuzz import resurrection_evidence
+import pytest
+
+from bench.fuzz import resurrection_evidence, snapshot_sequence_numbers
 from bench.fuzz_workload import OracleRow
 
 
@@ -70,3 +73,29 @@ class TestResurrectionEvidence:
         actual: dict[str, dict[str, Any]] = {"k9": {"is_deleted": False}, "k1": {"is_deleted": False}}
         evidence: list[dict[str, Any]] = resurrection_evidence(oracle_org, actual)
         assert [entry["record_id"] for entry in evidence] == ["k1", "k9"]
+
+
+def test_snapshot_sequences_use_bounded_pinned_metadata_lookup() -> None:
+    """Fuzz verification reads only its appended snapshots from the immutable metadata pin."""
+    catalog: MagicMock = MagicMock()
+    pin: MagicMock = MagicMock()
+    documents: dict[int, dict[str, int]] = {
+        101: {"snapshot-id": 101, "sequence-number": 7},
+        202: {"snapshot-id": 202, "sequence-number": 9},
+    }
+    pin.snapshot_loader.side_effect = documents.get
+    catalog.metadata.return_value = pin
+
+    assert snapshot_sequence_numbers(catalog, "bench.db.events", [101, 202]) == {101: 7, 202: 9}
+
+    catalog.metadata.assert_called_once_with("bench.db.events")
+    assert [call.args for call in pin.snapshot_loader.call_args_list] == [(101,), (202,)]
+
+
+def test_snapshot_sequences_fail_when_pinned_metadata_lost_an_append() -> None:
+    """Expired appended snapshots fail verification instead of fabricating source ordering."""
+    catalog: MagicMock = MagicMock()
+    catalog.metadata.return_value.snapshot_loader.return_value = None
+
+    with pytest.raises(RuntimeError, match="snapshot 101 is absent"):
+        snapshot_sequence_numbers(catalog, "bench.db.events", [101])

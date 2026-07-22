@@ -57,7 +57,7 @@ from bench.reconcile import (
 from bench.results import ensure_dir, save_phase, write_json
 from bench.search import load_artifacts, run_fts_leg, run_hybrid_leg
 from bench.search_server import self_hosted_search_api
-from bench.telemetry_capture import CaptureConfig, TelemetryCapture
+from bench.telemetry_capture import CaptureConfig, telemetry_capture_session
 from lance_etl.state import ControlPlaneRepository, ServingDataset
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -365,8 +365,8 @@ def catalog_search_leg(
 def run_e2e(config: BenchConfig) -> dict[str, Any]:
     """Run the reconciler-driven end-to-end benchmark, optionally capturing telemetry.
 
-    When ``config.capture_telemetry`` is True, a :class:`~bench.telemetry_capture.TelemetryCapture`
-    session is started before the first batch and torn down after verification. The session binds a
+    When ``config.capture_telemetry`` is True, :func:`~bench.telemetry_capture.telemetry_capture_session`
+    starts before the first batch and stops after verification. The session binds a
     DogStatsD UDP listener on ``127.0.0.1:{config.statsd_port}`` and an OTLP gRPC receiver on
     ``127.0.0.1:{config.otlp_port}``, writes all received telemetry to ``{config.workspace}/telemetry/``,
     and injects the required environment variables so all Spark executors and the reconciler emit to
@@ -385,7 +385,7 @@ def run_e2e(config: BenchConfig) -> dict[str, Any]:
             statsd_port=config.statsd_port,
             otlp_port=config.otlp_port,
         )
-        with TelemetryCapture(capture_cfg) as capture:
+        with telemetry_capture_session(capture_cfg) as capture:
             prev_env: dict[str, str | None] = {}
             for key, val in capture.env_overrides.items():
                 prev_env[key] = os.environ.get(key)

@@ -202,25 +202,27 @@ class TestSearchRequests:
         assert request.fusion_mode == pb2.HYBRID_FUSION_MODE_BALANCED
 
 
-class FakeRpcError(grpc.RpcError):
-    """A minimal ``grpc.RpcError`` stand-in carrying a fixed status code."""
+def fake_rpc_error(status_code: grpc.StatusCode) -> grpc.RpcError:
+    """Build a gRPC error carrying a fixed status code and stable message.
 
-    def __init__(self, code: grpc.StatusCode) -> None:
-        """Store the fixed status code this fake error reports.
+    Args:
+        status_code: Status code returned by the error.
 
-        Args:
-            code: The gRPC status code :meth:`code` returns.
-        """
-        super().__init__("boom")
-        self.status_code = code
+    Returns:
+        The configured gRPC error.
+    """
+    error: grpc.RpcError = grpc.RpcError("boom")
 
-    def code(self) -> grpc.StatusCode:
-        """Return the fixed status code.
+    def code() -> grpc.StatusCode:
+        """Return the configured status code.
 
         Returns:
-            The status code passed to the constructor.
+            The configured status code.
         """
-        return self.status_code
+        return status_code
+
+    error.code = code
+    return error
 
 
 class TestLoad:
@@ -315,10 +317,10 @@ class TestLoad:
                 timeout: Bounded RPC deadline.
 
             Raises:
-                FakeRpcError: Always, tagged ``RESOURCE_EXHAUSTED``.
+                grpc.RpcError: Always, tagged ``RESOURCE_EXHAUSTED``.
             """
             del request, timeout
-            raise FakeRpcError(grpc.StatusCode.RESOURCE_EXHAUSTED)
+            raise fake_rpc_error(grpc.StatusCode.RESOURCE_EXHAUSTED)
 
         monkeypatch.setattr("bench.search.LOAD_DURATION_SECONDS", 0.0)
         level: dict[str, Any] = run_load_level(
@@ -348,13 +350,13 @@ class TestLoad:
                 timeout: Bounded RPC deadline.
 
             Raises:
-                FakeRpcError: Always, tagged ``UNAVAILABLE``.
+                grpc.RpcError: Always, tagged ``UNAVAILABLE``.
             """
             del request, timeout
-            raise FakeRpcError(grpc.StatusCode.UNAVAILABLE)
+            raise fake_rpc_error(grpc.StatusCode.UNAVAILABLE)
 
         monkeypatch.setattr("bench.search.LOAD_DURATION_SECONDS", 0.0)
-        with pytest.raises(FakeRpcError):
+        with pytest.raises(grpc.RpcError):
             run_load_level(
                 SimpleNamespace(VectorSearch=vector_search_rpc),
                 pb2,

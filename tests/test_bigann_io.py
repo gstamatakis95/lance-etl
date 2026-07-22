@@ -11,6 +11,7 @@ import io
 import struct
 import unittest.mock
 import zlib
+from contextlib import AbstractContextManager, closing
 from pathlib import Path
 
 import numpy as np
@@ -74,39 +75,16 @@ def make_bvecs128_corpus(nvecs: int, seed: int = 0) -> np.ndarray:
     return rng.integers(0, 256, size=(nvecs, BVECS_DIM), dtype=np.uint8)
 
 
-class BytesResponse:
-    """Minimal file-like context manager wrapping a bytes buffer, used to mock HTTP responses."""
+def bytes_response(data: bytes) -> AbstractContextManager[io.BytesIO]:
+    """Wrap response bytes in a closing in-memory stream.
 
-    def __init__(self, data: bytes) -> None:
-        """Initialise with raw bytes.
+    Args:
+        data: The response body bytes.
 
-        Args:
-            data: The response body bytes.
-        """
-        self.buf: io.BytesIO = io.BytesIO(data)
-
-    def read(self, n: int = -1) -> bytes:
-        """Read up to n bytes from the buffer.
-
-        Args:
-            n: Maximum bytes to read. -1 reads all remaining.
-
-        Returns:
-            The bytes read.
-        """
-        return self.buf.read(n)
-
-    def __enter__(self) -> BytesResponse:
-        """Enter the context manager.
-
-        Returns:
-            Self.
-        """
-        return self
-
-    def __exit__(self, *args: object) -> None:
-        """Exit the context manager, closing the buffer."""
-        self.buf.close()
+    Returns:
+        A context manager yielding a readable in-memory stream.
+    """
+    return closing(io.BytesIO(data))
 
 
 def test_u8bin_header(tmp_path: Path) -> None:
@@ -289,9 +267,9 @@ def test_stream_bvecs_to_u8bin_oneshot(tmp_path: Path) -> None:
     gz_bytes: bytes = make_gzip_bvecs(vectors)
     dest: Path = tmp_path / "oneshot.u8bin"
 
-    def fake_open_range(url: str, start_byte: int) -> tuple[str, BytesResponse]:
-        """Return a BytesResponse wrapping the compressed data from start_byte onward."""
-        return url, BytesResponse(gz_bytes[start_byte:])
+    def fake_open_range(url: str, start_byte: int) -> tuple[str, AbstractContextManager[io.BytesIO]]:
+        """Return an in-memory response wrapping compressed data from the requested offset."""
+        return url, bytes_response(gz_bytes[start_byte:])
 
     with unittest.mock.patch("bench.bigann_io.open_range_response", side_effect=fake_open_range):
         written: int = stream_bvecs_to_u8bin("http://primary/", "http://fallback/", dest, limit)
@@ -323,10 +301,10 @@ def test_stream_bvecs_to_u8bin_resume(tmp_path: Path) -> None:
     dest_resume: Path = tmp_path / "resume.u8bin"
     requested_offsets: list[int] = []
 
-    def fake_open_range(url: str, start_byte: int) -> tuple[str, BytesResponse]:
+    def fake_open_range(url: str, start_byte: int) -> tuple[str, AbstractContextManager[io.BytesIO]]:
         """Return bytes from start_byte onward in the gzip stream, recording the offset."""
         requested_offsets.append(start_byte)
-        return url, BytesResponse(gz_bytes[start_byte:])
+        return url, bytes_response(gz_bytes[start_byte:])
 
     with unittest.mock.patch("bench.bigann_io.open_range_response", side_effect=fake_open_range):
         stream_bvecs_to_u8bin("http://primary/", "http://fallback/", dest_oneshot, limit)

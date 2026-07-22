@@ -92,15 +92,14 @@ class MaintenanceConfig:
             tombstone is deleted only once its ``ts`` is past both the record-retention window and
             the source replay horizon (see :attr:`replay_horizon_seconds`). A tombstone carries the
             delete mutation's event ``ts`` precisely so it can be expired on this clock. Datasets
-            without a tombstone column (the operator-library and namespace-migration callers) leave
-            this ``None`` and keep the plain ``ts < cutoff`` predicate.
+            without a tombstone column leave this ``None`` and keep the plain ``ts < cutoff`` predicate.
         replay_horizon_seconds: The source replay horizon in seconds. Only consulted when
             :attr:`deleted_column` is set. A tombstone is expired only when its ``ts`` is older than
             ``max(retention_seconds, replay_horizon_seconds)`` so its source-sequence anti-resurrection
             watermark outlives every window a replay could still re-apply. ``None`` means the horizon
             is unbounded and tombstones are never expired, which keeps replay safe at the cost of
             unbounded tombstone storage.
-        ts_column: The ``ts`` column used as the retention clock; must match ``ETLConfig.ts_col``.
+        ts_column: The ``ts`` column used as the retention clock.
         target_rows_per_fragment: Desired rows per compacted fragment; matches lance's
             ``CompactionOptions`` default of ``1_048_576`` so the default is explicit and immune
             to upstream shifts.
@@ -250,9 +249,8 @@ def retention_predicate(config: MaintenanceConfig, cutoff: datetime) -> str:
     """Build the retention delete predicate, tombstone-aware when a deleted column is configured.
 
     With no :attr:`MaintenanceConfig.deleted_column` the predicate is the plain
-    ``ts < cutoff`` clause, so operator-library and namespace-migration callers keep the exact
-    pre-existing behavior. When a deleted column is configured, live rows and tombstones expire on
-    separate clocks:
+    ``ts < cutoff`` clause. When a deleted column is configured, live rows and tombstones expire
+    on separate clocks:
 
     - A live row is deleted at ``ts < now - retention_seconds`` exactly as before (ADR 0018).
     - A tombstone is deleted only when its ``ts`` is older than BOTH the record-retention window
@@ -283,6 +281,7 @@ def retention_predicate(config: MaintenanceConfig, cutoff: datetime) -> str:
     Returns:
         A Lance SQL predicate string safe for passing to :meth:`lance.LanceDataset.delete`.
     """
+    validate_retention_seconds(config.retention_seconds)
     record_clause: str = build_retention_predicate(config.ts_column, cutoff)
     if config.deleted_column is None:
         return record_clause
@@ -309,8 +308,25 @@ def compute_cutoff(retention_seconds: int) -> datetime:
 
     Returns:
         The UTC instant marking the oldest ``ts`` that survives.
+
+    Raises:
+        ValueError: If the retention window is not positive.
     """
+    validate_retention_seconds(retention_seconds)
     return datetime.now(tz=UTC) - timedelta(seconds=retention_seconds)
+
+
+def validate_retention_seconds(retention_seconds: int | None) -> None:
+    """Reject a configured retention window that can expire current or future rows.
+
+    Args:
+        retention_seconds: Optional retention window.
+
+    Raises:
+        ValueError: If a configured window is zero or negative.
+    """
+    if retention_seconds is not None and retention_seconds <= 0:
+        raise ValueError("retention_seconds must be positive when configured")
 
 
 def dataset_cleanup_slot(uri: str, slots: int) -> int:
@@ -782,6 +798,7 @@ def commit_one_dataset(
     return result
 
 
+@dataclass
 class MaintenanceJob:
     """Runs retention expiry, unified task-based compaction, and version cleanup over a Lance fleet.
 
@@ -789,13 +806,7 @@ class MaintenanceJob:
     the plan-execute-commit rounds, subsuming normal compaction for the datasets it rewrites.
     """
 
-    def __init__(self, config: MaintenanceConfig) -> None:
-        """Initialize the maintenance job.
-
-        Args:
-            config: Maintenance configuration.
-        """
-        self.config: MaintenanceConfig = config
+    config: MaintenanceConfig
 
     def execute_fleet_tasks(
         self, spark: SparkSession, tasks: list[tuple[str, int, str]]
@@ -935,9 +946,15 @@ class MaintenanceJob:
         for plan in plans:
             uri: str = plan["uri"]
             if round_index == 0:
-                base_by_uri[uri] = {
+                round_base: dict[str, Any] = {
                     field: plan[field] for field in ("retention_rows_deleted", "error", "phase") if field in plan
                 }
+                prior_deleted: int = int(base_by_uri.get(uri, {}).get("retention_rows_deleted", 0))
+                if prior_deleted:
+                    combined_deleted: int = prior_deleted + int(round_base.get("retention_rows_deleted", 0))
+                    round_base["retention_rows_deleted"] = combined_deleted
+                    plan["retention_rows_deleted"] = combined_deleted
+                base_by_uri[uri] = {**base_by_uri.get(uri, {}), **round_base}
             if plan.get("task_jsons"):
                 planned.append(plan)
             else:
@@ -1007,13 +1024,17 @@ class MaintenanceJob:
         A misconfigured cleanup horizon is the one loud exception: it fails the whole run fast
         before any dataset is touched, because it would otherwise mark every dataset identically.
 
+        Duplicate URIs are maintained once, in first-occurrence order. This prevents two Spark
+        tasks from planning or committing rewrites for the same dataset concurrently within one
+        run.
+
         Args:
             spark: Active Spark session.
             dataset_uris: Datasets to maintain, typically those changed recently.
 
         Returns:
-            One statistics dictionary per dataset, in input order. A failed dataset's dictionary
-            carries an ``"error"`` message and a ``"phase"`` label.
+            One statistics dictionary per unique dataset, in first-occurrence order. A failed
+            dataset's dictionary carries an ``"error"`` message and a ``"phase"`` label.
 
         Raises:
             ValueError: If ``cleanup_older_than_seconds`` is set below
@@ -1021,10 +1042,11 @@ class MaintenanceJob:
                 whole run rather than mark every dataset with the same error.
         """
         config: MaintenanceConfig = self.config
+        validate_retention_seconds(config.retention_seconds)
         validate_cleanup_horizon(config)
         driver_telemetry: Telemetry = Telemetry.create(config.telemetry)
         with driver_telemetry.span("lance.maintenance.run") as run_span:
-            uris: list[str] = list(dataset_uris)
+            uris: list[str] = list(dict.fromkeys(dataset_uris))
             run_span.set_tag("dataset_count", len(uris))
             run_span.set_tag("retention_active", config.retention_active())
             if not uris:
@@ -1043,6 +1065,13 @@ class MaintenanceJob:
                     spark, uris, config, cutoff, driver_telemetry, cleanup_slot
                 )
                 results_by_uri.update(cluster_results)
+                base_by_uri.update(
+                    {
+                        uri: {"retention_rows_deleted": cluster_results[uri]["retention_rows_deleted"]}
+                        for uri in pending_uris
+                        if int(cluster_results.get(uri, {}).get("retention_rows_deleted", 0)) > 0
+                    }
+                )
 
             with driver_telemetry.timed("run.maintain_ms"):
                 round_index: Any

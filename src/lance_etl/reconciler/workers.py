@@ -6,17 +6,19 @@ import hashlib
 import json
 import logging
 import struct
+import tempfile
 import threading
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Protocol
 
 import lance
 import pyarrow as pa
 import pyarrow.compute as pc
-from pyspark import StorageLevel
+from pyspark import StorageLevel, TaskContext
 from pyspark.errors import AnalysisException
 from pyspark.sql import Column, DataFrame, Row, SparkSession
 from pyspark.sql.functions import (
@@ -25,11 +27,21 @@ from pyspark.sql.functions import (
     col,
     countDistinct,
     element_at,
+    exists,
+    isnan,
     lit,
     lower,
     map_keys,
     size,
+    spark_partition_id,
     trim,
+    when,
+)
+from pyspark.sql.functions import (
+    count as spark_count,
+)
+from pyspark.sql.functions import (
+    encode as spark_encode,
 )
 from pyspark.sql.functions import (
     max as spark_max,
@@ -49,6 +61,7 @@ from pyspark.sql.types import (
 )
 
 from lance_etl.cloud_storage import resolve_filesystem
+from lance_etl.etl.arrow import apply_fsl_cast
 from lance_etl.etl.completion import (
     CompletionMarker,
     completion_is_desired,
@@ -57,7 +70,6 @@ from lance_etl.etl.completion import (
 )
 from lance_etl.etl.digest import SOURCE_DIGEST_HEADER, canonical_event_digest, encode_bytes
 from lance_etl.etl.mutation import DELETE_OPERATIONS, UPSERT_OPERATIONS, normalize_operation
-from lance_etl.etl.pivot import apply_fsl_cast
 from lance_etl.etl.replay_sink import (
     DELETED_COLUMN,
     EVENT_DIGEST_COLUMN,
@@ -69,7 +81,7 @@ from lance_etl.etl.replay_sink import (
     replay_safe_merge,
     replay_table_chunks,
 )
-from lance_etl.etl.sink import dataset_absent
+from lance_etl.etl.storage import dataset_absent
 from lance_etl.indexing import (
     IndexJobConfig,
     LanceIndexer,
@@ -80,10 +92,9 @@ from lance_etl.publication.manifest import candidate_pin_name, schema_fingerprin
 from lance_etl.reconciler.config import ReconcilerSettings
 from lance_etl.reconciler.prewarm import ExactPrewarmer
 from lance_etl.reconciler.results import ResultKind, WorkResult
-from lance_etl.source import SnapshotRecord, SparkScanPlan, TargetKey, WindowKind, build_spark_scan, execute_spark_scan
+from lance_etl.source import SnapshotRecord, TargetKey, WindowKind, execute_spark_scan
 from lance_etl.state import (
     DatasetSpecRevision,
-    IcebergSource,
     IndexDefinition,
     IndexType,
     PublicationEvidence,
@@ -95,6 +106,39 @@ from lance_etl.state import (
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+LEASE_HEARTBEAT_JOIN_TIMEOUT_SECONDS: float = 1.0
+"""Maximum shutdown wait for a heartbeat blocked inside one PostgreSQL renewal."""
+
+SOURCE_DIGEST_MAX_PARTITIONS: int = 64
+"""Maximum range partitions used to sort one target's durable digest input."""
+
+SOURCE_DIGEST_PARTITION_FACTOR: int = 4
+"""Digest range partitions scheduled per available local Spark core."""
+
+SOURCE_DIGEST_CHUNK_BYTES: int = 1024 * 1024
+"""Soft byte cap on one ordered digest chunk streamed into the local spool."""
+
+SOURCE_DIGEST_RECORD_COLUMN: str = "lance_etl_digest_record"
+"""Temporary UTF-8 record-id bytes used for canonical range ordering."""
+
+SOURCE_DIGEST_PARTITION_COLUMN: str = "lance_etl_digest_partition"
+"""Temporary physical range-partition identity carried by digest chunks."""
+
+SOURCE_DIGEST_CHUNK_COLUMN: str = "lance_etl_digest_chunk"
+"""Temporary bounded encoded input chunk written into an executor spool file."""
+
+SOURCE_DIGEST_SPOOL_PREFIX: str = "lance-etl-source-digest-"
+"""Dedicated local temporary-directory prefix for one digest computation."""
+
+SourceDigestSpoolMetadata = tuple[int, str, int, int]
+"""Partition id, local file path, row count, and encoded byte count."""
+
+FragmentScanSeed = tuple[str, int, int, tuple[str, ...]]
+"""Bounded dataset seed expanded into exact fragment shards on an executor."""
+
+FragmentScanTask = tuple[str, int, int, list[str]]
+"""One exact fragment identity and projected columns transferred executor to executor."""
 
 
 class ExecutionContextRepository(Protocol):
@@ -139,6 +183,291 @@ class ServeWorkRunner(Protocol):
         ...
 
 
+def source_digest_partition_count(spark: SparkSession) -> int:
+    """Derive a bounded local range-sort width for durable source digests.
+
+    Args:
+        spark: Active local Spark session.
+
+    Returns:
+        Range partition count between two and :data:`SOURCE_DIGEST_MAX_PARTITIONS`.
+    """
+    parallelism: int = max(1, int(spark.sparkContext.defaultParallelism))
+    return max(2, min(SOURCE_DIGEST_MAX_PARTITIONS, parallelism * SOURCE_DIGEST_PARTITION_FACTOR))
+
+
+def encode_source_digest_record(record_id: bytes, source_sequence: int, event_digest: bytes) -> bytes:
+    """Encode one terminal identity under the durable v1 source-digest contract.
+
+    Args:
+        record_id: UTF-8 record identity bytes.
+        source_sequence: Non-negative signed 64-bit Iceberg sequence.
+        event_digest: Exact 32-byte canonical event digest.
+
+    Returns:
+        Bytes appended after :data:`SOURCE_DIGEST_HEADER` for this record.
+
+    Raises:
+        ValueError: If sequence or digest evidence violates the durable contract.
+    """
+    if source_sequence < 0 or source_sequence >= 1 << 63:
+        raise ValueError(f"source sequence is outside non-negative signed 64-bit range: {source_sequence}")
+    if len(event_digest) != 32:
+        raise ValueError(f"event digest must contain 32 bytes, got {len(event_digest)}")
+    return encode_bytes(record_id) + struct.pack(">q", source_sequence) + event_digest
+
+
+def source_digest_chunks(terminal: DataFrame, partitions: int) -> DataFrame:
+    """Build bounded globally ordered chunks for the unchanged v1 source digest.
+
+    Spark range-partitions the UTF-8 record-id bytes and sorts each range locally. Range partition
+    order plus local ordering is the same byte order used by ``canonical_source_digest``. Executors
+    encode rows into bounded chunks, then a local executor stage writes each partition to disk so
+    the driver collects only file metadata.
+
+    Args:
+        terminal: Duplicate-collapsed target mutations.
+        partitions: Positive range partition count.
+
+    Returns:
+        One row per bounded encoded chunk, retaining range-partition order.
+
+    Raises:
+        ValueError: If ``partitions`` is not positive.
+    """
+    if partitions < 1:
+        raise ValueError("source digest partitions must be positive")
+    ordered: DataFrame = (
+        terminal.select(
+            spark_encode(col("record_id"), "UTF-8").alias(SOURCE_DIGEST_RECORD_COLUMN),
+            SOURCE_SEQUENCE_COLUMN,
+            EVENT_DIGEST_COLUMN,
+        )
+        .repartitionByRange(partitions, col(SOURCE_DIGEST_RECORD_COLUMN))
+        .sortWithinPartitions(SOURCE_DIGEST_RECORD_COLUMN)
+        .withColumn(SOURCE_DIGEST_PARTITION_COLUMN, spark_partition_id())
+    )
+
+    def encode_batches(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
+        """Encode one sorted range partition into bounded Arrow binary chunks.
+
+        Args:
+            batches: Sorted Arrow batches from one physical range partition.
+
+        Yields:
+            Partition id, monotonic chunk sequence, bytes, and row count per chunk.
+        """
+        partition_id: int | None = None
+        sequence: int = 0
+        encoded = bytearray()
+        encoded_rows: int = 0
+
+        def output() -> pa.RecordBatch:
+            """Materialize the current non-empty chunk as one Arrow row.
+
+            Returns:
+                One bounded chunk record batch.
+            """
+            if partition_id is None or not encoded:
+                raise RuntimeError("source digest attempted to emit an empty chunk")
+            return pa.RecordBatch.from_pydict(
+                {
+                    SOURCE_DIGEST_PARTITION_COLUMN: [partition_id],
+                    "chunk_sequence": [sequence],
+                    SOURCE_DIGEST_CHUNK_COLUMN: [bytes(encoded)],
+                    "source_rows": [encoded_rows],
+                }
+            )
+
+        batch: pa.RecordBatch
+        for batch in batches:
+            row: dict[str, object]
+            for row in pa.Table.from_batches([batch]).to_pylist():
+                current_partition: int = int(row[SOURCE_DIGEST_PARTITION_COLUMN])
+                if partition_id is None:
+                    partition_id = current_partition
+                elif partition_id != current_partition:
+                    raise RuntimeError("one digest encoder observed multiple physical partitions")
+                record: bytes = encode_source_digest_record(
+                    bytes(row[SOURCE_DIGEST_RECORD_COLUMN]),
+                    int(row[SOURCE_SEQUENCE_COLUMN]),
+                    bytes(row[EVENT_DIGEST_COLUMN]),
+                )
+                if encoded and len(encoded) + len(record) > SOURCE_DIGEST_CHUNK_BYTES:
+                    yield output()
+                    sequence += 1
+                    encoded.clear()
+                    encoded_rows = 0
+                encoded.extend(record)
+                encoded_rows += 1
+        if encoded:
+            yield output()
+
+    return ordered.mapInArrow(
+        encode_batches,
+        (
+            f"{SOURCE_DIGEST_PARTITION_COLUMN} long, chunk_sequence long, "
+            f"{SOURCE_DIGEST_CHUNK_COLUMN} binary, source_rows long"
+        ),
+    )
+
+
+def spool_source_digest_partition(
+    partition_id: int,
+    chunks: Iterator[Row],
+    spool_directory: str,
+) -> Iterator[SourceDigestSpoolMetadata]:
+    """Write one ordered digest partition to a unique local task-attempt file.
+
+    Args:
+        partition_id: Physical Spark partition identity.
+        chunks: Ordered bounded digest rows for this partition.
+        spool_directory: Driver-created directory shared by every local executor.
+
+    Yields:
+        Exactly one bounded metadata tuple after the task file is closed successfully.
+
+    Raises:
+        RuntimeError: If chunk partition identity or sequence is not exact.
+    """
+    context: TaskContext | None = TaskContext.get()
+    attempt_id: str = str(context.taskAttemptId()) if context is not None else f"direct-{uuid.uuid4().hex}"
+    path: Path = Path(spool_directory) / (
+        f"partition-{partition_id:05d}-attempt-{attempt_id}-{uuid.uuid4().hex}.digest"
+    )
+    expected_sequence: int = 0
+    source_rows: int = 0
+    encoded_bytes: int = 0
+    try:
+        with path.open("xb") as output:
+            chunk: Row
+            for chunk in chunks:
+                chunk_partition: int = int(chunk[SOURCE_DIGEST_PARTITION_COLUMN])
+                if chunk_partition != partition_id:
+                    raise RuntimeError(
+                        f"digest spool partition {partition_id} received chunk for partition {chunk_partition}"
+                    )
+                sequence: int = int(chunk["chunk_sequence"])
+                if sequence != expected_sequence:
+                    raise RuntimeError(
+                        f"digest spool partition {partition_id} expected chunk {expected_sequence}, got {sequence}"
+                    )
+                payload: bytes = bytes(chunk[SOURCE_DIGEST_CHUNK_COLUMN])
+                chunk_rows: int = int(chunk["source_rows"])
+                if not payload or chunk_rows < 1:
+                    raise RuntimeError("source digest spool received an empty chunk")
+                output.write(payload)
+                encoded_bytes += len(payload)
+                source_rows += chunk_rows
+                expected_sequence += 1
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    yield partition_id, str(path), source_rows, encoded_bytes
+
+
+def consume_source_digest_spool(
+    metadata: list[SourceDigestSpoolMetadata],
+    spool_directory: str,
+    expected_partitions: int,
+) -> tuple[bytes, int]:
+    """Stream exact partition files into the frozen v1 SHA-256 state.
+
+    Args:
+        metadata: One bounded file descriptor tuple per physical partition.
+        spool_directory: Dedicated directory that must own every returned file.
+        expected_partitions: Exact physical partition count.
+
+    Returns:
+        Raw digest and terminal row count.
+
+    Raises:
+        RuntimeError: If metadata is incomplete, duplicated, outside the spool, or size-mismatched.
+    """
+    if len(metadata) != expected_partitions:
+        raise RuntimeError(f"source digest expected {expected_partitions} spool files, received {len(metadata)}")
+    ordered: list[SourceDigestSpoolMetadata] = sorted(metadata, key=lambda item: item[0])
+    root: Path = Path(spool_directory).resolve()
+    digest: Any = hashlib.sha256()
+    digest.update(SOURCE_DIGEST_HEADER)
+    source_rows: int = 0
+    expected_partition: int
+    item: SourceDigestSpoolMetadata
+    for expected_partition, item in enumerate(ordered):
+        partition_id, raw_path, partition_rows, expected_bytes = item
+        if partition_id != expected_partition:
+            raise RuntimeError(f"source digest expected spool partition {expected_partition}, received {partition_id}")
+        path: Path = Path(raw_path).resolve()
+        if path.parent != root:
+            raise RuntimeError(f"source digest spool file escaped its dedicated directory: {path}")
+        if path.stat().st_size != expected_bytes:
+            raise RuntimeError(
+                f"source digest spool file {path} expected {expected_bytes} bytes, found {path.stat().st_size}"
+            )
+        with path.open("rb") as source:
+            while block := source.read(SOURCE_DIGEST_CHUNK_BYTES):
+                digest.update(block)
+        source_rows += partition_rows
+    return digest.digest(), source_rows
+
+
+def compute_spooled_source_digest(chunks: DataFrame) -> tuple[bytes, int]:
+    """Spool executor partitions locally and consume only their bounded metadata on the driver.
+
+    Args:
+        chunks: Globally range-ordered bounded digest chunks.
+
+    Returns:
+        Raw frozen v1 digest and terminal row count.
+    """
+    expected_partitions: int = chunks.rdd.getNumPartitions()
+    with tempfile.TemporaryDirectory(prefix=SOURCE_DIGEST_SPOOL_PREFIX) as spool_directory:
+        metadata: list[SourceDigestSpoolMetadata] = chunks.rdd.mapPartitionsWithIndex(
+            lambda partition_id, rows: spool_source_digest_partition(partition_id, rows, spool_directory)
+        ).collect()
+        return consume_source_digest_spool(metadata, spool_directory, expected_partitions)
+
+
+def enumerate_fragment_scan_tasks(seed: FragmentScanSeed) -> Iterator[FragmentScanTask]:
+    """Expand one bounded dataset seed into bounded fragment rows on an executor.
+
+    Args:
+        seed: URI, pinned version, maximum shards, and projected columns.
+
+    Yields:
+        One exact fragment identity per bounded Spark row.
+    """
+    uri, version, maximum_shards, columns = seed
+    del maximum_shards
+    dataset: lance.LanceDataset = lance.dataset(uri, version=version)
+    fragment: lance.LanceFragment
+    for fragment in dataset.get_fragments():
+        yield uri, version, int(fragment.fragment_id), list(columns)
+
+
+def resolve_fragment_scan(dataset: lance.LanceDataset, fragment_ids: list[int]) -> list[lance.LanceFragment]:
+    """Resolve exact fragment handles without re-enumerating the full dataset manifest.
+
+    Args:
+        dataset: Exact pinned Lance dataset opened by a scan executor.
+        fragment_ids: Fragment identifiers assigned to that executor task.
+
+    Returns:
+        Exact fragment handles in task order.
+
+    Raises:
+        RuntimeError: If the pinned version does not contain an assigned fragment.
+    """
+    fragments: list[lance.LanceFragment] = []
+    fragment_id: int
+    for fragment_id in fragment_ids:
+        fragment: lance.LanceFragment | None = dataset.get_fragment(fragment_id)
+        if fragment is None:
+            raise RuntimeError(f"pinned Lance version is missing assigned fragment {fragment_id}")
+        fragments.append(fragment)
+    return fragments
+
+
 @dataclass(frozen=True, slots=True)
 class DistributedIngestRunner:
     """Execute one exact dataset snapshot under its frozen PostgreSQL specification."""
@@ -173,20 +502,15 @@ class DistributedIngestRunner:
             partition_spec_id=0,
         )
         spec: DatasetSpecRevision = context.spec_revision
-        scan: SparkScanPlan = build_spark_scan(
-            context.source_table,
-            snapshot,
-            WindowKind(context.source_snapshot_kind.value),
-            TargetKey(context.identity.tenant_id, context.identity.namespace, context.identity.org_id),
-            (
-                context.source.tenant_column,
-                context.source.namespace_column,
-                context.source.org_column,
-            ),
-        )
         exc: AnalysisException | ValueError
         try:
-            source: DataFrame = self.canonical_source(execute_spark_scan(self.spark, scan), context)
+            source: DataFrame = execute_spark_scan(
+                self.spark,
+                context.source_table,
+                snapshot,
+                WindowKind(context.source_snapshot_kind.value),
+                TargetKey(context.identity.tenant_id, context.identity.namespace, context.identity.org_id),
+            )
             self.validate_source_profile(source, spec)
             selected: DataFrame = self.select_profile_fields(source, spec)
             terminal: DataFrame = self.normalize_terminal(selected, context).persist(StorageLevel.MEMORY_AND_DISK)
@@ -211,61 +535,39 @@ class DistributedIngestRunner:
                     )
             except (AnalysisException, ValueError) as exc:
                 return blocked_result(context.claim, "SOURCE_PROFILE_VIOLATION", str(exc))
-            collapsed: DataFrame = terminal.dropDuplicates(["record_id", EVENT_DIGEST_COLUMN]).dropDuplicates(
-                ["record_id"]
-            )
-            source_digest: bytes
-            source_rows: int
-            source_digest, source_rows = self.compute_source_digest(collapsed)
-            applied: CompletionMarker | None = self.applied_completion_marker(context, source_digest)
-            if applied is not None:
+            collapsed: DataFrame = terminal.dropDuplicates(["record_id"]).persist(StorageLevel.MEMORY_AND_DISK)
+            try:
+                source_digest: bytes
+                source_rows: int
+                source_digest, source_rows = self.compute_source_digest(collapsed)
+                terminal.unpersist()
+                applied: CompletionMarker | None = self.applied_completion_marker(context, source_digest)
+                if applied is not None:
+                    return WorkResult(
+                        claim=context.claim,
+                        kind=ResultKind.INGEST_SUCCEEDED,
+                        data_lance_version=applied.lance_version,
+                        source_row_count=source_rows,
+                        source_digest=source_digest,
+                    )
+                versions: list[int] = self.write_terminal(collapsed, context)
+                if source_rows > 0 and not versions:
+                    raise RuntimeError("terminal write produced no verified executor result")
+                marker: CompletionMarker = self.finalize_marker(context, source_digest)
                 return WorkResult(
                     claim=context.claim,
                     kind=ResultKind.INGEST_SUCCEEDED,
-                    data_lance_version=applied.lance_version,
+                    data_lance_version=marker.lance_version,
                     source_row_count=source_rows,
                     source_digest=source_digest,
                 )
-            versions: list[int] = self.write_terminal(collapsed, context)
-            if source_rows > 0 and not versions:
-                raise RuntimeError("terminal write produced no verified executor result")
-            marker: CompletionMarker = self.finalize_marker(context, source_digest)
-            return WorkResult(
-                claim=context.claim,
-                kind=ResultKind.INGEST_SUCCEEDED,
-                data_lance_version=marker.lance_version,
-                source_row_count=source_rows,
-                source_digest=source_digest,
-            )
+            finally:
+                collapsed.unpersist()
         finally:
             terminal.unpersist()
 
-    def canonical_source(self, source: DataFrame, context: WorkExecutionContext) -> DataFrame:
-        """Project PostgreSQL-configured source columns into the canonical worker contract.
-
-        Args:
-            source: Exact Iceberg target scan using physical source names.
-            context: Source registration carrying the persisted column mapping.
-
-        Returns:
-            DataFrame with canonical ingestion names.
-        """
-        registration: IcebergSource = context.source
-        projections: list[Column] = [
-            col(registration.tenant_column).alias("tenant_id"),
-            col(registration.namespace_column).alias("namespace"),
-            col(registration.org_column).alias("org_id"),
-            col(registration.record_id_column).alias("record_id"),
-            col(registration.operation_column).alias("op"),
-            col(registration.ts_column).alias("ts"),
-            col(registration.vectors_column).alias("vectors"),
-            col(registration.texts_column).alias("texts"),
-            col(registration.metadata_column).alias("metadata"),
-        ]
-        return source.select(*projections)
-
     def validate_source_profile(self, source: DataFrame, spec: DatasetSpecRevision) -> None:
-        """Reject unknown map keys and wrong vector dimensions before the first write.
+        """Reject invalid rows through one distributed validation aggregation.
 
         Args:
             source: Exact target snapshot scan.
@@ -275,14 +577,18 @@ class DistributedIngestRunner:
             ValueError: If source fields violate the frozen dataset specification.
         """
         self.validate_source_schema(source)
-        if source.where(col("ts").isNull()).limit(1).count():
-            raise ValueError("source contains a null ts")
         normalized_operation: Column = lower(trim(col("op")))
-        supported: tuple[str, ...] = tuple(sorted(UPSERT_OPERATIONS | DELETE_OPERATIONS))
-        if source.where(col("op").isNull() | ~normalized_operation.isin(*supported)).limit(1).count():
-            raise ValueError("source contains an unsupported mutation operation")
-        self.validate_map_keys(source, spec)
-        self.validate_vector_dimensions(source, normalized_operation, spec)
+        checks: list[tuple[Column, str]] = self.source_profile_checks(normalized_operation, spec)
+        aggregations: list[Column] = [
+            spark_max(when(check[0], lit(1)).otherwise(lit(0))).alias(f"invalid_{index}")
+            for index, check in enumerate(checks)
+        ]
+        summary: Row | None = source.agg(*aggregations).first()
+        if summary is None:
+            raise RuntimeError("source profile validation produced no aggregate result")
+        for index, check in enumerate(checks):
+            if int(summary[index] or 0):
+                raise ValueError(check[1])
 
     def validate_source_schema(self, source: DataFrame) -> None:
         """Validate the fixed physical source types before distributed checks.
@@ -332,16 +638,28 @@ class DistributedIngestRunner:
         if not vectors_valid or not strings_valid:
             raise ValueError("source maps must match vectors<string,array<float>> and text metadata string maps")
 
-    def validate_map_keys(self, source: DataFrame, spec: DatasetSpecRevision) -> None:
-        """Reject dynamic map keys outside the frozen dataset specification.
+    def source_profile_checks(
+        self,
+        normalized_operation: Column,
+        spec: DatasetSpecRevision,
+    ) -> list[tuple[Column, str]]:
+        """Build ordered invalid-row checks for one exact source scan.
 
         Args:
-            source: Exact target snapshot scan.
+            normalized_operation: Normalized Spark operation expression.
             spec: Frozen dataset specification.
 
-        Raises:
-            ValueError: If a map contains a field outside the dataset specification.
+        Returns:
+            Boolean Spark expressions paired with deterministic contract error messages.
         """
+        supported: tuple[str, ...] = tuple(sorted(UPSERT_OPERATIONS | DELETE_OPERATIONS))
+        checks: list[tuple[Column, str]] = [
+            (col("ts").isNull(), "source contains a null ts"),
+            (
+                col("op").isNull() | ~normalized_operation.isin(*supported),
+                "source contains an unsupported mutation operation",
+            ),
+        ]
         map_contracts: tuple[tuple[str, tuple[str, ...]], ...] = (
             ("vectors", tuple(vector_field[0] for vector_field in spec.vector_fields)),
             ("texts", spec.text_fields),
@@ -354,36 +672,37 @@ class DistributedIngestRunner:
             unknown_count: Column = (
                 size(keys) if not allowed else size(array_except(keys, array(*(lit(name) for name in allowed))))
             )
-            if source.where(unknown_count > 0).limit(1).count():
-                raise ValueError(
-                    f"source map {map_column!r} contains fields outside spec revision {spec.spec_revision_id}"
+            checks.append(
+                (
+                    unknown_count > 0,
+                    f"source map {map_column!r} contains fields outside spec revision {spec.spec_revision_id}",
                 )
-
-    def validate_vector_dimensions(
-        self,
-        source: DataFrame,
-        normalized_operation: Column,
-        spec: DatasetSpecRevision,
-    ) -> None:
-        """Validate required vector presence and fixed dimensions.
-
-        Args:
-            source: Exact target snapshot scan.
-            normalized_operation: Normalized Spark operation expression.
-            spec: Frozen dataset specification.
-
-        Raises:
-            ValueError: If an upsert omits a vector or any vector has the wrong dimension.
-        """
+            )
         delete_operation: Column = normalized_operation.isin(*tuple(sorted(DELETE_OPERATIONS)))
         name: str
         dimension: int
         for name, dimension in spec.vector_fields:
             vector: Column = element_at(col("vectors"), lit(name))
-            if source.where(~delete_operation & vector.isNull()).limit(1).count():
-                raise ValueError(f"upsert is missing required vector field {name!r}")
-            if source.where(vector.isNotNull() & (size(vector) != dimension)).limit(1).count():
-                raise ValueError(f"vector field {name!r} does not match fixed dimension {dimension}")
+            invalid_element: Column = exists(
+                vector,
+                lambda value: (
+                    value.isNull() | isnan(value) | (value == lit(float("inf"))) | (value == lit(float("-inf")))
+                ),
+            )
+            checks.extend(
+                [
+                    (~delete_operation & vector.isNull(), f"upsert is missing required vector field {name!r}"),
+                    (
+                        vector.isNotNull() & (size(vector) != dimension),
+                        f"vector field {name!r} does not match fixed dimension {dimension}",
+                    ),
+                    (
+                        vector.isNotNull() & invalid_element,
+                        f"vector field {name!r} contains null or non-finite elements",
+                    ),
+                ]
+            )
+        return checks
 
     def select_profile_fields(self, source: DataFrame, spec: DatasetSpecRevision) -> DataFrame:
         """Project maps into the frozen complete post-image schema.
@@ -473,7 +792,13 @@ class DistributedIngestRunner:
         return source.mapInArrow(normalize_batches, schema=schema)
 
     def compute_source_digest(self, terminal: DataFrame) -> tuple[bytes, int]:
-        """Compute the frozen digest in one streaming sorted executor reduction.
+        """Compute the exact frozen v1 digest through local executor spool files.
+
+        Record IDs are range-partitioned and sorted as UTF-8 bytes across executors. The driver
+        collects one bounded file metadata tuple per physical partition, then streams the local
+        files in range order into one SHA-256 state. The result remains byte-for-byte compatible
+        with ``canonical_source_digest`` and existing completion markers without buffering a full
+        Spark partition on the driver.
 
         Args:
             terminal: Duplicate-collapsed target mutations.
@@ -481,38 +806,9 @@ class DistributedIngestRunner:
         Returns:
             Raw digest and terminal row count.
         """
-        ordered: DataFrame = (
-            terminal.select("record_id", SOURCE_SEQUENCE_COLUMN, EVENT_DIGEST_COLUMN)
-            .repartition(1)
-            .sortWithinPartitions("record_id")
-        )
-
-        def digest_batches(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
-            """Stream one globally sorted partition into a SHA-256 state.
-
-            Args:
-                batches: Globally ordered terminal tuple batches.
-
-            Yields:
-                One digest and row-count batch.
-            """
-            digest: Any = hashlib.sha256()
-            digest.update(SOURCE_DIGEST_HEADER)
-            count: int = 0
-            batch: pa.RecordBatch
-            for batch in batches:
-                row: dict[str, object]
-                for row in pa.Table.from_batches([batch]).to_pylist():
-                    digest.update(encode_bytes(str(row["record_id"]).encode("utf-8")))
-                    digest.update(struct.pack(">q", int(row[SOURCE_SEQUENCE_COLUMN])))
-                    digest.update(bytes(row[EVENT_DIGEST_COLUMN]))
-                    count += 1
-            yield pa.RecordBatch.from_pydict({"source_digest": [digest.digest()], "source_rows": [count]})
-
-        result: list[Row] = ordered.mapInArrow(digest_batches, "source_digest binary, source_rows long").collect()
-        if len(result) != 1:
-            raise RuntimeError("source digest reduction did not produce exactly one result")
-        return bytes(result[0]["source_digest"]), int(result[0]["source_rows"])
+        partitions: int = source_digest_partition_count(self.spark)
+        chunks: DataFrame = source_digest_chunks(terminal, partitions)
+        return compute_spooled_source_digest(chunks)
 
     def write_terminal(self, terminal: DataFrame, context: WorkExecutionContext) -> list[int]:
         """Write key-disjoint terminal partitions through replay-safe executor merges.
@@ -772,6 +1068,49 @@ class ConfiguredPublicationRunner:
             publication_evidence=evidence,
         )
 
+    def fragment_task_frame(
+        self,
+        uri: str,
+        version: int,
+        maximum_shards: int,
+        columns: tuple[str, ...],
+    ) -> DataFrame:
+        """Build exact fragment scan tasks from one bounded executor-expanded seed.
+
+        The driver sends only URI, pinned version, shard limit, and projected columns. One executor
+        opens the immutable version and enumerates its fragment IDs, then Spark redistributes the
+        resulting bounded shards directly to scan executors without collecting the inventory.
+
+        Args:
+            uri: Exact Lance dataset URI.
+            version: Pinned immutable Lance version.
+            maximum_shards: Maximum non-empty fragment shards.
+            columns: Projected scan columns.
+
+        Returns:
+            Spark frame containing exact fragment shard tasks.
+
+        Raises:
+            ValueError: If ``maximum_shards`` is not positive.
+        """
+        if maximum_shards < 1:
+            raise ValueError("fragment scan shard count must be positive")
+        seed: FragmentScanSeed = (uri, version, maximum_shards, columns)
+        task_rows: Any = (
+            self.spark.sparkContext.parallelize([seed], 1)
+            .flatMap(enumerate_fragment_scan_tasks)
+            .repartition(maximum_shards)
+        )
+        task_schema: StructType = StructType(
+            [
+                StructField("source_uri", StringType(), False),
+                StructField("source_version", LongType(), False),
+                StructField("fragment_id", LongType(), False),
+                StructField("columns", ArrayType(StringType(), False), False),
+            ]
+        )
+        return self.spark.createDataFrame(task_rows, task_schema)
+
     def canonical_rebuild(self, context: WorkExecutionContext) -> str | WorkResult:
         """Rewrite one exact applied source version into a canonical isolated candidate.
 
@@ -787,12 +1126,13 @@ class ConfiguredPublicationRunner:
         if source_version is None or candidate_uri is None:
             return blocked_result(context.claim, "REBUILD_CONTEXT_MISSING", "rebuild lacks exact source or candidate")
         self.ensure_rebuild_candidate(source_uri, source_version, candidate_uri)
-        fragment_ids: list[int] = self.fragment_inventory(source_uri, source_version)
         profile: DatasetSpecRevision = context.spec_revision
-        tasks: list[tuple[str, int, list[int], list[str]]] = [
-            (source_uri, source_version, list(shard), list(terminal_column_names(profile)))
-            for shard in shard_fragments(fragment_ids, profile.ingest_shuffle_partitions)
-        ]
+        task_frame: DataFrame = self.fragment_task_frame(
+            source_uri,
+            source_version,
+            profile.ingest_shuffle_partitions,
+            terminal_column_names(profile),
+        )
 
         def read_batches(task_batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
             """Stream exact source fragment shards as Arrow batches.
@@ -805,50 +1145,43 @@ class ConfiguredPublicationRunner:
             """
             task_batch: pa.RecordBatch
             for task_batch in task_batches:
-                task: dict[str, object]
-                for task in task_batch.to_pylist():
-                    dataset: lance.LanceDataset = lance.dataset(
-                        str(task["source_uri"]),
-                        version=int(task["source_version"]),
-                    )
-                    selected: set[int] = set(task["fragment_ids"])
-                    fragments: list[Any] = [
-                        fragment for fragment in dataset.get_fragments() if fragment.fragment_id in selected
-                    ]
-                    reader: pa.RecordBatchReader = dataset.scanner(
-                        columns=task["columns"],
-                        fragments=fragments,
-                    ).to_reader()
-                    batch: pa.RecordBatch
-                    for batch in reader:
-                        table: pa.Table = pa.Table.from_batches([batch])
-                        name: str
-                        dimension: int
-                        for name, dimension in profile.vector_fields:
-                            del dimension
-                            vector_index: int = table.schema.get_field_index(name)
-                            table = table.set_column(
-                                vector_index,
-                                pa.field(name, pa.list_(pa.float32())),
-                                pc.cast(table[name], pa.list_(pa.float32())),
-                            )
-                        digest_index: int = table.schema.get_field_index(EVENT_DIGEST_COLUMN)
+                tasks: list[dict[str, object]] = task_batch.to_pylist()
+                if not tasks:
+                    continue
+                first: dict[str, object] = tasks[0]
+                dataset: lance.LanceDataset = lance.dataset(
+                    str(first["source_uri"]),
+                    version=int(first["source_version"]),
+                )
+                fragments: list[lance.LanceFragment] = resolve_fragment_scan(
+                    dataset,
+                    [int(task["fragment_id"]) for task in tasks],
+                )
+                reader: pa.RecordBatchReader = dataset.scanner(
+                    columns=first["columns"],
+                    fragments=fragments,
+                ).to_reader()
+                batch: pa.RecordBatch
+                for batch in reader:
+                    table: pa.Table = pa.Table.from_batches([batch])
+                    name: str
+                    dimension: int
+                    for name, dimension in profile.vector_fields:
+                        del dimension
+                        vector_index: int = table.schema.get_field_index(name)
                         table = table.set_column(
-                            digest_index,
-                            pa.field(EVENT_DIGEST_COLUMN, pa.binary()),
-                            pc.cast(table[EVENT_DIGEST_COLUMN], pa.binary()),
+                            vector_index,
+                            pa.field(name, pa.list_(pa.float32())),
+                            pc.cast(table[name], pa.list_(pa.float32())),
                         )
-                        yield from table.to_batches()
+                    digest_index: int = table.schema.get_field_index(EVENT_DIGEST_COLUMN)
+                    table = table.set_column(
+                        digest_index,
+                        pa.field(EVENT_DIGEST_COLUMN, pa.binary()),
+                        pc.cast(table[EVENT_DIGEST_COLUMN], pa.binary()),
+                    )
+                    yield from table.to_batches()
 
-        task_schema: StructType = StructType(
-            [
-                StructField("source_uri", StringType(), False),
-                StructField("source_version", LongType(), False),
-                StructField("fragment_ids", ArrayType(LongType(), False), False),
-                StructField("columns", ArrayType(StringType(), False), False),
-            ]
-        )
-        task_frame: DataFrame = self.spark.createDataFrame(tasks, task_schema)
         rows: DataFrame = task_frame.mapInArrow(read_batches, terminal_spark_schema(profile)).persist(
             StorageLevel.MEMORY_AND_DISK
         )
@@ -938,38 +1271,6 @@ class ConfiguredPublicationRunner:
             raise RuntimeError("rebuild candidate bootstrap produced an invalid executor result")
         return int(versions[0])
 
-    def fragment_inventory(self, candidate_uri: str, lance_version: int) -> list[int]:
-        """Resolve one exact candidate fragment inventory on an executor.
-
-        Args:
-            candidate_uri: Candidate Lance dataset.
-            lance_version: Exact pinned version.
-
-        Returns:
-            Fragment identifiers for distributed executor scans.
-        """
-
-        def inventory(item: tuple[str, int]) -> list[int]:
-            """Return exact fragment identifiers from one executor open.
-
-            Args:
-                item: Candidate URI and exact version.
-
-            Returns:
-                Fragment identifiers.
-            """
-            uri: str
-            version: int
-            uri, version = item
-            return [int(fragment.fragment_id) for fragment in lance.dataset(uri, version=version).get_fragments()]
-
-        results: list[list[int]] = (
-            self.spark.sparkContext.parallelize([(candidate_uri, lance_version)], 1).map(inventory).collect()
-        )
-        if len(results) != 1:
-            raise RuntimeError("fragment inventory produced an invalid executor result")
-        return results[0]
-
     def write_rebuild_candidate(
         self,
         canonical: DataFrame,
@@ -1003,12 +1304,14 @@ class ConfiguredPublicationRunner:
                 Maximum exact candidate version for this non-empty partition.
             """
             telemetry: Telemetry = Telemetry.create(telemetry_config)
-            candidate_schema: pa.Schema = lance.dataset(candidate_uri).schema
+            candidate_schema: pa.Schema | None = None
             maximum_version: int | None = None
             batch: pa.RecordBatch
             for batch in batches:
                 if batch.num_rows == 0:
                     continue
+                if candidate_schema is None:
+                    candidate_schema = lance.dataset(candidate_uri).schema
                 table: pa.Table = pa.Table.from_batches([batch])
                 digest_index: int = table.schema.get_field_index(EVENT_DIGEST_COLUMN)
                 table = table.set_column(
@@ -1224,81 +1527,67 @@ class ConfiguredPublicationRunner:
         Returns:
             Total rows, distinct record IDs, live rows, and distinct live record IDs.
         """
-
-        def inventory(item: tuple[str, int]) -> list[int]:
-            """Read the exact fragment inventory on one executor.
-
-            Args:
-                item: Candidate URI and exact version.
-
-            Returns:
-                Fragment IDs.
-            """
-            uri: str
-            version: int
-            uri, version = item
-            dataset: lance.LanceDataset = lance.dataset(uri, version=version)
-            return [int(fragment.fragment_id) for fragment in dataset.get_fragments()]
-
-        inventory_rows: list[list[int]] = (
-            self.spark.sparkContext.parallelize([(candidate_uri, lance_version)], 1).map(inventory).collect()
+        task_frame: DataFrame = self.fragment_task_frame(
+            candidate_uri,
+            lance_version,
+            spec.ingest_shuffle_partitions,
+            ("record_id", DELETED_COLUMN),
         )
-        if len(inventory_rows) != 1:
-            raise RuntimeError("candidate count inventory produced an invalid executor result")
-        fragment_ids: list[int] = inventory_rows[0]
-        shards: list[tuple[int, ...]] = shard_fragments(fragment_ids, spec.ingest_shuffle_partitions)
 
-        def terminal_ids(item: tuple[str, int, tuple[int, ...]]) -> Iterator[tuple[str, bool]]:
-            """Stream record IDs and deletion state from one exact fragment shard.
+        def terminal_batches(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
+            """Stream only count-gate columns from exact candidate fragment shards.
 
             Args:
-                item: Candidate URI, version, and fragment IDs.
+                batches: Small Arrow batches of candidate URI, version, fragments, and columns.
 
             Yields:
-                Record IDs and deletion state for distributed distinct counting.
+                Record ID and deletion-state batches for Spark aggregation.
             """
-            uri: str
-            version: int
-            wanted: tuple[int, ...]
-            uri, version, wanted = item
-            dataset: lance.LanceDataset = lance.dataset(uri, version=version)
-            fragments: list[Any] = [
-                fragment for fragment in dataset.get_fragments() if fragment.fragment_id in set(wanted)
-            ]
-            reader: pa.RecordBatchReader = dataset.scanner(
-                columns=["record_id", DELETED_COLUMN],
-                fragments=fragments,
-            ).to_reader()
-            batch: pa.RecordBatch
-            for batch in reader:
-                record_id: object
-                is_deleted: object
-                for record_id, is_deleted in zip(
-                    batch.column(0).to_pylist(),
-                    batch.column(1).to_pylist(),
-                    strict=True,
-                ):
-                    yield str(record_id), bool(is_deleted)
+            task_batch: pa.RecordBatch
+            for task_batch in batches:
+                tasks: list[dict[str, object]] = task_batch.to_pylist()
+                if not tasks:
+                    continue
+                first: dict[str, object] = tasks[0]
+                dataset: lance.LanceDataset = lance.dataset(
+                    str(first["source_uri"]),
+                    version=int(first["source_version"]),
+                )
+                fragments: list[lance.LanceFragment] = resolve_fragment_scan(
+                    dataset,
+                    [int(task["fragment_id"]) for task in tasks],
+                )
+                reader: pa.RecordBatchReader = dataset.scanner(
+                    columns=first["columns"],
+                    fragments=fragments,
+                ).to_reader()
+                yield from reader
 
-        tasks: list[tuple[str, int, tuple[int, ...]]] = [(candidate_uri, lance_version, shard) for shard in shards]
-        terminal_rows: Any = (
-            self.spark.sparkContext.parallelize(tasks, max(1, len(tasks))).flatMap(terminal_ids).cache()
+        count_schema: StructType = StructType(
+            [
+                StructField("record_id", StringType(), False),
+                StructField(DELETED_COLUMN, BooleanType(), False),
+            ]
         )
-        try:
-            total_rows: int = terminal_rows.count()
-            distinct_all: int = (
-                terminal_rows.map(lambda item: item[0]).distinct(numPartitions=spec.ingest_shuffle_partitions).count()
-            )
-            live_rows: int = terminal_rows.filter(lambda item: not item[1]).count()
-            distinct_live: int = (
-                terminal_rows.filter(lambda item: not item[1])
-                .map(lambda item: item[0])
-                .distinct(numPartitions=spec.ingest_shuffle_partitions)
-                .count()
-            )
-        finally:
-            terminal_rows.unpersist()
-        return int(total_rows), int(distinct_all), int(live_rows), int(distinct_live)
+        terminal_rows: DataFrame = task_frame.mapInArrow(terminal_batches, count_schema).repartition(
+            spec.ingest_shuffle_partitions,
+            col("record_id"),
+        )
+        live: Column = ~col(DELETED_COLUMN)
+        summary: Row | None = terminal_rows.agg(
+            spark_count(lit(1)).alias("total_rows"),
+            countDistinct("record_id").alias("distinct_record_ids"),
+            spark_count(when(live, lit(1))).alias("live_rows"),
+            countDistinct(when(live, col("record_id"))).alias("distinct_live_record_ids"),
+        ).first()
+        if summary is None:
+            raise RuntimeError("candidate count aggregation produced no result")
+        return (
+            int(summary["total_rows"]),
+            int(summary["distinct_record_ids"]),
+            int(summary["live_rows"]),
+            int(summary["distinct_live_record_ids"]),
+        )
 
     def qualify_candidate(
         self,
@@ -1583,7 +1872,10 @@ class LeaseHeartbeat:
         """Stop renewal and wait for the bounded thread to terminate."""
         self.stop_event.set()
         if self.thread is not None:
-            self.thread.join(timeout=max(1.0, self.interval.total_seconds()))
+            self.thread.join(timeout=LEASE_HEARTBEAT_JOIN_TIMEOUT_SECONDS)
+            if self.thread.is_alive():
+                self.lost = True
+                logger.warning("lease renewal did not stop for work %s, marking lease lost", self.claim.work_id)
 
 
 def spec_payload_names(spec: DatasetSpecRevision) -> tuple[str, ...]:

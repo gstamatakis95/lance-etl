@@ -60,7 +60,7 @@ typed DataFusion expressions. Raw SQL is never accepted or constructed.
 
 ### One dataset per request
 
-Each route component is validated against `[A-Za-z0-9_-]+`. A request cannot fan out to another
+Each route component is validated against `[A-Za-z0-9_-]{1,128}`. A request cannot fan out to another
 dataset or organization. Hybrid fusion combines two result legs from the same exact version.
 
 ### Exact publication version

@@ -189,8 +189,9 @@ blocked row, and it does not touch source ownership or fencing beyond returning 
 expiration must still preserve (blocked, still-open, or inside the source's replay horizon).
 `claim_publication_cleanup` / `finalize_publication_cleanup` hand retired publications to the
 reconciler's external cleanup sweep (see [`reconciler/README.md`](../reconciler/README.md)) before
-their audit rows are deleted, and `delete_completed_audit` prunes old succeeded work and source
-snapshot rows past the audit retention horizon.
+their audit rows are deleted. `delete_completed_audit` prunes old succeeded publication work while
+preserving source snapshots, INGEST work, and REBUILD request identities as append-only evidence for
+delayed planner observations and exact replays.
 
 ## Invariants a maintainer must not break
 

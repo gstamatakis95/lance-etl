@@ -31,6 +31,10 @@ export LANCE_MEM_POOL_SIZE=4294967296
 
 Use `python -m bench COMMAND --help` for the complete current flag set.
 
+`python -m bench` starts through an import-light launcher. Spark-bearing commands (`prepare`, `e2e`,
+`experiment`, and `fuzz`) replace that process with the environment's `spark-submit` before importing
+Lance, Arrow, or telemetry libraries. Other commands replace it with the same Python interpreter.
+
 ## Corpus cache
 
 Raw corpus files are stored under `--corpus-root`, default `bench/corpora`. The cache is independent

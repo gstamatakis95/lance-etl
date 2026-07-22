@@ -14,8 +14,10 @@ required.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import MagicMock
 
 import lance
@@ -24,7 +26,7 @@ import pytest
 from conftest import FakeSpark
 
 import lance_etl.reconciler.workers as workers
-from lance_etl.reconciler import ResultKind, WorkResult
+from lance_etl.reconciler.results import ResultKind, WorkResult
 from lance_etl.reconciler.workers import ConfiguredPublicationRunner
 from lance_etl.state import (
     DatasetSpecRevision,
@@ -40,19 +42,14 @@ from lance_etl.state import (
 from lance_etl.telemetry import TelemetryConfig
 
 
+@dataclass
 class FakeMaintenanceJob:
     """Maintenance-job stand-in returning a preset per-dataset result list."""
 
-    result: list[dict[str, object]] = [{}]
+    result: ClassVar[list[dict[str, object]]] = [{}]
     """The per-dataset result list the fake returns, patched per test."""
 
-    def __init__(self, config: object) -> None:
-        """Ignore the real maintenance configuration.
-
-        Args:
-            config: The maintenance configuration, unused by the fake.
-        """
-        del config
+    config: object
 
     def run(self, spark: object, uris: list[str]) -> list[dict[str, object]]:
         """Return the preset result list.

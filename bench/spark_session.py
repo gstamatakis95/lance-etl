@@ -22,6 +22,7 @@ from pyspark.sql import SparkSession
 
 from bench.config import BenchConfig
 from bench.results import ensure_dir
+from lance_etl.spark_process import SPARK_CORE_CONF_PINS, ensure_spark_process_safety
 from lance_etl.telemetry import TelemetryConfig
 
 
@@ -29,7 +30,7 @@ def bench_telemetry_config() -> TelemetryConfig:
     """Build the offline-safe telemetry configuration for benchmark jobs.
 
     DogStatsD sends are fire-and-forget UDP so no agent is required in the benchmark environment.
-    When ``--capture-telemetry`` is active, :class:`~bench.telemetry_capture.TelemetryCapture`
+    When ``--capture-telemetry`` is active, :func:`~bench.telemetry_capture.telemetry_capture_session`
     sets ``LANCE_BENCH_STATSD_HOST`` and ``LANCE_BENCH_STATSD_PORT`` in the process environment
     before any Spark session is created.  This function reads those variables so that both the
     driver process and every Spark executor (which inherit the driver environment) direct their
@@ -74,5 +75,15 @@ def build_spark(config: BenchConfig, app_name: str) -> SparkSession:
         .config("spark.driver.memory", config.driver_memory)
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.shuffle.partitions", str(config.etl_partitions))
+        .config("spark.sql.adaptive.enabled", "true")
+        .config("spark.sql.adaptive.advisoryPartitionSizeInBytes", "64m")
+        .config("spark.sql.adaptive.coalescePartitions.initialPartitionNum", str(config.etl_partitions))
+        .config("spark.sql.execution.arrow.maxRecordsPerBatch", "4096")
     )
-    return builder.getOrCreate()
+    key: str
+    value: str
+    for key, value in SPARK_CORE_CONF_PINS.items():
+        builder = builder.config(key, value)
+    session: SparkSession = builder.getOrCreate()
+    ensure_spark_process_safety(session, "running benchmark jobs")
+    return session

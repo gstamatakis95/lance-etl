@@ -8,6 +8,7 @@ the steps they specialise.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import lance
@@ -34,6 +35,7 @@ from lance_etl.telemetry import Telemetry
 logger: logging.Logger = logging.getLogger(__name__)
 
 
+@dataclass
 class IndexHandler:
     """Base policy for planning one index over a dataset's fragments.
 
@@ -41,17 +43,9 @@ class IndexHandler:
     artifacts, and declare whether uncommitted segments merge before publication.
     """
 
-    def __init__(self, config: IndexJobConfig, column: str, index_name: str) -> None:
-        """Initialize the handler.
-
-        Args:
-            config: Indexing configuration.
-            column: The column to index.
-            index_name: The index name to publish under.
-        """
-        self.config: IndexJobConfig = config
-        self.column: str = column
-        self.index_name: str = index_name
+    config: IndexJobConfig
+    column: str
+    index_name: str
 
     def index_type(self) -> str:
         """Return the Lance index type string.

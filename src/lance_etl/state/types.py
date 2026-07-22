@@ -8,10 +8,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 
+from lance_etl.routing import validate_routing_segment
 from lance_etl.state.specs import DatasetSpecRevision, IndexType
-
-ROUTING_SEGMENT_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-"""Bounded routing-segment contract shared with the search service."""
 
 SOURCE_NAME_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
 """Bounded source-name contract shared with PostgreSQL."""
@@ -100,24 +98,6 @@ class WorkLauncherKind(StrEnum):
     LOCAL = "LOCAL"
 
 
-def validate_routing_segment(value: str, field_name: str) -> str:
-    """Validate one shared serving-route segment.
-
-    Args:
-        value: Candidate segment.
-        field_name: Field name used in the error.
-
-    Returns:
-        Validated value unchanged.
-
-    Raises:
-        ValueError: If the value is not a bounded allowlisted segment.
-    """
-    if ROUTING_SEGMENT_PATTERN.fullmatch(value) is None:
-        raise ValueError(f"{field_name} must match [A-Za-z0-9_-]{{1,128}}")
-    return value
-
-
 @dataclass(frozen=True, slots=True)
 class RoutingIdentity:
     """Authenticated serving identity of one logical dataset."""
@@ -149,7 +129,7 @@ class RoutingIdentity:
 
 @dataclass(frozen=True, slots=True)
 class IcebergSource:
-    """Database-owned Iceberg source and projection configuration."""
+    """Database-owned Iceberg source configuration."""
 
     source_id: uuid.UUID
     source_name: str
@@ -162,15 +142,6 @@ class IcebergSource:
     default_spec_id: uuid.UUID
     canonical_baseline_snapshot_id: int | None
     replay_horizon: timedelta
-    tenant_column: str = "tenant_id"
-    namespace_column: str = "namespace"
-    org_column: str = "org_id"
-    record_id_column: str = "record_id"
-    operation_column: str = "op"
-    ts_column: str = "ts"
-    vectors_column: str = "vectors"
-    texts_column: str = "texts"
-    metadata_column: str = "metadata"
 
     @property
     def spark_table(self) -> str:
@@ -182,7 +153,7 @@ class IcebergSource:
         return f"{self.spark_catalog}.{self.table_namespace}.{self.table_name}"
 
     def validate(self) -> IcebergSource:
-        """Validate database-owned source identity and projection names.
+        """Validate database-owned source identity.
 
         Returns:
             This validated source registration.
@@ -201,19 +172,6 @@ class IcebergSource:
             raise ValueError("canonical_baseline_snapshot_id must be non-negative")
         if self.replay_horizon <= timedelta(0):
             raise ValueError("replay_horizon must be positive")
-        columns: tuple[str, ...] = (
-            self.tenant_column,
-            self.namespace_column,
-            self.org_column,
-            self.record_id_column,
-            self.operation_column,
-            self.ts_column,
-            self.vectors_column,
-            self.texts_column,
-            self.metadata_column,
-        )
-        if any(IDENTIFIER_PATTERN.fullmatch(value) is None for value in columns):
-            raise ValueError("source projection columns must be valid identifiers")
         return self
 
 
@@ -245,6 +203,7 @@ class SourceSnapshotPlan:
     committed_at: datetime
     iceberg_operation: str
     kind: SourceSnapshotKind
+    source_planning_epoch: int | None = None
 
     def validate(self) -> SourceSnapshotPlan:
         """Validate snapshot identity and lineage.
@@ -259,6 +218,8 @@ class SourceSnapshotPlan:
             raise ValueError("snapshot, sequence, and partition specification IDs must be non-negative")
         if self.parent_snapshot_id is not None and self.parent_snapshot_id < 0:
             raise ValueError("parent_snapshot_id must be non-negative")
+        if self.source_planning_epoch is not None and self.source_planning_epoch < 0:
+            raise ValueError("source_planning_epoch must be non-negative")
         if (
             self.kind not in (SourceSnapshotKind.BASELINE, SourceSnapshotKind.REJECTED)
             and self.parent_snapshot_id is None

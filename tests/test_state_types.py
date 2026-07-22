@@ -10,7 +10,7 @@ import pytest
 
 from lance_etl.state.repository import dataset_uri_matches_root
 from lance_etl.state.specs import DatasetSpecRevision, IndexType, production_default_spec_revision
-from lance_etl.state.tables import metadata
+from lance_etl.state.tables import iceberg_sources, metadata
 from lance_etl.state.types import (
     DatasetPlan,
     IcebergSource,
@@ -71,6 +71,26 @@ def test_metadata_contains_exact_normalized_entities() -> None:
     assert set(metadata.tables) == APPLICATION_TABLES
 
 
+def test_source_registration_stores_identity_not_column_aliases() -> None:
+    """The source row cannot duplicate the code-owned physical schema."""
+    assert set(iceberg_sources.c.keys()) == {
+        "source_id",
+        "source_name",
+        "spark_catalog",
+        "table_namespace",
+        "table_name",
+        "table_uuid",
+        "lance_base_uri",
+        "lifecycle_state",
+        "default_spec_id",
+        "canonical_baseline_snapshot_id",
+        "replay_horizon_seconds",
+        "planning_epoch",
+        "created_at",
+        "updated_at",
+    }
+
+
 @pytest.mark.parametrize(
     "value",
     ["", ".", "..", "../escape", "a/b", "a\\b", "a.b", "a b", "x\ncontrol", "a" * 129],
@@ -86,13 +106,11 @@ def test_routing_validation_rejects_unsafe_segments(value: str) -> None:
 
 
 def test_routing_and_source_configuration_validate() -> None:
-    """Routes and database-owned source mappings accept the shared contract."""
+    """Routes and database-owned source identity accept the shared contract."""
     identity: RoutingIdentity = RoutingIdentity(tenant_id="Tenant-1_A", namespace="vectors", org_id="org1")
     assert DatasetPlan(identity=identity).validate().identity == identity
     source: IcebergSource = source_registration()
     assert source.validate().spark_table == "local.lake.raw.embeddings"
-    with pytest.raises(ValueError, match="projection columns"):
-        replace(source, vectors_column="bad/column").validate()
     with pytest.raises(ValueError, match="replay_horizon"):
         replace(source, replay_horizon=timedelta(0)).validate()
 

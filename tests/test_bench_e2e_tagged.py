@@ -33,6 +33,7 @@ from bench.bigann_io import write_u8bin
 from bench.config import BenchConfig, build_parser
 from bench.datasets import BigannAdapter
 from bench.e2e import run_e2e
+from bench.prepare import run_prepare
 from bench.reconcile import bench_spec_index_names
 from bench.results import read_json
 
@@ -124,6 +125,9 @@ def test_e2e_reconciler_publishes(tmp_path: Path) -> None:
 
     download_outcome: dict[str, Any] = BigannAdapter(limit=BASE_ROWS).download(corpus_root)
     assert download_outcome["skipped"] is True, "download must short-circuit when base+query files exist"
+
+    prepare_outcome: dict[str, Any] = run_prepare(config)
+    assert prepare_outcome["skipped"] is False, "fresh test workspace must build prepared benchmark artifacts"
 
     outcome: dict[str, Any] = run_e2e(config)
 

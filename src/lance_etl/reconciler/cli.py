@@ -15,6 +15,7 @@ from typing import Any, Protocol
 from lance_etl.reconciler.migrations import build_runtime_migrator
 from lance_etl.reconciler.runtime import build_runtime_application, build_runtime_operator
 from lance_etl.reconciler.service import ReconcilerApplication, ReconcilerOperator, RunOnceSummary, SloStatus
+from lance_etl.source import SourceConfigurationError
 from lance_etl.state import RoutingIdentity
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -22,9 +23,8 @@ logger: logging.Logger = logging.getLogger(__name__)
 EXIT_UNHEALTHY_STATUS: int = 3
 """Process exit code for `status` when `SloStatus.healthy` is `False`.
 
-Matches the fleet CLIs' partial-failure convention (`lance_etl.cliutil.EXIT_PARTIAL_FAILURE`) so a
-shell-level health check or cron wrapper can treat both the same way, without this package taking a
-direct dependency on the Spark-fleet CLI helper module.
+The distinct nonzero code lets a shell-level health check separate unhealthy state from an
+unexpected command failure.
 """
 
 
@@ -57,6 +57,27 @@ def positive_seconds(value: str) -> float:
     return seconds
 
 
+def positive_integer(value: str) -> int:
+    """Parse a strictly positive integer identity.
+
+    Args:
+        value: Command-line value.
+
+    Returns:
+        Positive integer.
+
+    Raises:
+        argparse.ArgumentTypeError: If the value is not a positive integer.
+    """
+    try:
+        parsed: int = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be an integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the local reconciler CLI.
 
@@ -73,8 +94,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--poll-seconds", type=positive_seconds)
     subparsers.add_parser("status")
     repair: argparse.ArgumentParser = subparsers.add_parser("repair")
-    repair.add_argument("--action", choices=("retry-blocked", "rebuild"), required=True)
+    repair.add_argument("--action", choices=("retry-blocked", "retry-blocked-source", "rebuild"), required=True)
     repair.add_argument("--work-id", type=uuid.UUID)
+    repair.add_argument("--source-snapshot-seq", type=positive_integer)
     repair.add_argument("--request-id", type=uuid.UUID)
     repair.add_argument("--tenant-id")
     repair.add_argument("--namespace")
@@ -101,9 +123,18 @@ def run_loop(
     last_result: RunOnceSummary | None = None
     try:
         while True:
-            last_result = application.run_once()
-            payload: dict[str, Any] | RunOnceSummary = asdict(last_result) if is_dataclass(last_result) else last_result
-            print(json.dumps(payload, sort_keys=True, default=str))
+            try:
+                last_result = application.run_once()
+            except SourceConfigurationError:
+                logger.exception("reconciler_terminal_source_configuration")
+                raise
+            except Exception:
+                logger.exception("reconciler_cycle_failed")
+            else:
+                payload: dict[str, Any] | RunOnceSummary = (
+                    asdict(last_result) if is_dataclass(last_result) else last_result
+                )
+                print(json.dumps(payload, sort_keys=True, default=str))
             sleep(poll_seconds)
     except KeyboardInterrupt:
         logger.info("reconciler_stopped")
@@ -173,6 +204,10 @@ def execute_repair(
         if args.work_id is None:
             raise ValueError("retry-blocked requires --work-id")
         return application.repair_blocked_work(args.work_id, args.dry_run)
+    if args.action == "retry-blocked-source":
+        if args.source_snapshot_seq is None:
+            raise ValueError("retry-blocked-source requires --source-snapshot-seq")
+        return application.repair_blocked_source_snapshot(args.source_snapshot_seq, args.dry_run)
     if not args.tenant_id or not args.namespace or not args.org_id or args.request_id is None:
         raise ValueError("rebuild requires --tenant-id, --namespace, --org-id, and --request-id")
     identity: RoutingIdentity = RoutingIdentity(args.tenant_id, args.namespace, args.org_id).validate()

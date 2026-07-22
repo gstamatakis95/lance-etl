@@ -1,8 +1,8 @@
 # `lance_etl.maintenance`
 
 `maintenance/` owns retention expiry, unified compaction, Lance version cleanup, the opt-in
-clustered rewrite, and the fleet upkeep libraries (manifest migration, blue-green serving tags,
-interval-tag pruning) that back the `COMPACT` phase of the reconciler's per-dataset work item. There
+clustered rewrite, and the fleet upkeep libraries (blue-green serving tags and interval-tag pruning)
+that back the `COMPACT` phase of the reconciler's per-dataset work item. There
 is one code path for every dataset size — `MaintenanceJob` plans, executes, and commits the same way
 for a one-fragment dataset and a thousand-fragment one. For where compaction sits in the
 reconciliation cycle (`INGEST -> COMPACT -> INDEX -> VALIDATE -> PREWARM -> PUBLISH`), see the
@@ -16,8 +16,7 @@ package. This README covers only what `maintenance/` does with fragments, deleti
 |---|---|
 | `job.py` | `MaintenanceConfig`, `MaintenanceJob`: retention expiry, the plan/execute/commit compaction split, version cleanup, and the commit-conflict replan loop |
 | `cluster.py` | Clustered rewrite: IVF-centroid-locality fragment reorganization and the preserved-centroid vector index rebuild ([ADR 0041](../../../docs/adr/fleet-orchestration-and-maintenance.md)) |
-| `tools.py` | Fleet-wide manifest V2 migration, blue-green serving-tag flips, and interval-tag pruning |
-| `cli.py` | Uninstalled operator CLI (`python -m lance_etl.maintenance.cli`) |
+| `tools.py` | Fleet-wide blue-green serving-tag flips and interval-tag pruning |
 | `__init__.py` | Re-exports the consumer surface from `job.py`, `cluster.py`, and `tools.py` |
 
 ## Retention expiry
@@ -37,8 +36,8 @@ Retention is a window on the frozen dataset specification revision
   tombstone carries the delete mutation's own event `ts` precisely so this predicate has something
   to expire it on. When `replay_horizon_seconds` is `None` the tombstone clause never matches, so
   tombstones are retained forever rather than risk resurrecting a row a late replay could still
-  legitimately re-apply. `MaintenanceConfig.deleted_column` is the opt-in switch: the operator
-  library and namespace-migration callers leave it unset and keep the plain predicate.
+  legitimately re-apply. `MaintenanceConfig.deleted_column` is the opt-in switch. Standalone
+  operator callers leave it unset and keep the plain predicate.
 
 `compute_cutoff` derives the fixed cutoff timestamp once per run. `run_retention_on_open_dataset`
 validates the `ts` (and `deleted_column`, if set) column exists, then runs
@@ -150,23 +149,24 @@ dataset:
    centroids are resolved sidecar-first via `resolve_cluster_centroids`, falling back to
    `dataset.get_ivf_model(index_name)` with a sidecar backfill — the same centroid-resolution pattern
    `indexing/optimize.py` uses.
-2. **Histogram** (`partition_histogram`, one flat job): assigns each row's nearest centroid
+2. **Histogram** (`partition_histogram`, one flat job per bounded dataset batch): assigns each row's nearest centroid
    (`assign_partition_ids`, replicating Lance's own IVF nearest-centroid assignment for l2, cosine,
-   and dot) in blocks of `ASSIGN_BLOCK_ROWS` (65536) and counts rows per partition.
+   and dot) in blocks of `ASSIGN_BLOCK_ROWS` (65536), then reduces shard histograms by dataset on
+   executors before collecting one bounded count vector per dataset.
 3. **Bucket derivation** (`derive_buckets`/`derive_global_buckets`, driver): packs the histogram into
    contiguous write buckets capped at `target_rows_per_fragment` rows, salting an oversized single
    partition into multiple sub-buckets.
-4. **Rewrite shuffle** (`run_rewrite_shuffle`, one flat job): reads full rows per shard, tags each
-   with a temporary partition column, and a `partitionBy` shuffle co-locates rows by bucket before
-   `write_bucket` sorts within the bucket and calls `write_fragments(mode="overwrite", ...)` —
-   uncommitted fragment metadata only, nothing is committed yet.
+4. **Rewrite shuffle** (`run_rewrite_shuffle`, one flat job per bounded dataset batch): reads full rows per shard, tags each
+   with a temporary partition column, streams IPC chunks under one combined per-shard buffer cap,
+   and a `partitionBy` shuffle co-locates rows by contiguous partition-range bucket. `write_bucket`
+   decodes one chunk at a time directly into `write_fragments(mode="overwrite", ...)`, producing
+   uncommitted fragment metadata without bucket-wide concatenation or sorting. Nothing is committed yet.
 5. **Commit overwrite** (`commit_cluster_overwrite`, per-dataset executor fan-out):
-   `LanceDataset.commit(uri, LanceOperation.Overwrite(schema, fragments), ...)` through
-   `commit_with_retries` with `large_commit_retries`. **This commit preserves version history, tags,
-   and the dataset config KV (column roles and the stored vector config) but drops every index** —
-   Overwrite always does. The `cluster_generation` fingerprint is stamped immediately after this
-   commit, before the index rebuild, so a rebuild failure still leaves the dataset correctly
-   clustered and not re-clustered again next run.
+   `LanceDataset.commit(uri, LanceOperation.Overwrite(schema, fragments), read_version=..., ...)`
+   through `commit_with_retries` with `large_commit_retries`. **This commit preserves version
+   history, tags, and the dataset config KV (column roles and the stored vector config) but drops
+   every index** — Overwrite always does. The committed fragment and row fingerprint is retained
+   for the finalisation phase.
 6. **Vector index rebuild** (`rebuild_indexes` -> `build_cluster_index_segment`, one flat job plus
    per-dataset finalize fan-out): rebuilds ONLY the IVF_RQ vector index, reusing the exact
    preserved-artifact tuple (`centroids`, `rabitq_model`, `num_bits`, `num_partitions`) that
@@ -174,7 +174,9 @@ dataset:
    `build_vector_segment` / `commit_segments` calls documented in the
    [indexing README](../indexing/README.md#vector-ivf_rq), i.e.
    `create_index_uncommitted` per shard, `merge_existing_index_segments`, then
-   `commit_existing_index_segments`.
+   `commit_existing_index_segments`. Only after that commit succeeds is the preserved data
+   fingerprint stamped as the current clustered generation. A rebuild failure therefore cannot
+   leave an unindexed generation marked current.
 
 BTREE, BITMAP, ZONEMAP, and FTS indexes are **not** touched by clustered rewrite — they are dropped
 by the Overwrite in step 5 and left for the next scheduled `LanceIndexer` run in `indexing/` to
@@ -187,11 +189,10 @@ failed index rebuild specifically is non-fatal to the rewrite itself: data stays
 clustered, just temporarily unindexed, marked with `{"error", "phase": "cluster_index"}` for the next
 run to pick up.
 
-## `tools.py`: manifest migration, serving tags, interval tags
+## `tools.py`: serving tags and interval tags
 
 | Function | Purpose |
 |---|---|
-| `migrate_dataset_manifest_paths` / `migrate_manifest_paths` | Calls `LanceDataset.migrate_manifest_paths_v2()` per dataset (driver dispatches, executors run). Idempotent but **not transactional** — the target datasets must be quiesced for the duration |
 | `update_serving_tag` / `update_serving_tags` | Flips one or more named tags (default `("HEAD",)`) to an explicit target version via `flip_one_tag` -> `resolve_serving_tag`, a create-or-update with a single-level lost-race fallback (`TAG_EXISTS_MARKER`/`TAG_MISSING_MARKER` string matching on the `ValueError` lance raises, since tag mutation is a plain object-store put/delete rather than an optimistic-concurrency manifest commit, so `commit_with_retries` does not apply here) |
 | `prune_interval_tags` | Classifies tags by `datetime.strptime(name, "%Y%m%dT%H%M%SZ")`, leaves non-matching tags (like `HEAD`) untouched, and deletes everything but the newest `tag_keep_last` interval tags, idempotent against a tag already missing |
 
@@ -200,28 +201,14 @@ docstring is explicit about the mandatory blue-green sequence: build the green v
 serving layer against that explicit version, only then flip the tag — a tag move alone never
 refreshes a running serving process's cache.
 
-## `cli.py`
+## Invocation
 
-The module docstring states plainly it is an uninstalled operator CLI, not a console script in
-`pyproject.toml`, reachable only as `python -m lance_etl.maintenance.cli`, with subcommands `run`
-(retention, if `--retention-seconds` is set, then compaction, then cleanup, in order), `tag`
-(blue-green `HEAD` promotion), and `migrate-manifests` (the V2 migration). Exit codes follow the
-shared convention: `0` every dataset succeeded, `1` an unhandled exception, `3`
-(`EXIT_PARTIAL_FAILURE`) some datasets failed in isolation while others succeeded.
-
-```bash
-uv run python -m lance_etl.maintenance.cli run --help
-uv run python -m lance_etl.maintenance.cli tag --help
-uv run python -m lance_etl.maintenance.cli migrate-manifests --help
-```
-
-Production compaction is never invoked through this CLI. `ConfiguredPublicationRunner.run` in
+The package has no standalone write CLI. `ConfiguredPublicationRunner.run` in
 `reconciler/workers.py` instantiates `MaintenanceJob(MaintenanceConfig(...))` directly whenever
 `spec.compaction_enabled`, driven by the durable PostgreSQL work item — see the
 [publication README](../publication/README.md) for how that fits into the publish workflow.
 `cluster.py`'s `run_cluster_rewrites` is reached only through `MaintenanceJob.run` when
 `MaintenanceConfig.cluster_rewrite` is set. Nothing in the reconciler imports `cluster.py` directly.
-The CLI is for standalone operator use outside the reconciler loop.
 
 ## Forbidden operations and invariants
 
@@ -259,5 +246,4 @@ The CLI is for standalone operator use outside the reconciler loop.
 | `tests/test_cluster_rewrite.py` | The full clustered-rewrite pipeline end to end |
 | `tests/test_serving_tag.py`, `tests/test_serving_tag_idempotency.py` | `update_serving_tag`/`flip_one_tag` including the lost-race fallback |
 | `tests/test_prune_interval_tags.py` | Interval-tag classification and pruning |
-| `tests/test_v2_manifest_paths.py` | `migrate_manifest_paths_v2` migration |
 | `tests/test_fleet_orchestration.py` | Fleet-level per-dataset failure isolation |

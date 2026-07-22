@@ -21,7 +21,6 @@ from test_state_postgres import (
     dataset_plan,
     draft_revision,
     evidence_for_context,
-    postgres_repository,
     register_source,
     source_plan,
 )
@@ -41,7 +40,7 @@ from lance_etl.state.types import (
     WorkState,
 )
 
-__all__ = ["postgres_repository"]
+pytest_plugins: list[str] = ["test_state_postgres"]
 
 
 def drive_publication(repository: ControlPlaneRepository, claim: WorkClaim, lance_version: int) -> bool:

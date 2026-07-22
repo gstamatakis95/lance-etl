@@ -2,9 +2,9 @@
 
 ## Source partition contract
 
-The registered Iceberg source uses route partition fields for tenant, namespace, and organization.
-It may also carry an hour transform for physical pruning. The exact configured route-column names
-come from `iceberg_sources`, not from a command-line flag.
+The registered Iceberg source uses the canonical route partition fields `tenant_id`, `namespace`,
+and `org_id`, followed by an `hour(ts)` transform for physical pruning. These physical names are a
+code-owned contract, not database or command-line configuration.
 
 The source adapter validates the active Iceberg partition specification before planning work. A
 partition-spec change is blocked because manifest routing and exact-snapshot qualification depend on
@@ -59,9 +59,9 @@ retention.
 
 ## Validation checklist
 
-- Confirm the registered route-column mapping matches the Iceberg table.
+- Confirm the Iceberg table uses the canonical route and `ts` column names.
 - Confirm the active partition spec is the one stored in qualified source evidence.
-- Confirm the dataset spec event-time field maps to the intended source column.
+- Confirm the dataset spec event-time field projects from the canonical `ts` column.
 - Confirm snapshot lineage is direct and complete from the canonical baseline.
 - Confirm range queries use typed bounds and the event-time scalar index.
 - Never use an hourly schedule label as a replay or publication identity.

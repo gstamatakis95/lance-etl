@@ -20,6 +20,8 @@ architecture decisions, see `../../docs/adr/README.md`.
 ```
 src/lance_etl/            Python package
   reconciler/             Local PostgreSQL-backed control loop
+    launcher.py           Import-light command routing through spark-submit or Python
+    driver.py             Post-replacement reconciler application driver
     cli.py                Installed lance-etl-reconcile command
     config.py             Local process bootstrap and Spark settings
     runtime.py            PostgreSQL, local Spark, worker, and prewarm wiring
@@ -39,34 +41,33 @@ src/lance_etl/            Python package
     contract.py           Fixed table UUID and partition specification validation
     lineage.py            Direct-parent snapshot chronology
     manifests.py          Physical-change classification and touched-target discovery
-    planner.py            Pinned baseline and incremental window planning
+    models.py             Pinned source, window, rejection, target, and scan records
     scans.py              Exact Spark snapshot scan construction
   etl/                    Shared ETL primitives composed by the reconciler
     replay_sink.py        Source-sequenced replay-safe Lance merge
     completion.py         Monotonic Lance completion marker
     digest.py             Canonical mutation and source digests
     mutation.py           Operation normalization and terminal mutation collapse
-    pivot.py              Map projection, schema alignment, and Arrow casts
-    sink.py               Executor-side content-routed idempotent Lance merge sink
+    arrow.py              Executor-side fixed-size-list vector normalization
+    storage.py            Current Lance format and missing-dataset classification
   indexing/               Segment-API index planning, build, commit, and maintenance libraries
   maintenance/            Retention, compaction, cleanup, and tag libraries
   publication/            Exact candidate manifests and publication workflow helpers
   recall/                 Offline recall audit libraries
   tools/                  Uninstalled operator library CLI
   cliutil.py              Shared local Spark and CLI helpers
+  spark_process.py        Lance-free Spark process safety pins and active-context validation
   telemetry.py            Datadog facade, Lance event bridge, and commit retries
   cloud_storage.py        PyArrow filesystem resolution and dataset discovery
   iceberg_optimize.py     Iceberg table maintenance library
-  migrate_namespace.py    Namespace copy and optimization library
 ```
-
-The `group_by_routing` sorted-run split is not a production symbol. It exists only as a test-only
-oracle in `tests/conftest.py`. Production streaming routing uses `stream_routing_groups`.
 
 ### Adjacent trees
 
 ```
 bench/                  Benchmark package (python -m bench). See bench/README.md for the full guide.
+  launcher.py           Import-light process replacement through spark-submit or the Python interpreter
+  driver.py             Post-replacement application driver that imports the benchmark CLI
   cli.py                Subcommand dispatch: download / prepare / search / report / e2e / experiment / qualify
   e2e.py                Reconciler-driven end-to-end run over the PostgreSQL control plane
   reconcile.py          Source and spec registration plus reconciler invocation for the e2e run
@@ -153,11 +154,11 @@ you are unsure whether an API exists or what its signature is, read that checkou
   `record_retention_seconds` and the source `replay_horizon_seconds`, so its source-sequence
   anti-resurrection watermark outlives every replayable window. An unbounded replay horizon means
   tombstones are never expired. `MaintenanceConfig.deleted_column` opts a dataset into this
-  tombstone-aware predicate. Operator-library and namespace-migration callers leave it unset and
-  keep the plain `ts < cutoff` predicate.
+  tombstone-aware predicate. Standalone operator callers leave it unset and keep the plain
+  `ts < cutoff` predicate.
 - V2 manifest paths default on (`enable_v2_manifest_paths=True` at dataset creation). New datasets
-  use V2. Existing datasets migrate via `migrate_manifest_paths_v2`. V2 makes every dataset open
-  a single object-store request regardless of version-history depth.
+  use V2, making every dataset open a single object-store request regardless of version-history
+  depth. Legacy V1 datasets are rebuild-only and have no in-place migration path here.
 - `lance.indices.IvfModel.save(uri, *, storage_options=)` / `IvfModel.load(uri, *,
   storage_options=)` persist and read IVF centroids through lance's own object-store layer in a
   single-file format. This is the centroid sidecar mechanism (ADR 0040). Never use

@@ -4,7 +4,9 @@ This package is the process that turns durable PostgreSQL state into Lance work 
 owns the one local Spark session for the reconciliation process, and it is the only code that
 executes `INGEST`, `PUBLISH`, and `REBUILD` claims read from
 [`lance_etl.state`](../state/README.md). Its entry point is the installed `lance-etl-reconcile`
-command and the `python -m lance_etl.reconciler` module.
+command and the `python -m lance_etl.reconciler` module. Both enter through an import-light launcher.
+The `run` and `run-once` commands replace that process with local `spark-submit` before loading Lance
+or Arrow. PostgreSQL-only commands replace it with the same Python interpreter and never start Spark.
 
 For the reconciliation cycle at a glance and the shared pipeline story (Iceberg reads, replay-safe
 ingestion, the segment-API index recipe), see the package [README](../README.md). For the hard
@@ -24,7 +26,9 @@ RPC warms its own persistent cache once a caller invokes it against a serving re
 
 | Module | Responsibility |
 |---|---|
-| `cli.py` | The installed `lance-etl-reconcile` command: argument parsing, `migrate` / `run-once` / `run` / `status` / `repair` dispatch, and the continuous poll loop |
+| `launcher.py` | Import-light command selection and local `spark-submit` process replacement |
+| `driver.py` | Post-replacement application driver |
+| `cli.py` | Argument parsing, `migrate` / `run-once` / `run` / `status` / `repair` dispatch, and the continuous poll loop |
 | `config.py` | Process bootstrap: PostgreSQL URL validation (psycopg 3, local-vs-remote TLS), local Spark master/catalog/warehouse settings, `ReconcilerSettings` re-export |
 | `runtime.py` | Fresh-process wiring: builds the local Spark session, the PostgreSQL engine and repository, resolves or bootstraps the Iceberg source registration, and assembles every collaborator into `ReconcilerApplication` (full run) or `ReconcilerOperator` (status/repair only, no Spark) |
 | `service.py` | `ReconcilerApplication.run_once`, `BoundedDispatcher` (bounded claim/execute/reconcile loop), `ResultReconciler` (typed result -> repository transition), retention-floor and SLO evaluation |
@@ -36,18 +40,19 @@ RPC warms its own persistent cache once a caller invokes it against a serving re
 | `results.py` | `WorkResult` / `ResultKind` — the closed, self-validating set of worker outcomes the dispatcher and reconciler understand |
 | `telemetry.py` | `TelemetrySloEmitter` — infallible low-cardinality Datadog gauges for reconciler health |
 | `migrations.py` | `AlembicMigrationRunner` — wraps `alembic upgrade head` for the `migrate` command. See the [migrations README](../../../migrations/README.md) |
-| `__main__.py` | `python -m lance_etl.reconciler` entry point, equivalent to the installed `lance-etl-reconcile` command |
-| `__init__.py` | Re-exports the package's public surface |
+| `__main__.py` | Import-light module entry point equivalent to the installed command |
+| `__init__.py` | Package marker kept import-light for process safety |
 
 ## The run-once cycle, phase by phase
 
 `ReconcilerApplication.run_once()` runs five steps in a fixed order, matching the numbered list in
 the package [README](../README.md):
 
-1. **`plan_and_enqueue_snapshots`** — repeatedly calls `SourcePlanProvider.plan()` (backed by
-   `DurableSourcePlanProvider` in `iceberg.py`) for the next accepted or durably rejected Iceberg
-   snapshot, and `SourcePlanEnqueuer.enqueue` to persist it and its touched datasets, up to
-   `settings.max_snapshots_per_plan` passes or until a pass enqueues nothing new.
+1. **`plan_and_enqueue_snapshots`** — pins one Iceberg metadata document, asks
+   `DurableSourcePlanProvider` for an accepted prefix plus at most one truncation sentinel, and
+   passes that single plan to `SourcePlanEnqueuer.enqueue`. Historical partition-spec resolution is
+   bounded to the checkpoint plus that prefix, and the enqueuer persists at most
+   `settings.max_snapshots_per_plan` snapshots per cycle.
 2. **`run_due_dataset_work`** — delegates to `BoundedDispatcher.run()`, described below.
 3. **`reconcile_results`** — delegates to `PublicationRetentionSweep.reconcile()` via the
    `ExternalResultSweep` protocol slot (despite the name, in the current local runtime this step
@@ -60,7 +65,11 @@ the package [README](../README.md):
 
 `run_once` returns a `RunOnceSummary` bundling all five results. `lance-etl-reconcile run` calls
 `run_once` in a loop separated by `poll_interval` (or an explicit `--poll-seconds`) until
-interrupted. It introduces no separate scheduler or retry database, per hard rule 9.
+interrupted. A transient failed cycle is logged and retried after the same interval. Initial source
+configuration failures that cannot produce trustworthy snapshot evidence exit immediately. An
+unconfigured or unretained baseline with an exact current-head record instead becomes an immutable
+blocked source checkpoint. `run-once` remains fail-fast for callers that need an immediate process
+failure. The loop introduces no separate scheduler or retry database, per hard rule 9.
 
 ## Worker execution and the publish-gate qualification
 
@@ -120,7 +129,7 @@ reconciles each result through `ResultReconciler.reconcile`. **Failure isolation
 reconciliation too, not just execution**: the `reconcile` call for each claim is itself wrapped.
 A `StateTransitionError` (a divergent replay — the same claim's durable evidence disagrees with
 what is already persisted) makes the dispatcher attempt a best-effort `block_work(claim,
-"STATE_DIVERGENCE", ...)` for that one row and count it in `blocked`; any other unexpected exception
+"STATE_DIVERGENCE", ...)` for that one row and count it in `blocked`. Any other unexpected exception
 from reconciliation is logged and counted in `blocked` the same way. Either way the loop continues
 with the next claim in the batch instead of raising out of `run()`. The loop stops early once a
 batch returns fewer claims than requested (the queue is drained) or the batch limit is reached, and
@@ -144,10 +153,15 @@ standalone result was dead code and has been removed.
 
 `lance-etl-reconcile status` and `repair` never start Spark — they run against `ReconcilerOperator`,
 a PostgreSQL-only surface built by `runtime.build_runtime_operator`. `repair --action retry-blocked
---work-id ...` calls `repository.retry_blocked_work` directly. `repair --action rebuild --tenant-id
-... --namespace ... --org-id ... --request-id ...` calls `repository.enqueue_rebuild` with an
-operator-supplied idempotency key, so repeating the same repair call is a no-op rather than a second
-rebuild. Both repairs accept `--dry-run` to validate input without mutating any state.
+--work-id ...` calls `repository.retry_blocked_work` directly. `repair --action retry-blocked-source
+--source-snapshot-seq ...` reopens one explicitly selected blocked accepted source checkpoint after
+an operator restores trustworthy Iceberg lineage. Child INGEST rows remain blocked until separately
+selected with `retry-blocked`, and work retry is rejected while the source gate remains closed.
+Immutable `REJECTED` checkpoints remain terminal.
+`repair --action rebuild --tenant-id ... --namespace ... --org-id ... --request-id ...` calls
+`repository.enqueue_rebuild` with an operator-supplied idempotency key, so repeating the same repair
+call is a no-op rather than a second rebuild. All repairs accept `--dry-run` to validate input without
+mutating any state.
 
 ## Invariants a maintainer must not break
 

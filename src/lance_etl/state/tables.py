@@ -398,15 +398,7 @@ iceberg_sources: sa.Table = sa.Table(
     sa.Column("default_spec_id", sa.Uuid(as_uuid=True), nullable=False),
     sa.Column("canonical_baseline_snapshot_id", sa.BigInteger(), nullable=True),
     sa.Column("replay_horizon_seconds", sa.BigInteger(), nullable=False, server_default="2592000"),
-    sa.Column("tenant_column", sa.String(128), nullable=False, server_default="tenant_id"),
-    sa.Column("namespace_column", sa.String(128), nullable=False, server_default="namespace"),
-    sa.Column("org_column", sa.String(128), nullable=False, server_default="org_id"),
-    sa.Column("record_id_column", sa.String(128), nullable=False, server_default="record_id"),
-    sa.Column("operation_column", sa.String(128), nullable=False, server_default="op"),
-    sa.Column("ts_column", sa.String(128), nullable=False, server_default="ts"),
-    sa.Column("vectors_column", sa.String(128), nullable=False, server_default="vectors"),
-    sa.Column("texts_column", sa.String(128), nullable=False, server_default="texts"),
-    sa.Column("metadata_column", sa.String(128), nullable=False, server_default="metadata"),
+    sa.Column("planning_epoch", sa.BigInteger(), nullable=False, server_default="0"),
     sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
     sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
     sa.UniqueConstraint("source_name", name="uq_iceberg_sources_name"),
@@ -437,42 +429,7 @@ iceberg_sources: sa.Table = sa.Table(
         name="ck_iceberg_sources_baseline_nonnegative",
     ),
     sa.CheckConstraint("replay_horizon_seconds > 0", name="ck_iceberg_sources_replay_positive"),
-    sa.CheckConstraint(
-        "tenant_column ~ '^[A-Za-z_][A-Za-z0-9_]{0,127}$'",
-        name="ck_iceberg_sources_tenant_column",
-    ),
-    sa.CheckConstraint(
-        "namespace_column ~ '^[A-Za-z_][A-Za-z0-9_]{0,127}$'",
-        name="ck_iceberg_sources_namespace_column",
-    ),
-    sa.CheckConstraint(
-        "org_column ~ '^[A-Za-z_][A-Za-z0-9_]{0,127}$'",
-        name="ck_iceberg_sources_org_column",
-    ),
-    sa.CheckConstraint(
-        "record_id_column ~ '^[A-Za-z_][A-Za-z0-9_]{0,127}$'",
-        name="ck_iceberg_sources_record_column",
-    ),
-    sa.CheckConstraint(
-        "operation_column ~ '^[A-Za-z_][A-Za-z0-9_]{0,127}$'",
-        name="ck_iceberg_sources_operation_column",
-    ),
-    sa.CheckConstraint(
-        "ts_column ~ '^[A-Za-z_][A-Za-z0-9_]{0,127}$'",
-        name="ck_iceberg_sources_ts_column",
-    ),
-    sa.CheckConstraint(
-        "vectors_column ~ '^[A-Za-z_][A-Za-z0-9_]{0,127}$'",
-        name="ck_iceberg_sources_vectors_column",
-    ),
-    sa.CheckConstraint(
-        "texts_column ~ '^[A-Za-z_][A-Za-z0-9_]{0,127}$'",
-        name="ck_iceberg_sources_texts_column",
-    ),
-    sa.CheckConstraint(
-        "metadata_column ~ '^[A-Za-z_][A-Za-z0-9_]{0,127}$'",
-        name="ck_iceberg_sources_metadata_column",
-    ),
+    sa.CheckConstraint("planning_epoch >= 0", name="ck_iceberg_sources_planning_epoch_nonnegative"),
 )
 
 datasets: sa.Table = sa.Table(
@@ -564,6 +521,18 @@ source_snapshots: sa.Table = sa.Table(
         "kind IN ('BASELINE', 'REJECTED') OR parent_snapshot_id IS NOT NULL",
         name="ck_source_snapshots_parent_required",
     ),
+)
+sa.Index(
+    "ix_source_snapshots_blocked_source",
+    source_snapshots.c.source_id,
+    source_snapshots.c.source_snapshot_seq,
+    postgresql_where=source_snapshots.c.state == "BLOCKED",
+)
+sa.Index(
+    "ix_source_snapshots_source_created",
+    source_snapshots.c.source_id,
+    source_snapshots.c.created_at,
+    source_snapshots.c.source_snapshot_seq,
 )
 
 dataset_work: sa.Table = sa.Table(
@@ -695,6 +664,26 @@ sa.Index(
     postgresql_where=sa.and_(
         dataset_work.c.kind == "INGEST",
         dataset_work.c.state != "SUCCEEDED",
+    ),
+)
+sa.Index(
+    "ix_dataset_work_ingest_snapshot",
+    dataset_work.c.source_snapshot_seq,
+    dataset_work.c.dataset_id,
+    postgresql_where=dataset_work.c.kind == "INGEST",
+)
+sa.Index(
+    "ix_dataset_work_open_snapshot",
+    dataset_work.c.source_snapshot_seq,
+    postgresql_where=dataset_work.c.state != "SUCCEEDED",
+)
+sa.Index(
+    "ix_dataset_work_completed_publish",
+    dataset_work.c.updated_at,
+    dataset_work.c.work_id,
+    postgresql_where=sa.and_(
+        dataset_work.c.kind == "PUBLISH",
+        dataset_work.c.state == "SUCCEEDED",
     ),
 )
 

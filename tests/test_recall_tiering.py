@@ -1,7 +1,7 @@
 """Tests for the recall job's small/big size tiering.
 
 A tiny batch of single-fragment groups must take the packed small path where one task scores many datasets, and a
-multi-fragment group must take the per-fragment fan-out. The fanned-out, driver-reduced top-k must equal the
+multi-fragment group must take the per-fragment fan-out. The fanned-out, executor-reduced top-k must equal the
 single-stream whole-dataset brute force exactly, ties included, both at the primitive level and through the full job.
 All datasets are local and all span input goes through :class:`InMemorySpanSource`, so no network is touched.
 """
@@ -9,7 +9,11 @@ All datasets are local and all span input goes through :class:`InMemorySpanSourc
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+import os
+import sys
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +21,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+from pyspark.sql import SparkSession
 
 from lance_etl.recall import (
     InMemorySpanSource,
@@ -31,11 +36,32 @@ from lance_etl.recall import (
     reduce_partial_top_k,
     reduce_vector_legs,
 )
+from lance_etl.recall.job import MAX_PARTIAL_CANDIDATES_PER_TASK, chunk_samples_by_k
 from lance_etl.telemetry import TelemetryConfig
 
 DIM: int = 8
 
 
+@pytest.fixture(scope="module")
+def real_spark() -> Iterator[SparkSession]:
+    """Provide a two-core local Spark session for the marked RDD integration case.
+
+    Yields:
+        Local Spark session using the locked Python interpreter.
+    """
+    os.environ["PYSPARK_PYTHON"] = sys.executable
+    os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+    session: SparkSession = (
+        SparkSession.builder.master("local[2]")
+        .appName("lance-etl-recall-tiering-tests")
+        .config("spark.ui.enabled", "false")
+        .getOrCreate()
+    )
+    yield session
+    session.stop()
+
+
+@dataclass
 class RecordedCall:
     """One recorded ``parallelize`` invocation, partitioned the way Spark would slice a list.
 
@@ -45,16 +71,17 @@ class RecordedCall:
         partitions: The items split round-robin into ``slices`` partitions, each a stand-in for one task.
     """
 
-    def __init__(self, items: list[Any], slices: int) -> None:
-        """Record and partition one parallelize call.
+    items: list[Any]
+    slices: int
 
-        Args:
-            items: The items handed to parallelize.
-            slices: The requested partition count.
+    @property
+    def partitions(self) -> list[list[Any]]:
+        """Split items round-robin across the requested slices.
+
+        Returns:
+            The simulated Spark partitions.
         """
-        self.items: list[Any] = items
-        self.slices: int = slices
-        self.partitions: list[list[Any]] = [items[offset::slices] for offset in range(slices)]
+        return [self.items[offset :: self.slices] for offset in range(self.slices)]
 
     def tasks(self) -> int:
         """Count the non-empty partitions, the number of tasks Spark would launch.
@@ -73,16 +100,11 @@ class RecordedCall:
         return max((len(partition) for partition in self.partitions), default=0)
 
 
+@dataclass
 class RecordingRdd:
     """A fake RDD that maps eagerly while preserving the partition structure."""
 
-    def __init__(self, partitions: list[list[Any]]) -> None:
-        """Initialize the fake RDD.
-
-        Args:
-            partitions: The partitioned items.
-        """
-        self.partitions: list[list[Any]] = partitions
+    partitions: list[list[Any]]
 
     def map(self, fn: Callable[[Any], Any]) -> RecordingRdd:
         """Apply a function to every item, keeping items in their partitions.
@@ -95,6 +117,48 @@ class RecordingRdd:
         """
         return RecordingRdd([[fn(item) for item in partition] for partition in self.partitions])
 
+    def flatMap(self, fn: Callable[[Any], Iterable[Any]]) -> RecordingRdd:
+        """Apply a function and flatten each result while retaining source partitions.
+
+        Args:
+            fn: The flat mapper.
+
+        Returns:
+            A new fake RDD with flattened mapped items.
+        """
+        return RecordingRdd([[result for item in partition for result in fn(item)] for partition in self.partitions])
+
+    def reduceByKey(self, fn: Callable[[Any, Any], Any], slices: int) -> RecordingRdd:
+        """Reduce key-value items into the requested number of partitions.
+
+        Args:
+            fn: Associative value reducer.
+            slices: The requested output partition count.
+
+        Returns:
+            A fake RDD containing one reduced value per key.
+        """
+        reduced: dict[Any, Any] = {}
+        for partition in self.partitions:
+            for key, value in partition:
+                reduced[key] = fn(reduced[key], value) if key in reduced else value
+        partitions: int = max(1, slices)
+        items: list[tuple[Any, Any]] = list(reduced.items())
+        return RecordingRdd([items[offset::partitions] for offset in range(partitions)])
+
+    def repartition(self, slices: int) -> RecordingRdd:
+        """Redistribute all items across the requested partition count.
+
+        Args:
+            slices: The requested output partition count.
+
+        Returns:
+            A fake shuffled RDD.
+        """
+        items: list[Any] = self.collect()
+        partitions: int = max(1, slices)
+        return RecordingRdd([items[offset::partitions] for offset in range(partitions)])
+
     def collect(self) -> list[Any]:
         """Flatten the partitions back into one list.
 
@@ -104,6 +168,7 @@ class RecordingRdd:
         return [item for partition in self.partitions for item in partition]
 
 
+@dataclass
 class RecordingSparkContext:
     """A fake SparkContext that records every parallelize call and its partitioning.
 
@@ -111,9 +176,7 @@ class RecordingSparkContext:
         calls: The recorded parallelize calls in invocation order.
     """
 
-    def __init__(self) -> None:
-        """Initialize the recording context."""
-        self.calls: list[RecordedCall] = []
+    calls: list[RecordedCall] = field(default_factory=list)
 
     def parallelize(self, items: list[Any], slices: int) -> RecordingRdd:
         """Record the call, partition the items, and return a fake RDD.
@@ -132,12 +195,11 @@ class RecordingSparkContext:
         return RecordingRdd(call.partitions)
 
 
+@dataclass
 class RecordingSpark:
     """A fake SparkSession exposing the recording context."""
 
-    def __init__(self) -> None:
-        """Initialize the fake session with its recording context."""
-        self.sparkContext: RecordingSparkContext = RecordingSparkContext()
+    sparkContext: RecordingSparkContext = field(default_factory=RecordingSparkContext)
 
 
 def make_vectors(rows: int, dim: int, seed: int) -> np.ndarray:
@@ -285,8 +347,19 @@ def tied_dataset(
     return uri, ids, vectors
 
 
+def test_sample_chunks_bound_aggregate_top_k_candidates() -> None:
+    """Large-tier work splits before one task can retain an unbounded product of samples and k."""
+    query: np.ndarray = make_vectors(1, DIM, 7)[0].astype(np.float64)
+    samples: list[RecallSample] = [make_sample(index, 1, query, list(range(10_000)), k=10_000) for index in range(5)]
+
+    chunks: list[list[RecallSample]] = chunk_samples_by_k(samples)
+
+    assert [len(chunk) for chunk in chunks] == [2, 2, 1]
+    assert all(sum(sample.k for sample in chunk) <= MAX_PARTIAL_CANDIDATES_PER_TASK for chunk in chunks)
+
+
 class TestExactness:
-    """The per-fragment partial top-k reduced on the driver equals the single-stream whole-dataset brute force."""
+    """The per-fragment partial top-k reduced by key equals the single-stream whole-dataset brute force."""
 
     def test_reduce_equals_single_stream_with_ties(self, tmp_path: Path) -> None:
         """A query tying across fragment boundaries reduces to the same ids and distances as the whole scan."""
@@ -321,24 +394,19 @@ class TestExactness:
         version: int = lance.dataset(uri).version
         sample: RecallSample = make_sample(0, version, query, oracle_top_k(ids, vectors, query, 10))
         fragment_partials: list[tuple[int, dict[str, Any]]] = []
-        for index in range(len(dataset.get_fragments())):
-            partials: dict[str, dict[str, Any]] = fragment_vector_partials(uri, version, index, [sample], config)
-            fragment_partials.append((index, partials[sample.sample_id]))
+        for fragment in dataset.get_fragments():
+            fragment_id: int = int(fragment.fragment_id)
+            partials: dict[str, dict[str, Any]] = fragment_vector_partials(uri, version, fragment_id, [sample], config)
+            fragment_partials.append((fragment_id, partials[sample.sample_id]))
         leg: dict[str, Any] = reduce_vector_legs(sample, fragment_partials)
         assert leg["status"] == "leg"
         assert leg["ids"] == whole_ids
         assert leg["count"] == whole_count
 
-    def test_stale_fragment_index_skips_instead_of_raising(
+    def test_invalid_planned_fragment_skips_instead_of_raising(
         self, tmp_path: Path, telemetry_config: TelemetryConfig
     ) -> None:
-        """A fragment_index beyond the freshly-opened dataset's fragment count skips rather than raising.
-
-        Stands in for a concurrent compaction shrinking the fragment count between the
-        ``classify_groups`` probe (which planned this index) and this task's own dataset open: the
-        dataset here genuinely has one fragment, so index 5 is out of range and must not raise
-        ``IndexError``.
-        """
+        """An invalid planned fragment identifier becomes a missing-fragment skip rather than an executor failure."""
         uri, ids, vectors = tied_dataset(tmp_path, fragments=1, rows_per_fragment=10, tie_span=3)
         version: int = lance.dataset(uri).version
         query: np.ndarray = make_vectors(1, DIM, 71)[0].astype(np.float64)
@@ -348,15 +416,24 @@ class TestExactness:
         partials: dict[str, dict[str, Any]] = fragment_vector_partials(uri, version, 5, [sample], config)
         assert partials[sample.sample_id] == {"status": "skip", "reason": "fragment_missing"}
 
-    def test_stale_fragment_index_skip_propagates_through_reduce(
+    def test_inventory_drift_sentinel_skips_instead_of_overflowing(
         self, tmp_path: Path, telemetry_config: TelemetryConfig
     ) -> None:
-        """A fragment_missing partial among otherwise-valid partials still skips the whole reduced leg.
+        """The negative executor-inventory sentinel never reaches pylance's unsigned fragment lookup."""
+        uri, ids, vectors = tied_dataset(tmp_path, fragments=1, rows_per_fragment=10, tie_span=3)
+        version: int = lance.dataset(uri).version
+        query: np.ndarray = make_vectors(1, DIM, 71)[0].astype(np.float64)
+        sample: RecallSample = make_sample(0, version, query, oracle_top_k(ids, vectors, query, 10))
+        config: RecallJobConfig = config_for(tmp_path, telemetry_config)
 
-        Mirrors :meth:`reduce_vector_legs`'s existing rule that any skip among a sample's per-fragment
-        partials skips the whole leg, so a mid-flight shrink degrades to an honest skip instead of a
-        recall score computed from an incomplete fragment scan.
-        """
+        partials: dict[str, dict[str, Any]] = fragment_vector_partials(uri, version, -1, [sample], config)
+
+        assert partials[sample.sample_id] == {"status": "skip", "reason": "version_missing"}
+
+    def test_invalid_planned_fragment_skip_propagates_through_reduce(
+        self, tmp_path: Path, telemetry_config: TelemetryConfig
+    ) -> None:
+        """A missing-fragment partial among otherwise-valid partials still skips the whole reduced leg."""
         uri, ids, vectors = tied_dataset(tmp_path, fragments=2, rows_per_fragment=10, tie_span=3)
         version: int = lance.dataset(uri).version
         query: np.ndarray = make_vectors(1, DIM, 71)[0].astype(np.float64)
@@ -371,6 +448,28 @@ class TestExactness:
         ]
         leg: dict[str, Any] = reduce_vector_legs(sample, fragment_partials)
         assert leg == {"status": "skip", "reason": "fragment_missing"}
+
+    def test_disappeared_planned_version_skips_instead_of_falling_forward(
+        self, tmp_path: Path, telemetry_config: TelemetryConfig
+    ) -> None:
+        """A missing exact task version cannot silently score partials from the latest snapshot."""
+        uri, ids, vectors = tied_dataset(tmp_path, fragments=2, rows_per_fragment=10, tie_span=3)
+        recorded_version: int = lance.dataset(uri).version
+        lance.write_dataset(vectors_table([len(ids)], make_vectors(1, DIM, 72)), uri, mode="append")
+        lance.dataset(uri).cleanup_old_versions(older_than=timedelta(0), retain_versions=1, delete_unverified=True)
+        query: np.ndarray = make_vectors(1, DIM, 71)[0].astype(np.float64)
+        sample: RecallSample = make_sample(
+            0,
+            recorded_version,
+            query,
+            oracle_top_k(ids, vectors, query, 10),
+            namespace="whale",
+        )
+        config: RecallJobConfig = config_for(tmp_path, telemetry_config)
+
+        partials: dict[str, dict[str, Any]] = fragment_vector_partials(uri, recorded_version, 0, [sample], config)
+
+        assert partials[sample.sample_id] == {"status": "skip", "reason": "version_missing"}
 
 
 class TestSmallTier:
@@ -397,7 +496,7 @@ class TestSmallTier:
             call for call in spark.sparkContext.calls if call.items and len(call.items[0]) == 3
         ]
         fanout_calls: list[RecordedCall] = [
-            call for call in spark.sparkContext.calls if call.items and len(call.items[0]) == 5
+            call for call in spark.sparkContext.calls if call.items and len(call.items[0]) == 4
         ]
         assert len(small_calls) == 1
         assert not fanout_calls
@@ -424,15 +523,56 @@ class TestLargeTier:
             spark, InMemorySpanSource(records=[span_record(sample)]), 0, 10**13
         )
         fanout_calls: list[RecordedCall] = [
-            call for call in spark.sparkContext.calls if call.items and len(call.items[0]) == 5
+            call for call in spark.sparkContext.calls if call.items and len(call.items[0]) == 4
         ]
         small_calls: list[RecordedCall] = [
             call for call in spark.sparkContext.calls if call.items and len(call.items[0]) == 3
         ]
         assert len(fanout_calls) == 1
-        assert len(fanout_calls[0].items) == 6
+        assert len(fanout_calls[0].items) == 1
+        assert fanout_calls[0].items[0][3] == 6
         assert not small_calls
         assert len(report.scores) == 1
+        assert report.scores[0].recall == pytest.approx(1.0)
+
+    @pytest.mark.integration
+    def test_large_group_executor_inventory_runs_on_real_spark(
+        self,
+        tmp_path: Path,
+        telemetry_config: TelemetryConfig,
+        real_spark: SparkSession,
+    ) -> None:
+        """The executor inventory, repartition, and bounded reducer chain serialize through PySpark.
+
+        Args:
+            tmp_path: Temporary local dataset root.
+            telemetry_config: Test telemetry configuration.
+            real_spark: Two-core local Spark session.
+        """
+        uri, ids, vectors = tied_dataset(tmp_path, fragments=4, rows_per_fragment=8, tie_span=3)
+        version: int = lance.dataset(uri).version
+        query: np.ndarray = make_vectors(1, DIM, 93)[0].astype(np.float64)
+        sample: RecallSample = make_sample(
+            0,
+            version,
+            query,
+            oracle_top_k(ids, vectors, query, 10),
+            namespace="whale",
+        )
+        config: RecallJobConfig = config_for(
+            tmp_path,
+            telemetry_config,
+            large_group_fragment_threshold=2,
+            large_tier_slices=2,
+        )
+
+        report: RecallReport = RecallAuditJob(config).run(
+            real_spark,
+            InMemorySpanSource(records=[span_record(sample)]),
+            0,
+            10**13,
+        )
+
         assert report.scores[0].recall == pytest.approx(1.0)
 
     def test_large_and_small_paths_score_identically(self, tmp_path: Path, telemetry_config: TelemetryConfig) -> None:
@@ -457,3 +597,52 @@ class TestLargeTier:
         assert small_score.ndcg == large_score.ndcg
         assert small_score.mrr == large_score.mrr
         assert large_score.recall == pytest.approx(0.6)
+
+    def test_missing_large_group_version_skips_without_fanout(
+        self, tmp_path: Path, telemetry_config: TelemetryConfig
+    ) -> None:
+        """A missing captured version stays out of large-tier fragment fanout and skips."""
+        uri, ids, vectors = tied_dataset(tmp_path, fragments=4, rows_per_fragment=10, tie_span=3)
+        recorded_version: int = lance.dataset(uri).version
+        appended_vectors: np.ndarray = make_vectors(1, DIM, 81)
+        lance.write_dataset(vectors_table([len(ids)], appended_vectors), uri, mode="append")
+        lance.dataset(uri).cleanup_old_versions(older_than=timedelta(0), retain_versions=1, delete_unverified=True)
+        query: np.ndarray = make_vectors(1, DIM, 71)[0].astype(np.float64)
+        served: list[int] = oracle_top_k(ids + [len(ids)], np.vstack([vectors, appended_vectors]), query, 10)
+        sample: RecallSample = make_sample(0, recorded_version, query, served, namespace="whale")
+        config: RecallJobConfig = config_for(tmp_path, telemetry_config, large_group_fragment_threshold=2)
+        spark: RecordingSpark = RecordingSpark()
+
+        report: RecallReport = RecallAuditJob(config).run(
+            spark, InMemorySpanSource(records=[span_record(sample)]), 0, 10**13
+        )
+
+        fanout_calls: list[RecordedCall] = [call for call in spark.sparkContext.calls if call.items]
+        assert not any(len(call.items[0]) == 4 for call in fanout_calls)
+        assert report.scores[0].skip_reason == "version_missing"
+        assert report.scores[0].recall is None
+
+    def test_duplicate_sample_ids_fall_back_to_collision_free_small_tier(
+        self, tmp_path: Path, telemetry_config: TelemetryConfig
+    ) -> None:
+        """Duplicate capture ids cannot overwrite each other's large-tier partial dictionaries."""
+        uri, ids, vectors = tied_dataset(tmp_path, fragments=4, rows_per_fragment=10, tie_span=3)
+        version: int = lance.dataset(uri).version
+        query: np.ndarray = make_vectors(1, DIM, 71)[0].astype(np.float64)
+        served: list[int] = oracle_top_k(ids, vectors, query, 10)
+        samples: list[RecallSample] = [
+            make_sample(index, version, query, served, sample_id="duplicate", namespace="whale") for index in range(2)
+        ]
+        config: RecallJobConfig = config_for(tmp_path, telemetry_config, large_group_fragment_threshold=2)
+        spark: RecordingSpark = RecordingSpark()
+
+        report: RecallReport = RecallAuditJob(config).run(
+            spark, InMemorySpanSource(records=[span_record(sample) for sample in samples]), 0, 10**13
+        )
+
+        fanout_calls: list[RecordedCall] = [
+            call for call in spark.sparkContext.calls if call.items and len(call.items[0]) == 4
+        ]
+        assert not fanout_calls
+        assert len(report.scores) == 2
+        assert all(score.recall == pytest.approx(1.0) for score in report.scores)

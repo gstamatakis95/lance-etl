@@ -64,7 +64,7 @@ from bench.reconcile import (
 )
 from bench.results import ensure_dir, save_phase
 from lance_etl.etl.mutation import normalize_operation
-from lance_etl.reconciler.iceberg import SparkIcebergCatalog
+from lance_etl.reconciler.iceberg import IcebergMetadataPin, SparkIcebergCatalog
 from lance_etl.state import (
     ControlPlaneRepository,
     DatasetSpecRevision,
@@ -304,12 +304,18 @@ def snapshot_sequence_numbers(catalog: SparkIcebergCatalog, table: str, snapshot
 
     Returns:
         A snapshot-id to sequence-number mapping restricted to the appended snapshots.
+
+    Raises:
+        RuntimeError: If the pinned Iceberg metadata no longer retains an appended snapshot.
     """
-    document: dict[str, Any] = catalog.metadata_document(table)
-    by_id: dict[int, int] = {
-        int(entry["snapshot-id"]): int(entry["sequence-number"]) for entry in document.get("snapshots", ())
-    }
-    return {snapshot_id: by_id[snapshot_id] for snapshot_id in snapshot_ids}
+    pin: IcebergMetadataPin = catalog.metadata(table)
+    sequences: dict[int, int] = {}
+    for snapshot_id in snapshot_ids:
+        document: dict[str, Any] | None = pin.snapshot_loader(snapshot_id)
+        if document is None:
+            raise RuntimeError(f"appended Iceberg snapshot {snapshot_id} is absent from pinned metadata")
+        sequences[snapshot_id] = int(document["sequence-number"])
+    return sequences
 
 
 def serving_versions(config: BenchConfig, repository: ControlPlaneRepository) -> dict[str, int | None]:

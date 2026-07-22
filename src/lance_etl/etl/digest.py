@@ -197,12 +197,16 @@ def canonical_source_digest(rows: Iterable[tuple[str, int, bytes]]) -> bytes:
         Raw 32-byte SHA-256 digest.
 
     Raises:
-        ValueError: If a source sequence or digest has an invalid representation.
+        ValueError: If a record id is duplicated or a source sequence or digest is invalid.
     """
     ordered: list[tuple[bytes, int, bytes]] = []
+    seen_record_ids: set[str] = set()
     for record_id, source_sequence, event_digest in rows:
-        if source_sequence < -(1 << 63) or source_sequence >= 1 << 63:
-            raise ValueError(f"source sequence is outside signed 64-bit range: {source_sequence}")
+        if record_id in seen_record_ids:
+            raise ValueError(f"source digest contains duplicate record id {record_id!r}")
+        seen_record_ids.add(record_id)
+        if source_sequence < 0 or source_sequence >= 1 << 63:
+            raise ValueError(f"source sequence is outside non-negative signed 64-bit range: {source_sequence}")
         if len(event_digest) != 32:
             raise ValueError(f"event digest must contain 32 bytes, got {len(event_digest)}")
         ordered.append((record_id.encode("utf-8"), source_sequence, event_digest))

@@ -6,6 +6,9 @@ from lance_etl.state.repository import (
     ControlPlaneRepository as ControlPlaneRepository,
 )
 from lance_etl.state.repository import (
+    StaleSourcePlanError as StaleSourcePlanError,
+)
+from lance_etl.state.repository import (
     StateTransitionError as StateTransitionError,
 )
 from lance_etl.state.repository import (

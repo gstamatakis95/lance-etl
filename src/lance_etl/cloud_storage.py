@@ -17,8 +17,8 @@ supplied, which is what keeps a fleet of around a million tiny datasets enumerab
 Provider caveats:
 
 - GCS: ``GcsFileSystem`` requires ``access_token`` and ``credential_token_expiration`` to be paired. Passing only
-  ``access_token`` raises ``ValueError`` (``pyarrow/_gcsfs.pyx:108-111``). If you authenticate with a service-account
-  file use ``GOOGLE_APPLICATION_CREDENTIALS`` and omit both keys so Application Default Credentials picks it up.
+  one raises ``ValueError`` (``pyarrow/_gcsfs.pyx:108-111``). If you authenticate with a service-account file use
+  ``GOOGLE_APPLICATION_CREDENTIALS`` and omit both keys so Application Default Credentials picks it up.
 - Azure: ``AzureFileSystem`` requires ``account_name`` as a positional argument (``pyarrow/_azurefs.pyx:110``).
   Supplying no ``account_name`` raises ``TypeError``. This module rejects that combination early with a clear error.
   With a managed identity supply ``account_name`` and omit the key.
@@ -30,6 +30,7 @@ the installed pyarrow if explicit credentials are passed for those providers.
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 from urllib.parse import urlparse
@@ -97,6 +98,38 @@ PROVIDER_OPTION_KEYS: dict[CloudProvider, dict[str, str]] = {
 }
 
 
+def parse_gcs_token_expiration(value: Any) -> datetime:
+    """Convert a GCS token expiration to the datetime required by PyArrow.
+
+    Storage options must remain strings because the same mapping is forwarded to pylance after
+    PyArrow discovery. This accepts an ISO 8601 timestamp or Unix epoch seconds encoded as a
+    string. Naive ISO timestamps are interpreted as UTC.
+
+    Args:
+        value: Configured token expiration.
+
+    Returns:
+        UTC token expiration datetime.
+
+    Raises:
+        ValueError: If the value is not a string containing a valid datetime or epoch seconds.
+    """
+    if not isinstance(value, str):
+        raise ValueError("credential_token_expiration must be a string for pylance compatibility")
+    try:
+        parsed: datetime = datetime.fromtimestamp(float(value), UTC)
+    except (OverflowError, OSError, ValueError):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError(
+                "credential_token_expiration must be an ISO 8601 timestamp or Unix epoch seconds"
+            ) from error
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
 def provider_for_uri(uri: str) -> CloudProvider:
     """Return the cloud provider implied by a URI scheme.
 
@@ -140,12 +173,13 @@ def map_storage_options(storage_options: dict[str, Any] | None, mapping: dict[st
     resolved: dict[str, Any] = {}
     for source, target in mapping.items():
         if source in options:
-            resolved[target] = options[source]
+            value: Any = options[source]
+            resolved[target] = parse_gcs_token_expiration(value) if target == "credential_token_expiration" else value
     return resolved
 
 
 def validate_gcs_kwargs(kwargs: dict[str, Any]) -> None:
-    """Raise ``ValueError`` when ``access_token`` is present without its required pair.
+    """Require token and expiration credentials to be supplied together.
 
     ``GcsFileSystem`` requires ``access_token`` and ``credential_token_expiration`` to be supplied together
     (``pyarrow/_gcsfs.pyx:108-111``). Passing only the token raises inside the Cython constructor with a confusing
@@ -156,11 +190,11 @@ def validate_gcs_kwargs(kwargs: dict[str, Any]) -> None:
     """
     has_token = "access_token" in kwargs
     has_expiry = "credential_token_expiration" in kwargs
-    if has_token and not has_expiry:
+    if has_token != has_expiry:
         raise ValueError(
-            "GcsFileSystem requires 'credential_token_expiration' whenever 'access_token' is supplied. "
-            "Add 'credential_token_expiration' to storage_options, or remove 'access_token' and rely on "
-            "GOOGLE_APPLICATION_CREDENTIALS / Application Default Credentials instead."
+            "GcsFileSystem requires 'access_token' and 'credential_token_expiration' together. Supply both in "
+            "storage_options, or remove both and rely on GOOGLE_APPLICATION_CREDENTIALS / Application Default "
+            "Credentials instead."
         )
 
 
@@ -181,8 +215,8 @@ def resolve_filesystem(uri: str, storage_options: dict[str, Any] | None) -> tupl
         A ``(filesystem, path)`` pair for the URI.
 
     Raises:
-        ValueError: If GCS ``access_token`` is supplied without ``credential_token_expiration``, or if Azure
-            ``storage_options`` contains no ``account_name``.
+        ValueError: If exactly one GCS token credential is supplied, or if Azure ``storage_options`` contains no
+            ``account_name``.
     """
     provider: CloudProvider = provider_for_uri(uri)
     kwargs: dict[str, Any] = map_storage_options(storage_options, PROVIDER_OPTION_KEYS.get(provider, {}))
@@ -235,7 +269,10 @@ def list_dataset_paths(filesystem: Any, base_path: str, subpath: str | None = No
         relative: str = info.path[len(base) :].lstrip("/")
         components: list[str] = relative.split("/")
         for depth, component in enumerate(components):
-            if component.endswith(".lance"):
+            is_dataset_root: bool = component.endswith(".lance") and (
+                depth < len(components) - 1 or info.type == pa_fs.FileType.Directory
+            )
+            if is_dataset_root:
                 datasets.add("/".join(components[: depth + 1]))
                 break
     return datasets
@@ -300,7 +337,7 @@ def discover_datasets(
     prefixes: list[str] = []
     for info in filesystem.get_file_info(selector):
         name: str = info.path[len(base) :].lstrip("/")
-        if name.endswith(".lance"):
+        if name.endswith(".lance") and info.type == pa_fs.FileType.Directory:
             datasets.add(name)
         elif info.type == pa_fs.FileType.Directory:
             prefixes.append(name)

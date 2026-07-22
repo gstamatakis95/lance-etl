@@ -153,20 +153,22 @@ class StubDrainApplication:
 
     Attributes:
         repository: The stub status repository consulted once a cycle is quiescent-looking.
+        summary: Cycle summary returned by every ``run_once`` invocation.
         cycles: Number of times ``run_once`` has been invoked.
     """
 
     repository: StubStatusRepository
+    summary: RunOnceSummary = field(default_factory=zero_claim_run_once_summary)
     cycles: int = field(default=0)
 
     def run_once(self) -> RunOnceSummary:
         """Return a zero-claim, zero-enqueue cycle summary.
 
         Returns:
-            A summary that always looks quiescent from the dispatch/planning counters alone.
+            The configured cycle summary.
         """
         self.cycles += 1
-        return zero_claim_run_once_summary()
+        return self.summary
 
 
 def noop_sleep(seconds: float) -> None:
@@ -210,6 +212,34 @@ def test_drain_reconciler_raises_when_retries_never_resolve(monkeypatch: pytest.
     with pytest.raises(RuntimeError, match="did not reach quiescence"):
         drain_reconciler(application)
     assert application.repository.calls == 3
+
+
+def test_drain_reconciler_raises_for_durably_blocked_work_before_polling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Existing durable blockage fails fast even when the dispatch blocked no new work."""
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(reconcile_module.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    summary: RunOnceSummary = zero_claim_run_once_summary()
+    summary = replace(
+        summary,
+        slo=replace(
+            summary.slo,
+            healthy=False,
+            reasons=("blocked_work",),
+            due_work=1,
+            blocked_work=1,
+        ),
+    )
+    application = StubDrainApplication(
+        repository=StubStatusRepository(statuses=[quiescent_control_plane_status(due_work=1)]),
+        summary=summary,
+    )
+    with pytest.raises(RuntimeError, match="blocked benchmark work"):
+        drain_reconciler(application)
+    assert application.cycles == 1
+    assert application.repository.calls == 0
+    assert sleep_calls == []
 
 
 def test_drain_reconciler_returns_immediately_when_already_quiescent(monkeypatch: pytest.MonkeyPatch) -> None:

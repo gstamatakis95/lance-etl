@@ -150,11 +150,11 @@ A source row records stable source identity and first-run bootstrap truth:
 - local Lance base URI and lifecycle state
 - default dataset spec and optional canonical baseline snapshot
 - replay horizon
-- route columns for tenant, namespace, and organization
-- record ID, operation, ts, vectors, texts, and metadata source columns
+- monotonic planning epoch that fences stale Iceberg observations across source gates and repairs
 
 The first local run inserts the source registration when absent. Later runs load it from PostgreSQL
-and reject a changed table UUID, table name, Lance root, baseline, or column mapping.
+and reject a changed table UUID, table name, Lance root, or baseline. Physical source names are a
+fixed code-owned contract and are not duplicated as database configuration.
 
 ### `datasets`
 
@@ -292,6 +292,7 @@ include it in the revision digest.
 ## Migration strategy
 
 Breaking changes are allowed. `migrations/versions/0001_control_plane.py` is the single Alembic
-baseline and seeds the bundled active dataset specification revision. Fresh
-local databases upgrade directly to the current 9-table schema. There is no compatibility bridge
-for older experimental schemas.
+baseline and seeds the bundled active dataset specification revision. Schema changes rewrite that
+baseline. Existing control-plane data is dropped and recreated instead of being carried through
+forward compatibility migrations. Fresh local databases upgrade directly to the current 9-table
+schema.

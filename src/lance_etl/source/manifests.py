@@ -12,7 +12,6 @@ from lance_etl.source.models import (
     ManifestStatus,
     SnapshotRecord,
     TargetKey,
-    TouchedTarget,
     WindowKind,
 )
 
@@ -61,6 +60,24 @@ def validate_append_entries(snapshot: SnapshotRecord, entries: tuple[ManifestEnt
     Raises:
         SourceSnapshotBlockedError: If the snapshot removes data or adds delete files.
     """
+    summary: dict[str, str] = dict(snapshot.summary)
+    try:
+        declared_nonempty: bool = any(int(summary.get(name, "0")) > 0 for name in ("added-data-files", "added-records"))
+    except ValueError as exc:
+        raise blocked_snapshot_error(
+            snapshot.snapshot_id,
+            "MANIFEST_SUMMARY_INVALID",
+            "append snapshot carries a malformed added-data summary",
+        ) from exc
+    has_added_data: bool = any(
+        entry.status is ManifestStatus.ADDED and entry.content is ManifestContent.DATA for entry in entries
+    )
+    if declared_nonempty and not has_added_data:
+        raise blocked_snapshot_error(
+            snapshot.snapshot_id,
+            "MANIFEST_EVIDENCE_MISSING",
+            "nonempty append snapshot has no added data-file manifest evidence",
+        )
     for entry in entries:
         if entry.snapshot_id != snapshot.snapshot_id and entry.status is not ManifestStatus.EXISTING:
             raise blocked_snapshot_error(
@@ -112,33 +129,32 @@ def validate_trusted_rewrite(
 def discover_added_targets(
     snapshot: SnapshotRecord,
     entries: Iterable[ManifestEntry],
-) -> tuple[TouchedTarget, ...]:
-    """Discover target identities and pruning hours only from this snapshot's added data files.
+) -> tuple[TargetKey, ...]:
+    """Discover target identities only from this snapshot's added data files.
 
     Args:
         snapshot: Accepted append snapshot.
         entries: Normalized manifest entries.
 
     Returns:
-        Targets in deterministic identity order with sorted unique hour values.
+        Unique targets in deterministic identity order.
 
     Raises:
         SourceSnapshotBlockedError: If a changed entry uses a different partition spec.
     """
-    target_hours: dict[TargetKey, set[int]] = {}
+    targets: set[TargetKey] = set()
     for entry in entries:
         if entry.status is not ManifestStatus.ADDED or entry.content is not ManifestContent.DATA:
             continue
         validate_entry_spec(snapshot, entry)
-        target = entry.partition.target_key()
-        target_hours.setdefault(target, set()).add(entry.partition.ts_hour)
-    return touched_targets(target_hours)
+        targets.add(entry.partition.target_key())
+    return sorted_targets(targets)
 
 
 def discover_baseline_targets(
     snapshot: SnapshotRecord,
     entries: Iterable[ManifestEntry],
-) -> tuple[TouchedTarget, ...]:
+) -> tuple[TargetKey, ...]:
     """Discover all live data-file target partitions for a validated canonical baseline.
 
     Args:
@@ -146,16 +162,15 @@ def discover_baseline_targets(
         entries: Live manifest entries at that exact snapshot.
 
     Returns:
-        Targets in deterministic identity order with sorted unique hour values.
+        Unique targets in deterministic identity order.
     """
-    target_hours: dict[TargetKey, set[int]] = {}
+    targets: set[TargetKey] = set()
     for entry in entries:
         if entry.status is ManifestStatus.DELETED or entry.content is not ManifestContent.DATA:
             continue
         validate_entry_spec(snapshot, entry)
-        target = entry.partition.target_key()
-        target_hours.setdefault(target, set()).add(entry.partition.ts_hour)
-    return touched_targets(target_hours)
+        targets.add(entry.partition.target_key())
+    return sorted_targets(targets)
 
 
 def validate_entry_spec(snapshot: SnapshotRecord, entry: ManifestEntry) -> None:
@@ -174,14 +189,13 @@ def validate_entry_spec(snapshot: SnapshotRecord, entry: ManifestEntry) -> None:
         )
 
 
-def touched_targets(target_hours: dict[TargetKey, set[int]]) -> tuple[TouchedTarget, ...]:
-    """Freeze a target-to-hours mapping in deterministic byte-compatible string order.
+def sorted_targets(targets: set[TargetKey]) -> tuple[TargetKey, ...]:
+    """Freeze target identities in deterministic string order.
 
     Args:
-        target_hours: Mutable discovery accumulator.
+        targets: Mutable discovery accumulator.
 
     Returns:
-        Immutable deterministic target records.
+        Immutable deterministic target identities.
     """
-    ordered_keys = sorted(target_hours, key=lambda key: (key.tenant_id, key.namespace, key.org_id))
-    return tuple(TouchedTarget(target, tuple(sorted(target_hours[target]))) for target in ordered_keys)
+    return tuple(sorted(targets, key=lambda key: (key.tenant_id, key.namespace, key.org_id)))

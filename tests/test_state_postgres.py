@@ -18,7 +18,12 @@ from sqlalchemy.engine import URL, Engine, RowMapping, make_url
 from sqlalchemy.engine.reflection import Inspector
 from sqlalchemy.schema import CreateSchema, DropSchema
 
-from lance_etl.state.repository import ControlPlaneRepository, StateTransitionError, build_control_plane_engine
+from lance_etl.state.repository import (
+    ControlPlaneRepository,
+    StaleSourcePlanError,
+    StateTransitionError,
+    build_control_plane_engine,
+)
 from lance_etl.state.settings import ReconcilerSettings
 from lance_etl.state.specs import (
     DEFAULT_SPEC_REVISION_ID,
@@ -351,7 +356,7 @@ def complete_and_publish_snapshot(
 def test_migration_creates_exact_entities_and_seeded_typed_configuration(
     postgres_repository: tuple[ControlPlaneRepository, Engine],
 ) -> None:
-    """Alembic creates fourteen entities and one normalized default revision.
+    """Alembic creates nine application tables and one normalized default revision.
 
     Args:
         postgres_repository: Fresh repository and engine fixture.
@@ -361,6 +366,19 @@ def test_migration_creates_exact_entities_and_seeded_typed_configuration(
     repository, engine = postgres_repository
     assert set(sa.inspect(engine).get_table_names()) == APPLICATION_TABLES | {"alembic_version"}
     inspector: Inspector = sa.inspect(engine)
+    source_columns: dict[str, dict[str, object]] = {
+        str(column["name"]): column for column in inspector.get_columns("iceberg_sources")
+    }
+    assert source_columns["planning_epoch"]["nullable"] is False
+    source_checks: set[str] = {
+        str(constraint["name"]) for constraint in inspector.get_check_constraints("iceberg_sources")
+    }
+    assert "ck_iceberg_sources_planning_epoch_nonnegative" in source_checks
+    source_snapshot_indexes: set[str] = {str(index["name"]) for index in inspector.get_indexes("source_snapshots")}
+    assert {
+        "ix_source_snapshots_blocked_source",
+        "ix_source_snapshots_source_created",
+    } <= source_snapshot_indexes
     expected_field_checks: set[str] = {
         "ck_dataset_fields_flags_contract",
         "ck_dataset_fields_map_key_target",
@@ -406,6 +424,12 @@ def test_migration_creates_exact_entities_and_seeded_typed_configuration(
         "source_snapshot_seq",
         "source_id",
     ]
+    work_indexes: set[str] = {str(index["name"]) for index in inspector.get_indexes("dataset_work")}
+    assert {
+        "ix_dataset_work_completed_publish",
+        "ix_dataset_work_ingest_snapshot",
+        "ix_dataset_work_open_snapshot",
+    } <= work_indexes
     publication_foreign_keys: list[dict[str, object]] = inspector.get_foreign_keys("dataset_publications")
     publication_work_identity: dict[str, object] = next(
         constraint
@@ -818,8 +842,8 @@ def test_source_bootstrap_is_idempotent_and_postgres_owned(
     with engine.connect() as connection:
         row: RowMapping = connection.execute(sa.select(iceberg_sources)).mappings().one()
     assert row["source_id"] == first.source_id
-    assert row["vectors_column"] == "vectors"
-    assert row["metadata_column"] == "metadata"
+    assert "vectors_column" not in row
+    assert "metadata_column" not in row
 
 
 def test_snapshot_enqueue_is_idempotent_and_fenced_claims_expire_safely(
@@ -885,6 +909,93 @@ def test_snapshot_enqueue_is_idempotent_and_fenced_claims_expire_safely(
     assert work_row["state"] == WorkState.SUCCEEDED.value
     assert work_row["attempt_count"] == 2
     assert work_row["lease_token"] is None
+
+
+def test_audit_cleanup_preserves_source_replay_evidence(
+    postgres_repository: tuple[ControlPlaneRepository, Engine],
+) -> None:
+    """Audit cleanup retains source snapshots and their immutable INGEST target sets.
+
+    Args:
+        postgres_repository: Fresh repository and engine fixture.
+    """
+    repository: ControlPlaneRepository
+    engine: Engine
+    repository, engine = postgres_repository
+    source: IcebergSource = register_source(repository)
+    plan: SourceSnapshotPlan = source_plan(source.source_id, 100, 10, None, SourceSnapshotKind.BASELINE)
+    snapshot_seq: int = repository.enqueue_source_snapshot(plan, [dataset_plan()])
+    ingest_claim: WorkClaim = claim_one(repository)
+    assert repository.complete_ingest(ingest_claim, 1, 10, b"a" * 32)
+
+    assert repository.delete_completed_audit(datetime.now(UTC) + timedelta(days=1), 100) == (0, 0)
+    assert repository.enqueue_source_snapshot(plan, [dataset_plan()]) == snapshot_seq
+    with engine.connect() as connection:
+        assert connection.scalar(sa.select(sa.func.count()).select_from(source_snapshots)) == 1
+        assert (
+            connection.scalar(
+                sa.select(sa.func.count()).select_from(dataset_work).where(dataset_work.c.kind == WorkKind.INGEST.value)
+            )
+            == 1
+        )
+
+
+def test_new_source_snapshot_must_extend_the_locked_durable_head(
+    postgres_repository: tuple[ControlPlaneRepository, Engine],
+) -> None:
+    """Serialized planners cannot persist sibling or sequence-regressing source checkpoints.
+
+    Args:
+        postgres_repository: Fresh repository and engine fixture.
+    """
+    repository: ControlPlaneRepository = postgres_repository[0]
+    source: IcebergSource = register_source(repository)
+    baseline: SourceSnapshotPlan = source_plan(source.source_id, 100, 10, None, SourceSnapshotKind.BASELINE)
+    child: SourceSnapshotPlan = source_plan(source.source_id, 101, 11, 100)
+    repository.enqueue_source_snapshot(baseline, [])
+    child_seq: int = repository.enqueue_source_snapshot(child, [])
+
+    assert repository.enqueue_source_snapshot(child, []) == child_seq
+    with pytest.raises(StateTransitionError, match="does not extend the durable head"):
+        repository.enqueue_source_snapshot(source_plan(source.source_id, 102, 12, 100), [])
+    with pytest.raises(StateTransitionError, match="does not extend the durable head"):
+        repository.enqueue_source_snapshot(source_plan(source.source_id, 103, 11, 101), [])
+    with pytest.raises(StateTransitionError, match="BASELINE is valid only"):
+        repository.enqueue_source_snapshot(
+            source_plan(source.source_id, 104, 13, 101, SourceSnapshotKind.BASELINE),
+            [],
+        )
+    with pytest.raises(StateTransitionError, match="changed the partition specification"):
+        repository.enqueue_source_snapshot(
+            replace(source_plan(source.source_id, 105, 13, 101), partition_spec_id=8),
+            [],
+        )
+
+
+def test_trusted_maintenance_checkpoint_cannot_create_ingest_work(
+    postgres_repository: tuple[ControlPlaneRepository, Engine],
+) -> None:
+    """The transaction boundary keeps metadata-only source windows targetless.
+
+    Args:
+        postgres_repository: Fresh repository and engine fixture.
+    """
+    repository: ControlPlaneRepository = postgres_repository[0]
+    source: IcebergSource = register_source(repository)
+    repository.enqueue_source_snapshot(
+        source_plan(source.source_id, 100, 10, None, SourceSnapshotKind.BASELINE),
+        [],
+    )
+    maintenance: SourceSnapshotPlan = source_plan(
+        source.source_id,
+        101,
+        11,
+        100,
+        SourceSnapshotKind.TRUSTED_MAINTENANCE,
+    )
+
+    with pytest.raises(StateTransitionError, match="cannot carry dataset work"):
+        repository.enqueue_source_snapshot(maintenance, [dataset_plan()])
 
 
 def test_ingest_to_publish_commits_normalized_evidence_and_pointer_atomically(
@@ -1108,10 +1219,338 @@ def test_retry_bound_blocks_work_and_explicit_retry_reopens_it(
     assert row["state"] == WorkState.BLOCKED.value
     assert row["error_code"] == "MAX_ATTEMPTS_EXHAUSTED"
     assert row["attempt_count"] == 2
+    assert repository.can_retry_blocked_work(second_claim.work_id)
     assert repository.retry_blocked_work(second_claim.work_id)
+    assert not repository.can_retry_blocked_work(second_claim.work_id)
     assert not repository.retry_blocked_work(second_claim.work_id)
     with engine.connect() as connection:
         assert connection.scalar(sa.select(dataset_work.c.state)) == WorkState.PENDING.value
+
+
+def test_completed_source_checkpoint_can_be_gated_and_explicitly_reopened(
+    postgres_repository: tuple[ControlPlaneRepository, Engine],
+) -> None:
+    """A late lineage failure gates the complete audit tip until explicit repair.
+
+    Args:
+        postgres_repository: Fresh repository and engine fixture.
+    """
+    repository: ControlPlaneRepository
+    engine: Engine
+    repository, engine = postgres_repository
+    source: IcebergSource = register_source(repository)
+    plan: SourceSnapshotPlan = source_plan(source.source_id, 100, 10, None, SourceSnapshotKind.BASELINE)
+    snapshot_seq: int = repository.enqueue_source_snapshot(plan, [])
+
+    assert not repository.can_retry_blocked_source_snapshot(snapshot_seq)
+    assert repository.block_source_snapshot(snapshot_seq, "SOURCE_LINEAGE_UNTRUSTED", "checkpoint disappeared")
+    assert repository.can_retry_blocked_source_snapshot(snapshot_seq)
+    assert repository.block_source_snapshot(snapshot_seq, "SOURCE_LINEAGE_UNTRUSTED", "checkpoint disappeared")
+    assert repository.enqueue_source_snapshot(plan, []) == snapshot_seq
+    with pytest.raises(StateTransitionError, match="source has a blocked checkpoint"):
+        repository.enqueue_source_snapshot(
+            source_plan(source.source_id, 101, 11, 100),
+            [],
+        )
+    with pytest.raises(StateTransitionError, match="different evidence"):
+        repository.block_source_snapshot(snapshot_seq, "SOURCE_TABLE_CONTRACT")
+
+    status: ControlPlaneStatus = repository.control_plane_status()
+    floor: RowMapping | None = repository.retention_floor()
+    assert status.blocked_source_snapshots == 1
+    assert status.retention_source_snapshot_seq == snapshot_seq
+    assert status.retention_state is SourceSnapshotState.BLOCKED
+    assert floor is not None
+    assert floor["source_snapshot_seq"] == snapshot_seq
+    assert floor["state"] == SourceSnapshotState.BLOCKED.value
+
+    assert repository.retry_blocked_source_snapshot(snapshot_seq)
+    assert not repository.can_retry_blocked_source_snapshot(snapshot_seq)
+    assert not repository.retry_blocked_source_snapshot(snapshot_seq)
+    with engine.connect() as connection:
+        checkpoint: RowMapping = (
+            connection.execute(
+                sa.select(source_snapshots).where(source_snapshots.c.source_snapshot_seq == snapshot_seq)
+            )
+            .mappings()
+            .one()
+        )
+    assert checkpoint["state"] == SourceSnapshotState.COMPLETE.value
+    assert checkpoint["error_code"] is None
+    assert checkpoint["error_message"] is None
+
+
+def test_source_planning_epoch_fences_repairs_and_converges_duplicate_gates(
+    postgres_repository: tuple[ControlPlaneRepository, Engine],
+) -> None:
+    """The source epoch rejects ABA observations while identical gates remain idempotent.
+
+    Args:
+        postgres_repository: Fresh repository and engine fixture.
+    """
+    repository: ControlPlaneRepository
+    engine: Engine
+    repository, engine = postgres_repository
+    source: IcebergSource = register_source(repository)
+    baseline: SourceSnapshotPlan = source_plan(source.source_id, 100, 10, None, SourceSnapshotKind.BASELINE)
+    snapshot_seq: int = repository.enqueue_source_snapshot(baseline, [dataset_plan()])
+    observed: RowMapping | None = repository.latest_source_snapshot(source.source_id)
+    assert observed is not None
+    assert observed["table_uuid"] == source.table_uuid
+    assert observed["source_planning_epoch"] == 0
+    assert observed["source_blocked"] is False
+    claim: WorkClaim = claim_one(repository)
+
+    assert repository.block_source_snapshot(
+        snapshot_seq,
+        "SOURCE_LINEAGE_UNTRUSTED",
+        "checkpoint disappeared",
+        expected_planning_epoch=0,
+    )
+    assert repository.retry_work(claim, timedelta(0), "TRANSIENT", "retry later", 3)
+    assert repository.block_source_snapshot(
+        snapshot_seq,
+        "SOURCE_LINEAGE_UNTRUSTED",
+        "checkpoint disappeared",
+        expected_planning_epoch=0,
+    )
+    with engine.connect() as connection:
+        work: RowMapping = connection.execute(sa.select(dataset_work)).mappings().one()
+        assert connection.scalar(sa.select(iceberg_sources.c.planning_epoch)) == 1
+    assert work["state"] == WorkState.BLOCKED.value
+    assert work["error_code"] == "SOURCE_LINEAGE_UNTRUSTED"
+
+    assert repository.retry_blocked_source_snapshot(snapshot_seq)
+    with pytest.raises(StaleSourcePlanError, match="planning epoch changed"):
+        repository.block_source_snapshot(
+            snapshot_seq,
+            "SOURCE_LINEAGE_UNTRUSTED",
+            "checkpoint disappeared",
+            expected_planning_epoch=0,
+        )
+    stale_child: SourceSnapshotPlan = replace(
+        source_plan(source.source_id, 101, 11, 100),
+        source_planning_epoch=0,
+    )
+    with pytest.raises(StaleSourcePlanError, match="planning epoch changed"):
+        repository.enqueue_source_snapshot(stale_child, [])
+    stale_replay: SourceSnapshotPlan = replace(baseline, source_planning_epoch=0)
+    assert repository.enqueue_source_snapshot(stale_replay, [dataset_plan()]) == snapshot_seq
+
+
+def test_stale_planner_gate_advances_to_the_latest_persisted_checkpoint(
+    postgres_repository: tuple[ControlPlaneRepository, Engine],
+) -> None:
+    """A late failure preserves the exact failed checkpoint after a concurrent planner advances.
+
+    Args:
+        postgres_repository: Fresh repository and engine fixture.
+    """
+    repository: ControlPlaneRepository
+    engine: Engine
+    repository, engine = postgres_repository
+    source: IcebergSource = register_source(repository)
+    first_seq: int = repository.enqueue_source_snapshot(
+        source_plan(source.source_id, 100, 10, None, SourceSnapshotKind.BASELINE),
+        [],
+    )
+    latest_seq: int = repository.enqueue_source_snapshot(
+        source_plan(source.source_id, 101, 11, 100),
+        [],
+    )
+
+    assert repository.block_source_snapshot(first_seq, "SOURCE_LINEAGE_UNTRUSTED")
+    with engine.connect() as connection:
+        states: dict[int, str] = {
+            int(row["source_snapshot_seq"]): str(row["state"])
+            for row in connection.execute(
+                sa.select(source_snapshots.c.source_snapshot_seq, source_snapshots.c.state)
+            ).mappings()
+        }
+    assert states[first_seq] == SourceSnapshotState.BLOCKED.value
+    assert states[latest_seq] == SourceSnapshotState.COMPLETE.value
+    floor: RowMapping | None = repository.retention_floor(datetime.now(UTC) + timedelta(days=365))
+    assert floor is not None
+    assert floor["source_snapshot_seq"] == first_seq
+    assert floor["state"] == SourceSnapshotState.BLOCKED.value
+    with pytest.raises(StateTransitionError, match="source has a blocked checkpoint"):
+        repository.enqueue_source_snapshot(
+            source_plan(source.source_id, 102, 12, 101),
+            [],
+        )
+
+
+def test_promoted_source_gate_blocks_earlier_child_repair(
+    postgres_repository: tuple[ControlPlaneRepository, Engine],
+) -> None:
+    """A later durable head cannot hide the source-wide gate from older child work.
+
+    Args:
+        postgres_repository: Fresh repository and engine fixture.
+    """
+    repository: ControlPlaneRepository
+    engine: Engine
+    repository, engine = postgres_repository
+    source: IcebergSource = register_source(repository)
+    first_seq: int = repository.enqueue_source_snapshot(
+        source_plan(source.source_id, 100, 10, None, SourceSnapshotKind.BASELINE),
+        [dataset_plan()],
+    )
+    latest_seq: int = repository.enqueue_source_snapshot(
+        source_plan(source.source_id, 101, 11, 100),
+        [dataset_plan()],
+    )
+
+    assert repository.block_source_snapshot(first_seq, "SOURCE_LINEAGE_UNTRUSTED")
+    with engine.connect() as connection:
+        work_by_seq: dict[int, RowMapping] = {
+            int(row["source_snapshot_seq"]): row for row in connection.execute(sa.select(dataset_work)).mappings()
+        }
+    assert work_by_seq[first_seq]["state"] == WorkState.BLOCKED.value
+    assert work_by_seq[latest_seq]["state"] == WorkState.BLOCKED.value
+    assert not repository.retry_blocked_work(work_by_seq[first_seq]["work_id"])
+    assert repository.claim_due_work(2, timedelta(minutes=1)) == []
+
+    assert repository.retry_blocked_source_snapshot(first_seq)
+    assert repository.retry_blocked_work(work_by_seq[first_seq]["work_id"])
+
+
+def test_source_checkpoint_repair_requires_separate_child_work_retry(
+    postgres_repository: tuple[ControlPlaneRepository, Engine],
+) -> None:
+    """Source recovery cannot implicitly reopen a child work identity.
+
+    Args:
+        postgres_repository: Fresh repository and engine fixture.
+    """
+    repository: ControlPlaneRepository
+    engine: Engine
+    repository, engine = postgres_repository
+    source: IcebergSource = register_source(repository)
+    snapshot_seq: int = repository.enqueue_source_snapshot(
+        source_plan(source.source_id, 100, 10, None, SourceSnapshotKind.BASELINE),
+        [dataset_plan()],
+    )
+
+    assert repository.block_source_snapshot(snapshot_seq, "SOURCE_LINEAGE_UNTRUSTED")
+    with engine.connect() as connection:
+        assert connection.scalar(sa.select(dataset_work.c.state)) == WorkState.BLOCKED.value
+        work_id: uuid.UUID = connection.scalar(sa.select(dataset_work.c.work_id))
+    assert not repository.retry_blocked_work(work_id)
+
+    assert repository.retry_blocked_source_snapshot(snapshot_seq)
+    with engine.connect() as connection:
+        checkpoint_state: str | None = connection.scalar(sa.select(source_snapshots.c.state))
+        work: RowMapping = connection.execute(sa.select(dataset_work)).mappings().one()
+    assert checkpoint_state == SourceSnapshotState.SEALED.value
+    assert work["state"] == WorkState.BLOCKED.value
+    assert work["error_code"] == "SOURCE_LINEAGE_UNTRUSTED"
+    assert repository.retry_blocked_work(work_id)
+    with engine.connect() as connection:
+        assert connection.scalar(sa.select(dataset_work.c.state)) == WorkState.PENDING.value
+
+
+def test_source_checkpoint_gate_persists_around_running_ingest(
+    postgres_repository: tuple[ControlPlaneRepository, Engine],
+) -> None:
+    """A lineage gate persists without invalidating a currently leased INGEST operation.
+
+    Args:
+        postgres_repository: Fresh repository and engine fixture.
+    """
+    repository: ControlPlaneRepository
+    engine: Engine
+    repository, engine = postgres_repository
+    source: IcebergSource = register_source(repository)
+    snapshot_seq: int = repository.enqueue_source_snapshot(
+        source_plan(source.source_id, 100, 10, None, SourceSnapshotKind.BASELINE),
+        [dataset_plan()],
+    )
+    claim: WorkClaim = claim_one(repository)
+    latest_seq: int = repository.enqueue_source_snapshot(
+        source_plan(source.source_id, 101, 11, 100),
+        [dataset_plan()],
+    )
+
+    assert repository.block_source_snapshot(snapshot_seq, "SOURCE_LINEAGE_UNTRUSTED")
+
+    with engine.connect() as connection:
+        checkpoint_states: dict[int, str] = {
+            int(row["source_snapshot_seq"]): str(row["state"])
+            for row in connection.execute(
+                sa.select(source_snapshots.c.source_snapshot_seq, source_snapshots.c.state)
+            ).mappings()
+        }
+        work_by_seq: dict[int, RowMapping] = {
+            int(row["source_snapshot_seq"]): row for row in connection.execute(sa.select(dataset_work)).mappings()
+        }
+    assert checkpoint_states[snapshot_seq] == SourceSnapshotState.BLOCKED.value
+    assert checkpoint_states[latest_seq] == SourceSnapshotState.SEALED.value
+    assert work_by_seq[snapshot_seq]["state"] == WorkState.RUNNING.value
+    assert work_by_seq[snapshot_seq]["lease_token"] == claim.lease_token
+    assert work_by_seq[latest_seq]["state"] == WorkState.BLOCKED.value
+
+    assert repository.complete_ingest(claim, 1, 10, b"a" * 32)
+    with engine.connect() as connection:
+        assert (
+            connection.scalar(
+                sa.select(source_snapshots.c.state).where(source_snapshots.c.source_snapshot_seq == snapshot_seq)
+            )
+            == SourceSnapshotState.BLOCKED.value
+        )
+
+
+def test_completed_checkpoint_gate_does_not_mutate_running_publication(
+    postgres_repository: tuple[ControlPlaneRepository, Engine],
+) -> None:
+    """A completed checkpoint can gate planning while publication retains its lease.
+
+    Args:
+        postgres_repository: Fresh repository and engine fixture.
+    """
+    repository: ControlPlaneRepository
+    engine: Engine
+    repository, engine = postgres_repository
+    source: IcebergSource = register_source(repository)
+    snapshot_seq: int = repository.enqueue_source_snapshot(
+        source_plan(source.source_id, 100, 10, None, SourceSnapshotKind.BASELINE),
+        [dataset_plan()],
+    )
+    ingest_claim: WorkClaim = claim_one(repository)
+    assert repository.complete_ingest(ingest_claim, 1, 10, b"a" * 32)
+    publish_claim: WorkClaim = claim_one(repository)
+    assert publish_claim.kind is WorkKind.PUBLISH
+
+    assert repository.block_source_snapshot(snapshot_seq, "SOURCE_LINEAGE_UNTRUSTED")
+    with engine.connect() as connection:
+        work: RowMapping = (
+            connection.execute(sa.select(dataset_work).where(dataset_work.c.work_id == publish_claim.work_id))
+            .mappings()
+            .one()
+        )
+    assert work["state"] == WorkState.RUNNING.value
+    assert work["lease_token"] == publish_claim.lease_token
+
+
+def test_rejected_source_checkpoint_cannot_be_retried(
+    postgres_repository: tuple[ControlPlaneRepository, Engine],
+) -> None:
+    """Immutable rejected source evidence remains permanently gated.
+
+    Args:
+        postgres_repository: Fresh repository and engine fixture.
+    """
+    repository: ControlPlaneRepository = postgres_repository[0]
+    source: IcebergSource = register_source(repository)
+    snapshot_seq: int = repository.enqueue_blocked_source_snapshot(
+        source_plan(source.source_id, 101, 11, 100, SourceSnapshotKind.REJECTED),
+        "UNTRUSTED_REWRITE",
+    )
+
+    with pytest.raises(StateTransitionError, match="rejected source snapshot evidence cannot be retried"):
+        repository.retry_blocked_source_snapshot(snapshot_seq)
+    with pytest.raises(StateTransitionError, match="rejected source snapshot evidence cannot be retried"):
+        repository.can_retry_blocked_source_snapshot(snapshot_seq)
 
 
 def test_rejected_snapshot_and_retention_floor_remain_durable(

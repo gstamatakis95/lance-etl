@@ -117,6 +117,23 @@ def test_source_digest_is_partition_and_input_order_independent() -> None:
     assert forward == reverse
 
 
+def test_source_digest_rejects_duplicate_keys_and_negative_sequences() -> None:
+    """Invalid terminal identities cannot produce an order-dependent durable digest."""
+    digest: bytes = b"a" * 32
+    with pytest.raises(ValueError, match="duplicate record id"):
+        canonical_source_digest([("duplicate", 1, digest), ("duplicate", 1, digest)])
+    with pytest.raises(ValueError, match="non-negative"):
+        canonical_source_digest([("record", -1, digest)])
+
+
+def test_mutation_collapse_rejects_invalid_sequence_metadata() -> None:
+    """Terminal rows always fit the non-negative signed int64 storage contract."""
+    with pytest.raises(ValueError, match="window sequence"):
+        collapse_snapshot_mutations([mutation({"text": "value"})], -1, 1)
+    with pytest.raises(ValueError, match="source sequence"):
+        collapse_snapshot_mutations([mutation({"text": "value"})], 1, 1 << 63)
+
+
 def test_source_digest_rejects_mixed_targets() -> None:
     """One target digest cannot accidentally include another target's mutation."""
     first: TerminalMutation = collapse_snapshot_mutations([mutation({"text": "first"})], 1, 1)[0]

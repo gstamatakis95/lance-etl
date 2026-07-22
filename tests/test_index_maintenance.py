@@ -207,7 +207,9 @@ def test_plan_rebuild_flag_forces_specs(dataset_uri: str, telemetry: Telemetry) 
     plan: dict[str, object] = plan_dataset_indexes(dataset_uri, rebuild_config, telemetry)
     assert "skipped" not in plan
     assert {spec["index_name"] for spec in plan["specs"]} == {"id_idx", "text_fts_idx"}
-    assert all(spec["shards"] for spec in plan["specs"])
+    assert all(int(spec["fragments"]) == len(lance.dataset(dataset_uri).get_fragments()) for spec in plan["specs"])
+    assert all(int(spec["shard_count"]) > 0 for spec in plan["specs"])
+    assert all("shards" not in spec for spec in plan["specs"])
 
 
 def test_optimize_existing_index_covers_new_fragments(dataset_uri: str, telemetry: Telemetry) -> None:

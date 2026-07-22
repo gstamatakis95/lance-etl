@@ -89,6 +89,10 @@ class StateTransitionError(RuntimeError):
     """Raised when durable state contradicts a requested transition."""
 
 
+class StaleSourcePlanError(StateTransitionError):
+    """Raised when an operator repair or newer planner invalidated an external source observation."""
+
+
 def utc_now() -> datetime:
     """Return the current timezone-aware UTC instant.
 
@@ -169,15 +173,6 @@ def source_from_row(row: Mapping[str, Any]) -> IcebergSource:
         lance_base_uri=str(row["lance_base_uri"]),
         canonical_baseline_snapshot_id=row["canonical_baseline_snapshot_id"],
         replay_horizon=timedelta(seconds=int(row["replay_horizon_seconds"])),
-        tenant_column=str(row["tenant_column"]),
-        namespace_column=str(row["namespace_column"]),
-        org_column=str(row["org_column"]),
-        record_id_column=str(row["record_id_column"]),
-        operation_column=str(row["operation_column"]),
-        ts_column=str(row["ts_column"]),
-        vectors_column=str(row["vectors_column"]),
-        texts_column=str(row["texts_column"]),
-        metadata_column=str(row["metadata_column"]),
     ).validate()
 
 
@@ -853,6 +848,125 @@ class ControlPlaneRepository:
             raise StateTransitionError("source default specification has no active revision")
         return revision_id
 
+    def lock_source_for_planning(self, connection: Connection, source_id: uuid.UUID) -> RowMapping:
+        """Lock one source as the serialization point for planning and source gates.
+
+        Args:
+            connection: Current transaction.
+            source_id: Source identity to serialize.
+
+        Returns:
+            Locked source registration.
+        """
+        return (
+            connection.execute(
+                sa.select(iceberg_sources).where(iceberg_sources.c.source_id == source_id).with_for_update()
+            )
+            .mappings()
+            .one()
+        )
+
+    def assert_source_gate_allows_snapshot(
+        self,
+        connection: Connection,
+        source_id: uuid.UUID,
+        snapshot_id: int,
+    ) -> None:
+        """Reject a new source snapshot while any checkpoint for the source is gated.
+
+        Existing snapshot identities remain replayable so callers can validate idempotency without
+        weakening the source gate.
+
+        Args:
+            connection: Current transaction holding the source lock.
+            source_id: Locked source identity.
+            snapshot_id: Planned Iceberg snapshot identity.
+
+        Raises:
+            StateTransitionError: If a gate is closed and the snapshot identity is new.
+        """
+        blocked: bool = bool(
+            connection.scalar(
+                sa.select(
+                    sa.exists(
+                        sa.select(sa.literal(1)).where(
+                            source_snapshots.c.source_id == source_id,
+                            source_snapshots.c.state == SourceSnapshotState.BLOCKED.value,
+                        )
+                    )
+                )
+            )
+        )
+        if not blocked:
+            return
+        existing: bool = bool(
+            connection.scalar(
+                sa.select(
+                    sa.exists(
+                        sa.select(sa.literal(1)).where(
+                            source_snapshots.c.source_id == source_id,
+                            source_snapshots.c.snapshot_id == snapshot_id,
+                        )
+                    )
+                )
+            )
+        )
+        if not existing:
+            raise StateTransitionError("source has a blocked checkpoint")
+
+    def assert_new_snapshot_extends_latest(self, connection: Connection, plan: SourceSnapshotPlan) -> None:
+        """Require a new accepted snapshot to extend the locked durable source head.
+
+        Exact replays bypass the head check and are validated by
+        :meth:`insert_or_validate_snapshot`. A source's first durable checkpoint must be either an
+        accepted baseline or rejected baseline evidence. Every later new checkpoint must name the
+        current durable head as its direct parent and advance the Iceberg sequence number.
+
+        Args:
+            connection: Current transaction holding the source lock.
+            plan: Validated accepted source plan.
+
+        Raises:
+            StateTransitionError: If a new plan would create a sibling or regress the durable lineage.
+        """
+        existing: bool = bool(
+            connection.scalar(
+                sa.select(
+                    sa.exists(
+                        sa.select(sa.literal(1)).where(
+                            source_snapshots.c.source_id == plan.source_id,
+                            source_snapshots.c.snapshot_id == plan.snapshot_id,
+                        )
+                    )
+                )
+            )
+        )
+        if existing:
+            return
+        latest: RowMapping | None = (
+            connection.execute(
+                sa.select(source_snapshots)
+                .where(source_snapshots.c.source_id == plan.source_id)
+                .order_by(source_snapshots.c.iceberg_sequence_number.desc())
+                .limit(1)
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if latest is None:
+            if plan.kind not in (SourceSnapshotKind.BASELINE, SourceSnapshotKind.REJECTED):
+                raise StateTransitionError("first source checkpoint must be a baseline or rejected baseline")
+            return
+        if plan.kind is SourceSnapshotKind.BASELINE:
+            raise StateTransitionError("BASELINE is valid only for the first source checkpoint")
+        if plan.kind is not SourceSnapshotKind.REJECTED and plan.partition_spec_id != latest["partition_spec_id"]:
+            raise StateTransitionError("accepted source snapshot changed the partition specification")
+        if (
+            plan.parent_snapshot_id != latest["snapshot_id"]
+            or plan.iceberg_sequence_number <= latest["iceberg_sequence_number"]
+        ):
+            raise StateTransitionError("new source snapshot does not extend the durable head")
+
     def enqueue_source_snapshot(self, plan: SourceSnapshotPlan, dataset_plans: Sequence[DatasetPlan]) -> int:
         """Seal one source snapshot and enqueue its dataset INGEST work.
 
@@ -871,30 +985,38 @@ class ControlPlaneRepository:
         if plan.kind is SourceSnapshotKind.REJECTED:
             raise ValueError("rejected snapshots require enqueue_blocked_source_snapshot")
         validated: list[DatasetPlan] = [dataset_plan.validate() for dataset_plan in dataset_plans]
+        if plan.kind is SourceSnapshotKind.TRUSTED_MAINTENANCE and validated:
+            raise StateTransitionError("trusted maintenance checkpoints cannot carry dataset work")
         with self.engine.begin() as connection:
+            source_row: RowMapping = self.lock_source_for_planning(connection, plan.source_id)
+            if source_row["lifecycle_state"] != SourceLifecycleState.ACTIVE.value:
+                raise StateTransitionError("source must be ACTIVE before planning")
+            known_snapshot: bool = bool(
+                connection.scalar(
+                    sa.select(
+                        sa.exists(
+                            sa.select(sa.literal(1)).where(
+                                source_snapshots.c.source_id == plan.source_id,
+                                source_snapshots.c.snapshot_id == plan.snapshot_id,
+                            )
+                        )
+                    )
+                )
+            )
+            if (
+                not known_snapshot
+                and plan.source_planning_epoch is not None
+                and plan.source_planning_epoch != source_row["planning_epoch"]
+            ):
+                raise StaleSourcePlanError("source planning epoch changed before enqueue")
+            self.assert_source_gate_allows_snapshot(connection, plan.source_id, plan.snapshot_id)
+            self.assert_new_snapshot_extends_latest(connection, plan)
             snapshot_seq: int
             inserted: bool
             snapshot_seq, inserted = self.insert_or_validate_snapshot(connection, plan)
-            source_row: RowMapping = (
-                connection.execute(
-                    sa.select(iceberg_sources).where(iceberg_sources.c.source_id == plan.source_id).with_for_update()
-                )
-                .mappings()
-                .one()
-            )
-            if source_row["lifecycle_state"] != SourceLifecycleState.ACTIVE.value:
-                raise StateTransitionError("source must be ACTIVE before planning")
-            default_revision_id: uuid.UUID = self.active_spec_revision_id(connection, source_row["default_spec_id"])
-            expected_dataset_ids: set[uuid.UUID] = set()
-            for dataset_plan in validated:
-                dataset_row: RowMapping = self.insert_or_validate_dataset(
-                    connection,
-                    source_from_row(source_row),
-                    dataset_plan,
-                    default_revision_id,
-                )
-                expected_dataset_ids.add(dataset_row["dataset_id"])
-                self.insert_ingest_work(connection, dataset_row, snapshot_seq)
+            expected_dataset_ids: set[uuid.UUID] = {
+                deterministic_dataset_id(plan.source_id, dataset_plan.identity) for dataset_plan in validated
+            }
             if not inserted:
                 actual_dataset_ids: set[uuid.UUID] = set(
                     connection.scalars(
@@ -906,10 +1028,32 @@ class ControlPlaneRepository:
                 )
                 if actual_dataset_ids != expected_dataset_ids:
                     raise StateTransitionError("source snapshot was replayed with a different dataset set")
+                if not expected_dataset_ids:
+                    connection.execute(
+                        sa.update(source_snapshots)
+                        .where(
+                            source_snapshots.c.source_snapshot_seq == snapshot_seq,
+                            source_snapshots.c.state != SourceSnapshotState.BLOCKED.value,
+                        )
+                        .values(state=SourceSnapshotState.COMPLETE.value, updated_at=utc_now())
+                    )
+                return snapshot_seq
+            default_revision_id: uuid.UUID = self.active_spec_revision_id(connection, source_row["default_spec_id"])
+            for dataset_plan in validated:
+                dataset_row: RowMapping = self.insert_or_validate_dataset(
+                    connection,
+                    source_from_row(source_row),
+                    dataset_plan,
+                    default_revision_id,
+                )
+                self.insert_ingest_work(connection, dataset_row, snapshot_seq)
             if not expected_dataset_ids:
                 connection.execute(
                     sa.update(source_snapshots)
-                    .where(source_snapshots.c.source_snapshot_seq == snapshot_seq)
+                    .where(
+                        source_snapshots.c.source_snapshot_seq == snapshot_seq,
+                        source_snapshots.c.state != SourceSnapshotState.BLOCKED.value,
+                    )
                     .values(state=SourceSnapshotState.COMPLETE.value, updated_at=utc_now())
                 )
             return snapshot_seq
@@ -934,6 +1078,29 @@ class ControlPlaneRepository:
         if plan.kind is not SourceSnapshotKind.REJECTED:
             raise ValueError("blocked source snapshots must use REJECTED kind")
         with self.engine.begin() as connection:
+            source_row: RowMapping = self.lock_source_for_planning(connection, plan.source_id)
+            if source_row["lifecycle_state"] != SourceLifecycleState.ACTIVE.value:
+                raise StateTransitionError("source must be ACTIVE before planning")
+            known_snapshot: bool = bool(
+                connection.scalar(
+                    sa.select(
+                        sa.exists(
+                            sa.select(sa.literal(1)).where(
+                                source_snapshots.c.source_id == plan.source_id,
+                                source_snapshots.c.snapshot_id == plan.snapshot_id,
+                            )
+                        )
+                    )
+                )
+            )
+            if (
+                not known_snapshot
+                and plan.source_planning_epoch is not None
+                and plan.source_planning_epoch != source_row["planning_epoch"]
+            ):
+                raise StaleSourcePlanError("source planning epoch changed before enqueue")
+            self.assert_source_gate_allows_snapshot(connection, plan.source_id, plan.snapshot_id)
+            self.assert_new_snapshot_extends_latest(connection, plan)
             snapshot_seq: int
             inserted: bool
             snapshot_seq, inserted = self.insert_or_validate_snapshot(
@@ -943,6 +1110,13 @@ class ControlPlaneRepository:
                 error_code=error_code,
                 error_message=error_message,
             )
+            if inserted:
+                current: datetime = utc_now()
+                connection.execute(
+                    sa.update(iceberg_sources)
+                    .where(iceberg_sources.c.source_id == plan.source_id)
+                    .values(planning_epoch=iceberg_sources.c.planning_epoch + 1, updated_at=current)
+                )
             if not inserted:
                 row: RowMapping = (
                     connection.execute(
@@ -1142,13 +1316,13 @@ class ControlPlaneRepository:
             raise StateTransitionError("INGEST work idempotency key carries different frozen inputs")
 
     def latest_source_snapshot(self, source_id: uuid.UUID | None = None) -> RowMapping | None:
-        """Read the latest durable source snapshot.
+        """Read the latest durable source snapshot with source identity and gate state.
 
         Args:
             source_id: Optional source identity. Omit only when one source exists.
 
         Returns:
-            Latest snapshot mapping or ``None``.
+            Latest snapshot mapping augmented with ``table_uuid`` and ``source_blocked``, or ``None``.
         """
         with self.engine.connect() as connection:
             selected_source_id: uuid.UUID | None = source_id
@@ -1159,9 +1333,22 @@ class ControlPlaneRepository:
                 selected_source_id = source_ids[0] if source_ids else None
             if selected_source_id is None:
                 return None
+            gate_snapshot: Any = source_snapshots.alias("gate_source_snapshot")
+            source_blocked: Any = sa.exists(
+                sa.select(sa.literal(1)).where(
+                    gate_snapshot.c.source_id == selected_source_id,
+                    gate_snapshot.c.state == SourceSnapshotState.BLOCKED.value,
+                )
+            ).label("source_blocked")
             return (
                 connection.execute(
-                    sa.select(source_snapshots)
+                    sa.select(
+                        source_snapshots,
+                        iceberg_sources.c.table_uuid,
+                        iceberg_sources.c.planning_epoch.label("source_planning_epoch"),
+                        source_blocked,
+                    )
+                    .join(iceberg_sources, iceberg_sources.c.source_id == source_snapshots.c.source_id)
                     .where(source_snapshots.c.source_id == selected_source_id)
                     .order_by(source_snapshots.c.iceberg_sequence_number.desc())
                     .limit(1)
@@ -1175,22 +1362,39 @@ class ControlPlaneRepository:
         source_snapshot_seq: int,
         error_code: str,
         error_message: str | None = None,
+        expected_planning_epoch: int | None = None,
     ) -> bool:
-        """Block one unapplied snapshot and its unclaimed INGEST work.
+        """Gate one accepted source lineage and its unclaimed INGEST work.
+
+        A source-lineage failure can be discovered after all INGEST work completed, while
+        publication work remains open. The exact failed checkpoint becomes the durable planning
+        gate even when another planner already persisted later checkpoints, and all later
+        unclaimed INGEST work is blocked. Publication and rebuild work remain unchanged.
 
         Args:
             source_snapshot_seq: Durable source sequence.
             error_code: Bounded contract failure.
             error_message: Optional bounded diagnostic.
+            expected_planning_epoch: Optional planner-observed source epoch used as an ABA fence.
 
         Returns:
-            Whether the snapshot is blocked afterward.
+            Whether the source lineage is blocked afterward.
 
         Raises:
-            StateTransitionError: If work is running or the snapshot completed.
+            StateTransitionError: If different block evidence already exists.
         """
         current: datetime = utc_now()
+        persisted_code: str | None = bounded_error(error_code, ERROR_CODE_LIMIT)
+        persisted_message: str | None = bounded_error(error_message, ERROR_MESSAGE_LIMIT)
         with self.engine.begin() as connection:
+            source_id: uuid.UUID | None = connection.scalar(
+                sa.select(source_snapshots.c.source_id).where(
+                    source_snapshots.c.source_snapshot_seq == source_snapshot_seq
+                )
+            )
+            if source_id is None:
+                return False
+            source_row: RowMapping = self.lock_source_for_planning(connection, source_id)
             row: RowMapping | None = (
                 connection.execute(
                     sa.select(source_snapshots)
@@ -1202,36 +1406,35 @@ class ControlPlaneRepository:
             )
             if row is None:
                 return False
-            if row["state"] == SourceSnapshotState.COMPLETE.value:
-                raise StateTransitionError("completed source snapshot cannot be blocked")
-            running_count: int = int(
-                connection.scalar(
-                    sa.select(sa.func.count())
-                    .select_from(dataset_work)
-                    .where(
-                        dataset_work.c.source_snapshot_seq == source_snapshot_seq,
-                        dataset_work.c.state == WorkState.RUNNING.value,
-                    )
-                )
-                or 0
-            )
-            if running_count:
-                raise StateTransitionError("source snapshot has running work")
+            same_block: bool = row["state"] == SourceSnapshotState.BLOCKED.value and (
+                row["error_code"],
+                row["error_message"],
+            ) == (persisted_code, persisted_message)
+            if (
+                expected_planning_epoch is not None
+                and source_row["planning_epoch"] != expected_planning_epoch
+                and not same_block
+            ):
+                raise StaleSourcePlanError("source planning epoch changed before gate")
+            if row["state"] == SourceSnapshotState.BLOCKED.value and (row["error_code"], row["error_message"]) != (
+                persisted_code,
+                persisted_message,
+            ):
+                raise StateTransitionError("blocked source snapshot carries different evidence")
             connection.execute(
                 sa.update(dataset_work)
                 .where(
-                    dataset_work.c.source_snapshot_seq == source_snapshot_seq,
+                    dataset_work.c.source_id == source_id,
+                    dataset_work.c.source_snapshot_seq >= source_snapshot_seq,
                     dataset_work.c.kind == WorkKind.INGEST.value,
-                    dataset_work.c.state.in_(
-                        (WorkState.PENDING.value, WorkState.RETRY_WAIT.value, WorkState.BLOCKED.value)
-                    ),
+                    dataset_work.c.state.in_((WorkState.PENDING.value, WorkState.RETRY_WAIT.value)),
                 )
                 .values(
                     state=WorkState.BLOCKED.value,
                     lease_token=None,
                     lease_expires_at=None,
-                    error_code=bounded_error(error_code, ERROR_CODE_LIMIT),
-                    error_message=bounded_error(error_message, ERROR_MESSAGE_LIMIT),
+                    error_code=persisted_code,
+                    error_message=persisted_message,
                     updated_at=current,
                 )
             )
@@ -1240,10 +1443,93 @@ class ControlPlaneRepository:
                 .where(source_snapshots.c.source_snapshot_seq == source_snapshot_seq)
                 .values(
                     state=SourceSnapshotState.BLOCKED.value,
-                    error_code=bounded_error(error_code, ERROR_CODE_LIMIT),
-                    error_message=bounded_error(error_message, ERROR_MESSAGE_LIMIT),
+                    error_code=persisted_code,
+                    error_message=persisted_message,
                     updated_at=current,
                 )
+            )
+            if row["state"] != SourceSnapshotState.BLOCKED.value:
+                connection.execute(
+                    sa.update(iceberg_sources)
+                    .where(iceberg_sources.c.source_id == source_id)
+                    .values(planning_epoch=iceberg_sources.c.planning_epoch + 1, updated_at=current)
+                )
+            return True
+
+    def retry_blocked_source_snapshot(
+        self,
+        source_snapshot_seq: int,
+        now: datetime | None = None,
+    ) -> bool:
+        """Explicitly reopen one accepted source checkpoint used as a planning gate.
+
+        Immutable ``REJECTED`` snapshot evidence cannot be retried. An accepted checkpoint returns
+        to ``COMPLETE`` when all of its INGEST work succeeded, otherwise to ``SEALED``. Child work
+        remains blocked and requires a separate explicit work repair after the source gate clears.
+
+        Args:
+            source_snapshot_seq: Durable blocked source identity.
+            now: Optional deterministic transaction time.
+
+        Returns:
+            Whether a blocked accepted checkpoint transitioned.
+
+        Raises:
+            StateTransitionError: If the selected row is immutable rejected evidence.
+        """
+        current: datetime = now or utc_now()
+        with self.engine.begin() as connection:
+            source_id: uuid.UUID | None = connection.scalar(
+                sa.select(source_snapshots.c.source_id).where(
+                    source_snapshots.c.source_snapshot_seq == source_snapshot_seq
+                )
+            )
+            if source_id is None:
+                return False
+            self.lock_source_for_planning(connection, source_id)
+            row: RowMapping | None = (
+                connection.execute(
+                    sa.select(source_snapshots)
+                    .where(source_snapshots.c.source_snapshot_seq == source_snapshot_seq)
+                    .with_for_update()
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if row is None or row["state"] != SourceSnapshotState.BLOCKED.value:
+                return False
+            if row["kind"] == SourceSnapshotKind.REJECTED.value:
+                raise StateTransitionError("rejected source snapshot evidence cannot be retried")
+            incomplete_ingest: bool = bool(
+                connection.scalar(
+                    sa.select(
+                        sa.exists(
+                            sa.select(sa.literal(1)).where(
+                                dataset_work.c.source_snapshot_seq == source_snapshot_seq,
+                                dataset_work.c.kind == WorkKind.INGEST.value,
+                                dataset_work.c.state != WorkState.SUCCEEDED.value,
+                            )
+                        )
+                    )
+                )
+            )
+            restored_state: SourceSnapshotState = (
+                SourceSnapshotState.SEALED if incomplete_ingest else SourceSnapshotState.COMPLETE
+            )
+            connection.execute(
+                sa.update(source_snapshots)
+                .where(source_snapshots.c.source_snapshot_seq == source_snapshot_seq)
+                .values(
+                    state=restored_state.value,
+                    error_code=None,
+                    error_message=None,
+                    updated_at=current,
+                )
+            )
+            connection.execute(
+                sa.update(iceberg_sources)
+                .where(iceberg_sources.c.source_id == source_id)
+                .values(planning_epoch=iceberg_sources.c.planning_epoch + 1, updated_at=current)
             )
             return True
 
@@ -1260,6 +1546,29 @@ class ControlPlaneRepository:
             dataset_work.c.state.in_((WorkState.PENDING.value, WorkState.RETRY_WAIT.value)),
             dataset_work.c.next_attempt_at <= current,
         )
+
+    def source_snapshot_allows_work(self, work: Any) -> sa.ColumnElement[bool]:
+        """Prevent INGEST claims while any durable checkpoint for their source is gated.
+
+        Publication and rebuild work may finish after a source gate closes because they operate on
+        already materialized generations. Only INGEST consumes the gated source lineage. The gate
+        is source-wide because a late failure can promote its evidence onto a newer checkpoint than
+        the child work that exposed it.
+
+        Args:
+            work: Dataset-work table or alias being checked.
+
+        Returns:
+            SQL expression allowing non-INGEST work or an INGEST row whose source has no blocked checkpoint.
+        """
+        snapshot: Any = source_snapshots.alias("work_source_snapshot")
+        blocked: Any = sa.exists(
+            sa.select(sa.literal(1)).where(
+                snapshot.c.source_id == work.c.source_id,
+                snapshot.c.state == SourceSnapshotState.BLOCKED.value,
+            )
+        )
+        return sa.or_(work.c.kind != WorkKind.INGEST.value, ~blocked)
 
     def lane_order_predicate(self) -> sa.ColumnElement[bool]:
         """Require all earlier still-reachable source generations in a lane to finish.
@@ -1433,6 +1742,7 @@ class ControlPlaneRepository:
                     .join(datasets, datasets.c.dataset_id == dataset_work.c.dataset_id)
                     .where(
                         self.due_predicate(current),
+                        self.source_snapshot_allows_work(dataset_work),
                         self.lane_order_predicate(),
                         self.expected_state_predicate(),
                         datasets.c.lifecycle_state == DatasetLifecycleState.ACTIVE.value,
@@ -1441,6 +1751,7 @@ class ControlPlaneRepository:
                         dataset_work.c.source_snapshot_seq.asc().nullslast(),
                         sa.case((dataset_work.c.kind == WorkKind.INGEST.value, 0), else_=1),
                         dataset_work.c.created_at,
+                        dataset_work.c.work_id,
                     )
                     .with_for_update(of=dataset_work, skip_locked=True)
                     .limit(limit * 4)
@@ -1845,6 +2156,7 @@ class ControlPlaneRepository:
                 .where(
                     dataset_work.c.work_id == work_id,
                     dataset_work.c.state == WorkState.BLOCKED.value,
+                    self.source_snapshot_allows_work(dataset_work),
                 )
                 .values(
                     state=WorkState.PENDING.value,
@@ -1857,6 +2169,58 @@ class ControlPlaneRepository:
                 )
             )
             return result.rowcount == 1
+
+    def can_retry_blocked_work(self, work_id: uuid.UUID) -> bool:
+        """Check whether one blocked work identity is currently eligible for explicit retry.
+
+        Args:
+            work_id: Durable work identity selected by an operator.
+
+        Returns:
+            Whether the row is blocked and its source lineage is not gated.
+        """
+        with self.engine.connect() as connection:
+            return bool(
+                connection.scalar(
+                    sa.select(
+                        sa.exists(
+                            sa.select(sa.literal(1)).where(
+                                dataset_work.c.work_id == work_id,
+                                dataset_work.c.state == WorkState.BLOCKED.value,
+                                self.source_snapshot_allows_work(dataset_work),
+                            )
+                        )
+                    )
+                )
+            )
+
+    def can_retry_blocked_source_snapshot(self, source_snapshot_seq: int) -> bool:
+        """Check whether one blocked accepted source checkpoint is eligible for repair.
+
+        Args:
+            source_snapshot_seq: Durable source-snapshot sequence selected by an operator.
+
+        Returns:
+            Whether the checkpoint is blocked and accepted.
+
+        Raises:
+            StateTransitionError: If the selected checkpoint is immutable rejected evidence.
+        """
+        with self.engine.connect() as connection:
+            row: RowMapping | None = (
+                connection.execute(
+                    sa.select(source_snapshots.c.state, source_snapshots.c.kind).where(
+                        source_snapshots.c.source_snapshot_seq == source_snapshot_seq
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if row is None or row["state"] != SourceSnapshotState.BLOCKED.value:
+            return False
+        if row["kind"] == SourceSnapshotKind.REJECTED.value:
+            raise StateTransitionError("rejected source snapshot evidence cannot be retried")
+        return True
 
     def complete_ingest(
         self,
@@ -2167,6 +2531,7 @@ class ControlPlaneRepository:
             sa.update(source_snapshots)
             .where(
                 source_snapshots.c.source_snapshot_seq == source_snapshot_seq,
+                source_snapshots.c.state != SourceSnapshotState.BLOCKED.value,
                 ~incomplete,
             )
             .values(state=SourceSnapshotState.COMPLETE.value, updated_at=current)
@@ -2618,26 +2983,24 @@ class ControlPlaneRepository:
         Returns:
             Earliest retained snapshot mapping or ``None``.
         """
-        open_work: Any = sa.exists(
-            sa.select(sa.literal(1)).where(
-                dataset_work.c.source_snapshot_seq == source_snapshots.c.source_snapshot_seq,
-                dataset_work.c.state != WorkState.SUCCEEDED.value,
-            )
+        replay_threshold: Any = sa.func.to_timestamp(
+            sa.extract("epoch", sa.literal(current)) - iceberg_sources.c.replay_horizon_seconds
         )
-        replay_age_seconds: Any = sa.extract("epoch", sa.literal(current) - source_snapshots.c.created_at)
+        candidate_sequences: Any = sa.union_all(
+            sa.select(source_snapshots.c.source_snapshot_seq.label("source_snapshot_seq")).where(
+                source_snapshots.c.state == SourceSnapshotState.BLOCKED.value
+            ),
+            sa.select(dataset_work.c.source_snapshot_seq.label("source_snapshot_seq")).where(
+                dataset_work.c.state != WorkState.SUCCEEDED.value
+            ),
+            sa.select(source_snapshots.c.source_snapshot_seq.label("source_snapshot_seq"))
+            .join(iceberg_sources, iceberg_sources.c.source_id == source_snapshots.c.source_id)
+            .where(source_snapshots.c.created_at >= replay_threshold),
+        ).subquery("retention_floor_candidates")
+        floor_sequence: Any = sa.select(sa.func.min(candidate_sequences.c.source_snapshot_seq)).scalar_subquery()
         return (
             connection.execute(
-                sa.select(source_snapshots)
-                .join(iceberg_sources, iceberg_sources.c.source_id == source_snapshots.c.source_id)
-                .where(
-                    sa.or_(
-                        source_snapshots.c.state == SourceSnapshotState.BLOCKED.value,
-                        open_work,
-                        replay_age_seconds <= iceberg_sources.c.replay_horizon_seconds,
-                    )
-                )
-                .order_by(source_snapshots.c.source_snapshot_seq)
-                .limit(1)
+                sa.select(source_snapshots).where(source_snapshots.c.source_snapshot_seq == floor_sequence)
             )
             .mappings()
             .one_or_none()
@@ -2669,7 +3032,9 @@ class ControlPlaneRepository:
             state_counts: dict[str, int] = {
                 str(row["state"]): int(row["count"])
                 for row in connection.execute(
-                    sa.select(dataset_work.c.state, sa.func.count().label("count")).group_by(dataset_work.c.state)
+                    sa.select(dataset_work.c.state, sa.func.count().label("count"))
+                    .where(dataset_work.c.state != WorkState.SUCCEEDED.value)
+                    .group_by(dataset_work.c.state)
                 ).mappings()
             }
             due_work: int = int(
@@ -2833,14 +3198,14 @@ class ControlPlaneRepository:
             return result.rowcount == 1
 
     def delete_completed_audit(self, completed_before: datetime, limit: int) -> tuple[int, int]:
-        """Prune bounded completed work and unreferenced source snapshots.
+        """Prune bounded completed publication work while preserving replay identities.
 
         Args:
             completed_before: Fixed audit cutoff.
             limit: Per-table deletion bound.
 
         Returns:
-            Deleted work and source-snapshot row counts.
+            Deleted work count and a zero source-snapshot count.
         """
         if limit < 1:
             raise ValueError("audit deletion limit must be positive")
@@ -2849,6 +3214,7 @@ class ControlPlaneRepository:
                 sa.select(dataset_work.c.work_id)
                 .where(
                     dataset_work.c.state == WorkState.SUCCEEDED.value,
+                    dataset_work.c.kind == WorkKind.PUBLISH.value,
                     dataset_work.c.updated_at < completed_before,
                     ~sa.exists(
                         sa.select(sa.literal(1)).where(dataset_publications.c.work_id == dataset_work.c.work_id)
@@ -2861,34 +3227,4 @@ class ControlPlaneRepository:
             work_result: sa.CursorResult[Any] = connection.execute(
                 sa.delete(dataset_work).where(dataset_work.c.work_id.in_(sa.select(work_ids.c.work_id)))
             )
-            snapshot_ids: Any = (
-                sa.select(source_snapshots.c.source_snapshot_seq)
-                .where(
-                    source_snapshots.c.state == SourceSnapshotState.COMPLETE.value,
-                    source_snapshots.c.updated_at < completed_before,
-                    ~sa.exists(
-                        sa.select(sa.literal(1)).where(
-                            dataset_work.c.source_snapshot_seq == source_snapshots.c.source_snapshot_seq
-                        )
-                    ),
-                    ~sa.exists(
-                        sa.select(sa.literal(1)).where(
-                            dataset_publications.c.source_snapshot_seq == source_snapshots.c.source_snapshot_seq
-                        )
-                    ),
-                    ~sa.exists(
-                        sa.select(sa.literal(1)).where(
-                            datasets.c.last_applied_source_snapshot_seq == source_snapshots.c.source_snapshot_seq
-                        )
-                    ),
-                )
-                .order_by(source_snapshots.c.source_snapshot_seq)
-                .limit(limit)
-                .cte("completed_snapshot_ids")
-            )
-            snapshot_result: sa.CursorResult[Any] = connection.execute(
-                sa.delete(source_snapshots).where(
-                    source_snapshots.c.source_snapshot_seq.in_(sa.select(snapshot_ids.c.source_snapshot_seq))
-                )
-            )
-            return int(work_result.rowcount or 0), int(snapshot_result.rowcount or 0)
+            return int(work_result.rowcount or 0), 0

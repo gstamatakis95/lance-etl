@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
 
 
 class WindowKind(StrEnum):
@@ -110,14 +109,6 @@ class ManifestEntry:
 
 
 @dataclass(frozen=True, slots=True)
-class TouchedTarget:
-    """A target touched by one snapshot and its manifest-derived pruning hours."""
-
-    target: TargetKey
-    hours: tuple[int, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class MaintenanceTrust:
     """Catalog-authenticated evidence for a logical maintenance rewrite."""
 
@@ -150,24 +141,20 @@ class SourceCheckpoint:
 
 
 @dataclass(frozen=True, slots=True)
-class SparkScanPlan:
-    """A deterministic Spark read pinned to one source window and target."""
-
-    table: str
-    options: tuple[tuple[str, str], ...]
-    target: TargetKey
-    source_sequence: int
-    route_columns: tuple[str, str, str] = ("tenant_id", "namespace", "org_id")
-
-
-@dataclass(frozen=True, slots=True)
 class WindowPlan:
     """One source window and all target work derived from its immutable manifests."""
 
     snapshot: SnapshotRecord
     kind: WindowKind
-    touched_targets: tuple[TouchedTarget, ...]
-    scans: tuple[SparkScanPlan, ...]
+    targets: tuple[TargetKey, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SourceSnapshotRejection:
+    """One exact unsupported snapshot observed after an accepted plan prefix."""
+
+    snapshot: SnapshotRecord
+    error_code: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,18 +163,6 @@ class SourcePlan:
 
     table_uuid: str
     pinned_head_snapshot_id: int | None
-    partition_spec_id: int
     windows: tuple[WindowPlan, ...]
-
-    def retention_snapshot_id(self) -> int | None:
-        """Return the oldest snapshot needed to execute this plan.
-
-        Returns:
-            Parent of the first append window, its baseline snapshot, or ``None`` for an empty plan.
-        """
-        if not self.windows:
-            return None
-        first: Any = self.windows[0]
-        if first.kind is WindowKind.BASELINE:
-            return first.snapshot.snapshot_id
-        return first.snapshot.parent_snapshot_id
+    planning_epoch: int | None = None
+    rejection: SourceSnapshotRejection | None = None

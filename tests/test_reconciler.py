@@ -15,35 +15,39 @@ import lance
 import pyarrow as pa
 import pytest
 from conftest import FakeSpark
+from pyspark.errors import AnalysisException
+from pyspark.sql import Row
 
 from lance_etl.etl.completion import CompletionConflict, CompletionMarker, finalize_completion_marker
-from lance_etl.reconciler import (
+from lance_etl.reconciler.cli import EXIT_UNHEALTHY_STATUS, build_parser, execute_command, main, run_loop
+from lance_etl.reconciler.config import ReconcilerSettings, RuntimeSettings, default_reconciler_settings
+from lance_etl.reconciler.iceberg import (
+    MAX_MANIFEST_FACTS_PER_SNAPSHOT,
+    DurableSourcePlanProvider,
+    IcebergMetadataPin,
+    SparkIcebergCatalog,
+    collect_manifest_rows,
+    manifest_from_row,
+)
+from lance_etl.reconciler.planning import EnqueueSummary, SourcePlanEnqueuer
+from lance_etl.reconciler.results import DispatchSummary, ReconcileSummary, ResultKind, WorkResult
+from lance_etl.reconciler.service import (
     BoundedDispatcher,
-    DispatchSummary,
-    EnqueueSummary,
     ReconcilerApplication,
     ReconcilerOperator,
-    ReconcilerSettings,
-    ReconcileSummary,
-    ResultKind,
     ResultReconciler,
     RetentionDecision,
     RunOnceSummary,
     SloStatus,
-    SourcePlanEnqueuer,
-    WorkResult,
-    default_reconciler_settings,
     evaluate_slo,
+    execute_isolated,
     retention_decision,
 )
-from lance_etl.reconciler.cli import EXIT_UNHEALTHY_STATUS, build_parser, execute_command, main
-from lance_etl.reconciler.config import RuntimeSettings
-from lance_etl.reconciler.iceberg import DurableSourcePlanProvider
-from lance_etl.reconciler.service import execute_isolated
 from lance_etl.reconciler.workers import (
     ConfiguredPublicationRunner,
     DistributedIngestRunner,
     FencedWorkExecutor,
+    LeaseHeartbeat,
     index_kind_matches,
     lance_major_version,
     observed_index_type,
@@ -60,10 +64,13 @@ from lance_etl.source import (
     PartitionField,
     PartitionSpec,
     SnapshotRecord,
+    SourceConfigurationError,
+    SourceContractError,
+    SourceLineageError,
     SourcePlan,
+    SourceSnapshotBlockedError,
     TableMetadata,
     TargetKey,
-    TouchedTarget,
     WindowKind,
     WindowPlan,
 )
@@ -259,8 +266,8 @@ def source_plan(source: IcebergSource, window_count: int = 2) -> SourcePlan:
             str(source.table_uuid), snapshot_id, snapshot_id - 1, snapshot_id, 1000, "append", 7
         )
         target: TargetKey = TargetKey(f"tenant{index}", "vectors", "org1")
-        windows.append(WindowPlan(snapshot, WindowKind.APPEND, (TouchedTarget(target, (1, 9)),), ()))
-    return SourcePlan(str(source.table_uuid), window_count + 1, 7, tuple(windows))
+        windows.append(WindowPlan(snapshot, WindowKind.APPEND, (target,)))
+    return SourcePlan(str(source.table_uuid), window_count + 1, tuple(windows))
 
 
 def test_source_plan_enqueuer_maps_snapshots_and_database_spec() -> None:
@@ -342,6 +349,194 @@ def test_invalid_initial_baseline_is_a_durable_rejected_snapshot() -> None:
     assert error_code == "BASELINE_NOT_CANONICAL"
 
 
+def test_baseline_contract_value_error_is_durably_rejected() -> None:
+    """A deterministic baseline profile error cannot wedge every planner cycle."""
+    source: IcebergSource = source_registration(9)
+    metadata: TableMetadata = TableMetadata(str(source.table_uuid), 9, valid_partition_spec())
+    baseline: SnapshotRecord = SnapshotRecord(str(source.table_uuid), 9, None, 9, 1000, "append", 7)
+    catalog: MagicMock = MagicMock()
+    catalog.table_metadata.return_value = metadata
+    catalog.snapshots_through.return_value = (baseline,)
+    repository: MagicMock = MagicMock()
+    repository.latest_source_snapshot.return_value = None
+    qualifier: MagicMock = MagicMock()
+    qualifier.qualify.side_effect = ValueError("baseline source contains an unsupported mutation operation")
+
+    plan: SourcePlan = DurableSourcePlanProvider(source, catalog, repository, qualifier).plan()
+
+    assert plan.windows == ()
+    blocked_plan: SourceSnapshotPlan
+    error_code: str
+    blocked_plan, error_code = repository.enqueue_blocked_source_snapshot.call_args.args
+    assert blocked_plan.snapshot_id == baseline.snapshot_id
+    assert error_code == "BASELINE_NOT_CANONICAL"
+
+
+def test_missing_initial_baseline_configuration_rejects_the_exact_current_head() -> None:
+    """A nonempty source without a baseline pin becomes durably blocked after one read."""
+    source: IcebergSource = source_registration(None)
+    metadata: TableMetadata = TableMetadata(str(source.table_uuid), 12, valid_partition_spec())
+    head: SnapshotRecord = SnapshotRecord(str(source.table_uuid), 12, 11, 12, 1200, "append", 7)
+    catalog: MagicMock = MagicMock()
+    catalog.table_metadata.return_value = metadata
+    catalog.snapshots_through.return_value = (head,)
+    repository: MagicMock = MagicMock()
+    repository.latest_source_snapshot.return_value = None
+    qualifier: MagicMock = MagicMock()
+
+    plan: SourcePlan = DurableSourcePlanProvider(source, catalog, repository, qualifier).plan()
+
+    assert plan.windows == ()
+    blocked_plan: SourceSnapshotPlan
+    error_code: str
+    blocked_plan, error_code = repository.enqueue_blocked_source_snapshot.call_args.args
+    assert blocked_plan.snapshot_id == head.snapshot_id
+    assert blocked_plan.kind is SourceSnapshotKind.REJECTED
+    assert error_code == "BASELINE_NOT_CONFIGURED"
+    catalog.snapshots_through.assert_called_once_with(
+        source.spark_table,
+        12,
+        12,
+        descendant_limit=0,
+        retain_head=True,
+    )
+    qualifier.qualify.assert_not_called()
+
+
+def test_unretained_initial_baseline_rejects_the_exact_current_head() -> None:
+    """An expired or forked baseline pin becomes durable current-head rejection evidence."""
+    source: IcebergSource = source_registration(9)
+    metadata: TableMetadata = TableMetadata(str(source.table_uuid), 12, valid_partition_spec())
+    head: SnapshotRecord = SnapshotRecord(str(source.table_uuid), 12, 11, 12, 1200, "append", 7)
+    catalog: MagicMock = MagicMock()
+    catalog.table_metadata.return_value = metadata
+    catalog.snapshots_through.return_value = (head,)
+    repository: MagicMock = MagicMock()
+    repository.latest_source_snapshot.return_value = None
+    qualifier: MagicMock = MagicMock()
+
+    plan: SourcePlan = DurableSourcePlanProvider(source, catalog, repository, qualifier).plan()
+
+    assert plan.windows == ()
+    blocked_plan: SourceSnapshotPlan
+    error_code: str
+    blocked_plan, error_code = repository.enqueue_blocked_source_snapshot.call_args.args
+    assert blocked_plan.snapshot_id == head.snapshot_id
+    assert blocked_plan.kind is SourceSnapshotKind.REJECTED
+    assert error_code == "BASELINE_NOT_RETAINED"
+    qualifier.qualify.assert_not_called()
+
+
+def test_durable_initial_rejection_short_circuits_the_next_planner_cycle() -> None:
+    """A persisted bootstrap rejection closes the source gate before another Iceberg read."""
+    source: IcebergSource = source_registration(9)
+    metadata: TableMetadata = TableMetadata(str(source.table_uuid), 12, valid_partition_spec())
+    head: SnapshotRecord = SnapshotRecord(str(source.table_uuid), 12, 11, 12, 1200, "append", 7)
+    blocked_row: dict[str, object] = {
+        "source_snapshot_seq": 21,
+        "table_uuid": source.table_uuid,
+        "snapshot_id": head.snapshot_id,
+        "iceberg_sequence_number": head.sequence_number,
+        "partition_spec_id": head.partition_spec_id,
+        "state": SourceSnapshotState.BLOCKED.value,
+        "source_blocked": True,
+        "source_planning_epoch": 1,
+    }
+    catalog: MagicMock = MagicMock()
+    catalog.table_metadata.return_value = metadata
+    catalog.snapshots_through.return_value = (head,)
+    repository: MagicMock = MagicMock()
+    repository.latest_source_snapshot.side_effect = [None, blocked_row]
+    provider: DurableSourcePlanProvider = DurableSourcePlanProvider(source, catalog, repository, MagicMock())
+
+    first: SourcePlan = provider.plan()
+    second: SourcePlan = provider.plan()
+
+    assert first.windows == ()
+    assert second.windows == ()
+    assert second.pinned_head_snapshot_id == head.snapshot_id
+    repository.enqueue_blocked_source_snapshot.assert_called_once()
+    catalog.table_metadata.assert_called_once_with(source.spark_table)
+    catalog.snapshots_through.assert_called_once_with(
+        source.spark_table,
+        12,
+        9,
+        descendant_limit=0,
+        retain_head=True,
+    )
+
+
+def test_baseline_expiration_during_exact_scan_is_durably_rejected() -> None:
+    """A baseline removed after ancestry pinning cannot become an endless catalog retry."""
+    source: IcebergSource = source_registration(9)
+    metadata: TableMetadata = TableMetadata(str(source.table_uuid), 9, valid_partition_spec())
+    baseline: SnapshotRecord = SnapshotRecord(str(source.table_uuid), 9, None, 9, 1000, "append", 7)
+    catalog: MagicMock = MagicMock()
+    catalog.table_metadata.return_value = metadata
+    catalog.snapshots_through.return_value = (baseline,)
+    repository: MagicMock = MagicMock()
+    repository.latest_source_snapshot.return_value = None
+    qualifier: MagicMock = MagicMock()
+    qualifier.qualify.side_effect = AnalysisException("snapshot 9 is no longer retained")
+
+    plan: SourcePlan = DurableSourcePlanProvider(source, catalog, repository, qualifier).plan()
+
+    assert plan.windows == ()
+    blocked_plan: SourceSnapshotPlan
+    error_code: str
+    blocked_plan, error_code = repository.enqueue_blocked_source_snapshot.call_args.args
+    assert blocked_plan.snapshot_id == baseline.snapshot_id
+    assert error_code == "BASELINE_NOT_RETAINED"
+
+
+@pytest.mark.parametrize("baseline_snapshot_id", [None, 9])
+def test_initial_source_without_exact_snapshot_evidence_is_terminal(
+    baseline_snapshot_id: int | None,
+) -> None:
+    """An empty initial source cannot synthesize a rejected snapshot or retry forever."""
+    source: IcebergSource = source_registration(baseline_snapshot_id)
+    catalog: MagicMock = MagicMock()
+    catalog.table_metadata.return_value = TableMetadata(str(source.table_uuid), None, valid_partition_spec())
+    repository: MagicMock = MagicMock()
+    repository.latest_source_snapshot.return_value = None
+
+    with pytest.raises(SourceConfigurationError, match="existing canonical baseline snapshot"):
+        DurableSourcePlanProvider(source, catalog, repository, MagicMock()).plan()
+
+    repository.enqueue_blocked_source_snapshot.assert_not_called()
+    catalog.snapshots_through.assert_not_called()
+
+
+def test_initial_table_replacement_is_terminal_without_invented_snapshot_evidence() -> None:
+    """A replacement table UUID before baseline exits instead of adopting foreign history."""
+    source: IcebergSource = source_registration(9)
+    catalog: MagicMock = MagicMock()
+    catalog.table_metadata.return_value = TableMetadata(str(uuid.uuid4()), 9, valid_partition_spec())
+    repository: MagicMock = MagicMock()
+    repository.latest_source_snapshot.return_value = None
+
+    with pytest.raises(SourceConfigurationError, match="differs from its PostgreSQL registration"):
+        DurableSourcePlanProvider(source, catalog, repository, MagicMock()).plan()
+
+    repository.enqueue_blocked_source_snapshot.assert_not_called()
+    catalog.snapshots_through.assert_not_called()
+
+
+def test_malformed_initial_table_identity_is_a_terminal_configuration_error() -> None:
+    """Malformed immutable table metadata cannot become an infinite transient retry."""
+    source: IcebergSource = source_registration(9)
+    catalog: MagicMock = MagicMock()
+    catalog.table_metadata.side_effect = SourceContractError("invalid table UUID")
+    repository: MagicMock = MagicMock()
+    repository.latest_source_snapshot.return_value = None
+
+    with pytest.raises(SourceConfigurationError, match="metadata violates"):
+        DurableSourcePlanProvider(source, catalog, repository, MagicMock()).plan()
+
+    catalog.end_planning.assert_called_once_with(source.spark_table)
+    repository.enqueue_blocked_source_snapshot.assert_not_called()
+
+
 def test_source_contract_drift_blocks_the_existing_audit_tip() -> None:
     """Changed table metadata stops planning before any incremental scan."""
     source: IcebergSource = source_registration()
@@ -358,8 +553,412 @@ def test_source_contract_drift_blocks_the_existing_audit_tip() -> None:
     }
     plan: SourcePlan = DurableSourcePlanProvider(source, catalog, repository, MagicMock()).plan()
     assert plan.windows == ()
+    assert plan.table_uuid == str(source.table_uuid)
+    assert SourcePlanEnqueuer(repository, reconciler_settings(), source).enqueue(plan).enqueued_snapshots == 0
     repository.block_source_snapshot.assert_called_once_with(11, "SOURCE_TABLE_CONTRACT")
     catalog.snapshots_through.assert_not_called()
+
+
+def test_durable_checkpoint_uses_persisted_table_identity() -> None:
+    """A corrupt durable table identity cannot be replaced by current metadata."""
+    source: IcebergSource = source_registration()
+    catalog: MagicMock = MagicMock()
+    catalog.table_metadata.return_value = TableMetadata(str(source.table_uuid), 9, valid_partition_spec())
+    repository: MagicMock = MagicMock()
+    repository.latest_source_snapshot.return_value = {
+        "source_snapshot_seq": 11,
+        "table_uuid": uuid.uuid4(),
+        "snapshot_id": 9,
+        "iceberg_sequence_number": 9,
+        "partition_spec_id": 7,
+        "state": SourceSnapshotState.COMPLETE.value,
+    }
+
+    plan: SourcePlan = DurableSourcePlanProvider(source, catalog, repository, MagicMock()).plan()
+
+    assert plan.windows == ()
+    repository.block_source_snapshot.assert_called_once_with(11, "SOURCE_TABLE_CONTRACT")
+    catalog.snapshots_through.assert_not_called()
+
+
+def checkpoint_row(source: IcebergSource, snapshot_id: int = 9, sequence_number: int = 9) -> dict[str, object]:
+    """Build one complete durable source audit-tip row.
+
+    Args:
+        source: Registered source identity.
+        snapshot_id: Durable Iceberg snapshot id.
+        sequence_number: Durable Iceberg sequence number.
+
+    Returns:
+        Repository row mapping accepted by the durable provider.
+    """
+    return {
+        "source_snapshot_seq": 11,
+        "table_uuid": source.table_uuid,
+        "snapshot_id": snapshot_id,
+        "iceberg_sequence_number": sequence_number,
+        "partition_spec_id": 7,
+        "state": SourceSnapshotState.COMPLETE.value,
+    }
+
+
+def test_durable_checkpoint_cannot_lose_current_snapshot() -> None:
+    """A missing current head after durable progress blocks the exact audit tip."""
+    source: IcebergSource = source_registration()
+    catalog: MagicMock = MagicMock()
+    catalog.table_metadata.return_value = TableMetadata(str(source.table_uuid), None, valid_partition_spec())
+    repository: MagicMock = MagicMock()
+    repository.latest_source_snapshot.return_value = checkpoint_row(source)
+
+    plan: SourcePlan = DurableSourcePlanProvider(source, catalog, repository, MagicMock()).plan()
+
+    assert plan.windows == ()
+    repository.block_source_snapshot.assert_called_once_with(11, "SOURCE_LINEAGE_UNTRUSTED")
+    catalog.snapshots_through.assert_not_called()
+
+
+def test_unchanged_durable_head_requires_retained_checkpoint_metadata() -> None:
+    """An unchanged head is not trusted when its immutable metadata row disappeared."""
+    source: IcebergSource = source_registration()
+    catalog: MagicMock = MagicMock()
+    catalog.table_metadata.return_value = TableMetadata(str(source.table_uuid), 9, valid_partition_spec())
+    catalog.snapshots_through.return_value = ()
+    repository: MagicMock = MagicMock()
+    repository.latest_source_snapshot.return_value = checkpoint_row(source)
+
+    plan: SourcePlan = DurableSourcePlanProvider(source, catalog, repository, MagicMock()).plan()
+
+    assert plan.windows == ()
+    repository.block_source_snapshot.assert_called_once_with(11, "SOURCE_LINEAGE_UNTRUSTED")
+
+
+def test_durable_checkpoint_sequence_must_match_retained_metadata() -> None:
+    """A rewritten or corrupt checkpoint sequence blocks the durable audit tip."""
+    source: IcebergSource = source_registration()
+    retained: SnapshotRecord = SnapshotRecord(str(source.table_uuid), 9, None, 8, 1000, "append", 7)
+    catalog: MagicMock = MagicMock()
+    catalog.table_metadata.return_value = TableMetadata(str(source.table_uuid), 9, valid_partition_spec())
+    catalog.snapshots_through.return_value = (retained,)
+    repository: MagicMock = MagicMock()
+    repository.latest_source_snapshot.return_value = checkpoint_row(source, sequence_number=9)
+
+    plan: SourcePlan = DurableSourcePlanProvider(source, catalog, repository, MagicMock()).plan()
+
+    assert plan.windows == ()
+    repository.block_source_snapshot.assert_called_once_with(11, "SOURCE_LINEAGE_UNTRUSTED")
+
+
+def test_incremental_provider_plans_one_bounded_prefix_from_one_metadata_pin() -> None:
+    """One provider call emits a bounded prefix plus one truncation sentinel."""
+    source: IcebergSource = source_registration()
+    catalog: MagicMock = MagicMock()
+    catalog.table_metadata.return_value = TableMetadata(str(source.table_uuid), 15, valid_partition_spec())
+    catalog.snapshots_through.return_value = tuple(
+        SnapshotRecord(
+            str(source.table_uuid),
+            snapshot_id,
+            snapshot_id - 1 if snapshot_id > 9 else None,
+            snapshot_id,
+            snapshot_id * 1000,
+            "append",
+            7,
+        )
+        for snapshot_id in range(15, 8, -1)
+    )
+    catalog.manifest_entries.return_value = ()
+    repository: MagicMock = MagicMock()
+    repository.latest_source_snapshot.return_value = checkpoint_row(source)
+
+    plan: SourcePlan = DurableSourcePlanProvider(source, catalog, repository, MagicMock()).plan(2)
+
+    assert [window.snapshot.snapshot_id for window in plan.windows] == [10, 11, 12]
+    catalog.begin_planning.assert_called_once_with(source.spark_table)
+    catalog.end_planning.assert_called_once_with(source.spark_table)
+    catalog.snapshots_through.assert_called_once_with(source.spark_table, 15, 9, descendant_limit=3)
+
+
+def test_incremental_provider_enqueues_accepted_prefix_then_exact_rejection() -> None:
+    """A rejected child observed after valid work is durably gated in the same cycle."""
+    source: IcebergSource = source_registration()
+    checkpoint: SnapshotRecord = SnapshotRecord(str(source.table_uuid), 9, None, 9, 9000, "append", 7)
+    accepted: SnapshotRecord = SnapshotRecord(str(source.table_uuid), 10, 9, 10, 10_000, "append", 7)
+    rejected: SnapshotRecord = SnapshotRecord(str(source.table_uuid), 11, 10, 11, 11_000, "delete", 7)
+    catalog: MagicMock = MagicMock()
+    catalog.table_metadata.return_value = TableMetadata(str(source.table_uuid), 11, valid_partition_spec())
+    catalog.snapshots_through.return_value = (rejected, accepted, checkpoint)
+    catalog.manifest_entries.return_value = ()
+    repository: MagicMock = MagicMock()
+    repository.latest_source_snapshot.return_value = checkpoint_row(source)
+    repository.enqueue_source_snapshot.return_value = 12
+    provider: DurableSourcePlanProvider = DurableSourcePlanProvider(source, catalog, repository, MagicMock())
+
+    plan: SourcePlan = provider.plan(32)
+    summary: EnqueueSummary = SourcePlanEnqueuer(repository, reconciler_settings(), source).enqueue(plan)
+
+    assert [window.snapshot.snapshot_id for window in plan.windows] == [10]
+    assert plan.rejection is not None
+    assert plan.rejection.snapshot.snapshot_id == 11
+    assert plan.rejection.error_code == "PHYSICAL_DELETE"
+    assert summary.enqueued_snapshots == 1
+    assert not summary.truncated
+    blocked_plan: SourceSnapshotPlan
+    error_code: str
+    blocked_plan, error_code = repository.enqueue_blocked_source_snapshot.call_args.args
+    assert blocked_plan.snapshot_id == 11
+    assert blocked_plan.parent_snapshot_id == 10
+    assert error_code == "PHYSICAL_DELETE"
+    catalog.verify_planning_snapshots.assert_called_once_with(
+        source.spark_table,
+        str(source.table_uuid),
+        (9, 10, 11),
+    )
+
+
+def test_live_catalog_rebind_discards_observed_windows_and_gates_checkpoint() -> None:
+    """A failed post-read identity check cannot enqueue facts from a rebound table name."""
+    source: IcebergSource = source_registration()
+    checkpoint: SnapshotRecord = SnapshotRecord(str(source.table_uuid), 9, None, 9, 9000, "append", 7)
+    accepted: SnapshotRecord = SnapshotRecord(str(source.table_uuid), 10, 9, 10, 10_000, "append", 7)
+    catalog: MagicMock = MagicMock()
+    catalog.table_metadata.return_value = TableMetadata(str(source.table_uuid), 10, valid_partition_spec())
+    catalog.snapshots_through.return_value = (accepted, checkpoint)
+    catalog.manifest_entries.return_value = ()
+    catalog.verify_planning_snapshots.side_effect = SourceLineageError("table identity changed")
+    repository: MagicMock = MagicMock()
+    repository.latest_source_snapshot.return_value = checkpoint_row(source)
+
+    plan: SourcePlan = DurableSourcePlanProvider(source, catalog, repository, MagicMock()).plan()
+
+    assert plan.windows == ()
+    repository.block_source_snapshot.assert_called_once_with(11, "SOURCE_LINEAGE_UNTRUSTED")
+
+
+def test_unreadable_increment_manifest_becomes_exact_blocked_evidence() -> None:
+    """A permanent Spark metadata failure is classified instead of retried forever."""
+    spark: MagicMock = MagicMock()
+    spark.read.format.return_value.load.side_effect = AnalysisException("snapshot is no longer retained")
+    catalog: SparkIcebergCatalog = SparkIcebergCatalog(spark)
+
+    with pytest.raises(SourceSnapshotBlockedError) as raised:
+        catalog.manifest_entries("local.db.events", 10)
+
+    assert raised.value.snapshot_id == 10
+    assert raised.value.error_code == "SOURCE_SNAPSHOT_NOT_READABLE"
+
+
+@pytest.mark.parametrize("column", ["tenant_id", "namespace", "org_id", "ts_hour"])
+def test_manifest_normalization_rejects_null_required_partitions(column: str) -> None:
+    """Null partition facts never become synthetic routes or generic retry failures.
+
+    Args:
+        column: Required partition column made null.
+    """
+    values: dict[str, object] = {
+        "entry_snapshot_id": 10,
+        "entry_status": 1,
+        "entry_content": 0,
+        "entry_spec_id": 7,
+        "tenant_id": "tenant1",
+        "namespace": "namespace1",
+        "org_id": "org1",
+        "ts_hour": 500_000,
+    }
+    values[column] = None
+
+    with pytest.raises(SourceSnapshotBlockedError) as raised:
+        manifest_from_row(Row(**values))
+
+    assert raised.value.snapshot_id == 10
+    assert raised.value.error_code == "SOURCE_PARTITION_NULL"
+
+
+@pytest.mark.parametrize("value", ["", "/", "x" * 129])
+def test_manifest_normalization_rejects_invalid_routing_partitions(value: str) -> None:
+    """Invalid non-null routes become exact blocked evidence instead of retry loops.
+
+    Args:
+        value: Invalid tenant partition value.
+    """
+    values: dict[str, object] = {
+        "entry_snapshot_id": 10,
+        "entry_status": 1,
+        "entry_content": 0,
+        "entry_spec_id": 7,
+        "tenant_id": value,
+        "namespace": "namespace1",
+        "org_id": "org1",
+        "ts_hour": 500_000,
+    }
+
+    with pytest.raises(SourceSnapshotBlockedError) as raised:
+        manifest_from_row(Row(**values))
+
+    assert raised.value.snapshot_id == 10
+    assert raised.value.error_code == "SOURCE_PARTITION_ROUTING"
+
+
+def test_catalog_accepts_registered_multilevel_namespace() -> None:
+    """Catalog validation matches the persisted dotted namespace contract."""
+    catalog: SparkIcebergCatalog = SparkIcebergCatalog(MagicMock())
+
+    assert catalog.validate_table("catalog.org.analytics.events") == "catalog.org.analytics.events"
+
+
+def test_large_ancestry_limits_partition_spec_resolution_to_bounded_suffix() -> None:
+    """A 10,000-snapshot backlog keeps only a bounded Python ancestry tail."""
+    table_uuid: str = str(uuid.uuid4())
+    requested: int = 0
+
+    def load_snapshot(snapshot_id: int) -> dict[str, object] | None:
+        """Generate one retained snapshot without materializing the full history.
+
+        Args:
+            snapshot_id: Requested snapshot identity.
+
+        Returns:
+            Generated snapshot projection, or ``None`` outside the retained range.
+        """
+        nonlocal requested
+        requested += 1
+        if snapshot_id < 1 or snapshot_id > 10_000:
+            return None
+        return {
+            "snapshot-id": snapshot_id,
+            "parent-snapshot-id": snapshot_id - 1 if snapshot_id > 1 else None,
+            "sequence-number": snapshot_id,
+            "timestamp-ms": snapshot_id * 1000,
+            "summary": {"operation": "append"},
+        }
+
+    pin: IcebergMetadataPin = IcebergMetadataPin(
+        TableMetadata(table_uuid, 10_000, PartitionSpec(7, ())),
+        "memory:test",
+        load_snapshot,
+    )
+    catalog: MagicMock = MagicMock(spec=SparkIcebergCatalog)
+    catalog.validate_table.return_value = "local.db.events"
+    catalog.metadata.return_value = pin
+
+    def resolve_specs(
+        table: str,
+        rows: tuple[dict[str, object], ...],
+        fallback: int,
+    ) -> dict[int, int]:
+        """Resolve every bounded test row to one fixed specification.
+
+        Args:
+            table: Ignored validated table name.
+            rows: Bounded snapshot documents.
+            fallback: Active partition specification.
+
+        Returns:
+            Snapshot-to-specification mapping.
+        """
+        del table
+        return {int(snapshot["snapshot-id"]): fallback for snapshot in rows}
+
+    catalog.snapshot_partition_spec_ids.side_effect = resolve_specs
+
+    records: tuple[SnapshotRecord, ...] = SparkIcebergCatalog.snapshots_through(
+        catalog,
+        "local.db.events",
+        10_000,
+        1,
+        descendant_limit=33,
+    )
+
+    assert [record.snapshot_id for record in records] == list(range(34, 0, -1))
+    resolved_rows: tuple[dict[str, object], ...] = catalog.snapshot_partition_spec_ids.call_args.args[1]
+    assert len(resolved_rows) == 34
+
+    endpoints: tuple[SnapshotRecord, ...] = SparkIcebergCatalog.snapshots_through(
+        catalog,
+        "local.db.events",
+        10_000,
+        -1,
+        descendant_limit=0,
+        retain_head=True,
+    )
+    assert [record.snapshot_id for record in endpoints] == [10_000, 1]
+    endpoint_rows: tuple[dict[str, object], ...] = catalog.snapshot_partition_spec_ids.call_args.args[1]
+    assert len(endpoint_rows) == 2
+    assert requested < 100_000
+
+
+def test_catalog_reuses_one_metadata_pin_inside_a_planning_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Table metadata and ancestry reads share one exact cycle-scoped generation.
+
+    Args:
+        monkeypatch: Scoped metadata-reader replacement.
+    """
+    reads: list[str] = []
+    pin: IcebergMetadataPin = IcebergMetadataPin(
+        TableMetadata(str(uuid.uuid4()), 9, PartitionSpec(7, ())),
+        "memory:test",
+        MagicMock(),
+    )
+
+    def read_metadata(catalog: SparkIcebergCatalog, table: str) -> IcebergMetadataPin:
+        """Record one physical metadata load.
+
+        Args:
+            catalog: Ignored catalog instance.
+            table: Validated table name.
+
+        Returns:
+            Shared metadata pin.
+        """
+        del catalog
+        reads.append(table)
+        return pin
+
+    monkeypatch.setattr(SparkIcebergCatalog, "read_metadata", read_metadata)
+    catalog: SparkIcebergCatalog = SparkIcebergCatalog(MagicMock())
+
+    catalog.begin_planning("local.db.events")
+    assert catalog.metadata("local.db.events") is pin
+    assert catalog.metadata("local.db.events") is pin
+    catalog.end_planning("local.db.events")
+    assert catalog.metadata("local.db.events") is pin
+    assert reads == ["local.db.events", "local.db.events"]
+
+
+def test_catalog_reads_the_java_catalog_current_metadata_pointer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Metadata pinning never infers current state from skewable log timestamps.
+
+    Args:
+        monkeypatch: Scoped Java-pointer adapter replacement.
+    """
+    requests: list[str] = []
+    pin: IcebergMetadataPin = IcebergMetadataPin(
+        TableMetadata(str(uuid.uuid4()), None, PartitionSpec(7, ())),
+        "memory:test",
+        MagicMock(),
+    )
+
+    def current_metadata(spark: MagicMock, table: str) -> IcebergMetadataPin:
+        """Return the exact test metadata pin.
+
+        Args:
+            spark: Ignored Spark session double.
+            table: Validated table requested by the catalog.
+
+        Returns:
+            Current test metadata pin.
+        """
+        del spark
+        requests.append(table)
+        return pin
+
+    monkeypatch.setattr("lance_etl.reconciler.iceberg.current_iceberg_metadata", current_metadata)
+    spark: MagicMock = MagicMock()
+    catalog: SparkIcebergCatalog = SparkIcebergCatalog(spark)
+
+    assert catalog.read_metadata("local.db.events") is pin
+    assert requests == ["local.db.events"]
+    spark.read.format.assert_not_called()
 
 
 def test_work_result_requires_exact_ingest_and_publication_evidence() -> None:
@@ -530,6 +1129,25 @@ def test_fenced_executor_rejects_stale_context_without_external_work() -> None:
     assert result.error_code == "STALE_CLAIM"
     ingest.run.assert_not_called()
     publisher.run.assert_not_called()
+
+
+def test_heartbeat_marks_lease_lost_when_renewal_thread_cannot_stop() -> None:
+    """A stalled renewal cannot let the worker publish an ambiguously fenced result."""
+    heartbeat: LeaseHeartbeat = LeaseHeartbeat(
+        MagicMock(),
+        work_claim(),
+        timedelta(minutes=15),
+        timedelta(minutes=5),
+    )
+    thread: MagicMock = MagicMock()
+    thread.is_alive.return_value = True
+    heartbeat.thread = thread
+
+    heartbeat.stop()
+
+    thread.join.assert_called_once_with(timeout=1.0)
+    assert heartbeat.stop_event.is_set()
+    assert heartbeat.lost
 
 
 def test_required_indexes_are_entirely_specification_driven() -> None:
@@ -724,7 +1342,7 @@ def test_applied_completion_marker_short_circuits_a_completed_window(tmp_path: P
         runner.applied_completion_marker(ingest_probe_context(uri, 3), b"x" * 32)
 
 
-class FakeColumn:
+class FakeColumn(int):
     """Minimal stand-in for a pyspark ``Column``, inert outside of an active SparkContext."""
 
     def isNull(self) -> FakeColumn:
@@ -745,18 +1363,6 @@ class FakeColumn:
             This column.
         """
         del name
-        return self
-
-    def __gt__(self, other: object) -> FakeColumn:
-        """Return self, standing in for a real greater-than comparison.
-
-        Args:
-            other: Ignored comparison operand.
-
-        Returns:
-            This column.
-        """
-        del other
         return self
 
 
@@ -876,17 +1482,26 @@ class FakeTerminalFrame:
         """Record no-op release of the fake persisted frame."""
 
 
-def fake_execute_spark_scan(spark: object, plan: object) -> object:
+def fake_execute_spark_scan(
+    spark: object,
+    table: str,
+    snapshot: object,
+    kind: object,
+    target: object,
+) -> object:
     """Return an opaque scan result without touching a real Spark session.
 
     Args:
         spark: Ignored Spark session.
-        plan: Ignored scan plan.
+        table: Ignored source table.
+        snapshot: Ignored immutable source snapshot.
+        kind: Ignored source window kind.
+        target: Ignored target identity.
 
     Returns:
         An opaque scan-result stand-in, forwarded unchanged by the stubbed phase methods.
     """
-    del spark, plan
+    del spark, table, snapshot, kind, target
     return object()
 
 
@@ -925,19 +1540,6 @@ class StubbedPhasesIngestRunner(DistributedIngestRunner):
     `applied_completion_marker`, `write_terminal`, `finalize_marker`) are left to each test to
     override or fail, isolating exactly the boundary PR-03 narrows.
     """
-
-    def canonical_source(self, source: object, context: object) -> object:
-        """Return the scan output unchanged.
-
-        Args:
-            source: Fake upstream scan result.
-            context: Ignored execution context.
-
-        Returns:
-            The unchanged source.
-        """
-        del context
-        return source
 
     def validate_source_profile(self, source: object, spec: object) -> None:
         """Accept any source without inspection.
@@ -1236,7 +1838,7 @@ def test_slo_reports_queue_blockage_and_retention_age() -> None:
 def test_application_runs_local_cycle_in_dependency_order() -> None:
     """The one-process application plans, drains, sweeps, gates, then emits."""
     provider: MagicMock = MagicMock()
-    provider.plan.return_value = SourcePlan(str(uuid.uuid4()), None, 7, ())
+    provider.plan.return_value = SourcePlan(str(uuid.uuid4()), None, ())
     enqueuer: MagicMock = MagicMock()
     planning: EnqueueSummary = EnqueueSummary(None, 0, 0, (), False)
     enqueuer.enqueue.return_value = planning
@@ -1264,6 +1866,8 @@ def test_application_runs_local_cycle_in_dependency_order() -> None:
     assert result.reconciliation == reconciliation
     assert not result.retention.retention_held
     assert result.slo.healthy
+    provider.plan.assert_called_once_with(application.settings.max_snapshots_per_plan)
+    enqueuer.enqueue.assert_called_once_with(provider.plan.return_value)
     emitter.emit.assert_called_once_with(result.slo)
 
 
@@ -1285,6 +1889,53 @@ def test_rebuild_repair_uses_a_stable_operator_request() -> None:
     result: uuid.UUID | None = application.repair_rebuild(identity, request_id, False)
     assert result == application.repository.enqueue_rebuild.return_value
     application.repository.enqueue_rebuild.assert_called_once_with(identity, request_id)
+
+
+def test_blocked_source_repair_requires_an_explicit_operator_transition() -> None:
+    """Source-checkpoint recovery supports dry run and delegates one exact durable identity."""
+    application: ReconcilerApplication = ReconcilerApplication(
+        MagicMock(),
+        MagicMock(),
+        MagicMock(),
+        MagicMock(),
+        MagicMock(),
+        MagicMock(),
+        reconciler_settings(),
+    )
+    application.repository.can_retry_blocked_source_snapshot.return_value = True
+    application.repository.retry_blocked_source_snapshot.return_value = True
+
+    assert application.repair_blocked_source_snapshot(17, True)
+    application.repository.can_retry_blocked_source_snapshot.assert_called_once_with(17)
+    application.repository.retry_blocked_source_snapshot.assert_not_called()
+    assert application.repair_blocked_source_snapshot(17, False)
+    application.repository.retry_blocked_source_snapshot.assert_called_once_with(17)
+
+
+def test_postgres_only_operator_can_repair_a_blocked_source_checkpoint() -> None:
+    """The status and repair surface delegates source recovery without requiring Spark."""
+    repository: MagicMock = MagicMock()
+    repository.can_retry_blocked_source_snapshot.return_value = True
+    repository.retry_blocked_source_snapshot.return_value = True
+    operator: ReconcilerOperator = ReconcilerOperator(repository, MagicMock(), reconciler_settings())
+
+    assert operator.repair_blocked_source_snapshot(19, True)
+    repository.can_retry_blocked_source_snapshot.assert_called_once_with(19)
+    repository.retry_blocked_source_snapshot.assert_not_called()
+    assert operator.repair_blocked_source_snapshot(19, False)
+    repository.retry_blocked_source_snapshot.assert_called_once_with(19)
+
+
+def test_blocked_work_dry_run_checks_current_retry_eligibility() -> None:
+    """A work dry run reads the durable gate without mutating the selected row."""
+    repository: MagicMock = MagicMock()
+    repository.can_retry_blocked_work.return_value = False
+    operator: ReconcilerOperator = ReconcilerOperator(repository, MagicMock(), reconciler_settings())
+    work_id: uuid.UUID = uuid.uuid4()
+
+    assert not operator.repair_blocked_work(work_id, True)
+    repository.can_retry_blocked_work.assert_called_once_with(work_id)
+    repository.retry_blocked_work.assert_not_called()
 
 
 def test_runtime_settings_are_local_and_have_no_remote_execution_options(
@@ -1326,8 +1977,57 @@ def test_cli_exposes_only_local_control_plane_actions() -> None:
     migrator: MagicMock = MagicMock()
     assert execute_command(None, parser.parse_args(["migrate"]), migrator) == {"migrated": True}
     migrator.migrate.assert_called_once_with()
+    operator: MagicMock = MagicMock(spec=ReconcilerOperator)
+    operator.repair_blocked_source_snapshot.return_value = True
+    repair_args: argparse.Namespace = parser.parse_args(
+        ["repair", "--action", "retry-blocked-source", "--source-snapshot-seq", "17"]
+    )
+    assert execute_command(operator, repair_args)
+    operator.repair_blocked_source_snapshot.assert_called_once_with(17, False)
+    with pytest.raises(ValueError, match="requires --source-snapshot-seq"):
+        execute_command(operator, parser.parse_args(["repair", "--action", "retry-blocked-source"]))
+    with pytest.raises(SystemExit):
+        parser.parse_args(["repair", "--action", "retry-blocked-source", "--source-snapshot-seq", "0"])
     with pytest.raises(SystemExit):
         parser.parse_args(["rollback"])
+
+
+def test_continuous_cli_retries_a_failed_cycle() -> None:
+    """Continuous mode logs one failed cycle and preserves the next successful result."""
+    application: MagicMock = MagicMock(spec=ReconcilerApplication)
+    result: MagicMock = MagicMock(spec=RunOnceSummary)
+    application.run_once.side_effect = [RuntimeError("temporary catalog failure"), result]
+    sleep: MagicMock = MagicMock(side_effect=[None, KeyboardInterrupt()])
+
+    assert run_loop(application, 1.0, sleep) is result
+    assert application.run_once.call_count == 2
+    assert sleep.call_count == 2
+
+
+def test_continuous_cli_exits_on_terminal_source_configuration() -> None:
+    """Continuous mode never retries a deterministic bootstrap fault without durable evidence."""
+    application: MagicMock = MagicMock(spec=ReconcilerApplication)
+    application.run_once.side_effect = SourceConfigurationError("initial baseline is unavailable")
+    sleep: MagicMock = MagicMock()
+
+    with pytest.raises(SourceConfigurationError, match="initial baseline is unavailable"):
+        run_loop(application, 1.0, sleep)
+
+    application.run_once.assert_called_once_with()
+    sleep.assert_not_called()
+
+
+def test_manifest_collection_blocks_before_driver_rows_are_unbounded() -> None:
+    """Manifest discovery probes one extra fact and rejects an oversized snapshot."""
+    selected: MagicMock = MagicMock()
+    selected.limit.return_value.collect.return_value = [MagicMock()] * (MAX_MANIFEST_FACTS_PER_SNAPSHOT + 1)
+
+    with pytest.raises(SourceSnapshotBlockedError) as raised:
+        collect_manifest_rows(selected, 91)
+
+    assert raised.value.snapshot_id == 91
+    assert raised.value.error_code == "SOURCE_MANIFEST_FACT_LIMIT"
+    selected.limit.assert_called_once_with(MAX_MANIFEST_FACTS_PER_SNAPSHOT + 1)
 
 
 def slo_status(healthy: bool) -> SloStatus:

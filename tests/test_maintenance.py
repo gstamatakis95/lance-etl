@@ -17,9 +17,7 @@ import pyarrow as pa
 import pytest
 from conftest import FakeSpark
 
-import lance_etl.maintenance.cli as maintenance_cli
 import lance_etl.maintenance.job as maintenance_job
-from lance_etl.cliutil import EXIT_PARTIAL_FAILURE
 from lance_etl.fanout import count_failed
 from lance_etl.maintenance import (
     MaintenanceConfig,
@@ -31,21 +29,6 @@ from lance_etl.maintenance import (
     validate_column_name,
 )
 from lance_etl.telemetry import Telemetry, TelemetryConfig
-
-
-def fake_build_spark(*args: object, **kwargs: object) -> FakeSpark:
-    """Return a fake session regardless of the requested Spark configuration.
-
-    Args:
-        args: Ignored positional arguments.
-        kwargs: Ignored keyword arguments.
-
-    Returns:
-        A fresh fake Spark session.
-    """
-    del args, kwargs
-    return FakeSpark()
-
 
 DELETED_COLUMN: str = "is_deleted"
 
@@ -105,8 +88,26 @@ class TestMaintenanceConfigDefaults:
         config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config, retention_seconds=RETENTION_SECONDS)
         assert config.retention_active() is True
 
+    @pytest.mark.parametrize("invalid", [0, -1])
+    def test_nonpositive_retention_fails_before_fleet_access(
+        self,
+        telemetry_config: TelemetryConfig,
+        invalid: int,
+    ) -> None:
+        """A destructive current-or-future cutoff is invalid even for an empty fleet.
+
+        Args:
+            telemetry_config: Test telemetry configuration.
+            invalid: Non-positive retention window.
+        """
+        config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config, retention_seconds=invalid)
+        with pytest.raises(ValueError, match="retention_seconds must be positive"):
+            MaintenanceJob(config).run(FakeSpark(), [])
+        with pytest.raises(ValueError, match="retention_seconds must be positive"):
+            compute_cutoff(invalid)
+
     def test_ts_column_default(self, telemetry_config: TelemetryConfig) -> None:
-        """The default ts column matches ETLConfig.ts_col."""
+        """The default retention column matches the fixed source event-time field."""
         assert MaintenanceConfig(telemetry=telemetry_config).ts_column == "ts"
 
 
@@ -321,8 +322,7 @@ class TestRetentionDelete:
 
         Regression guard for PR-02 finding 3: the configured ``ts`` column being absent from a
         dataset's schema is a contract violation, not benign "nothing to do", so it must be
-        visible to :func:`~lance_etl.fanout.count_failed` and, in turn, to the maintenance CLI's
-        exit code.
+        visible to :func:`~lance_etl.fanout.count_failed`.
         """
         uri: str = str(tmp_path / "no_ts_fleet.lance")
         lance.write_dataset(pa.table({"id": pa.array([1, 2], pa.int64())}), uri)
@@ -345,20 +345,6 @@ class TestRetentionDelete:
         config: MaintenanceConfig = MaintenanceConfig(telemetry=TelemetryConfig(), commit_backoff_seconds=0.0)
         results: list[dict[str, object]] = MaintenanceJob(config).run(FakeSpark(), [missing_uri])
         assert count_failed(results) == 1
-
-    def test_cli_exits_partial_failure_on_unopenable_dataset(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The maintenance CLI's exit code reflects a fleet run over one unopenable dataset.
-
-        Regression guard for PR-02: the maintenance ``run`` subcommand must map an isolated open
-        failure to :data:`~lance_etl.cliutil.EXIT_PARTIAL_FAILURE`, not exit ``0`` as if the whole
-        fleet run succeeded.
-        """
-        monkeypatch.setattr(maintenance_cli, "build_spark", fake_build_spark)
-        missing_uri: str = str(tmp_path / "does_not_exist.lance")
-        exit_code: int = maintenance_cli.main(["run", "--dataset-uri", missing_uri])
-        assert exit_code == EXIT_PARTIAL_FAILURE
 
 
 class TestRetentionOffIsNoop:
@@ -397,11 +383,12 @@ class TestRunOrdering:
     def test_plan_fan_out_covers_all_datasets(
         self, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The plan fan-out calls plan_one_dataset for every dataset in the fleet.
+        """The plan fan-out calls plan_one_dataset once per unique dataset in the fleet.
 
         With the unified design, plan_one_dataset handles retention, the skip check, and the compaction plan in one
-        executor task per dataset. Patching plan_one_dataset at the module level lets the test observe that every URI
-        is planned exactly once.
+        executor task per dataset. Repeated input URIs are removed before fan-out so the same dataset cannot race
+        itself. Patching plan_one_dataset at the module level lets the test observe that every unique URI is planned
+        exactly once.
 
         Args:
             telemetry_config: The test telemetry configuration.
@@ -423,8 +410,54 @@ class TestRunOrdering:
 
         monkeypatch.setattr(maintenance_job, "plan_one_dataset", record_plan)
         config: MaintenanceConfig = MaintenanceConfig(telemetry=telemetry_config, retention_seconds=RETENTION_SECONDS)
-        MaintenanceJob(config).run(FakeSpark(), ["a.lance", "b.lance"])
+        MaintenanceJob(config).run(FakeSpark(), ["a.lance", "a.lance", "b.lance", "a.lance"])
         assert processed == ["a.lance", "b.lance"]
+
+    def test_cluster_retention_count_survives_passthrough(
+        self, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Retention completed during cluster planning remains in the normal-maintenance result.
+
+        Args:
+            telemetry_config: The test telemetry configuration.
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+
+        def cluster_then_passthrough(
+            spark: object,
+            uris: list[str],
+            config: MaintenanceConfig,
+            cutoff: datetime | None,
+            telemetry: Telemetry,
+            cleanup_slot: int | None = None,
+        ) -> tuple[dict[str, dict[str, object]], list[str]]:
+            """Simulate cluster planning that expires rows and routes the dataset onward."""
+            del spark, config, cutoff, telemetry, cleanup_slot
+            uri: str = uris[0]
+            return ({uri: {"uri": uri, "retention_rows_deleted": 7}}, [uri])
+
+        def terminal_plan(
+            uri: str,
+            config: MaintenanceConfig,
+            cutoff: datetime | None,
+            telemetry: Telemetry,
+            cleanup_slot: int | None = None,
+        ) -> dict[str, object]:
+            """Return a terminal normal-maintenance plan with no additional expiry."""
+            del config, cutoff, telemetry, cleanup_slot
+            return {"uri": uri, "retention_rows_deleted": 0, "tasks": 0, "bytes_removed": 0}
+
+        monkeypatch.setattr(maintenance_job.maintenance_cluster, "run_cluster_rewrites", cluster_then_passthrough)
+        monkeypatch.setattr(maintenance_job, "plan_one_dataset", terminal_plan)
+        config: MaintenanceConfig = MaintenanceConfig(
+            telemetry=telemetry_config,
+            retention_seconds=RETENTION_SECONDS,
+            cluster_rewrite=True,
+        )
+
+        results: list[dict[str, object]] = MaintenanceJob(config).run(FakeSpark(), ["a.lance"])
+
+        assert results[0]["retention_rows_deleted"] == 7
 
     def test_run_expires_then_compacts_real_dataset(self, retention_dataset: tuple[str, int, int]) -> None:
         """An end-to-end run deletes expired rows and compacts the survivors into one fragment."""

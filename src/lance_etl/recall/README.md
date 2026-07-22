@@ -13,8 +13,8 @@ the [package README](../README.md) for the reconciliation cycle whose publicatio
 
 Recording the exact serving version is what makes the score exact rather than approximate under
 concurrent writes: the audit must run inside the maintenance cleanup retention horizon so the
-recorded version has not been version-pruned, or scoring falls back to the latest version with a
-`version_drift` flag on every affected sample. A structurally-below-1.0 recall for `text`/`hybrid`
+recorded version has not been version-pruned. A pruned version is skipped as `version_missing`
+instead of being scored against different data. A structurally-below-1.0 recall for `text`/`hybrid`
 samples is an expected signal, not necessarily a bug: `queries.tokenize_text` is a Unicode
 word-splitting approximation of Lance's own tokenizer, so a genuine tokenizer divergence between the
 reference and the index shows up as measured sub-1.0 recall on text legs.
@@ -48,12 +48,14 @@ filter, cursor pagination) using only `DD_API_KEY`/`DD_APP_KEY` from the environ
 client dependency beyond the standard library. `flatten_recall_attributes` normalizes both the flat
 (`recall.sample_id`) and nested (`custom.recall.sample_id`) shapes the Spans API can return into one
 flat dict. `parse_recall_sample` then validates every field strictly: routing components go through
-`attr_path_component`, which combines the `PATH_COMPONENT_PATTERN` allowlist with an explicit
-rejection of `.`/`..` so a malformed capture cannot escape the routing-key path prefix, and JSON
-array/object attributes are decoded and shape-checked before use. A field that fails validation
-raises `SampleParseError` with a bounded-cardinality `reason` key rather than raising out of the
-whole batch. `parse_samples` collects these into a `dict[str, int]` skip-reason count instead of
-losing the batch to one bad record.
+`attr_path_component`, which applies the same bounded `[A-Za-z0-9_-]{1,128}` contract as ingestion,
+the control plane, and serving, so a malformed capture cannot name an unreachable dataset path.
+JSON array/object attributes are decoded and shape-checked before use. Query vectors have a fixed
+defensive dimension ceiling. Result arrays cannot exceed `k`, and result ids must be bounded
+hashable JSON scalars. A field that fails validation raises `SampleParseError` with a
+bounded-cardinality `reason` key rather than raising out of the whole batch. `parse_samples`
+collects these into a `dict[str, int]` skip-reason count instead of losing the batch to one bad
+record.
 
 ## Query replay (`queries.py`)
 
@@ -69,27 +71,31 @@ both breaking ties on id for determinism.
 
 ## Scoring (`scoring.py`)
 
-`resolve_dataset` opens the dataset pinned at the sample's recorded version, falling back to the
-latest version (with `version_drift=True`) only when the pinned version is unavailable, and
-returning `None` only when the URI cannot be opened at all. `brute_force_top_k_scored` streams
+`resolve_dataset` opens only the dataset pinned at the sample's recorded version and returns `None`
+when that exact manifest has been pruned. `brute_force_top_k_scored` streams
 `(id, vector)` batches through numpy, merging each batch's partial top-k into a running top-k via
 `merge_top_k` so memory stays bounded by `batch_size + k` regardless of dataset size. An optional
 `fragments` argument restricts the scan to specific fragments, which is the primitive the large-tier
-fan-out (below) uses per fragment. `bm25_top_k` materializes the candidate text columns once,
-computes per-column Okapi BM25 (`k1`=`BM25_K1`, `b`=`BM25_B`) via `bm25_column_scores`, sums boosted
-column scores, and ranks documents that matched at least one clause, breaking ties on id.
+fan-out (below) uses per fragment. `bm25_top_k` makes two streaming scans at the pinned version.
+The first retains only exact per-column document lengths and query-term frequencies. The second
+scores one batch at a time and retains only the running top-k. This keeps memory bounded by the
+query vocabulary, scanner batch size, and `k` while preserving exact per-column Okapi BM25
+(`k1`=`BM25_K1`, `b`=`BM25_B`). Boosted column scores are summed and ties break on id.
 `ranking_quality` computes all three metrics from one exact ground-truth order: graded relevance is
 `n - j` for the item at 1-based true rank `j` (so the top-1 item outranks everything), recall@k is
 `|served ∩ true-top-k| / min(k, candidate_count)`, nDCG@k divides the served ranking's DCG by the
 ideal DCG of the true order, and MRR is the reciprocal rank at which the single true top-1 item
-appears in the served list, `0` if absent.
+appears in the served list, `0` if absent. A duplicate served id receives gain only at its first
+position, so duplicates cannot inflate nDCG.
 
 ## The two-tier fan-out (`job.py`)
 
 `RecallAuditJob.run` fetches and parses spans on the driver, groups samples by `(dataset_uri,
 dataset_version)`, then classifies each group with one distributed probe job
 (`classify_groups`) that opens each group's dataset, reads its fragment count, and checks
-scorability and version drift — the driver itself never opens a dataset. Groups at or below
+whether the exact recorded version remains scorable. The probe returns only a fragment count. Large-group fragment
+identifiers are enumerated once on an executor and repartitioned into fragment tasks, so the driver
+never opens a dataset or retains an unbounded fragment inventory. Groups at or below
 `large_group_fragment_threshold` (default 32) go to the **small tier** (`run_small_tier`): packed
 `config.small_tier_slices` ways so one task scores many small groups end to end with the unchanged
 `score_version_group`, amortizing task scheduling and cold-open cost across a long tail of tiny
@@ -98,12 +104,13 @@ per-tenant datasets.
 Groups above the threshold go to the **large tier** (`run_large_tier`), which splits by leg:
 
 - The vector leg fans out `(group, fragment)` pairs (`fragment_vector_partials`), each computing one
-  fragment's partial top-k. The driver reduces per-sample partials in ascending fragment order
-  (`reduce_vector_legs` -> `reduce_partial_top_k`) with the same `merge_top_k` stable merge the
-  single-stream scan uses, so the reduced top-k is bit-identical (ties included) to a whole-dataset
-  brute force. `fragment_index` is bounds-checked against the freshly-opened dataset's own fragment
-  count, degrading a shrunk fragment set to a per-sample `fragment_missing` skip rather than an
-  uncaught `IndexError`.
+  fragment's partial top-k by direct identifier lookup. The pairs are created by an executor-side
+  inventory stage and shuffled directly to the scan stage. Keyed map-side and reduce-side combiners
+  merge each sample associatively while retaining only its best `k` candidates. Explicit fragment
+  and local-rank ordering gives the same stable tie order as the single-stream scan without
+  materializing every partial on one executor. The driver therefore receives only one reduced leg
+  per sample, and the result stays bit-identical to a whole-dataset brute force, ties included. A
+  missing planned fragment becomes a per-sample `fragment_missing` skip.
 - The BM25 leg stays whole-dataset (`whole_dataset_text_legs`) because inverse document frequency
   and average document length are corpus-global statistics that cannot be sharded per fragment
   without changing the scores.
@@ -112,8 +119,9 @@ Groups above the threshold go to the **large tier** (`run_large_tier`), which sp
 leg, and hybrid samples by fusing both with the recorded strategy. `aggregate_scores` builds the
 report table in order — overall, per RPC-parameter bucket (`nprobes_min`/`nprobes_max`/
 `refine_factor`), per query type, per organization — and `emit_recall_metrics` gauges only the RPC
-and query-type buckets (bounded cardinality). Org-level numbers stay in the stdout table so the
-metric tag space does not grow with tenant count.
+and query-type buckets. Raw RPC integers are grouped into the fixed ranges `nonpositive`, `1`, `2`,
+`3-4`, `5-8`, `9-16`, `17-32`, `33-64`, and `65+`, with separate absent labels. Org-level numbers
+stay in the stdout table so the metric tag space does not grow with tenant count.
 
 ## Tests
 
@@ -122,7 +130,7 @@ metric tag space does not grow with tenant count.
 against hand-computable rankings plus end-to-end text and hybrid replay through
 `InMemorySpanSource` against tiny real local Lance datasets. `tests/test_recall_scoring.py` covers
 brute-force scoring, version pinning, and the aggregation/report math. `tests/test_recall_tiering.py`
-covers the small/large size split and asserts the fanned-out, driver-reduced top-k equals the
+covers the small/large size split and asserts the fanned-out, executor-reduced top-k equals the
 single-stream whole-dataset brute force exactly, both at the primitive level and through the full
-job, with Spark replaced everywhere by the `FakeSpark`/`FakeSparkContext` fixtures in
-`tests/conftest.py` since this job only ever calls `parallelize().map().collect()`.
+job, with Spark replaced by local recording fixtures that model map, flat-map, keyed reduction, and
+collection.

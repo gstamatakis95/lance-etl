@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import uuid
@@ -19,6 +20,7 @@ from lance_etl.reconciler.service import BoundedDispatcher, ReconcilerApplicatio
 from lance_etl.reconciler.telemetry import TelemetrySloEmitter
 from lance_etl.reconciler.workers import ConfiguredPublicationRunner, DistributedIngestRunner, FencedWorkExecutor
 from lance_etl.source import TableMetadata
+from lance_etl.spark_process import SPARK_CORE_CONF_PINS, ensure_spark_process_safety
 from lance_etl.state import (
     ControlPlaneRepository,
     IcebergSource,
@@ -26,6 +28,44 @@ from lance_etl.state import (
     build_control_plane_engine,
 )
 from lance_etl.telemetry import Telemetry, TelemetryConfig
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+LOCAL_SPARK_SQL_CONFIG: dict[str, str] = {
+    "spark.sql.adaptive.enabled": "true",
+    "spark.sql.adaptive.advisoryPartitionSizeInBytes": "64m",
+    "spark.sql.adaptive.coalescePartitions.initialPartitionNum": str(DEFAULT_LOCAL_SHUFFLE_PARTITIONS),
+    "spark.sql.execution.arrow.maxRecordsPerBatch": "4096",
+}
+"""Memory-bounded SQL defaults for the local reconciler's Arrow and shuffle stages."""
+
+
+def close_runtime_resources(spark: SparkSession | None, engine: Engine | None) -> None:
+    """Release every initialized process-owned runtime resource.
+
+    Args:
+        spark: Optional initialized local Spark session.
+        engine: Optional initialized PostgreSQL engine.
+    """
+    try:
+        if spark is not None:
+            spark.stop()
+    finally:
+        if engine is not None:
+            engine.dispose()
+
+
+def close_failed_runtime(spark: SparkSession | None, engine: Engine | None) -> None:
+    """Best-effort cleanup without masking a bootstrap failure.
+
+    Args:
+        spark: Optional initialized local Spark session.
+        engine: Optional initialized PostgreSQL engine.
+    """
+    try:
+        close_runtime_resources(spark, engine)
+    except Exception:
+        logger.exception("reconciler runtime cleanup failed during bootstrap")
 
 
 def build_runtime_spark(settings: RuntimeSettings) -> SparkSession:
@@ -55,10 +95,17 @@ def build_runtime_spark(settings: RuntimeSettings) -> SparkSession:
         .config(f"{catalog_prefix}.warehouse", warehouse_uri)
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.shuffle.partitions", str(DEFAULT_LOCAL_SHUFFLE_PARTITIONS))
-        .config("spark.speculation", "false")
         .config("spark.ui.enabled", "false")
     )
-    return builder.getOrCreate()
+    key: str
+    value: str
+    for key, value in SPARK_CORE_CONF_PINS.items():
+        builder = builder.config(key, value)
+    for key, value in LOCAL_SPARK_SQL_CONFIG.items():
+        builder = builder.config(key, value)
+    session: SparkSession = builder.getOrCreate()
+    ensure_spark_process_safety(session, "running the reconciler")
+    return session
 
 
 def build_runtime_prewarmer(spark: SparkSession) -> ExactPrewarmer:
@@ -121,24 +168,25 @@ def build_runtime_application() -> ReconcilerApplication:
             if registered_source is not None
             else runtime_settings.canonical_baseline_snapshot_id
         )
-        bootstrap_catalog: SparkIcebergCatalog = SparkIcebergCatalog(spark)
-        metadata: TableMetadata = bootstrap_catalog.table_metadata(source_table)
-        source: IcebergSource = repository.ensure_source_registration(
-            source_name="local",
-            source_table=source_table,
-            table_uuid=uuid.UUID(metadata.table_uuid),
-            canonical_baseline_snapshot_id=baseline_snapshot_id,
-            lance_base_uri=lance_base_uri,
-        )
+        source: IcebergSource
+        if registered_source is None:
+            bootstrap_catalog: SparkIcebergCatalog = SparkIcebergCatalog(spark)
+            metadata: TableMetadata = bootstrap_catalog.table_metadata(source_table)
+            source = repository.ensure_source_registration(
+                source_name="local",
+                source_table=source_table,
+                table_uuid=uuid.UUID(metadata.table_uuid),
+                canonical_baseline_snapshot_id=baseline_snapshot_id,
+                lance_base_uri=lance_base_uri,
+            )
+        else:
+            source = registered_source
         if source.lifecycle_state is not SourceLifecycleState.ACTIVE:
             raise RuntimeError("the local Iceberg source registration is not active")
         reconciler_settings: ReconcilerSettings = ReconcilerSettings.from_environment()
         catalog: SparkIcebergCatalog = SparkIcebergCatalog(
             spark,
             source.canonical_baseline_snapshot_id,
-            source.tenant_column,
-            source.namespace_column,
-            source.org_column,
         )
         provider: DurableSourcePlanProvider = DurableSourcePlanProvider(
             source,
@@ -162,15 +210,12 @@ def build_runtime_application() -> ReconcilerApplication:
             repository, spark, reconciler_settings, telemetry_config
         )
     except Exception:
-        spark.stop()
-        if engine is not None:
-            engine.dispose()
+        close_failed_runtime(spark, engine)
         raise
 
     def shutdown_runtime() -> None:
         """Stop local Spark and release pooled PostgreSQL connections."""
-        spark.stop()
-        engine.dispose()
+        close_runtime_resources(spark, engine)
 
     return ReconcilerApplication(
         provider,
@@ -190,15 +235,20 @@ def build_runtime_operator() -> ReconcilerOperator:
     Returns:
         Local control-plane operator that does not create a Spark session.
     """
-    settings: RuntimeSettings = RuntimeSettings.from_environment()
-    telemetry: Telemetry = Telemetry.create(
-        TelemetryConfig(
-            service=settings.datadog_service,
-            env=settings.datadog_env,
-            metric_prefix="lance.pipeline",
+    engine: Engine | None = None
+    try:
+        settings: RuntimeSettings = RuntimeSettings.from_environment()
+        telemetry: Telemetry = Telemetry.create(
+            TelemetryConfig(
+                service=settings.datadog_service,
+                env=settings.datadog_env,
+                metric_prefix="lance.pipeline",
+            )
         )
-    )
-    engine: Engine = build_control_plane_engine(settings.database_url)
-    repository: ControlPlaneRepository = ControlPlaneRepository(engine)
-    reconciler_settings: ReconcilerSettings = ReconcilerSettings.from_environment()
+        engine = build_control_plane_engine(settings.database_url)
+        repository: ControlPlaneRepository = ControlPlaneRepository(engine)
+        reconciler_settings: ReconcilerSettings = ReconcilerSettings.from_environment()
+    except Exception:
+        close_failed_runtime(None, engine)
+        raise
     return ReconcilerOperator(repository, TelemetrySloEmitter(telemetry), reconciler_settings, engine.dispose)

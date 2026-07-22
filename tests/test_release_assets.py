@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from alembic import command as alembic_command
 from alembic.config import Config
+from alembic.script import Script, ScriptDirectory
 
 from lance_etl.reconciler.migrations import AlembicMigrationRunner
 
@@ -97,3 +98,20 @@ def test_control_plane_migration_uses_the_configured_postgres_url(monkeypatch: p
     }
     runbook: str = read_repository_file("docs/production-release.md")
     assert "lance-etl-reconcile migrate" in runbook
+
+
+def test_control_plane_migration_is_one_resettable_baseline() -> None:
+    """The control plane has one self-contained baseline and no forward revisions."""
+    configuration: Config = Config(str(REPOSITORY_ROOT / "alembic.ini"))
+    configuration.set_main_option("script_location", str(REPOSITORY_ROOT / "migrations"))
+    scripts: ScriptDirectory = ScriptDirectory.from_config(configuration)
+    revisions: list[Script] = list(scripts.walk_revisions())
+
+    assert [path.name for path in (REPOSITORY_ROOT / "migrations" / "versions").glob("*.py")] == [
+        "0001_control_plane.py"
+    ]
+    assert len(revisions) == 1
+    assert revisions[0].revision == "0001_control_plane"
+    assert revisions[0].down_revision is None
+    assert scripts.get_heads() == ["0001_control_plane"]
+    assert "must be dropped and recreated" in read_repository_file("migrations/README.md")

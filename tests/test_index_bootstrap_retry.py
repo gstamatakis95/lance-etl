@@ -16,10 +16,11 @@ from pathlib import Path
 from typing import Any
 
 import lance
+import pyarrow as pa
 import pytest
 from conftest import make_vector_table, write_fragmented_dataset
 
-from lance_etl.indexing import IndexJobConfig, bootstrap_vector_index
+from lance_etl.indexing import IndexJobConfig, bootstrap_vector_index, load_vector_config
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 ROWS: int = 512
@@ -164,3 +165,53 @@ def test_bootstrap_succeeds_without_conflict(
     committed: lance.LanceDataset = lance.dataset(dataset_uri)
     assert stats["fragments"] == len(committed.get_fragments())
     assert "vector_idx" in {item["name"] for item in committed.list_indices()}
+
+
+def test_bootstrap_retry_records_latest_training_rows(
+    dataset_uri: str, telemetry: Telemetry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retry after a concurrent append stores evidence from the generation it actually trained.
+
+    Args:
+        dataset_uri: URI of the pre-built test dataset.
+        telemetry: The telemetry facade fixture.
+        monkeypatch: Pytest monkeypatch used to append rows and inject the first conflict.
+    """
+    extra_rows: int = 64
+    real_create_index: Callable[..., Any] = lance.LanceDataset.create_index
+    calls: list[int] = []
+
+    def create_index(self: lance.LanceDataset, *args: Any, **kwargs: Any) -> Any:
+        """Append rows before the first conflict, then delegate the retry to pylance.
+
+        Args:
+            self: Dataset instance receiving the call.
+            args: Positional arguments forwarded to pylance.
+            kwargs: Keyword arguments forwarded to pylance.
+
+        Returns:
+            The result from pylance's real implementation on the retry.
+
+        Raises:
+            OSError: On the first invocation after committing the concurrent append.
+        """
+        calls.append(1)
+        if len(calls) == 1:
+            table: pa.Table = make_vector_table(rows=extra_rows, dim=DIM, seed=37)
+            appended: pa.Table = table.set_column(0, "id", pa.array(range(ROWS, ROWS + extra_rows), pa.int64()))
+            lance.write_dataset(appended, dataset_uri, mode="append")
+            raise OSError(COMMIT_CONFLICT_MESSAGE)
+        return real_create_index(self, *args, **kwargs)
+
+    monkeypatch.setattr(lance.LanceDataset, "create_index", create_index)
+    stats: dict[str, object] = bootstrap_vector_index(
+        dataset_uri, "vector", "vector_idx", bootstrap_config(), telemetry
+    )
+
+    committed: lance.LanceDataset = lance.dataset(dataset_uri)
+    config: dict[str, object] | None = load_vector_config(committed, "vector")
+    assert len(calls) == 2
+    assert committed.count_rows() == ROWS + extra_rows
+    assert stats["fragments"] == len(committed.get_fragments())
+    assert config is not None
+    assert config["rows_at_train"] == ROWS + extra_rows

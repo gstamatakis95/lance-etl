@@ -1,8 +1,8 @@
 """Depth-agnostic dataset discovery under a base URI.
 
 Covers :func:`lance_etl.cloud_storage.discover_datasets` on a local filesystem with datasets at mixed depths,
-the empty and missing base cases, the executor-fanned Spark path returning identical results to the
-pure-driver walk, and the ``--base-uri`` wiring through the CLI's ``load_dataset_uris``.
+the empty and missing base cases, and the executor-fanned Spark path returning identical results to the
+pure-driver walk.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import lance
@@ -17,10 +18,53 @@ import pyarrow as pa
 import pytest
 from pyspark.sql import SparkSession
 
-import lance_etl.indexing.cli as indexing_cli
-import lance_etl.maintenance.cli as maintenance_cli
-from lance_etl.cliutil import load_dataset_uris
-from lance_etl.cloud_storage import dataset_paths_under, discover_datasets
+from lance_etl.cloud_storage import dataset_paths_under, discover_datasets, resolve_filesystem, validate_gcs_kwargs
+
+
+@pytest.mark.parametrize(
+    "credentials",
+    [{"access_token": "token"}, {"credential_token_expiration": 1_800_000_000}],
+)
+def test_gcs_token_credentials_must_be_paired(credentials: dict[str, object]) -> None:
+    """Either half of an explicit GCS token pair fails before filesystem construction.
+
+    Args:
+        credentials: Incomplete mapped GCS constructor credentials.
+    """
+    with pytest.raises(ValueError, match="requires 'access_token'.*together"):
+        validate_gcs_kwargs(credentials)
+
+
+@pytest.mark.parametrize(
+    "expiration",
+    ["1800000000", "2027-01-15T08:00:00Z"],
+)
+def test_gcs_token_expiration_reaches_real_constructor_as_datetime(expiration: object) -> None:
+    """String expiration forms construct the installed PyArrow filesystem.
+
+    Args:
+        expiration: Supported token expiration representation.
+    """
+    filesystem, path = resolve_filesystem(
+        "gs://test-bucket/example",
+        {"access_token": "token", "credential_token_expiration": expiration},
+    )
+    assert isinstance(filesystem, pa.fs.GcsFileSystem)
+    assert path == "test-bucket/example"
+
+
+@pytest.mark.parametrize("expiration", [1_800_000_000, datetime(2027, 1, 15, 8, tzinfo=UTC)])
+def test_gcs_token_expiration_rejects_non_string_storage_options(expiration: object) -> None:
+    """PyArrow conversion cannot bless a value that pylance will reject later.
+
+    Args:
+        expiration: Non-string programmatic expiration.
+    """
+    with pytest.raises(ValueError, match="must be a string"):
+        resolve_filesystem(
+            "gs://test-bucket/example",
+            {"access_token": "token", "credential_token_expiration": expiration},
+        )
 
 
 @pytest.fixture(scope="module")
@@ -107,6 +151,7 @@ def test_fanned_discovery_ignores_stray_first_level_files(tmp_path: Path, spark:
     """A plain file at the first level is neither a dataset nor a prefix to descend into."""
     write_tiny_dataset(str(tmp_path / "a" / "y.lance"))
     (tmp_path / "notes.txt").write_text("not a dataset", encoding="utf-8")
+    (tmp_path / "misleading.lance").write_text("not a dataset either", encoding="utf-8")
     assert discover_datasets(str(tmp_path), spark=spark) == [str(tmp_path / "a" / "y.lance")]
     assert discover_datasets(str(tmp_path)) == [str(tmp_path / "a" / "y.lance")]
 
@@ -121,46 +166,3 @@ def test_dataset_paths_under_subpath_stays_base_relative(mixed_depth_base: Path)
     """Listing one first-level prefix returns paths relative to the base, not the prefix."""
     found: set[str] = dataset_paths_under(str(mixed_depth_base), None, "a")
     assert found == {"a/y.lance", "a/b/c/z.lance"}
-
-
-def test_cli_base_uri_discovers_datasets(mixed_depth_base: Path) -> None:
-    """The maintenance run subcommand's --base-uri flag feeds discovery through load_dataset_uris."""
-    args = maintenance_cli.build_parser().parse_args(["run", "--base-uri", str(mixed_depth_base)])
-    uris: list[str] = load_dataset_uris(args)
-    assert len(uris) == 3
-    assert all(uri.endswith(".lance") for uri in uris)
-
-
-def test_cli_base_uri_combines_with_explicit_uris(mixed_depth_base: Path) -> None:
-    """Explicit --dataset-uri values and discovered datasets are combined."""
-    args = indexing_cli.build_parser().parse_args(
-        ["--dataset-uri", "s3://bucket/explicit.lance", "--base-uri", str(mixed_depth_base)]
-    )
-    uris: list[str] = load_dataset_uris(args)
-    assert uris[0] == "s3://bucket/explicit.lance"
-    assert len(uris) == 4
-
-
-def test_cli_dedupes_repeated_explicit_uris() -> None:
-    """Repeating the same --dataset-uri flag contributes exactly one URI, not two."""
-    args = indexing_cli.build_parser().parse_args(
-        [
-            "--dataset-uri",
-            "s3://bucket/one.lance",
-            "--dataset-uri",
-            "s3://bucket/one.lance",
-            "--dataset-uri",
-            "s3://bucket/two.lance",
-        ]
-    )
-    uris: list[str] = load_dataset_uris(args)
-    assert uris == ["s3://bucket/one.lance", "s3://bucket/two.lance"]
-
-
-def test_cli_dedupes_explicit_uri_also_found_by_discovery(mixed_depth_base: Path) -> None:
-    """A URI named both explicitly and via --base-uri discovery contributes exactly one entry."""
-    duplicate_uri: str = str(mixed_depth_base / "x.lance")
-    args = indexing_cli.build_parser().parse_args(["--dataset-uri", duplicate_uri, "--base-uri", str(mixed_depth_base)])
-    uris: list[str] = load_dataset_uris(args)
-    assert len(uris) == len(set(uris)) == 3
-    assert uris[0] == duplicate_uri

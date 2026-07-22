@@ -55,6 +55,10 @@ def walk_snapshot_lineage(
         SourceLineageError: If ancestry is missing, cyclic, forked, or non-monotonic.
     """
     indexed = index_snapshots(snapshots)
+    stop = indexed.get(stop_snapshot_id)
+    if stop is None:
+        raise SourceLineageError(f"recorded ancestor snapshot {stop_snapshot_id} is missing from bounded metadata")
+    validate_snapshot_identity(stop, expected_table_uuid, expected_partition_spec_id)
     if pinned_head_snapshot_id == stop_snapshot_id:
         return ()
     reverse_path: list[SnapshotRecord] = []
@@ -78,10 +82,6 @@ def walk_snapshot_lineage(
         if previous_sequence is not None and snapshot.sequence_number <= previous_sequence:
             raise SourceLineageError("Iceberg sequence numbers are not strictly increasing along snapshot ancestry")
         previous_sequence = snapshot.sequence_number
-    stop = indexed.get(stop_snapshot_id)
-    if stop is None:
-        raise SourceLineageError(f"recorded ancestor snapshot {stop_snapshot_id} is missing from bounded metadata")
-    validate_snapshot_identity(stop, expected_table_uuid, expected_partition_spec_id)
     if ordered and ordered[0].sequence_number <= stop.sequence_number:
         raise SourceLineageError("first descendant sequence number does not follow the recorded ancestor")
     return ordered

@@ -34,7 +34,7 @@ The control plane is normalized into exactly nine application tables
 | `dataset_spec_revisions` | Immutable, numbered data contract carrying its own `spec_id`, `name`, and `description` |
 | `dataset_fields` | Ordered target schema and its projection from Iceberg |
 | `index_definitions` | Required Lance indexes with typed IVF_RQ and INVERTED options as nullable columns |
-| `iceberg_sources` | The registered source table, its immutable UUID, and the source-column mapping |
+| `iceberg_sources` | The registered source table, its immutable UUID, storage root, and planning fence |
 | `source_snapshots` | The exact Iceberg snapshot ledger and blocked-history evidence |
 | `datasets` | First-class route identity plus the mutable materialization cursor, `fence_epoch`, and `active_publication_id` |
 | `dataset_work` | Deterministic work rows with lease, attempt count, phase, and latest error |
@@ -72,8 +72,9 @@ The source is one partitioned Iceberg table. Every record carries the routing tr
 `texts`, and `metadata`. The Iceberg partition contract is
 `(tenant_id, namespace, org_id, hours(ts))`. That contract is validated on every planning run by
 `validate_partition_contract` in `source/contract.py`, whose `REQUIRED_PARTITION_FIELDS` fixes the
-last partition to `hour(ts)`. The registered column names live on the `iceberg_sources` row, where
-`ts_column` and `record_id_column` default to `ts` and `record_id`.
+partition field names and the last partition to `hour(ts)`. Baseline qualification and ingestion
+enforce the complete physical schema. Source column aliases are not configuration. A table with
+different physical names must be rewritten to this canonical contract.
 
 The reconciler never trusts wall-clock time or numeric snapshot ordering to decide source progress.
 It follows the exact direct-parent snapshot chain instead
@@ -82,8 +83,8 @@ in `source/lineage.py` walks from the pinned head down through each `parent_snap
 recorded ancestor, rejecting cycles, forks, missing links, and any chain whose Iceberg sequence
 numbers do not strictly increase. The Spark reader resolves each accepted window to snapshot-id
 bounds, never timestamps, because Iceberg 1.10 rejects `start-timestamp` and `end-timestamp`
-outside changelog scans. `build_spark_scan` in `source/scans.py` emits `snapshot-id` for a baseline
-and `start-snapshot-id` plus `end-snapshot-id` for an incremental append.
+outside changelog scans. `snapshot_scan_options` in `source/scans.py` emits `snapshot-id` for a
+baseline and `start-snapshot-id` plus `end-snapshot-id` for an incremental append.
 
 Every accepted or rejected transition becomes a durable row in `source_snapshots`, recording the
 snapshot id, parent id, Iceberg sequence number, partition spec id, commit time, operation, a
@@ -98,7 +99,7 @@ short-circuits further planning until an operator intervenes.
 
 The first local run reads the actual Iceberg table UUID and registers the source in
 `iceberg_sources`. PostgreSQL is authoritative afterward, so a later attempt to point the same
-source name at a different table, storage root, baseline, or column mapping is rejected.
+source name at a different table, storage root, or baseline is rejected.
 
 On each cycle the reconciler builds a side-effect-free source plan and hands it to
 `SourcePlanEnqueuer.enqueue` in `reconciler/planning.py`. For each accepted window it derives the
@@ -151,9 +152,9 @@ Within one transition, mutations are normalized and collapsed to one terminal st
 `collapse_snapshot_mutations` in `etl/mutation.py` keys the collapse on `record_id`, folds each
 source operation spelling to `upsert` or `delete`, and treats an exact-duplicate redelivery as a
 no-op while raising on the same record producing two different content digests. The map columns are
-pivoted into typed target columns by `pivot_map_columns` in `etl/pivot.py`, which extracts each
-declared key from the `vectors`, `texts`, and `metadata` maps and casts each vector to its fixed-size
-float32 list.
+projected directly in Spark from the immutable specification's declared `vectors`, `texts`, and
+`metadata` keys. Vector fields are cast to their declared fixed-size float32 dimensions by
+`apply_fsl_cast` in `etl/arrow.py` before the replay-safe merge.
 
 ## Stage 5: the replay-safe merge_insert write path
 

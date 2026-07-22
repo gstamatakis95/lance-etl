@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 import uuid
@@ -14,10 +15,18 @@ from unittest.mock import MagicMock
 import lance
 import pyarrow as pa
 import pytest
-from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame, SparkSession
 
-from lance_etl.reconciler import ResultKind, WorkResult
-from lance_etl.reconciler.workers import ConfiguredPublicationRunner
+import lance_etl.reconciler.workers as reconciler_workers
+from lance_etl.etl.digest import canonical_source_digest
+from lance_etl.etl.replay_sink import DELETED_COLUMN, EVENT_DIGEST_COLUMN, SOURCE_SEQUENCE_COLUMN
+from lance_etl.reconciler.iceberg import BaselineQualifier
+from lance_etl.reconciler.results import ResultKind, WorkResult
+from lance_etl.reconciler.workers import (
+    ConfiguredPublicationRunner,
+    DistributedIngestRunner,
+    source_digest_chunks,
+)
 from lance_etl.state import (
     DatasetField,
     DatasetSpecRevision,
@@ -215,6 +224,218 @@ def rebuild_context(source_uri: str, source_version: int, candidate_uri: str) ->
         artifact_manifest_uri=None,
         artifact_digest=None,
     )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("invalid", [None, float("nan"), float("inf"), float("-inf")])
+def test_source_profile_rejects_invalid_vector_elements(spark: SparkSession, invalid: float | None) -> None:
+    """Null and non-finite elements fail in Spark before Arrow digest execution.
+
+    Args:
+        spark: Local Spark session.
+        invalid: Invalid vector element under test.
+    """
+    values: list[float | None] = vector(1.0)
+    values[3] = invalid
+    source = spark.createDataFrame(
+        [("tenant1", "namespace1", "org1", "record1", "upsert", TIMESTAMP, {"vector": values}, {}, {})],
+        (
+            "tenant_id string, namespace string, org_id string, record_id string, op string, ts timestamp, "
+            "vectors map<string,array<float>>, texts map<string,string>, metadata map<string,string>"
+        ),
+    )
+    runner: DistributedIngestRunner = DistributedIngestRunner(spark, TelemetryConfig())
+
+    with pytest.raises(ValueError, match="contains null or non-finite elements"):
+        runner.validate_source_profile(source, local_spec())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("invalid", [None, float("nan"), float("inf"), float("-inf")])
+def test_baseline_profile_rejects_nonfinite_vectors_before_arrow(spark: SparkSession, invalid: float | None) -> None:
+    """Baseline canonicalization cannot turn deterministic bad vector elements into Spark retries.
+
+    Args:
+        spark: Local Spark session.
+        invalid: Non-finite vector element under test.
+    """
+    values: list[float | None] = vector(1.0)
+    values[3] = invalid
+    source_frame = spark.createDataFrame(
+        [("tenant1", "namespace1", "org1", "record1", "upsert", TIMESTAMP, {"vector": values}, {}, {})],
+        (
+            "tenant_id string, namespace string, org_id string, record_id string, op string, ts timestamp, "
+            "vectors map<string,array<float>>, texts map<string,string>, metadata map<string,string>"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="null or non-finite vector element"):
+        BaselineQualifier(spark).validate_contract(source_frame)
+
+
+@pytest.mark.integration
+def test_distributed_source_digest_matches_frozen_v1_contract(spark: SparkSession) -> None:
+    """Range-sorted chunks preserve the durable digest across input layouts.
+
+    Args:
+        spark: Local Spark session.
+    """
+    suffixes: tuple[str, ...] = ("", "\x00", "e\u0301", "é", "ä", "🧭", "𐀀")
+    digest_rows: list[tuple[str, int, bytes]] = [
+        (
+            f"{index:04d}-{suffixes[index % len(suffixes)]}",
+            index * 7,
+            hashlib.sha256(str(index).encode("utf-8")).digest(),
+        )
+        for index in range(257)
+    ]
+    terminal = spark.createDataFrame(
+        list(reversed(digest_rows)),
+        f"record_id string, {SOURCE_SEQUENCE_COLUMN} long, {EVENT_DIGEST_COLUMN} binary",
+    )
+    expected: bytes = canonical_source_digest(digest_rows)
+    runner: DistributedIngestRunner = DistributedIngestRunner(spark, TelemetryConfig())
+
+    for input_partitions in (2, 5, 9):
+        assert runner.compute_source_digest(terminal.repartition(input_partitions)) == (expected, len(digest_rows))
+
+    empty = spark.createDataFrame(
+        [],
+        f"record_id string, {SOURCE_SEQUENCE_COLUMN} long, {EVENT_DIGEST_COLUMN} binary",
+    )
+    assert runner.compute_source_digest(empty) == (canonical_source_digest([]), 0)
+
+
+@pytest.mark.integration
+def test_source_digest_spool_avoids_driver_partition_buffering_and_cleans_up(
+    spark: SparkSession,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Digest consumption never uses ``toLocalIterator`` and removes its dedicated local spool.
+
+    Args:
+        spark: Local Spark session.
+        tmp_path: Isolated parent for the driver-created spool directory.
+        monkeypatch: Pytest monkeypatch used to reject the old iterator boundary.
+    """
+    digest_rows: list[tuple[str, int, bytes]] = [
+        (f"record-{index:04d}", index, hashlib.sha256(str(index).encode("utf-8")).digest()) for index in range(129)
+    ]
+    terminal = spark.createDataFrame(
+        list(reversed(digest_rows)),
+        f"record_id string, {SOURCE_SEQUENCE_COLUMN} long, {EVENT_DIGEST_COLUMN} binary",
+    )
+    old_iterator: MagicMock = MagicMock(side_effect=AssertionError("driver iterator buffering is forbidden"))
+    monkeypatch.setattr(DataFrame, "toLocalIterator", old_iterator)
+    monkeypatch.setattr(reconciler_workers.tempfile, "tempdir", str(tmp_path))
+
+    runner: DistributedIngestRunner = DistributedIngestRunner(spark, TelemetryConfig())
+    assert runner.compute_source_digest(terminal) == (canonical_source_digest(digest_rows), len(digest_rows))
+    old_iterator.assert_not_called()
+    assert list(tmp_path.iterdir()) == []
+
+    failed_consumer: MagicMock = MagicMock(side_effect=RuntimeError("digest consumption failed"))
+    monkeypatch.setattr(reconciler_workers, "consume_source_digest_spool", failed_consumer)
+    with pytest.raises(RuntimeError, match="digest consumption failed"):
+        runner.compute_source_digest(terminal)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.integration
+def test_source_digest_plan_has_no_single_partition_exchange(
+    spark: SparkSession,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Digest ordering uses a multi-partition range exchange.
+
+    Args:
+        spark: Local Spark session.
+        capsys: Captured Spark plan output.
+    """
+    terminal = spark.createDataFrame(
+        [("b", 2, b"b" * 32), ("a", 1, b"a" * 32)],
+        f"record_id string, {SOURCE_SEQUENCE_COLUMN} long, {EVENT_DIGEST_COLUMN} binary",
+    )
+    chunks = source_digest_chunks(terminal, 4)
+
+    chunks.explain(mode="simple")
+    plan: str = capsys.readouterr().out.lower()
+    assert "rangepartitioning" in plan
+    assert "singlepartition" not in plan
+    assert chunks.rdd.getNumPartitions() > 1
+
+
+@pytest.mark.integration
+def test_candidate_counts_use_one_exact_distributed_aggregation(spark: SparkSession, tmp_path: Path) -> None:
+    """The publication gate counts duplicates and tombstones without caching Python row objects.
+
+    Args:
+        spark: Local Spark session.
+        tmp_path: Isolated candidate roots.
+    """
+    candidate: lance.LanceDataset = lance.write_dataset(
+        terminal_table(
+            [
+                terminal_row("a", 1, b"a"),
+                terminal_row("a", 2, b"b", value=2.0),
+                terminal_row("b", 1, b"c", deleted=True),
+                terminal_row("c", 1, b"d"),
+            ]
+        ),
+        str(tmp_path / "count-candidate.lance"),
+        max_rows_per_file=1,
+    )
+    runner: ConfiguredPublicationRunner = ConfiguredPublicationRunner(spark, TelemetryConfig(), MagicMock())
+
+    assert runner.candidate_counts(candidate.uri, candidate.version, local_spec()) == (4, 3, 3, 2)
+
+    empty: lance.LanceDataset = lance.write_dataset(
+        terminal_table([]),
+        str(tmp_path / "empty-count-candidate.lance"),
+    )
+    assert runner.candidate_counts(empty.uri, empty.version, local_spec()) == (0, 0, 0, 0)
+
+
+@pytest.mark.integration
+def test_fragment_tasks_keep_high_fragment_inventory_off_driver(spark: SparkSession, tmp_path: Path) -> None:
+    """A high-fragment version becomes bounded executor scan rows with exact coverage.
+
+    Args:
+        spark: Local Spark session.
+        tmp_path: Isolated candidate root.
+    """
+    row_count: int = 257
+    candidate: lance.LanceDataset = lance.write_dataset(
+        terminal_table([terminal_row(f"record-{index:04d}", index, b"a") for index in range(row_count)]),
+        str(tmp_path / "high-fragment-candidate.lance"),
+        max_rows_per_file=1,
+    )
+    runner: ConfiguredPublicationRunner = ConfiguredPublicationRunner(spark, TelemetryConfig(), MagicMock())
+    tasks = runner.fragment_task_frame(
+        candidate.uri,
+        candidate.version,
+        4,
+        ("record_id", DELETED_COLUMN),
+    )
+    summary = tasks.selectExpr(
+        "count(*) AS task_count",
+        "count(DISTINCT fragment_id) AS fragment_count",
+    ).first()
+
+    assert summary is not None
+    assert int(summary["task_count"]) == row_count
+    assert int(summary["fragment_count"]) == row_count
+    assert runner.candidate_counts(candidate.uri, candidate.version, local_spec()) == (
+        row_count,
+        row_count,
+        row_count,
+        row_count,
+    )
+    rebuilt_uri: str = str(tmp_path / "high-fragment-rebuilt.lance")
+    context: WorkExecutionContext = rebuild_context(candidate.uri, candidate.version, rebuilt_uri)
+    assert runner.canonical_rebuild(context) == rebuilt_uri
+    assert lance.dataset(rebuilt_uri).count_rows() == row_count
 
 
 @pytest.mark.integration

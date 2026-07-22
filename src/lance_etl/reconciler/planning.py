@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from lance_etl.reconciler.config import ReconcilerSettings
-from lance_etl.source import SourcePlan, TargetKey, TouchedTarget, WindowKind, WindowPlan
+from lance_etl.source import SourcePlan, SourceSnapshotRejection, TargetKey, WindowKind, WindowPlan
 from lance_etl.state import DatasetPlan, IcebergSource, RoutingIdentity, SourceSnapshotKind, SourceSnapshotPlan
 
 
@@ -24,6 +24,18 @@ class SourceSnapshotRepository(Protocol):
 
         Returns:
             Existing or newly created window sequence.
+        """
+        ...
+
+    def enqueue_blocked_source_snapshot(self, plan: SourceSnapshotPlan, error_code: str) -> int:
+        """Persist one exact rejected snapshot after its accepted parent prefix.
+
+        Args:
+            plan: Rejected immutable source snapshot.
+            error_code: Bounded rejection classification.
+
+        Returns:
+            Existing or newly created source snapshot sequence.
         """
         ...
 
@@ -51,7 +63,7 @@ class SourcePlanEnqueuer:
         """Map a bounded prefix of one pinned source plan into idempotent repository calls.
 
         Args:
-            source_plan: Side-effect-free plan emitted by ``SourcePlanner``.
+            source_plan: Pinned plan emitted by the durable Iceberg provider.
 
         Returns:
             Durable window identities and whether another planner pass is needed.
@@ -66,9 +78,20 @@ class SourcePlanEnqueuer:
         sequences: list[int] = []
         window: WindowPlan
         for window in selected:
-            state_plan: SourceSnapshotPlan = map_snapshot(self.source.source_id, window)
+            state_plan: SourceSnapshotPlan = map_snapshot(
+                self.source.source_id,
+                window,
+                source_plan.planning_epoch,
+            )
             datasets: list[DatasetPlan] = map_datasets(window)
             sequences.append(self.repository.enqueue_source_snapshot(state_plan, datasets))
+        if source_plan.rejection is not None and len(selected) == len(source_plan.windows):
+            rejection_plan: SourceSnapshotPlan = map_rejection(
+                self.source.source_id,
+                source_plan.rejection,
+                source_plan.planning_epoch,
+            )
+            self.repository.enqueue_blocked_source_snapshot(rejection_plan, source_plan.rejection.error_code)
         return EnqueueSummary(
             pinned_head_snapshot_id=source_plan.pinned_head_snapshot_id,
             planned_snapshots=len(source_plan.windows),
@@ -78,12 +101,46 @@ class SourcePlanEnqueuer:
         )
 
 
-def map_snapshot(source_id: uuid.UUID, window: WindowPlan) -> SourceSnapshotPlan:
+def map_rejection(
+    source_id: uuid.UUID,
+    rejection: SourceSnapshotRejection,
+    source_planning_epoch: int | None = None,
+) -> SourceSnapshotPlan:
+    """Convert one deferred rejection into durable source evidence.
+
+    Args:
+        source_id: PostgreSQL-owned source identity.
+        rejection: Exact unsupported snapshot and bounded code.
+        source_planning_epoch: Optional durable planner fence.
+
+    Returns:
+        Rejected source snapshot plan.
+    """
+    snapshot = rejection.snapshot
+    return SourceSnapshotPlan(
+        source_id=source_id,
+        snapshot_id=snapshot.snapshot_id,
+        parent_snapshot_id=snapshot.parent_snapshot_id,
+        iceberg_sequence_number=snapshot.sequence_number,
+        partition_spec_id=snapshot.partition_spec_id,
+        committed_at=datetime.fromtimestamp(snapshot.committed_at_ms / 1000, UTC),
+        iceberg_operation=snapshot.operation,
+        kind=SourceSnapshotKind.REJECTED,
+        source_planning_epoch=source_planning_epoch,
+    )
+
+
+def map_snapshot(
+    source_id: uuid.UUID,
+    window: WindowPlan,
+    source_planning_epoch: int | None = None,
+) -> SourceSnapshotPlan:
     """Convert one source window into the durable source-snapshot representation.
 
     Args:
         source_id: PostgreSQL-owned Iceberg source identity.
         window: Accepted source window.
+        source_planning_epoch: Optional durable planner fence observed before reading Iceberg.
 
     Returns:
         Durable source-snapshot plan.
@@ -99,6 +156,7 @@ def map_snapshot(source_id: uuid.UUID, window: WindowPlan) -> SourceSnapshotPlan
         committed_at=committed_at,
         iceberg_operation=window.snapshot.operation,
         kind=snapshot_kind,
+        source_planning_epoch=source_planning_epoch,
     )
 
 
@@ -118,17 +176,17 @@ def map_datasets(window: WindowPlan) -> list[DatasetPlan]:
         return []
     seen: set[TargetKey] = set()
     plans: list[DatasetPlan] = []
-    touched: TouchedTarget
-    for touched in window.touched_targets:
-        if touched.target in seen:
+    target: TargetKey
+    for target in window.targets:
+        if target in seen:
             raise ValueError("source window contains a duplicate target identity")
-        seen.add(touched.target)
+        seen.add(target)
         plans.append(
             DatasetPlan(
                 identity=RoutingIdentity(
-                    tenant_id=touched.target.tenant_id,
-                    namespace=touched.target.namespace,
-                    org_id=touched.target.org_id,
+                    tenant_id=target.tenant_id,
+                    namespace=target.namespace,
+                    org_id=target.org_id,
                 )
             )
         )

@@ -188,15 +188,17 @@ def postgres_production_plane() -> Iterator[tuple[ControlPlaneRepository, Engine
 
 
 @pytest.fixture
-def local_spark(tmp_path: Path) -> Iterator[SparkSession]:
+def local_spark(tmp_path: Path, fresh_spark_gateway: None) -> Iterator[SparkSession]:
     """Create the local filesystem-backed Iceberg Spark runtime.
 
     Args:
         tmp_path: Isolated Iceberg warehouse root.
+        fresh_spark_gateway: Guard ensuring Iceberg packages can enter the driver classpath.
 
     Yields:
         Local two-core Spark session with Iceberg extensions enabled.
     """
+    del fresh_spark_gateway
     settings: RuntimeSettings = RuntimeSettings(
         database_url=DEFAULT_DATABASE_URL,
         lance_base_uri=str(tmp_path / "lance"),
@@ -468,9 +470,6 @@ def build_application(
     catalog: SparkIcebergCatalog = SparkIcebergCatalog(
         spark,
         source.canonical_baseline_snapshot_id,
-        source.tenant_column,
-        source.namespace_column,
-        source.org_column,
     )
     provider: DurableSourcePlanProvider = DurableSourcePlanProvider(
         source,
@@ -526,6 +525,33 @@ def test_snapshot_normalization_uses_metadata_sequence_number() -> None:
     )
     assert record.snapshot_id == 101
     assert record.sequence_number == 23
+
+
+@pytest.mark.integration
+def test_spark_catalog_normalizes_real_iceberg_metadata_lineage(local_spark: SparkSession) -> None:
+    """One real metadata document supplies a complete direct-parent snapshot chain.
+
+    Args:
+        local_spark: Local Iceberg-enabled Spark session.
+    """
+    table: str = "local.db.lineage_events"
+    create_source_table(local_spark, table)
+    baseline_snapshot_id: int = append_source_rows(local_spark, table, 0, 2)
+    head_snapshot_id: int = append_source_rows(local_spark, table, 2, 4)
+    catalog: SparkIcebergCatalog = SparkIcebergCatalog(local_spark)
+
+    records: tuple[Any, ...] = catalog.snapshots_through(table, head_snapshot_id, baseline_snapshot_id)
+
+    assert [record.snapshot_id for record in records] == [head_snapshot_id, baseline_snapshot_id]
+    assert records[0].parent_snapshot_id == baseline_snapshot_id
+    assert records[0].sequence_number > records[1].sequence_number
+    assert all(record.operation == "append" for record in records)
+    assert len({record.partition_spec_id for record in records}) == 1
+    catalog.verify_planning_snapshots(
+        table,
+        records[0].table_uuid,
+        (baseline_snapshot_id, head_snapshot_id),
+    )
 
 
 @pytest.mark.integration

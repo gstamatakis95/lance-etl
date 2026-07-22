@@ -18,8 +18,6 @@ from bench.config import BenchConfig
 from bench.results import save_phase
 from lance_etl.etl.digest import encode_mapping
 from lance_etl.etl.mutation import MutationInput, collapse_snapshot_mutations
-from lance_etl.etl.pivot import ETLConfig
-from lance_etl.telemetry import TelemetryConfig
 
 LOCAL_COHORT_ROW_LIMIT: int = 1_000_000
 """Largest synthetic cohort permitted without an explicit operator opt-in."""
@@ -32,6 +30,23 @@ BASE_TIME: datetime = datetime(2025, 1, 1, tzinfo=UTC)
 
 MAX_SHUFFLE_PARTITIONS: int = 32_768
 """Upper clamp on the routing-shuffle width the collapse cohort qualifies against."""
+
+
+@dataclass(frozen=True)
+class QualificationSizing:
+    """Local routing-width inputs used only by deterministic qualification math.
+
+    Attributes:
+        num_partitions: Optional fixed shuffle width.
+        bucket_rows: Target rows per routing bucket.
+        max_buckets_per_dataset: Maximum buckets for one hot target.
+        datasets_per_task: Target small datasets assigned to one task.
+    """
+
+    num_partitions: int | None = None
+    bucket_rows: int = 2_000_000
+    max_buckets_per_dataset: int = 32
+    datasets_per_task: int = 64
 
 
 def bucket_count(rows: int, bucket_rows: int, max_buckets: int) -> int:
@@ -49,7 +64,7 @@ def bucket_count(rows: int, bucket_rows: int, max_buckets: int) -> int:
     return min(max_buckets, max(1, math.ceil(rows / safe_bucket_rows)))
 
 
-def shuffle_partition_count(total_rows: int, trio_count: int, config: ETLConfig) -> int:
+def shuffle_partition_count(total_rows: int, trio_count: int, config: QualificationSizing) -> int:
     """Size the routing shuffle by both total rows and distinct-trio count.
 
     Takes the larger of a row floor (so no partition holds far more than ``bucket_rows`` rows) and
@@ -60,7 +75,7 @@ def shuffle_partition_count(total_rows: int, trio_count: int, config: ETLConfig)
     Args:
         total_rows: Total collapsed rows in the increment.
         trio_count: Number of distinct routing trios in the increment.
-        config: ETL configuration carrying the sizing tunables.
+        config: Qualification-only sizing inputs.
 
     Returns:
         The planned shuffle-partition width, at least one.
@@ -326,7 +341,7 @@ def qualification_measurements(row_count: int) -> dict[str, Any]:
     _, peak_bytes = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     elapsed_seconds: float = time.perf_counter() - started
-    config = ETLConfig(base_uri="qualification://local", telemetry=TelemetryConfig())
+    config = QualificationSizing()
     shuffle_width: int = shuffle_partition_count(terminal_rows, len(input_by_target), config)
     hot_rows: int = max(target_terminals.values())
     return {

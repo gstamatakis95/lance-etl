@@ -36,7 +36,7 @@ The application schema has exactly 9 tables:
 | Dataset contract | `dataset_spec_revisions` | Immutable numbered behavior carrying its own `spec_id`, `name`, and `description` |
 | Schema | `dataset_fields` | Ordered roles, types, nullability, and source projection |
 | Indexes | `index_definitions` | Required Lance indexes with typed IVF_RQ and INVERTED options as nullable columns gated by per-type CHECK constraints |
-| Source | `iceberg_sources`, `source_snapshots` | Registered table, storage namespace, column mapping, exact lineage, and blocked evidence |
+| Source | `iceberg_sources`, `source_snapshots` | Registered table, storage namespace, planning fence, exact lineage, and blocked evidence |
 | Dataset | `datasets` | First-class logical identity plus the mutable materialization cursor, fence, and active publication pointer |
 | Execution | `dataset_work` | Deterministic work, current lease, attempt count, latest error, and exact fence state |
 | Publication | `dataset_publications`, `publication_indexes` | Immutable Lance version and complete qualification evidence |
@@ -73,8 +73,8 @@ Assigning a new desired revision to materialized data creates one deterministic 
 ## Source planning
 
 The first run registers the Iceberg table UUID, catalog-qualified name, Lance storage namespace,
-optional canonical baseline, replay horizon, and source-column mapping. PostgreSQL is authoritative
-thereafter.
+optional canonical baseline, and replay horizon. PostgreSQL is authoritative thereafter. The
+physical source schema is the fixed code-owned contract rather than stored alias configuration.
 
 Planning follows direct parent snapshot lineage. Snapshot IDs are opaque identities. The process
 records each accepted or rejected transition with sequence number, partition spec, operation, and

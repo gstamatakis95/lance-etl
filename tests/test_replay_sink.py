@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import lance
 import pyarrow as pa
+import pyarrow.compute as pc
 import pytest
 
 from lance_etl.etl.replay_sink import (
@@ -15,6 +17,7 @@ from lance_etl.etl.replay_sink import (
     SOURCE_SEQUENCE_COLUMN,
     WINDOW_SEQUENCE_COLUMN,
     ReplayConflict,
+    load_key_states,
     replay_safe_merge,
     replay_table_chunks,
     replay_update_condition,
@@ -97,6 +100,60 @@ def test_one_hundred_retries_converge_without_duplicates(tmp_path: Path, telemet
     assert dataset.version == first_version
     assert len(rows) == 1
     assert rows[0]["text"] == "first"
+
+
+def test_duplicate_terminal_input_is_rejected_before_bootstrap(tmp_path: Path, telemetry: Telemetry) -> None:
+    """Even exact duplicate keys cannot create duplicate physical rows in a new dataset."""
+    path: Path = tmp_path / "duplicate-input.lance"
+    row: pa.Table = terminal_table("id", 1, b"a", "first")
+    duplicated: pa.Table = pa.concat_tables([row, row])
+    with pytest.raises(ReplayConflict, match="duplicate key"):
+        replay_safe_merge(str(path), duplicated, telemetry)
+    assert not path.exists()
+
+
+def test_preexisting_duplicate_keys_fail_reconciliation(tmp_path: Path, telemetry: Telemetry) -> None:
+    """A corrupted dataset cannot be mistaken for one reconciled logical key."""
+    uri: str = str(tmp_path / "duplicate-stored.lance")
+    row: pa.Table = terminal_table("id", 1, b"a", "first")
+    lance.write_dataset(pa.concat_tables([row, row]), uri)
+    with pytest.raises(ReplayConflict, match="duplicate stored key"):
+        replay_safe_merge(uri, row, telemetry)
+
+
+def test_key_state_lookup_uses_typed_arrow_filter() -> None:
+    """Record ids are bound as typed values instead of interpolated into SQL text."""
+    key: str = "id' OR record_id IS NOT NULL"
+    stored: pa.Table = pa.table(
+        {
+            "record_id": pa.array([key], type=pa.string()),
+            SOURCE_SEQUENCE_COLUMN: pa.array([3], type=pa.int64()),
+            EVENT_DIGEST_COLUMN: pa.array([b"a" * 32], type=pa.binary(32)),
+        }
+    )
+    dataset: MagicMock = MagicMock()
+    dataset.to_table.return_value = stored
+
+    assert load_key_states(dataset, "record_id", [key]) == {key: (3, b"a" * 32)}
+    assert isinstance(dataset.to_table.call_args.kwargs["filter"], pc.Expression)
+
+
+@pytest.mark.parametrize("column", [WINDOW_SEQUENCE_COLUMN, SOURCE_SEQUENCE_COLUMN])
+def test_negative_replay_sequences_are_rejected(column: str, tmp_path: Path, telemetry: Telemetry) -> None:
+    """Replay ordering metadata must fit its non-negative source contract.
+
+    Args:
+        column: System sequence column made invalid.
+        tmp_path: Temporary dataset root.
+        telemetry: Offline telemetry facade.
+    """
+    path: Path = tmp_path / f"negative-{column}.lance"
+    table: pa.Table = terminal_table("id", 1, b"a", "first")
+    index: int = table.schema.get_field_index(column)
+    table = table.set_column(index, column, pa.array([-1], type=pa.int64()))
+    with pytest.raises(ValueError, match="non-negative"):
+        replay_safe_merge(str(path), table, telemetry)
+    assert not path.exists()
 
 
 def test_older_source_work_cannot_overwrite_newer_state(tmp_path: Path, telemetry: Telemetry) -> None:

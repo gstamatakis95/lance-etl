@@ -17,7 +17,7 @@ See the repository [README](../../README.md) for setup and [AGENTS.md](AGENTS.md
 | [`reconciler/`](reconciler/README.md) | The local PostgreSQL-backed control loop: `lance-etl-reconcile`'s planning, work claiming, and fenced workers |
 | [`source/`](source/README.md) | Exact Iceberg snapshot discovery and deterministic, side-effect-free replay planning |
 | [`state/`](state/README.md) | The PostgreSQL control-plane schema and repository: specifications, work, leases, and publications |
-| [`tools/`](tools/README.md) | Uninstalled operator CLI bundling the recall audit, namespace migration, and Iceberg source-table optimization |
+| [`tools/`](tools/README.md) | Uninstalled operator CLI bundling recall audit and Iceberg source-table optimization |
 
 ## Reconciliation cycle
 
@@ -47,7 +47,7 @@ The application schema contains exactly 9 normalized tables:
 | `dataset_spec_revisions` | Immutable schema and ingestion, compaction, indexing, publication, and retention policy, carrying its own `spec_id`, `name`, and `description` |
 | `dataset_fields` | Ordered target fields, semantic roles, physical types, and Iceberg projections |
 | `index_definitions` | Ordered required Lance indexes with typed IVF_RQ and INVERTED options as nullable columns gated by per-type CHECK constraints |
-| `iceberg_sources` | Source identity, local Lance base URI, baseline, replay horizon, and source-column mapping |
+| `iceberg_sources` | Source identity, local Lance base URI, baseline, replay horizon, and planning fence |
 | `datasets` | First-class `(tenant_id, namespace, org_id)` route, source, lifecycle, desired spec revision, and the mutable materialization cursor, fence, and active publication pointer |
 | `source_snapshots` | Exact Iceberg lineage and accepted or blocked transition evidence |
 | `dataset_work` | Durable work, lease, retry state, and latest bounded error under the dataset fence |
@@ -108,13 +108,14 @@ dataset's desired revision.
 Process bootstrap values identify the local Iceberg table and Lance root. On the first run,
 `ensure_source_registration` creates an active `iceberg_sources` row and binds it to the bundled
 active spec. It records the table UUID, catalog and table name, canonical baseline, replay horizon,
-Lance storage namespace, and source-column mapping. Later runs treat the PostgreSQL row as
-authoritative and reject drift. `datasets.ingest_lance_uri` and `ingest_lance_version` are the
-current physical materialization cursor for each dataset.
+and Lance storage namespace. Later runs treat the PostgreSQL row as authoritative and reject drift.
+The physical Iceberg schema uses fixed canonical source names rather than database aliases.
+`datasets.ingest_lance_uri` and `ingest_lance_version` are the current physical materialization
+cursor for each dataset.
 
-The source contract requires direct snapshot lineage and the route partition fields configured in
-the source row. An existing table needs a canonical baseline. Unsupported deletes and untrusted
-rewrites are recorded as blocked snapshots instead of being guessed through.
+The source contract requires direct snapshot lineage and canonical route partition fields. An
+existing table needs a canonical baseline. Unsupported deletes and untrusted rewrites are recorded
+as blocked snapshots instead of being guessed through.
 
 ## Local Spark boundary
 

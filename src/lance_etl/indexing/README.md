@@ -20,7 +20,6 @@ There is no separate "small dataset" code path. For where indexing sits in the r
 | `segments.py` | Segment (de)serialization, the Lance field-id helper, stale-fragment detection, and the generic commit-with-retry primitives every handler calls |
 | `optimize.py` | The vector-artifact config KV, the object-store centroid sidecar cache, and incremental delta-merge (`optimize_indices`) for every index type |
 | `config.py` | `IndexJobConfig`, index-name derivation, and the IVF partition-count and retrain policy |
-| `cli.py` | Uninstalled operator CLI (`python -m lance_etl.indexing.cli`) |
 | `__init__.py` | Re-exports the consumer surface (`LanceIndexer`, `IndexJobConfig`, and the handler/segment symbols) |
 
 ## The five index families and their build recipes
@@ -153,13 +152,13 @@ through the `"maintain"` spec path described above, not `bound_fleet_deltas`.
 `LanceIndexer.run` / `run_round` (`runner.py`) run entirely on the driver: they own the round loop,
 fold per-round results into `stats_by_uri`, and produce the final failure/metrics report
 (`report_fleet_failures`). The driver never opens a Lance dataset for row-level work. Every dataset
-open happens inside a Spark closure:
+open happens inside a Spark closure. Serialized segment metadata reduces directly from build
+executors to one commit executor per index, so fragment inventories never return to the driver:
 
 | Phase | Function | Fan-out |
 |---|---|---|
 | Plan | `plan_dataset_indexes` | `mapPartitions` per dataset |
-| Build | `build_one_shard` / `bootstrap_vector_index` | one flat Spark job across the whole fleet (`build_fleet_segments`) |
-| Commit | `commit_one_index` (-> `commit_segments`, `commit_fts_index`) | `mapPartitions` (`commit_fleet`) |
+| Build and commit | `build_one_shard` / `bootstrap_vector_index` / `commit_one_index` | one flat Spark reduce-and-commit job across the whole fleet (`build_and_commit_fleet`) |
 | Delta-bound | `merge_index_deltas` | `mapPartitions` (`bound_fleet_deltas`) |
 
 Each executor closure calls `Telemetry.create(config.telemetry)` itself, per the per-process
@@ -188,23 +187,14 @@ telemetry rule in [`AGENTS.md`](../AGENTS.md).
 | `commit_retries` | `DEFAULT_COMMIT_RETRIES` (20, from `telemetry.py`) | Retry budget for every commit in this package |
 | `commit_backoff_seconds` | 0.5 | Base backoff between commit retries |
 
-## How to invoke
+## Invocation
 
-`cli.py` is an uninstalled operator CLI. It is not registered as a console script in
-`pyproject.toml` and runs as a module:
-
-```bash
-uv run python -m lance_etl.indexing.cli --help
-```
-
-Substitute real arguments for `--help` for an actual run.
-
-In production this package is never invoked through its CLI. The reconciler calls it directly:
+The package has no standalone write CLI. Indexing runs only through a fenced PostgreSQL work item.
+The reconciler calls the library directly:
 `ConfiguredPublicationRunner.run_indexing` in `reconciler/workers.py` instantiates
 `LanceIndexer(self.index_config(spec, definition)).run(self.spark, [candidate_uri])` once per
 `spec.index_definitions` entry, driven by the durable PostgreSQL work item, every time a `PUBLISH`
-or `REBUILD` work row runs indexing. The CLI exists for standalone operator use against a dataset
-outside the reconciler loop, not as a production code path.
+or `REBUILD` work row runs indexing.
 
 ## Testing pointers
 

@@ -603,13 +603,7 @@ def build_reconciler_application(
     )
     source = install_bench_spec(repository, source, config, spec_revision)
     settings: ReconcilerSettings = ReconcilerSettings.from_environment()
-    catalog: SparkIcebergCatalog = SparkIcebergCatalog(
-        spark,
-        source.canonical_baseline_snapshot_id,
-        source.tenant_column,
-        source.namespace_column,
-        source.org_column,
-    )
+    catalog: SparkIcebergCatalog = SparkIcebergCatalog(spark, source.canonical_baseline_snapshot_id)
     provider: DurableSourcePlanProvider = DurableSourcePlanProvider(
         source,
         catalog,
@@ -651,11 +645,17 @@ def drain_reconciler(application: ReconcilerApplication, raise_on_blocked: bool 
     only returns once both ``retry_wait_work`` and ``due_work`` are zero; otherwise it sleeps
     briefly and keeps cycling so a pending retry gets a chance to become due and be claimed.
 
+    A blocked dispatch outcome is not the only way blockage can be observed. Work may already be
+    durably ``BLOCKED`` when the drain starts, or a repository sweep may block stale work without
+    producing a blocked dispatch outcome. The cycle's SLO snapshot carries that durable count, so
+    fail-fast mode checks it before polling work that may be permanently unclaimable behind the
+    blocked lane.
+
     Args:
         application: Wired reconciler application.
-        raise_on_blocked: When true (the default, preserving existing behavior) any blocked cycle
-            raises immediately. When false, blocked cycles accumulate into the totals and the drain
-            proceeds to quiescence so a caller can inspect the blocked work row.
+        raise_on_blocked: When true (the default, preserving existing behavior) any newly or
+            durably blocked work raises immediately. When false, blocked cycles accumulate into the
+            totals and the drain proceeds to quiescence so a caller can inspect the blocked work row.
 
     Returns:
         Aggregate counts across every cycle: ``cycles``, ``enqueued``, ``claimed``, ``succeeded``,
@@ -683,7 +683,7 @@ def drain_reconciler(application: ReconcilerApplication, raise_on_blocked: bool 
         totals["advanced"] += summary.dispatch.advanced
         totals["retried"] += summary.dispatch.retried
         totals["blocked"] += summary.dispatch.blocked
-        if summary.dispatch.blocked and raise_on_blocked:
+        if raise_on_blocked and (summary.dispatch.blocked or summary.slo.blocked_work):
             raise RuntimeError("reconciler blocked benchmark work; inspect dataset_work error evidence")
         if summary.planning.enqueued_snapshots == 0 and summary.dispatch.claimed == 0:
             status: ControlPlaneStatus = application.repository.control_plane_status()

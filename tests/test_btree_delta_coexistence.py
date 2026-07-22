@@ -1,8 +1,6 @@
 """Concurrent replay-merge coexistence with BTREE index deltas.
 
-Recovers the BTREE-delta coexistence regression classifier from the deleted
-``tests/test_concurrent_coexistence.py``, ported to the production merge path
-(``lance_etl.etl.replay_sink.replay_safe_merge``) rather than the retired ``apply_merge``.
+Exercises the production replay merge path against multiple unmerged BTREE delta segments.
 
 A dataset carries multiple unmerged BTREE delta segments (BTREE segments commit unmerged per hard
 rule 6) while several threads run ``replay_safe_merge`` concurrently over disjoint key ranges. This
