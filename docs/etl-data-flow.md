@@ -336,6 +336,6 @@ registers the source through `ControlPlaneRepository`, wires a real `ReconcilerA
 each corpus batch as a new Iceberg snapshot, and drains the reconciler through ingest, compaction,
 indexing, validation, prewarm, and publication. It then reads each organization's active publication
 back through the same serving resolution, opens the dataset at its exact version, and verifies the
-terminal `record_id` count and the presence of the vector index. Optional authenticated search legs
-exercise the Rust service through the same catalog join. The benchmark is the standing proof that the
-whole path described here works end to end.
+terminal `record_id` count and the presence of the vector index. Optional replica-local search legs,
+served over the Rust service's unauthenticated loopback transport, exercise the same catalog join.
+The benchmark is the standing proof that the whole path described here works end to end.

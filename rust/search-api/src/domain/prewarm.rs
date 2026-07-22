@@ -104,7 +104,7 @@ pub trait Prewarmer: Send + Sync + 'static {
     ) -> impl Future<Output = Result<PrewarmReport, SearchError>> + Send;
 }
 
-/// Authenticated internal prewarm contract over one explicit immutable serving route.
+/// Unauthenticated replica-local prewarm contract over one explicit immutable serving route.
 pub trait ExactPrewarmer: Send + Sync + 'static {
     /// Warms metadata and every committed user index for exactly `route` on the local process.
     fn prewarm_exact(

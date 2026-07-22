@@ -664,16 +664,17 @@ impl Metrics {
             .send();
     }
 
-    /// Duration of reading the IVF centroids for one Clusters call.
-    pub fn clusters_read(&self, duration: Duration) {
+    /// One index-metadata load failure while probing whether a dataset has a committed index of
+    /// `kind`, used to gate the `fast_search` default for the vector and text legs.
+    ///
+    /// A sustained non-zero rate means index-metadata reads are failing (object-store errors,
+    /// manifest problems) and the affected dataset's `fast_search` default is silently disabled as
+    /// a result, a performance degradation the query response itself never surfaces.
+    pub fn index_probe_error(&self, kind: PrewarmIndexKind) {
         self.client
-            .distribution_with_tags("clusters.read.duration_ms", millis(duration))
+            .count_with_tags("index_probe_errors", 1)
+            .with_tag("kind", kind.as_tag())
             .send();
-    }
-
-    /// Number of centroids returned by one Clusters call.
-    pub fn clusters_centroids(&self, count: u64) {
-        self.client.distribution_with_tags("clusters.centroids", count).send();
     }
 }
 
@@ -731,7 +732,7 @@ mod tests {
         metrics.cache_disk_gauges(CacheName::Store, 10, 2);
         metrics.cache_sweep(CacheName::Index, Duration::from_millis(7), 4);
         metrics.prewarm(PrewarmStatus::Partial, Duration::from_millis(5));
-        metrics.clusters_read(Duration::from_millis(2));
+        metrics.index_probe_error(PrewarmIndexKind::Vector);
     }
 
     #[test]
@@ -851,21 +852,16 @@ mod tests {
     }
 
     #[test]
-    fn clusters_metrics_render_expected_tags() {
+    fn index_probe_error_metric_renders_expected_tag() {
         let (metrics, drain) = spy_metrics();
-        metrics.clusters_read(Duration::from_millis(9));
-        metrics.clusters_centroids(256);
+        metrics.index_probe_error(PrewarmIndexKind::Vector);
         let lines = drain();
-        let expect = [
-            "search_api.clusters.read.duration_ms:9|d",
-            "search_api.clusters.centroids:256|d",
-        ];
-        for head in expect {
-            assert!(
-                lines.iter().any(|line| line.starts_with(head)),
-                "missing {head} in {lines:?}"
-            );
-        }
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("search_api.index_probe_errors:1|c") && line.contains("kind:vector")),
+            "missing index_probe_errors metric: {lines:?}"
+        );
     }
 
     #[test]

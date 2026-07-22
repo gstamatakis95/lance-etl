@@ -296,7 +296,10 @@ impl Config {
     /// `LANCE_ETL_BASE_URI` and `LANCE_ETL_DATABASE_URL` are required. The base URI is the only
     /// object-store prefix catalog routes may use. The gRPC server always binds plaintext to
     /// loopback and the PostgreSQL catalog connection is always plaintext, using the connection
-    /// string as given. There is exactly one runtime mode. Optional overrides: `SEARCH_API_PORT`,
+    /// string as given. There is exactly one runtime mode. `SEARCH_API_PORT` is rejected outright
+    /// when it equals [`DEFAULT_HEALTH_PORT`], since that port is a fixed constant for the
+    /// separate plaintext health service and colliding with it would otherwise surface only as a
+    /// bare address-in-use bind failure at startup. Optional overrides: `SEARCH_API_PORT`,
     /// `SEARCH_API_CACHE_DIR`, `SEARCH_API_CACHE_BACKEND` (`disk`, `redis`, or `memory`),
     /// `SEARCH_API_REDIS_URL` (required for the `redis` backend), `SEARCH_API_REDIS_NAMESPACE`
     /// (default `search-api`), `SEARCH_API_STATSD_ADDR` (default honors `DD_AGENT_HOST`),
@@ -334,6 +337,12 @@ impl Config {
         if cache_backend == CacheBackendKind::Redis && redis_url.is_none() {
             return Err("SEARCH_API_REDIS_URL must be set when SEARCH_API_CACHE_BACKEND=redis".to_string());
         }
+        let port: u16 = env_number("SEARCH_API_PORT", DEFAULT_PORT)?;
+        if port == DEFAULT_HEALTH_PORT {
+            return Err(format!(
+                "SEARCH_API_PORT must not equal {DEFAULT_HEALTH_PORT}: that port is fixed for the plaintext gRPC health service and binding the search server there would collide with it"
+            ));
+        }
         Ok(Self {
             base_uri,
             database_url,
@@ -341,7 +350,7 @@ impl Config {
             dataset_cache_capacity: DEFAULT_DATASET_CACHE_CAPACITY,
             index_cache_bytes: DEFAULT_INDEX_CACHE_BYTES,
             metadata_cache_bytes: DEFAULT_METADATA_CACHE_BYTES,
-            port: env_number("SEARCH_API_PORT", DEFAULT_PORT)?,
+            port,
             cache_dir: PathBuf::from(env_string("SEARCH_API_CACHE_DIR", DEFAULT_CACHE_DIR)),
             disk_index_cache_bytes: DEFAULT_DISK_INDEX_CACHE_BYTES,
             disk_store_cache_bytes: DEFAULT_DISK_STORE_CACHE_BYTES,
@@ -662,6 +671,37 @@ mod tests {
             || {
                 let err = Config::from_env().unwrap_err();
                 assert!(err.contains("SEARCH_API_PORT"));
+            },
+        );
+    }
+
+    #[test]
+    fn port_colliding_with_the_fixed_health_port_is_rejected() {
+        with_env(
+            &[
+                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
+                ("SEARCH_API_PORT", Some("8081")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err();
+                assert!(
+                    err.contains("SEARCH_API_PORT") && err.contains("8081"),
+                    "expected an explicit collision message naming the port, got {err:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn a_port_distinct_from_the_health_port_is_accepted() {
+        with_env(
+            &[
+                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
+                ("SEARCH_API_PORT", Some("9090")),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.port, 9090);
             },
         );
     }

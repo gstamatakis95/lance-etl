@@ -18,13 +18,13 @@ duplicate it here. This file is agent-facing and complementary.
 ```
 rust/search-api/        Rust gRPC search service (tonic, lance crate)
   proto/                lance_etl/v1/lance_etl.proto (SearchService and DatasetTarget)
+                        lance_etl/internal/v1/admin.proto (AdminService: replica-local Prewarm)
   src/domain/           Transport-agnostic types and traits
     target.rs           DatasetTarget, DatasetRef — dataset addressing (one dataset per request)
     query.rs            VectorQuery, TextQuery, HybridQuery, Hit, FusedHit
     filter.rs           Typed predicate AST (no raw SQL)
     backend.rs          SearchBackend trait
     prewarm.rs          PrewarmSpec, PrewarmReport, Prewarmer trait
-    clusters.rs         ClusterSpec, ClusterReport, ClusterReader trait
     fusion.rs           FusionSpec (Rrf and Weighted variants) and within-dataset fusion logic
     error.rs            SearchError
   src/cache/            Persistent two-tier caching layer (index + metadata, no raw data), pluggable disk/redis backends
@@ -42,11 +42,13 @@ rust/search-api/        Rust gRPC search service (tonic, lance crate)
     text.rs             Domain text query tree -> Lance FTS parameters
     rows.rs             Arrow record batch -> JSON row conversion
     prewarm.rs          Prewarmer impl over Lance prewarm APIs
-    index_reader.rs     IVF centroid extraction, ClusterReader impl
     error.rs            Lance error classification into SearchError
   src/grpc/             Tonic transport
     mod.rs              SearchGrpc<B>: tonic service adapter
     convert.rs          Proto <-> domain conversion for the search service
+    admin.rs            AdminGrpc<B>: unauthenticated replica-local administration, rides port 8080
+    admission.rs        AdmissionController: bounded global and per-tenant search admission
+    timeout.rs          RouteTimeoutLayer: per-route gRPC request timeouts
   src/telemetry/        Datadog observability
     traces.rs           OTLP span export, JSON stdout logs with trace correlation
     metrics.rs          Typed DogStatsD facade (Metrics struct + Rpc tag enum)

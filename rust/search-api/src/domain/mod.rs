@@ -10,12 +10,10 @@
 //! - [`fusion`]: hybrid leg fusion strategies (RRF and weighted score fusion).
 //! - [`backend`]: the [`SearchBackend`] trait every engine implements.
 //! - [`prewarm`]: cache prewarming types and the [`Prewarmer`] trait.
-//! - [`clusters`]: IVF centroid introspection types and the [`ClusterReader`] trait.
 //! - [`error`]: the single domain error type shared below the transport.
 
 pub mod backend;
 pub mod catalog;
-pub mod clusters;
 pub mod error;
 pub mod filter;
 pub mod fusion;
@@ -25,7 +23,6 @@ pub mod target;
 
 pub use backend::SearchBackend;
 pub use catalog::{ServingCatalog, ServingRoute};
-pub use clusters::{ClusterReader, ClusterReport, ClusterSpec};
 pub use error::SearchError;
 pub use filter::{CompareOp, Filter, Literal};
 pub use fusion::FusionSpec;

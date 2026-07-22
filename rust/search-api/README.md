@@ -42,7 +42,7 @@ the exact version it resolved even if another publication becomes active concurr
 |---|---|---|
 | Domain | `src/domain/` | Engine-neutral routes, typed filters, queries, results, and traits |
 | Cache | `src/cache/` | Memory plus disk, Redis, or memory-only index and metadata caching |
-| Lance | `src/lance/` | Exact-version dataset opens and vector, text, hybrid, prewarm, and cluster operations |
+| Lance | `src/lance/` | Exact-version dataset opens and vector, text, hybrid, and prewarm operations |
 | Catalog | `src/catalog/` | PostgreSQL logical-route resolution |
 | gRPC | `src/grpc/` | Protobuf conversion and tonic transport |
 | Telemetry | `src/telemetry/` | Datadog metrics, spans, logs, and recall sampling |

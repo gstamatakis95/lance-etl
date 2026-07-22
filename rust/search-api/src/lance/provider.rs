@@ -104,7 +104,7 @@ pub trait DatasetProvider: Send + Sync + 'static {
         self.dataset(target, reference)
     }
 
-    /// Opens one caller-supplied exact route for authenticated replica-local prewarm.
+    /// Opens one caller-supplied exact route for unauthenticated replica-local prewarm.
     fn dataset_for_exact_prewarm(
         &self,
         target: &DatasetTarget,
@@ -706,7 +706,7 @@ impl DatasetProvider for CachingDatasetProvider {
         self.open(target, reference, true, None).await
     }
 
-    /// Opens and records one authenticated exact candidate route without consulting mutable state.
+    /// Opens and records one unauthenticated exact candidate route without consulting mutable state.
     async fn dataset_for_exact_prewarm(
         &self,
         target: &DatasetTarget,

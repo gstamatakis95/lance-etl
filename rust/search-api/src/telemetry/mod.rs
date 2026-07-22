@@ -65,10 +65,11 @@
 //! - `serve.tag_resolved` (count, tagged `changed`): a `HEAD` re-resolution after the TTL lapsed.
 //!   `changed:true` marks a replica observing a `HEAD` move.
 //!
-//! Clusters and recall ([`metrics::Metrics::clusters_read`], `clusters_centroids`,
-//! `recall_sample`):
-//! - `clusters.read.duration_ms` (distribution: centroid read duration), `clusters.centroids`
-//!   (distribution: centroid count), `recall.samples` (count, tagged `query_type`/`filtered`).
+//! Recall and index probing ([`metrics::Metrics::recall_sample`],
+//! [`metrics::Metrics::index_probe_error`]):
+//! - `recall.samples` (count, tagged `query_type`/`filtered`).
+//! - `index_probe_errors` (count, tagged `kind`): an index-metadata load failure while probing for
+//!   a committed index, which silently disables the `fast_search` default for the affected leg.
 //!
 //! Normal spans carry bounded execution facts such as `search.k`, `dataset.version`, aggregate
 //! object-store counters, and the gRPC status code. Target identity and storage URI are omitted.

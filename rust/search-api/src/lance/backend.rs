@@ -22,7 +22,7 @@ use crate::lance::filter::{filter_to_expr, time_range_to_expr};
 use crate::lance::provider::DatasetProvider;
 use crate::lance::rows::batch_to_json_rows;
 use crate::lance::text::text_query_to_fts;
-use crate::telemetry::{Metrics, Rpc};
+use crate::telemetry::{Metrics, PrewarmIndexKind, Rpc};
 
 /// Column key under which Lance reports vector distances.
 const DISTANCE_KEY: &str = "_distance";
@@ -500,9 +500,22 @@ fn execution_stats_callback(
 /// with no vector index causes Lance to return an empty result immediately (scanner.rs
 /// ~3804-3807), so the default must be skipped for the unindexed small-org tier. This check is
 /// O(#indices) against the in-memory manifest and does not perform any IO.
-async fn dataset_has_vector_index(dataset: &Dataset, column: &str) -> bool {
-    let Ok(metas) = dataset.load_indices().await else {
-        return false;
+///
+/// A `load_indices` failure is distinct from "no index exists": it means the probe itself could
+/// not complete, so it is logged and counted through [`Metrics::index_probe_error`] before falling
+/// back to the same `false` degrade path (the `fast_search` default is skipped, never applied
+/// blind).
+async fn dataset_has_vector_index(dataset: &Dataset, column: &str, metrics: &Metrics) -> bool {
+    let metas = match dataset.load_indices().await {
+        Ok(metas) => metas,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed to load index metadata while probing for a vector index; disabling the fast_search default"
+            );
+            metrics.index_probe_error(PrewarmIndexKind::Vector);
+            return false;
+        }
     };
     use crate::lance::prewarm::VECTOR_DETAILS_SUFFIX;
     metas.iter().any(|meta| {
@@ -533,9 +546,22 @@ async fn dataset_has_vector_index(dataset: &Dataset, column: &str) -> bool {
 /// default must not fire for the unindexed small-org tier. Without this guard, fresh fragments
 /// appended between nightly index runs would be silently excluded even when no index exists. This
 /// check is O(#indices) against the in-memory manifest and does not perform any IO.
-async fn dataset_has_fts_index(dataset: &Dataset, columns: &[String]) -> bool {
-    let Ok(metas) = dataset.load_indices().await else {
-        return false;
+///
+/// A `load_indices` failure is distinct from "no index exists": it means the probe itself could
+/// not complete, so it is logged and counted through [`Metrics::index_probe_error`] before falling
+/// back to the same `false` degrade path (the `fast_search` default is skipped, never applied
+/// blind).
+async fn dataset_has_fts_index(dataset: &Dataset, columns: &[String], metrics: &Metrics) -> bool {
+    let metas = match dataset.load_indices().await {
+        Ok(metas) => metas,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed to load index metadata while probing for an FTS index; disabling the fast_search default"
+            );
+            metrics.index_probe_error(PrewarmIndexKind::Fts);
+            return false;
+        }
     };
     use crate::lance::prewarm::INVERTED_DETAILS_SUFFIX;
     metas.iter().any(|meta| {
@@ -639,7 +665,7 @@ async fn run_vector_query(
     }
     let apply_fast_search = match query.fast_search {
         Some(value) => value,
-        None => d.fast_search_default && dataset_has_vector_index(dataset, &column_name).await,
+        None => d.fast_search_default && dataset_has_vector_index(dataset, &column_name, context.metrics).await,
     };
     if apply_fast_search {
         scanner.fast_search();
@@ -702,7 +728,7 @@ async fn run_text_query(
     let d = &context.ann_defaults;
     let apply_fast_search = match query.fast_search {
         Some(value) => value,
-        None => d.fast_search_default && dataset_has_fts_index(dataset, &query.columns).await,
+        None => d.fast_search_default && dataset_has_fts_index(dataset, &query.columns, context.metrics).await,
     };
     if apply_fast_search {
         scanner.fast_search();
@@ -732,6 +758,12 @@ async fn run_text_query(
 /// only when `keep_row_id` is also set, otherwise it is stripped after capture. When `has_row_id` is
 /// false the scanner did not fetch the column and the hit carries a placeholder row id of 0, which is
 /// never consulted because such hits never feed fusion dedup.
+///
+/// # Errors
+///
+/// A missing or non-numeric score column is an internal error, same as a missing `record_id`: a
+/// silently defaulted score of `0.0` would rank a real result as if it were maximally relevant, so
+/// a malformed row must fail loudly rather than mis-rank.
 fn rows_to_hits(rows: Vec<Map<String, Value>>, score_key: &str) -> Result<Vec<Hit>, SearchError> {
     rows.into_iter()
         .map(|mut row| {
@@ -739,7 +771,10 @@ fn rows_to_hits(rows: Vec<Map<String, Value>>, score_key: &str) -> Result<Vec<Hi
                 .remove(RECORD_ID_COLUMN)
                 .and_then(|value| value.as_str().map(ToOwned::to_owned))
                 .ok_or_else(|| SearchError::internal("search result row is missing a string record_id"))?;
-            let score = row.remove(score_key).and_then(|value| value.as_f64()).unwrap_or(0.0);
+            let score = row
+                .remove(score_key)
+                .and_then(|value| value.as_f64())
+                .ok_or_else(|| SearchError::internal(format!("search result row is missing a numeric {score_key}")))?;
             Ok(Hit { record_id, score, row })
         })
         .collect()
@@ -778,5 +813,36 @@ mod tests {
     fn validate_k_accepts_within_bounds() {
         validate_k(1, 10_000).unwrap();
         validate_k(10_000, 10_000).unwrap();
+    }
+
+    #[test]
+    fn rows_to_hits_errors_on_a_missing_score() {
+        let mut row = Map::new();
+        row.insert(RECORD_ID_COLUMN.to_string(), Value::String("v1".to_string()));
+        let err = rows_to_hits(vec![row], SCORE_KEY).unwrap_err();
+        assert!(
+            matches!(err, SearchError::Internal(ref message) if message.contains(SCORE_KEY)),
+            "expected an internal error naming the missing score column, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rows_to_hits_errors_on_a_non_numeric_score() {
+        let mut row = Map::new();
+        row.insert(RECORD_ID_COLUMN.to_string(), Value::String("v1".to_string()));
+        row.insert(SCORE_KEY.to_string(), Value::String("not-a-number".to_string()));
+        let err = rows_to_hits(vec![row], SCORE_KEY).unwrap_err();
+        assert!(matches!(err, SearchError::Internal(_)));
+    }
+
+    #[test]
+    fn rows_to_hits_accepts_a_numeric_score() {
+        let mut row = Map::new();
+        row.insert(RECORD_ID_COLUMN.to_string(), Value::String("v1".to_string()));
+        row.insert(SCORE_KEY.to_string(), Value::from(0.5));
+        let hits = rows_to_hits(vec![row], SCORE_KEY).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record_id, "v1");
+        assert_eq!(hits[0].score, 0.5);
     }
 }

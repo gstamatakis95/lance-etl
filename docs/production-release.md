@@ -199,9 +199,7 @@ Inspect open work directly:
 ```bash
 psql lance_etl -x -c \
   "SELECT work_id, dataset_id, kind, phase, state, attempt_count,
-          launcher_kind, airflow_ctx_dag_id, airflow_ctx_dag_run_id,
-          airflow_ctx_task_id, airflow_ctx_map_index, airflow_ctx_try_number,
-          next_attempt_at, lease_expires_at, error_code
+          launcher_kind, next_attempt_at, lease_expires_at, error_code
    FROM dataset_work
    WHERE state <> 'SUCCEEDED'
    ORDER BY next_attempt_at, created_at"
