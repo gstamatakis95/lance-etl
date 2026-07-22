@@ -508,11 +508,18 @@ def bootstrap_vector_index(
 
     Runs a committed ``create_index`` whose internal training uses lance's streaming k-means
     (bounded memory regardless of partition count), sharing a freshly minted RaBitQ rotation so
-    later incremental segments stay on the same model. After the commit the artifact config is
-    stored and the trained centroids are cached to the object-store sidecar keyed by
-    ``rows_at_train`` (:func:`persist_bootstrap_centroids`), so future runs reuse them sidecar-first
-    with a ``get_ivf_model`` fallback (ADR 0040). ``replace=True`` makes a growth retrain a
-    wholesale index replacement.
+    later incremental segments stay on the same model. The rotation is minted by
+    ``lance.lance.indices.build_rq_model``, imported at module scope as ``native_indices``. That
+    module is the compiled PyO3 extension backing pylance, not the public ``lance.indices``
+    package, so this is the least-protected import in the repo: no deprecation contract covers it,
+    and pylance could relocate or rename it across majors without warning. It is verified present
+    with this exact signature (``build_rq_model(dimension, num_bits=1, dtype="float32")``) on the
+    pinned ``pylance==8.0.0``, per ``src/lance_etl/AGENTS.md``'s API ground truth section. Any
+    pylance version bump must re-verify this import deliberately rather than assuming it survives
+    unchanged. After the commit the artifact config is stored and the trained centroids are cached
+    to the object-store sidecar keyed by ``rows_at_train`` (:func:`persist_bootstrap_centroids`),
+    so future runs reuse them sidecar-first with a ``get_ivf_model`` fallback (ADR 0040).
+    ``replace=True`` makes a growth retrain a wholesale index replacement.
 
     The commit is wrapped in :func:`commit_index_with_retries` (``config.commit_retries``
     budget) so a concurrent maintenance, compaction, or ETL commit on the same dataset no longer

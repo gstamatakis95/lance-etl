@@ -15,7 +15,7 @@ The seven documents:
 | [serving-filters-and-tags.md](serving-filters-and-tags.md) | Crate layering, the typed filter AST, time ranges, blue-green serving, per-query version pinning |
 | [caching-and-observability.md](caching-and-observability.md) | The persistent cache and its pluggable backends, Prewarm, the Lance trace bridge, recall auditing |
 | [rejected-and-operator-tools.md](rejected-and-operator-tools.md) | The stable-row-id rejection, V2 manifest paths, knob reduction, the retired intake decision, namespace migration |
-| [postgresql-dataset-control-plane.md](postgresql-dataset-control-plane.md) | Exact 14-table control plane, immutable dataset specifications, durable work, immutable publications, and the local runtime |
+| [postgresql-dataset-control-plane.md](postgresql-dataset-control-plane.md) | Exact 9-table control plane, immutable dataset specifications, durable work, immutable publications, and the local runtime |
 
 Index of every original ADR number:
 
@@ -62,4 +62,4 @@ Index of every original ADR number:
 | 0039 | Commit-retry and idempotency hardening for bootstrap and tag operations | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
 | 0040 | Object-store centroid cache for distributed vector builds | [indexing.md](indexing.md) | Accepted (supersedes 0025) |
 | 0041 | Clustered rewrite: centroid-locality dataset reorganization | [fleet-orchestration-and-maintenance.md](fleet-orchestration-and-maintenance.md) | Accepted |
-| 0042 | First-class PostgreSQL dataset control plane | [postgresql-dataset-control-plane.md](postgresql-dataset-control-plane.md) | Accepted, exact 14-table local design |
+| 0042 | First-class PostgreSQL dataset control plane | [postgresql-dataset-control-plane.md](postgresql-dataset-control-plane.md) | Accepted, exact 9-table local design |

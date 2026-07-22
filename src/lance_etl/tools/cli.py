@@ -1,7 +1,8 @@
 """Operator tools CLI: recall audit, namespace migration, and Iceberg source-table optimization.
 
-Exposes the ``main()`` entry point consumed by the ``lance-etl-tools`` script and
-``python -m lance_etl.tools``.  Three subcommands are provided.
+Uninstalled operator CLI, not registered as a console script in ``pyproject.toml``. Exposes the
+``main()`` entry point reachable via ``python -m lance_etl.tools.cli``. Three subcommands are
+provided.
 
 ``recall`` replays Datadog-sampled vector queries as exact brute-force scans against the dataset
 versions that served them and reports recall@k, nDCG@k, and MRR.
@@ -280,3 +281,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "optimize-iceberg": run_optimize_iceberg,
     }
     return run_cli_main(build_parser(), runners, argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

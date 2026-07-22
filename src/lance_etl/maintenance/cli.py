@@ -209,3 +209,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "migrate-manifests": run_migrate_manifests,
     }
     return run_cli_main(build_parser(), runners, argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

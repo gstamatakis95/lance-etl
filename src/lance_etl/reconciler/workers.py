@@ -1571,7 +1571,8 @@ class LeaseHeartbeat:
                 if not self.repository.renew_lease(self.claim, self.lease_duration):
                     self.lost = True
                     return
-            except Exception:
+            except Exception as exc:
+                logger.warning("lease renewal failed for work %s, marking lease lost: %s", self.claim.work_id, exc)
                 self.lost = True
                 return
 

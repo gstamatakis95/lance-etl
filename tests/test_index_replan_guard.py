@@ -329,6 +329,49 @@ def make_scalar_dataset(uri: str) -> None:
     lance.write_dataset(pa.table({"id": pa.array(range(200), pa.int64())}), uri, mode="create", max_rows_per_file=100)
 
 
+def test_real_lance_orphan_fragment_error_matches_stale_fragment_marker(tmp_path: Path) -> None:
+    """The genuine Lance ``CreateIndex`` orphan-fragment error is provoked and detected.
+
+    ``STALE_FRAGMENT_MARKERS`` includes ``"would orphan fragments"``, a substring lifted from
+    Lance's own Rust message in ``rust/lance/src/index.rs`` (``CreateIndex: incoming segments for
+    '{}' would orphan fragments {:?} from existing segment {}``). The racing-compaction tests above
+    exercise this module's own pre-commit ``"no longer exist"`` guard, not Lance's internal
+    wording, because ``commit_segments`` re-validates fragment coverage against the live fragment
+    set before ever reaching ``commit_existing_index_segments``, so a real upstream orphan never
+    gets that far. This test bypasses that guard and calls the segment-commit API directly, the
+    same way ``commit_segments`` and ``build_scalar_segment``/``build_vector_segment`` do, so the
+    real upstream error text is what ``is_stale_fragment_error`` is checked against: a wide BTREE
+    segment is committed over both fragments of a two-fragment dataset, then a same-name segment
+    covering only one fragment is committed on top of it, leaving the other fragment orphaned. If a
+    future lance release rewords this message, this test fails and flags the drift instead of the
+    replan guard silently going quiet.
+
+    Args:
+        tmp_path: Isolated dataset root.
+    """
+    uri: str = str(tmp_path / "real_orphan.lance")
+    make_scalar_dataset(uri)
+    dataset: lance.LanceDataset = lance.dataset(uri)
+    fragment_ids: list[int] = [fragment.fragment_id for fragment in dataset.get_fragments()]
+    assert len(fragment_ids) == 2
+
+    wide_segment: Any = dataset.create_index_uncommitted(
+        column="id", index_type="BTREE", name="idx", fragment_ids=fragment_ids
+    )
+    dataset.commit_existing_index_segments("idx", "id", [wide_segment])
+
+    narrower: lance.LanceDataset = lance.dataset(uri)
+    partial_segment: Any = narrower.create_index_uncommitted(
+        column="id", index_type="BTREE", name="idx", replace=True, fragment_ids=[fragment_ids[0]]
+    )
+
+    committer: lance.LanceDataset = lance.dataset(uri)
+    with pytest.raises(ValueError, match="would orphan fragments") as excinfo:
+        committer.commit_existing_index_segments("idx", "id", [partial_segment])
+
+    assert is_stale_fragment_error(excinfo.value)
+
+
 def test_stale_replan_exhausts_to_terminal_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Every commit reporting a stale fragment exhausts the rounds into the terminal error phase."""
     uri: str = str(tmp_path / "exhaust.lance")

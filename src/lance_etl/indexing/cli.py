@@ -105,3 +105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         next scheduled run.
     """
     return run_cli_main(build_parser(), run, argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

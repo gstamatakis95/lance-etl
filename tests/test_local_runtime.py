@@ -303,6 +303,92 @@ def test_runtime_bootstraps_source_then_uses_postgres_truth(
     engine.dispose.assert_called_once_with()
 
 
+def test_runtime_bootstrap_failure_stops_spark_and_disposes_engine(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A bootstrap failure after Spark and the PostgreSQL engine exist releases both before raising.
+
+    Args:
+        monkeypatch: Scoped dependency fixture.
+        tmp_path: Isolated local storage root.
+    """
+    runtime_settings: RuntimeSettings = replace(local_settings(tmp_path), canonical_baseline_snapshot_id=41)
+    table_uuid: uuid.UUID = uuid.uuid4()
+    paused_source: IcebergSource = IcebergSource(
+        source_id=uuid.uuid4(),
+        source_name="local",
+        spark_catalog="local",
+        table_namespace="db",
+        table_name="events",
+        table_uuid=table_uuid,
+        lance_base_uri=runtime_settings.lance_base_uri,
+        lifecycle_state=SourceLifecycleState.PAUSED,
+        default_spec_id=uuid.uuid4(),
+        canonical_baseline_snapshot_id=41,
+        replay_horizon=timedelta(days=30),
+    )
+    reconciler_settings: ReconcilerSettings = replace(
+        ReconcilerSettings(), poll_interval=timedelta(seconds=19)
+    ).validate()
+    spark: MagicMock = MagicMock()
+    repository: MagicMock = MagicMock()
+    repository.source_by_name.return_value = None
+    repository.ensure_source_registration.return_value = paused_source
+    bootstrap_catalog: MagicMock = MagicMock()
+    bootstrap_catalog.table_metadata.return_value = SimpleNamespace(table_uuid=str(table_uuid))
+    catalog_factory: MagicMock = MagicMock(return_value=bootstrap_catalog)
+    repository_factory: MagicMock = MagicMock(return_value=repository)
+    telemetry: MagicMock = MagicMock()
+    engine: MagicMock = MagicMock()
+    monkeypatch.setattr(
+        reconciler_runtime.RuntimeSettings, "from_environment", MagicMock(return_value=runtime_settings)
+    )
+    monkeypatch.setattr(
+        reconciler_runtime.ReconcilerSettings, "from_environment", MagicMock(return_value=reconciler_settings)
+    )
+    monkeypatch.setattr(reconciler_runtime, "build_runtime_spark", MagicMock(return_value=spark))
+    monkeypatch.setattr(reconciler_runtime.Telemetry, "create", MagicMock(return_value=telemetry))
+    monkeypatch.setattr(reconciler_runtime, "build_control_plane_engine", MagicMock(return_value=engine))
+    monkeypatch.setattr(reconciler_runtime, "ControlPlaneRepository", repository_factory)
+    monkeypatch.setattr(reconciler_runtime, "SparkIcebergCatalog", catalog_factory)
+
+    with pytest.raises(RuntimeError, match="not active"):
+        reconciler_runtime.build_runtime_application()
+
+    spark.stop.assert_called_once_with()
+    engine.dispose.assert_called_once_with()
+
+
+def test_runtime_bootstrap_failure_before_engine_exists_still_stops_spark(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failure before the PostgreSQL engine is built still stops the already-created Spark session.
+
+    Args:
+        monkeypatch: Scoped dependency fixture.
+        tmp_path: Isolated local storage root.
+    """
+    runtime_settings: RuntimeSettings = local_settings(tmp_path)
+    spark: MagicMock = MagicMock()
+    monkeypatch.setattr(
+        reconciler_runtime.RuntimeSettings, "from_environment", MagicMock(return_value=runtime_settings)
+    )
+    monkeypatch.setattr(reconciler_runtime, "build_runtime_spark", MagicMock(return_value=spark))
+    monkeypatch.setattr(reconciler_runtime.Telemetry, "create", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(
+        reconciler_runtime,
+        "build_control_plane_engine",
+        MagicMock(side_effect=RuntimeError("cannot reach PostgreSQL")),
+    )
+
+    with pytest.raises(RuntimeError, match="cannot reach PostgreSQL"):
+        reconciler_runtime.build_runtime_application()
+
+    spark.stop.assert_called_once_with()
+
+
 def test_run_command_uses_postgres_poll_interval_by_default() -> None:
     """Continuous local execution inherits its default cadence from PostgreSQL."""
     application: MagicMock = MagicMock()

@@ -83,8 +83,8 @@ and reconciliation semantics before any public write RPC is added.
 
 Status: Accepted
 
-`migrate_namespace.py` (`NamespaceMigrator`, `MigrateConfig`, run via `lance-etl-tools
-migrate-namespace`) migrates a whole namespace by copy-plus-optimize, keeping the source: every
+`migrate_namespace.py` (`NamespaceMigrator`, `MigrateConfig`, run via
+`python -m lance_etl.tools.cli migrate-namespace`) migrates a whole namespace by copy-plus-optimize, keeping the source: every
 dataset whose namespace path component matches the source is copied to the same address with
 the component swapped, then optimized in production order — write, recompact (reusing
 `MaintenanceJob`), reindex (reusing `LanceIndexer` and its segment flows, skipped when no index
