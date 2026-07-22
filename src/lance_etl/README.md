@@ -5,6 +5,20 @@ serving truth. A local Spark session supplies Iceberg access and executor-side L
 
 See the repository [README](../../README.md) for setup and [AGENTS.md](AGENTS.md) for Python rules.
 
+## Package tour
+
+| Package | Responsibility |
+|---|---|
+| [`etl/`](etl/README.md) | Replay-safe ingestion primitives (source-sequenced merge, mutation collapse, completion marker) composed by the reconciler |
+| [`indexing/`](indexing/README.md) | Segment-API index planning, build, commit, and maintenance libraries for IVF_RQ, BTREE, BITMAP, ZONEMAP, and INVERTED |
+| [`maintenance/`](maintenance/README.md) | Retention, compaction, cleanup, and blue-green serving-tag libraries for the Lance datasets |
+| [`publication/`](publication/README.md) | Exact candidate manifests and the publication workflow helpers that qualify a materialized revision for serving |
+| [`recall/`](recall/README.md) | Offline recall audit: replays Datadog-sampled queries against pinned Lance versions and scores recall@k, nDCG@k, and MRR |
+| [`reconciler/`](reconciler/README.md) | The local PostgreSQL-backed control loop: `lance-etl-reconcile`'s planning, work claiming, and fenced workers |
+| [`source/`](source/README.md) | Exact Iceberg snapshot discovery and deterministic, side-effect-free replay planning |
+| [`state/`](state/README.md) | The PostgreSQL control-plane schema and repository: specifications, work, leases, and publications |
+| [`tools/`](tools/README.md) | Uninstalled operator CLI bundling the recall audit, namespace migration, and Iceberg source-table optimization |
+
 ## Reconciliation cycle
 
 `lance-etl-reconcile run-once` performs one bounded cycle:
