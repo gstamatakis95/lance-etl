@@ -661,6 +661,39 @@ def retention_band_evidence(
     return evidence
 
 
+def resurrection_evidence(oracle_org: dict[str, OracleRow], actual: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Summarize every key whose terminal oracle state was produced by a revive.
+
+    Makes the resurrection ("delete then re-upsert at a higher source sequence") coverage explicit
+    in the evidence document rather than implicit in the ``op_scenarios`` counts alone: each entry
+    cross-references the key against the actual published row so a revived key's live status is
+    asserted directly here, on top of the full field-level comparison :func:`compare_key` already
+    runs for every key (oracle and actual alike).
+
+    Args:
+        oracle_org: Expected terminal state for this org.
+        actual: The org's published rows keyed by record id, empty when unpublished.
+
+    Returns:
+        One entry per revived key, carrying its expected regenerated payload version and whether
+        it was found live among the actual published rows.
+    """
+    entries: list[dict[str, Any]] = []
+    for record_id in sorted(oracle_org):
+        row: OracleRow = oracle_org[record_id]
+        if row.scenario != "revive":
+            continue
+        published: dict[str, Any] | None = actual.get(record_id)
+        entries.append(
+            {
+                "record_id": record_id,
+                "expected_payload_version": row.payload_version,
+                "published_live": published is not None and not bool(published["is_deleted"]),
+            }
+        )
+    return entries
+
+
 def verify_org(
     config: BenchConfig,
     settings: FuzzSettings,
@@ -690,6 +723,7 @@ def verify_org(
             "ok": len(oracle_org) == 0,
             "expected_total": len(oracle_org),
             "fingerprint": fingerprint,
+            "resurrection_evidence": resurrection_evidence(oracle_org, {}),
         }
     actual: dict[str, dict[str, Any]]
     total: int
@@ -731,6 +765,7 @@ def verify_org(
         "indexes": built,
         "missing_indexes": missing_indexes,
         "retention_bands": retention_band_evidence(settings, org, actual),
+        "resurrection_evidence": resurrection_evidence(oracle_org, actual),
         "fingerprint": fingerprint,
         "lance_version": serving.lance_version,
     }

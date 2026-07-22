@@ -23,6 +23,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import grpc
 
@@ -224,21 +225,21 @@ def self_hosted_search_api(
     env["SEARCH_API_PORT"] = str(port)
     if statsd_addr is not None:
         env["SEARCH_API_STATSD_ADDR"] = statsd_addr
-    log_file = None
-    stdout_target: int | object = subprocess.DEVNULL
-    if log_path is not None:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_file = log_path.open("ab")
-        stdout_target = log_file
-    logger.info("spawning self-hosted search-api %s on port %d", binary, port)
-    process: subprocess.Popen[bytes] = subprocess.Popen(
-        [str(binary)], env=env, stdout=stdout_target, stderr=subprocess.STDOUT
-    )
+    log_file: Any | None = None
+    process: subprocess.Popen[bytes] | None = None
     try:
+        stdout_target: int | object = subprocess.DEVNULL
+        if log_path is not None:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_file = log_path.open("ab")
+            stdout_target = log_file
+        logger.info("spawning self-hosted search-api %s on port %d", binary, port)
+        process = subprocess.Popen([str(binary)], env=env, stdout=stdout_target, stderr=subprocess.STDOUT)
         wait_for_serving(process, timeout_seconds=startup_timeout_seconds, log_path=log_path)
         logger.info("self-hosted search-api ready at 127.0.0.1:%d", port)
         yield f"127.0.0.1:{port}"
     finally:
-        terminate_process(process)
+        if process is not None:
+            terminate_process(process)
         if log_file is not None:
             log_file.close()

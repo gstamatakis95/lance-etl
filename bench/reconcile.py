@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -72,6 +73,7 @@ from lance_etl.reconciler.workers import (
 from lance_etl.source.models import TableMetadata
 from lance_etl.state import (
     ControlPlaneRepository,
+    ControlPlaneStatus,
     DatasetSpecRevision,
     FieldRole,
     IcebergSource,
@@ -98,6 +100,10 @@ SOURCE_TABLE_NAME: str = "events"
 
 MAX_DRAIN_CYCLES: int = 500
 """Upper bound on reconciliation cycles per drain to fail fast on a stuck queue."""
+
+RETRY_QUIESCENCE_POLL_SECONDS: float = 1.0
+"""Delay between drain cycles while retry-wait or due work remains, giving a pending retry a
+chance to become due and be claimed before the next cycle."""
 
 BENCH_SPEC_NAMESPACE: uuid.UUID = uuid.UUID("2f7a2f3c-8d1e-5a4b-9c6d-0f1e2a3b4c5d")
 """Deterministic namespace for the benchmark specification identities, isolated from the seed."""
@@ -185,26 +191,28 @@ def isolated_control_plane(
     base_url: URL = make_url(database_url)
     schema_name: str = f"lance_bench_e2e_{uuid.uuid4().hex}"
     admin_engine: Engine = sa.create_engine(base_url)
-    with admin_engine.begin() as connection:
-        connection.execute(CreateSchema(schema_name))
-    isolated_url: URL = base_url.update_query_dict({"options": f"-csearch_path={schema_name}"})
-    isolated_url_string: str = isolated_url.render_as_string(hide_password=False)
-    engine: Engine | None = None
     try:
-        alembic_config: Config = Config(str(REPO_ROOT / "alembic.ini"))
-        alembic_config.set_main_option("script_location", str(REPO_ROOT / "migrations"))
-        alembic_config.set_main_option("sqlalchemy.url", isolated_url_string.replace("%", "%%"))
-        command.upgrade(alembic_config, "head")
-        engine = build_control_plane_engine(isolated_url_string)
-        yield ControlPlaneRepository(engine), engine, isolated_url_string
+        with admin_engine.begin() as connection:
+            connection.execute(CreateSchema(schema_name))
+        isolated_url: URL = base_url.update_query_dict({"options": f"-csearch_path={schema_name}"})
+        isolated_url_string: str = isolated_url.render_as_string(hide_password=False)
+        engine: Engine | None = None
+        try:
+            alembic_config: Config = Config(str(REPO_ROOT / "alembic.ini"))
+            alembic_config.set_main_option("script_location", str(REPO_ROOT / "migrations"))
+            alembic_config.set_main_option("sqlalchemy.url", isolated_url_string.replace("%", "%%"))
+            command.upgrade(alembic_config, "head")
+            engine = build_control_plane_engine(isolated_url_string)
+            yield ControlPlaneRepository(engine), engine, isolated_url_string
+        finally:
+            if engine is not None:
+                engine.dispose()
+            if keep:
+                logger.info("keeping benchmark control-plane schema %s (schema is NOT dropped)", schema_name)
+            else:
+                with admin_engine.begin() as connection:
+                    connection.execute(DropSchema(schema_name, cascade=True))
     finally:
-        if engine is not None:
-            engine.dispose()
-        if keep:
-            logger.info("keeping benchmark control-plane schema %s (schema is NOT dropped)", schema_name)
-        else:
-            with admin_engine.begin() as connection:
-                connection.execute(DropSchema(schema_name, cascade=True))
         admin_engine.dispose()
 
 
@@ -633,6 +641,16 @@ def build_reconciler_application(
 def drain_reconciler(application: ReconcilerApplication, raise_on_blocked: bool = True) -> dict[str, int]:
     """Run reconciliation cycles until the source and work queues are quiescent.
 
+    A cycle that enqueues nothing and claims nothing is not necessarily quiescent: work can be
+    sitting in ``RETRY_WAIT`` with ``next_attempt_at`` in the future (a transient failure whose
+    retry has not come due yet), or ``PENDING``/claimable work can exist that this particular cycle
+    happened not to claim. Declaring quiescence in that state would return undercounted totals and
+    make a downstream verification fail with misleading "missing data" evidence instead of the true
+    "work is still retrying" cause. So after a cycle claims and enqueues nothing, the drain also
+    consults :meth:`~lance_etl.state.repository.ControlPlaneRepository.control_plane_status` and
+    only returns once both ``retry_wait_work`` and ``due_work`` are zero; otherwise it sleeps
+    briefly and keeps cycling so a pending retry gets a chance to become due and be claimed.
+
     Args:
         application: Wired reconciler application.
         raise_on_blocked: When true (the default, preserving existing behavior) any blocked cycle
@@ -668,7 +686,10 @@ def drain_reconciler(application: ReconcilerApplication, raise_on_blocked: bool 
         if summary.dispatch.blocked and raise_on_blocked:
             raise RuntimeError("reconciler blocked benchmark work; inspect dataset_work error evidence")
         if summary.planning.enqueued_snapshots == 0 and summary.dispatch.claimed == 0:
-            return totals
+            status: ControlPlaneStatus = application.repository.control_plane_status()
+            if status.retry_wait_work == 0 and status.due_work == 0:
+                return totals
+            time.sleep(RETRY_QUIESCENCE_POLL_SECONDS)
     raise RuntimeError("reconciler did not reach quiescence within the benchmark cycle bound")
 
 

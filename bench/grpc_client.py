@@ -86,7 +86,7 @@ def load_stubs(gen_dir: Path) -> tuple[ModuleType, ModuleType]:
     return pb2, pb2_grpc
 
 
-def open_stub(config: BenchConfig, pb2_grpc: ModuleType, timeout_seconds: float = 5.0) -> Any:
+def open_stub(config: BenchConfig, pb2_grpc: ModuleType, timeout_seconds: float = 5.0) -> tuple[Any, Any]:
     """Open a plaintext channel to the local search service.
 
     Args:
@@ -95,7 +95,9 @@ def open_stub(config: BenchConfig, pb2_grpc: ModuleType, timeout_seconds: float 
         timeout_seconds: Readiness wait budget.
 
     Returns:
-        A ready ``SearchServiceStub``.
+        The opened channel and a ready ``SearchServiceStub`` bound to it. The caller owns the
+        returned channel and must close it (typically in a ``finally`` block) once done with the
+        stub, otherwise the underlying connection is only reclaimed at process exit.
 
     Raises:
         RuntimeError: If no endpoint is configured or the service is unreachable.
@@ -108,7 +110,7 @@ def open_stub(config: BenchConfig, pb2_grpc: ModuleType, timeout_seconds: float 
     except grpc.FutureTimeoutError as error:
         channel.close()
         raise RuntimeError(f"search service unreachable at {config.endpoint}") from error
-    return pb2_grpc.SearchServiceStub(channel)
+    return channel, pb2_grpc.SearchServiceStub(channel)
 
 
 def generate_and_load_stubs(gen_dir: Path) -> tuple[ModuleType, ModuleType]:
@@ -123,7 +125,7 @@ def generate_and_load_stubs(gen_dir: Path) -> tuple[ModuleType, ModuleType]:
     return load_stubs(generate_stubs(gen_dir))
 
 
-def open_ready_stub(config: BenchConfig, gen_dir: Path, timeout_seconds: float = 5.0) -> tuple[ModuleType, Any]:
+def open_ready_stub(config: BenchConfig, gen_dir: Path, timeout_seconds: float = 5.0) -> tuple[ModuleType, Any, Any]:
     """Compile, import, and open a ready stub against ``config.endpoint`` in one call.
 
     Combines :func:`generate_and_load_stubs` and :func:`open_stub` for the common case where the
@@ -138,7 +140,8 @@ def open_ready_stub(config: BenchConfig, gen_dir: Path, timeout_seconds: float =
         timeout_seconds: Readiness wait budget forwarded to :func:`open_stub`.
 
     Returns:
-        The generated proto module and the ready connected stub.
+        The generated proto module, the opened channel (owned by the caller, which must close it),
+        and the ready connected stub.
 
     Raises:
         RuntimeError: If no endpoint is configured or the service is unreachable.
@@ -146,8 +149,10 @@ def open_ready_stub(config: BenchConfig, gen_dir: Path, timeout_seconds: float =
     pb2: ModuleType
     pb2_grpc: ModuleType
     pb2, pb2_grpc = generate_and_load_stubs(gen_dir)
-    stub: Any = open_stub(config, pb2_grpc, timeout_seconds=timeout_seconds)
-    return pb2, stub
+    channel: Any
+    stub: Any
+    channel, stub = open_stub(config, pb2_grpc, timeout_seconds=timeout_seconds)
+    return pb2, channel, stub
 
 
 def target_key(org_id: str) -> str:

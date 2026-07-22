@@ -12,6 +12,14 @@ normalize to an upsert, and ``delete`` / ``d`` normalize to a tombstone. Last-wr
 strictly by the Iceberg source sequence, never by the event ``ts``, so generated timestamps are
 deliberately uncorrelated with delivery order. Retention band populations are planted with reserved
 key prefixes and never mutated again so record expiry never interacts with resurrection.
+
+Two scenarios beyond plain insert/update/delete exercise the replay sink's tombstone-transition
+paths: ``revive`` resurrects a previously tombstoned key with a bumped content version (an upsert
+over an existing tombstone at a higher source sequence must flip ``is_deleted`` back to false and
+replace the payload), and ``redelete`` lands a second tombstone over an already-dead key (a delete
+over an existing tombstone). Both draw only from keys a normal, non-absent delete actually
+tombstoned, and both use the same recent timestamp band as every other non-planted op so retention
+mode never expires them mid-run.
 """
 
 from __future__ import annotations
@@ -27,6 +35,12 @@ from lance_etl.etl.mutation import DELETE_OPERATIONS, UPSERT_OPERATIONS, normali
 
 ABSENT_DELETE_PROBABILITY: float = 0.10
 """Chance a generated delete targets a never-born key, landing an absent-key tombstone."""
+
+REVIVE_PROBABILITY: float = 0.30
+"""Chance an insert attempt resurrects a previously tombstoned key instead of minting a fresh one."""
+
+REDELETE_PROBABILITY: float = 0.25
+"""Chance a delete attempt re-tombstones an already-dead key instead of a live one."""
 
 MAX_REPORTED_MISMATCHES: int = 25
 """Upper bound on per-org content mismatches embedded verbatim in the evidence document."""
@@ -217,12 +231,15 @@ class OracleRow:
         is_deleted: Whether the record is a tombstone.
         payload_version: Content version regenerated for live-row content comparison.
         snapshot_ordinal: Snapshot whose Iceberg sequence the stored source sequence must equal.
+        scenario: Evidence label of the winning (terminal) op for this key, letting a caller
+            identify, for example, a key whose terminal state was produced by a ``revive``.
     """
 
     ts_us: int
     is_deleted: bool
     payload_version: int
     snapshot_ordinal: int
+    scenario: str
 
 
 def parse_mix(raw: str) -> tuple[int, int, int]:
@@ -272,6 +289,9 @@ class WorkloadBuilder:
         per_snapshot: Accumulated ops keyed by snapshot ordinal.
         reserved: Keys no random op may touch in a given snapshot.
         alive: Currently live record ids.
+        dead: Previously live record ids tombstoned by a normal (non-absent) delete, eligible for
+            a later resurrection or re-delete. Absent-key deletes never populate this set: a key
+            that was never alive cannot be resurrected.
         key_org: Owning org for every allocated record id.
         payload_version: Latest content version for every record id.
         next_ordinal: Next unborn key ordinal.
@@ -285,6 +305,7 @@ class WorkloadBuilder:
     per_snapshot: list[list[FuzzOp]]
     reserved: list[set[str]]
     alive: set[str] = field(default_factory=set)
+    dead: set[str] = field(default_factory=set)
     key_org: dict[str, str] = field(default_factory=dict)
     payload_version: dict[str, int] = field(default_factory=dict)
     next_ordinal: int = 0
@@ -429,16 +450,66 @@ class WorkloadBuilder:
         """
         return sorted(self.alive - used - self.reserved[snapshot])
 
-    def do_insert(self, snapshot: int, used: set[str]) -> FuzzOp | None:
-        """Emit an insert of a fresh key when the keyspace is not exhausted.
+    def available_dead(self, snapshot: int, used: set[str]) -> list[str]:
+        """Return tombstoned keys eligible for a revival or a re-delete in a snapshot.
+
+        Args:
+            snapshot: The snapshot being generated.
+            used: Keys already touched in this snapshot.
+
+        Returns:
+            Sorted eligible dead record ids.
+        """
+        return sorted(self.dead - used - self.reserved[snapshot])
+
+    def maybe_revive(self, snapshot: int, used: set[str]) -> FuzzOp | None:
+        """Occasionally resurrect a previously tombstoned key with a bumped content version.
+
+        Exercises the ``etl/replay_sink.py`` ``when_matched_update_all`` watermark path: an upsert
+        for a tombstoned key at a higher source sequence must flip ``is_deleted`` back to false and
+        replace the payload. Draws only from :attr:`WorkloadBuilder.dead`, never from absent-delete
+        keys, which were never alive and so cannot be resurrected.
 
         Args:
             snapshot: Target snapshot.
             used: Keys already touched in this snapshot.
 
         Returns:
-            The emitted op, or ``None`` when no unborn key remains.
+            The emitted ``revive`` op, or ``None`` when the dice missed or no dead key is eligible.
         """
+        if self.rng.random() >= REVIVE_PROBABILITY:
+            return None
+        candidates: list[str] = self.available_dead(snapshot, used)
+        if not candidates:
+            return None
+        record_id: str = self.rng.choice(candidates)
+        self.dead.discard(record_id)
+        self.alive.add(record_id)
+        self.payload_version[record_id] += 1
+        version: int = self.payload_version[record_id]
+        op: FuzzOp = FuzzOp(
+            snapshot, self.key_org[record_id], record_id, self.upsert_spelling(), self.fresh_ts(), version, "revive"
+        )
+        used.add(record_id)
+        return op
+
+    def do_insert(self, snapshot: int, used: set[str]) -> FuzzOp | None:
+        """Emit a revive of a dead key, or an insert of a fresh key when not exhausted.
+
+        A revive (see :meth:`maybe_revive`) is attempted first and, when drawn, is returned
+        regardless of remaining keyspace budget since it reuses an already-allocated key rather
+        than consuming a fresh one.
+
+        Args:
+            snapshot: Target snapshot.
+            used: Keys already touched in this snapshot.
+
+        Returns:
+            The emitted op, or ``None`` when no revive was drawn and no unborn key remains.
+        """
+        revive_op: FuzzOp | None = self.maybe_revive(snapshot, used)
+        if revive_op is not None:
+            return revive_op
         if self.next_ordinal >= self.settings.keyspace:
             return None
         org: str = self.settings.org_ids()[self.insert_count % self.settings.tenants]
@@ -471,16 +542,51 @@ class WorkloadBuilder:
         used.add(record_id)
         return op
 
-    def do_delete(self, snapshot: int, used: set[str]) -> FuzzOp | None:
-        """Emit a delete of a live key or, occasionally, an absent-key tombstone.
+    def maybe_redelete(self, snapshot: int, used: set[str]) -> FuzzOp | None:
+        """Occasionally re-tombstone an already-dead key instead of a live one.
+
+        Exercises a second tombstone landing over an existing tombstone (the same source-sequence
+        watermark path a revive uses, just staying deleted). Draws only from
+        :attr:`WorkloadBuilder.dead`, distinct from the absent-key delete branch which targets a
+        key that was never alive.
 
         Args:
             snapshot: Target snapshot.
             used: Keys already touched in this snapshot.
 
         Returns:
-            The emitted op, or ``None`` when no live key exists and an absent delete was not drawn.
+            The emitted ``redelete`` op, or ``None`` when the dice missed or no dead key is
+            eligible.
         """
+        if self.rng.random() >= REDELETE_PROBABILITY:
+            return None
+        candidates: list[str] = self.available_dead(snapshot, used)
+        if not candidates:
+            return None
+        record_id: str = self.rng.choice(candidates)
+        op: FuzzOp = FuzzOp(
+            snapshot, self.key_org[record_id], record_id, self.delete_spelling(), self.fresh_ts(), 1, "redelete"
+        )
+        used.add(record_id)
+        return op
+
+    def do_delete(self, snapshot: int, used: set[str]) -> FuzzOp | None:
+        """Emit a re-delete of a dead key, a delete of a live key, or an absent-key tombstone.
+
+        A re-delete (see :meth:`maybe_redelete`) is attempted first. Failing that, the existing
+        absent-key and live-key delete branches run unchanged.
+
+        Args:
+            snapshot: Target snapshot.
+            used: Keys already touched in this snapshot.
+
+        Returns:
+            The emitted op, or ``None`` when no re-delete was drawn, no live key exists, and an
+            absent delete was not drawn either.
+        """
+        redelete_op: FuzzOp | None = self.maybe_redelete(snapshot, used)
+        if redelete_op is not None:
+            return redelete_op
         if self.rng.random() < ABSENT_DELETE_PROBABILITY:
             org: str = self.settings.org_ids()[self.rng.randrange(self.settings.tenants)]
             record_id: str = f"absent{self.absent_count:06d}"
@@ -494,6 +600,7 @@ class WorkloadBuilder:
             return None
         alive_key: str = self.rng.choice(candidates)
         self.alive.discard(alive_key)
+        self.dead.add(alive_key)
         delete_op: FuzzOp = FuzzOp(
             snapshot, self.key_org[alive_key], alive_key, self.delete_spelling(), self.fresh_ts(), 1, "normal"
         )
@@ -661,6 +768,7 @@ def replay_state(workload: FuzzWorkload, verified_through_snapshot: int) -> dict
             is_deleted=op.is_delete(),
             payload_version=op.payload_version,
             snapshot_ordinal=op.snapshot,
+            scenario=op.scenario,
         )
     return state
 

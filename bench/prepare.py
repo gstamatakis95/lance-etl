@@ -206,47 +206,47 @@ def write_iceberg_table(
         The wall time of the write in seconds.
     """
     spark = build_spark(config, "bench-prepare")
-    corpus_root: Path = config.corpus_root
-    cluster_vocab, common_vocab = vocab
-    tenants: int = config.tenants
-    seed: int = config.seed
-    words_per_text: int = config.words_per_text
-    no_text: bool = config.no_text
-    slices: list[tuple[int, int]] = [
-        (start, min(config.rows_per_slice, config.limit - start))
-        for start in range(0, config.limit, config.rows_per_slice)
-    ]
-
-    def generate(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
-        """Generate the row batches for the slice specs assigned to this task.
-
-        Args:
-            batches: Arrow batches of ``(start, count)`` slice specs.
-
-        Yields:
-            One row batch per slice spec.
-        """
-        for batch in batches:
-            starts: list[int] = batch.column("start").to_pylist()
-            counts: list[int] = batch.column("count").to_pylist()
-            for start, count in zip(starts, counts, strict=True):
-                yield slice_record_batch(
-                    int(start),
-                    int(count),
-                    adapter,
-                    corpus_root,
-                    centroids,
-                    cluster_vocab,
-                    common_vocab,
-                    tenants,
-                    seed,
-                    words_per_text,
-                    no_text,
-                )
-
-    spark_ddl: str = SPARK_ROW_DDL_NO_TEXT if no_text else SPARK_ROW_DDL
-    started: float = time.perf_counter()
     try:
+        corpus_root: Path = config.corpus_root
+        cluster_vocab, common_vocab = vocab
+        tenants: int = config.tenants
+        seed: int = config.seed
+        words_per_text: int = config.words_per_text
+        no_text: bool = config.no_text
+        slices: list[tuple[int, int]] = [
+            (start, min(config.rows_per_slice, config.limit - start))
+            for start in range(0, config.limit, config.rows_per_slice)
+        ]
+
+        def generate(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
+            """Generate the row batches for the slice specs assigned to this task.
+
+            Args:
+                batches: Arrow batches of ``(start, count)`` slice specs.
+
+            Yields:
+                One row batch per slice spec.
+            """
+            for batch in batches:
+                starts: list[int] = batch.column("start").to_pylist()
+                counts: list[int] = batch.column("count").to_pylist()
+                for start, count in zip(starts, counts, strict=True):
+                    yield slice_record_batch(
+                        int(start),
+                        int(count),
+                        adapter,
+                        corpus_root,
+                        centroids,
+                        cluster_vocab,
+                        common_vocab,
+                        tenants,
+                        seed,
+                        words_per_text,
+                        no_text,
+                    )
+
+        spark_ddl: str = SPARK_ROW_DDL_NO_TEXT if no_text else SPARK_ROW_DDL
+        started: float = time.perf_counter()
         spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {config.catalog}.db")
         specs = spark.createDataFrame(slices, "start long, count long").repartition(len(slices))
         rows = specs.mapInArrow(generate, schema=spark_ddl)

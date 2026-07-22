@@ -344,17 +344,20 @@ def catalog_search_leg(
             log_path=log_path,
         ) as endpoint:
             hosted_config: BenchConfig = replace(config, endpoint=endpoint)
-            stub = open_stub(hosted_config, pb2_grpc, timeout_seconds=5.0)
-            result: dict[str, Any] = run_catalog_grpc_legs(
-                hosted_config, expected_versions, queries, ground_truth, stub, pb2
-            )
-            if config.no_text:
-                result["fts"] = {"skipped": "no_text mode; FTS leg disabled"}
-                result["hybrid"] = {"skipped": "no_text mode; hybrid leg disabled"}
-            else:
-                result["fts"] = run_fts_leg(stub, pb2, hosted_config, artifacts, expected_versions)
-                result["hybrid"] = run_hybrid_leg(stub, pb2, hosted_config, artifacts, expected_versions)
-            return result
+            channel, stub = open_stub(hosted_config, pb2_grpc, timeout_seconds=5.0)
+            try:
+                result: dict[str, Any] = run_catalog_grpc_legs(
+                    hosted_config, expected_versions, queries, ground_truth, stub, pb2
+                )
+                if config.no_text:
+                    result["fts"] = {"skipped": "no_text mode; FTS leg disabled"}
+                    result["hybrid"] = {"skipped": "no_text mode; hybrid leg disabled"}
+                else:
+                    result["fts"] = run_fts_leg(stub, pb2, hosted_config, artifacts, expected_versions)
+                    result["hybrid"] = run_hybrid_leg(stub, pb2, hosted_config, artifacts, expected_versions)
+                return result
+            finally:
+                channel.close()
     except Exception as exc:
         return {"status": "FAILED", "reason": str(exc)}
 

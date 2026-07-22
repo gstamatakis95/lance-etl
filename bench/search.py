@@ -529,6 +529,28 @@ def run_search(config: BenchConfig) -> dict[str, Any]:
     )
 
 
+def search_headline_status(load: dict[str, Any], sweep: list[dict[str, Any]]) -> str:
+    """Derive the top-level ``bench search`` phase status from the load and recall-sweep legs.
+
+    The load leg (:func:`run_load_leg`) reports ``FAILED`` only when every configured concurrency
+    level was rejected. The sweep leg (:func:`sweep_point`) always runs one point, but that point
+    can still measure zero queries when the query set or the configured org list is empty. Either
+    condition means the phase produced no usable measurement, and the caller must not report the
+    standalone document as ``MEASURED``.
+
+    Args:
+        load: The load leg result document.
+        sweep: The recall sweep leg result points.
+
+    Returns:
+        ``"FAILED"`` when the load leg failed or the sweep measured zero queries, ``"MEASURED"``
+        otherwise.
+    """
+    load_measured: bool = load.get("status") == "MEASURED"
+    sweep_measured: bool = any(int(point.get("queries", 0)) > 0 for point in sweep)
+    return "MEASURED" if load_measured and sweep_measured else "FAILED"
+
+
 def run_search_against_endpoint(
     config: BenchConfig,
     expected_versions: dict[str, int] | None = None,
@@ -552,52 +574,68 @@ def run_search_against_endpoint(
             with ``pb2`` or not at all.
 
     Returns:
-        The phase result document.
+        The phase result document, carrying ``status: "FAILED"`` when the load leg was fully
+        rejected or the sweep measured zero queries.
+
+    Raises:
+        RuntimeError: If the headline status is ``FAILED``, after the result document is still
+            saved as ``search.json`` so the failure evidence is inspectable.
     """
     if expected_versions is None:
         expected_versions = load_expected_versions(config)
     artifacts: dict[str, Any] = load_artifacts(config)
+    channel: Any
     stub: Any
     if pb2 is None or pb2_grpc is None:
-        pb2, stub = open_ready_stub(config, config.workspace / "grpc_gen")
+        pb2, channel, stub = open_ready_stub(config, config.workspace / "grpc_gen")
     else:
-        stub = open_stub(config, pb2_grpc)
-    queries: np.ndarray = artifacts["queries"]
-    if config.max_queries is not None:
-        queries = queries[: config.max_queries]
+        channel, stub = open_stub(config, pb2_grpc)
+    try:
+        queries: np.ndarray = artifacts["queries"]
+        if config.max_queries is not None:
+            queries = queries[: config.max_queries]
 
-    first_queries: dict[str, Any] = measure_first_queries(stub, pb2, config, queries, expected_versions)
-    warmup_count: int = config.warmup_queries
-    if warmup_count > 0:
-        logger.info("warmup: %d profile-owned queries with results discarded", warmup_count)
-        org: Any
-        for org in config.org_ids():
-            query: Any
-            for query in queries[:warmup_count]:
-                request: Any = pb2.VectorSearchRequest(
-                    target=dataset_target(pb2, org), query=vector_query(pb2, query), k=config.search_k
-                )
-                response: Any
-                unused_ms: Any
-                response, unused_ms = timed_call(stub.VectorSearch, request)
-                del unused_ms
-                validate_served_version(response, org, expected_versions[org])
-    sweep: list[dict[str, Any]] = [
-        sweep_point(stub, pb2, config, queries, artifacts["ground_truth"], expected_versions)
-    ]
-    load: dict[str, Any] = run_load_leg(stub, pb2, config, queries[0], expected_versions)
-    result: dict[str, Any] = {
-        "endpoint": config.endpoint,
-        "status": "MEASURED",
-        "expected_versions": expected_versions,
-        "first_queries": first_queries,
-        "sweep": sweep,
-        "load": load,
-    }
-    if config.no_text:
-        result["fts"] = {"skipped": "no_text mode; FTS leg disabled"}
-        result["hybrid"] = {"skipped": "no_text mode; hybrid leg disabled"}
-    else:
-        result["fts"] = run_fts_leg(stub, pb2, config, artifacts, expected_versions)
-        result["hybrid"] = run_hybrid_leg(stub, pb2, config, artifacts, expected_versions)
-    return save_phase(config, "search", result)
+        first_queries: dict[str, Any] = measure_first_queries(stub, pb2, config, queries, expected_versions)
+        warmup_count: int = config.warmup_queries
+        if warmup_count > 0:
+            logger.info("warmup: %d profile-owned queries with results discarded", warmup_count)
+            org: Any
+            for org in config.org_ids():
+                query: Any
+                for query in queries[:warmup_count]:
+                    request: Any = pb2.VectorSearchRequest(
+                        target=dataset_target(pb2, org), query=vector_query(pb2, query), k=config.search_k
+                    )
+                    response: Any
+                    unused_ms: Any
+                    response, unused_ms = timed_call(stub.VectorSearch, request)
+                    del unused_ms
+                    validate_served_version(response, org, expected_versions[org])
+        sweep: list[dict[str, Any]] = [
+            sweep_point(stub, pb2, config, queries, artifacts["ground_truth"], expected_versions)
+        ]
+        load: dict[str, Any] = run_load_leg(stub, pb2, config, queries[0], expected_versions)
+        headline_status: str = search_headline_status(load, sweep)
+        result: dict[str, Any] = {
+            "endpoint": config.endpoint,
+            "status": headline_status,
+            "expected_versions": expected_versions,
+            "first_queries": first_queries,
+            "sweep": sweep,
+            "load": load,
+        }
+        if config.no_text:
+            result["fts"] = {"skipped": "no_text mode; FTS leg disabled"}
+            result["hybrid"] = {"skipped": "no_text mode; hybrid leg disabled"}
+        else:
+            result["fts"] = run_fts_leg(stub, pb2, config, artifacts, expected_versions)
+            result["hybrid"] = run_hybrid_leg(stub, pb2, config, artifacts, expected_versions)
+    finally:
+        channel.close()
+    saved: dict[str, Any] = save_phase(config, "search", result)
+    if headline_status == "FAILED":
+        raise RuntimeError(
+            f"search phase failed: load leg status={load.get('status')!r}, "
+            f"sweep queries={[point.get('queries') for point in sweep]}; inspect search.json"
+        )
+    return saved
