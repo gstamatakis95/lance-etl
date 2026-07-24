@@ -17,9 +17,9 @@ use crate::cache::janitor::CacheJanitor;
 use crate::cache::layout::prepare_cache_root;
 use crate::cache::redis_store::RedisEntryStore;
 use crate::cache::store_cache::MetadataByteCache;
-use crate::config::{CacheBackendKind, Config};
-use crate::domain::{DatasetRef, DatasetTarget, SearchError};
-use crate::lance::error::classify_lance_error;
+use crate::config::{CacheBackendKind, Config, PRODUCTION_SERVE_TAG};
+use crate::domain::{DatasetRef, DatasetTarget, SearchError, ServingCatalog, ServingRoute};
+use crate::lance::error::{classify_lance_error, is_definitive_open_absence};
 use crate::telemetry::{CacheName, Metrics, Tier};
 
 /// Upper bound on the weight a single open-dataset handle contributes to the handle-cache budget.
@@ -46,8 +46,7 @@ pub fn handle_weight(dataset: &Dataset) -> u32 {
 /// outlive the freshness window — otherwise a low-traffic tenant would keep serving the version
 /// captured at first open until capacity pressure happened to evict the handle. Version-pinned
 /// `(uri, Some(v))` handles are immutable snapshots and never expire by time; capacity weighting
-/// alone bounds them. The window reuses `serve_tag_ttl_secs`, giving `Latest` and default
-/// `Serve` opens the same staleness bound the serve-by-tag path already has.
+/// alone bounds them. The window reuses `serve_tag_ttl_secs` for the explicit `Latest` path.
 struct UnpinnedHandleExpiry {
     ttl: Duration,
 }
@@ -77,10 +76,10 @@ pub trait DatasetProvider: Send + Sync + 'static {
     ///
     /// The target resolves to `{base}/{org}/{tenant}/{namespace}.lance`.
     ///
-    /// `reference` selects the committed version: [`DatasetRef::Serve`] follows the provider's
-    /// configured serve policy (a resolved serve tag, or latest), [`DatasetRef::Latest`] opens
-    /// latest (freshness-bounded: a cached latest handle is refreshed within the serve-tag TTL,
-    /// so a new commit becomes visible within that window), and
+    /// `reference` selects the committed version: [`DatasetRef::Serve`] resolves the fixed
+    /// production `HEAD` tag, [`DatasetRef::Latest`] opens latest (freshness-bounded: a cached
+    /// latest handle is refreshed within the tag TTL, so a new commit becomes visible within that
+    /// window), and
     /// [`DatasetRef::Version`]/[`DatasetRef::Tag`] pin an explicit version. A version-pinned
     /// open keys the handle cache on the resolved version, so blue and green versions of one
     /// dataset coexist and a tag flip selects a different handle rather than mutating one.
@@ -103,6 +102,18 @@ pub trait DatasetProvider: Send + Sync + 'static {
         reference: DatasetRef,
     ) -> impl Future<Output = Result<Arc<Dataset>, SearchError>> + Send {
         self.dataset(target, reference)
+    }
+
+    /// Opens one caller-supplied exact route for unauthenticated replica-local prewarm.
+    fn dataset_for_exact_prewarm(
+        &self,
+        target: &DatasetTarget,
+        route: ServingRoute,
+    ) -> impl Future<Output = Result<Arc<Dataset>, SearchError>> + Send {
+        async move {
+            let _ = (target, route);
+            Err(SearchError::internal("exact prewarm is not supported by this provider"))
+        }
     }
 
     /// Approximate bytes resident in the shared index cache. Providers without one report 0.
@@ -140,14 +151,16 @@ pub fn build_session(config: &Config, index_backend: Option<Arc<HybridIndexCache
 /// weight ([`handle_weight`]) rather than a flat entry count, so the cheap tiny-tenant tail stays
 /// resident while a few heavy whale handles are capped.
 ///
-/// Blue-green serving: when `serve_by_tag` is on, [`DatasetRef::Serve`] resolves `serve_tag` to a
-/// concrete version through `tag_versions` (a short-TTL cache, so a tag flip propagates within the
-/// TTL without a manifest read per request) and opens that exact version. Because the handle cache
+/// Blue-green serving: [`DatasetRef::Serve`] resolves the fixed production `HEAD` tag to a concrete
+/// version through `tag_versions` (a short-TTL cache, so a tag flip propagates within the TTL
+/// without a manifest read per request) and opens that exact version. Because the handle cache
 /// and Lance's own version- and index-UUID-scoped disk/metadata caches all key on the resolved
 /// version, a freshly built green version that was prewarmed by version is served warm the moment
 /// the tag flips onto it, while the draining blue handle ages out by capacity.
 pub struct CachingDatasetProvider {
     base_uri: String,
+    catalog: Option<Arc<dyn ServingCatalog>>,
+    serving_routes: Cache<DatasetTarget, ServingRoute>,
     session: Arc<Session>,
     /// Open-handle LRU keyed by `(uri, resolved version)` and bounded by total [`handle_weight`].
     datasets: Cache<(String, Option<u64>), Arc<Dataset>>,
@@ -155,23 +168,34 @@ pub struct CachingDatasetProvider {
     /// `(uri, selector)` where the selector encodes the resolved reference intent (`latest`,
     /// `version:{n}`, or `tag:{name}`). Keying on the reference — rather than a resolved version
     /// that a failed tag resolution never produces — lets the cache cover tag-addressed misses
-    /// (`DatasetRef::Tag` and every serve-by-tag request) as well as `Latest`/`Version`, so a hot
+    /// (`DatasetRef::Tag` and every production `HEAD` request) as well as `Latest`/`Version`, so a hot
     /// loop of requests for a nonexistent dataset or tag is answered from here instead of hammering
-    /// the object store. Only NotFound outcomes are cached — a missing dataset OR a missing tag,
-    /// never a transient failure — and the TTL
+    /// the object store. Only definitive dataset, reference, or version absence is cached. A
+    /// generic missing object inside a live dataset is treated as transient and never cached. The TTL
     /// ([`crate::config::DEFAULT_NEGATIVE_OPEN_TTL_SECS`]) bounds how long a freshly created
     /// dataset can still be reported missing.
     negative_opens: Cache<(String, String), SearchError>,
     tag_versions: Cache<(String, String), u64>,
     last_tag_version: Cache<(String, String), u64>,
     last_prewarmed: Cache<String, u64>,
-    serve_by_tag: bool,
-    serve_tag: String,
     store_params: Option<ObjectStoreParams>,
     index_cache: Option<Arc<HybridIndexCacheBackend>>,
     store_cache: Option<Arc<MetadataByteCache>>,
     disk_stores: Option<(Arc<DiskEntryStore>, Arc<DiskEntryStore>)>,
     metrics: Arc<Metrics>,
+    /// The redis index tier's registry hygiene loop handle, owned so [`Drop`] can abort it. `None`
+    /// for the disk and memory backends.
+    registry_hygiene_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for CachingDatasetProvider {
+    /// Aborts the redis registry hygiene loop, if one is running, so it does not outlive the
+    /// provider that owns its `RedisEntryStore`.
+    fn drop(&mut self) {
+        if let Some(task) = self.registry_hygiene_task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl CachingDatasetProvider {
@@ -179,12 +203,25 @@ impl CachingDatasetProvider {
     /// persistent cache tiers, and sizing the dataset-handle LRU. Cache backend setup failures
     /// fall back to in-memory caching so the service still serves traffic.
     pub async fn new(config: &Config) -> Self {
-        Self::build(config, Arc::new(Metrics::disabled()), None).await
+        Self::build(config, Arc::new(Metrics::disabled()), None, None).await
     }
 
-    /// Like [`Self::new`] but emitting cache and dataset-resolution metrics through `metrics`.
-    pub async fn with_telemetry(config: &Config, metrics: Arc<Metrics>) -> Self {
-        Self::build(config, metrics, None).await
+    /// Creates the production provider backed by an exact serving catalog.
+    pub async fn with_catalog_and_telemetry(
+        config: &Config,
+        catalog: Arc<dyn ServingCatalog>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self::build(config, metrics, None, Some(catalog)).await
+    }
+
+    /// Creates a provider with an exact serving catalog and an optional inner store wrapper.
+    pub async fn with_catalog_and_inner_store_wrapper(
+        config: &Config,
+        catalog: Arc<dyn ServingCatalog>,
+        inner_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    ) -> Self {
+        Self::build(config, Arc::new(Metrics::disabled()), inner_wrapper, Some(catalog)).await
     }
 
     /// Like [`Self::new`] but chains an extra wrapper *inside* the metadata byte cache (between
@@ -193,7 +230,7 @@ impl CachingDatasetProvider {
         config: &Config,
         inner_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     ) -> Self {
-        Self::build(config, Arc::new(Metrics::disabled()), inner_wrapper).await
+        Self::build(config, Arc::new(Metrics::disabled()), inner_wrapper, None).await
     }
 
     /// Shared constructor wiring the persistent tiers, the store wrapper chain, and telemetry.
@@ -201,6 +238,7 @@ impl CachingDatasetProvider {
         config: &Config,
         metrics: Arc<Metrics>,
         inner_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+        catalog: Option<Arc<dyn ServingCatalog>>,
     ) -> Self {
         let caches = match config.cache_backend {
             CacheBackendKind::Memory => BuiltCaches::none(),
@@ -219,6 +257,7 @@ impl CachingDatasetProvider {
             index_cache,
             store_cache,
             disk_stores,
+            registry_hygiene_task,
         } = caches;
         let mut wrappers: Vec<Arc<dyn WrappingObjectStore>> = Vec::new();
         if let Some(inner) = inner_wrapper {
@@ -243,6 +282,11 @@ impl CachingDatasetProvider {
         };
         Self {
             base_uri: config.base_uri.clone(),
+            catalog,
+            serving_routes: Cache::builder()
+                .max_capacity(config.dataset_cache_capacity)
+                .time_to_live(Duration::from_secs(crate::config::DEFAULT_SERVING_CATALOG_TTL_SECS))
+                .build(),
             session: build_session(config, index_cache.clone()),
             datasets: Cache::builder()
                 .max_capacity(config.dataset_cache_capacity)
@@ -261,13 +305,12 @@ impl CachingDatasetProvider {
                 .build(),
             last_tag_version: Cache::new(config.dataset_cache_capacity),
             last_prewarmed: Cache::new(config.dataset_cache_capacity),
-            serve_by_tag: config.serve_by_tag,
-            serve_tag: config.serve_tag.clone(),
             store_params,
             index_cache,
             store_cache,
             disk_stores,
             metrics,
+            registry_hygiene_task,
         }
     }
 
@@ -315,18 +358,35 @@ impl CachingDatasetProvider {
         format!("{base}/{org}/{tenant}/{namespace}.lance")
     }
 
+    /// Resolves and validates the exact catalog tuple for one production serving request.
+    async fn serving_route(&self, target: &DatasetTarget) -> Result<ServingRoute, SearchError> {
+        target.validate()?;
+        let catalog = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| SearchError::internal("serving catalog is not configured"))?
+            .clone();
+        let target_key = target.clone();
+        let route = self
+            .serving_routes
+            .try_get_with(target_key.clone(), async move { catalog.resolve(&target_key).await })
+            .await
+            .map_err(|error| error.as_ref().clone())?;
+        validate_serving_route(&self.base_uri, &route)?;
+        Ok(route)
+    }
+
     /// Builds the `negative_opens` key for a `(uri, reference)` pair.
     ///
     /// The selector mirrors what [`Self::resolve_reference`] will consult, so a NotFound recorded
     /// under this key short-circuits every subsequent identical request within the TTL — including
     /// the tag paths, whose resolution failure happens before any version is known. `Serve`
-    /// collapses onto `latest` or `tag:{serve_tag}` exactly as the serve policy resolves it, and a
-    /// `Tag` request naming the serve tag shares that key because both open the same thing.
+    /// collapses onto `tag:HEAD`, and an explicit `Tag("HEAD")` request shares that key because
+    /// both open the same thing.
     fn negative_open_key(&self, uri: &str, reference: &DatasetRef) -> (String, String) {
         let selector = match reference {
             DatasetRef::Latest => "latest".to_string(),
-            DatasetRef::Serve if !self.serve_by_tag => "latest".to_string(),
-            DatasetRef::Serve => format!("tag:{}", self.serve_tag),
+            DatasetRef::Serve => format!("tag:{PRODUCTION_SERVE_TAG}"),
             DatasetRef::Version(version) => format!("version:{version}"),
             DatasetRef::Tag(tag) => format!("tag:{tag}"),
         };
@@ -335,8 +395,8 @@ impl CachingDatasetProvider {
 
     /// Resolves a [`DatasetRef`] to the concrete version to open.
     ///
-    /// `Serve` follows the serve policy: the serve tag when `serve_by_tag` is on, else latest.
-    /// `Latest` resolves to no version (the `(uri, None)` handle key), so a later serving open
+    /// `Serve` resolves the fixed production `HEAD` tag. `Latest` resolves to no version (the
+    /// `(uri, None)` handle key), so a later open
     /// of the same latest handle reads back a prewarmed version and reports `warmed:true`. The
     /// `(uri, None)` handle itself expires after the serve-tag TTL ([`UnpinnedHandleExpiry`]),
     /// so a commit that lands after the open becomes visible within one TTL window.
@@ -344,11 +404,10 @@ impl CachingDatasetProvider {
     /// a serving request pinned by `version_ref` — the open's INTENT is carried separately (see
     /// [`DatasetProvider::dataset_for_prewarm`]), never inferred from the ref. A returned
     /// version of `None` means open the latest manifest.
-    async fn resolve_reference(&self, uri: &str, reference: DatasetRef) -> Result<Option<u64>, SearchError> {
+    async fn resolve_reference(&self, uri: &str, reference: DatasetRef) -> Result<Option<u64>, Arc<lance::Error>> {
         Ok(match reference {
             DatasetRef::Latest => None,
-            DatasetRef::Serve if !self.serve_by_tag => None,
-            DatasetRef::Serve => Some(self.resolve_tag_version(uri, &self.serve_tag).await?),
+            DatasetRef::Serve => Some(self.resolve_tag_version(uri, PRODUCTION_SERVE_TAG).await?),
             DatasetRef::Version(version) => Some(version),
             DatasetRef::Tag(tag) => Some(self.resolve_tag_version(uri, &tag).await?),
         })
@@ -364,7 +423,7 @@ impl CachingDatasetProvider {
     /// Concurrent callers for the same key coalesce onto a single read through the Moka future
     /// cache's `try_get_with`, which runs the loader at most once per key per TTL window. This caps
     /// a fleet-wide simultaneous-expiry burst at one live manifest read per process per tag.
-    async fn resolve_tag_version(&self, uri: &str, tag: &str) -> Result<u64, SearchError> {
+    async fn resolve_tag_version(&self, uri: &str, tag: &str) -> Result<u64, Arc<lance::Error>> {
         let key = (uri.to_string(), tag.to_string());
         self.tag_versions
             .try_get_with(key.clone(), async {
@@ -372,22 +431,21 @@ impl CachingDatasetProvider {
                 let changed = self.last_tag_version.get(&key).await != Some(version);
                 self.metrics.serve_tag_resolved(changed);
                 self.last_tag_version.insert(key.clone(), version).await;
-                Ok::<u64, SearchError>(version)
+                Ok::<u64, lance::Error>(version)
             })
             .await
-            .map_err(|err| (*err).clone())
     }
 
     /// Reads which committed version a tag currently points at by opening at the tag and reporting
     /// the loaded manifest version. The manifest read is cache-served, the tag JSON read is live.
-    async fn read_tag_version(&self, uri: &str, tag: &str) -> Result<u64, SearchError> {
+    async fn read_tag_version(&self, uri: &str, tag: &str) -> Result<u64, lance::Error> {
         let mut builder = DatasetBuilder::from_uri(uri)
             .with_session(self.session.clone())
             .with_tag(tag);
         if let Some(params) = self.store_params.clone() {
             builder = builder.with_store_params(params);
         }
-        let dataset = builder.load().await.map_err(|err| classify_lance_error(&err))?;
+        let dataset = builder.load().await?;
         Ok(dataset.version_id())
     }
 
@@ -415,6 +473,10 @@ struct BuiltCaches {
     store_cache: Option<Arc<MetadataByteCache>>,
     /// The two disk stores for janitor construction. `None` for the redis and memory backends.
     disk_stores: Option<(Arc<DiskEntryStore>, Arc<DiskEntryStore>)>,
+    /// The redis index tier's registry hygiene loop handle. `None` for the disk and memory
+    /// backends. Owned by the provider so it can be aborted on drop instead of leaking for the
+    /// life of the process.
+    registry_hygiene_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl BuiltCaches {
@@ -424,8 +486,40 @@ impl BuiltCaches {
             index_cache: None,
             store_cache: None,
             disk_stores: None,
+            registry_hygiene_task: None,
         }
     }
+}
+
+/// Classifies one raw open failure and records it only when absence is definitive.
+async fn classify_open_failure(
+    negative_opens: &Cache<(String, String), SearchError>,
+    negative_key: (String, String),
+    raw: &lance::Error,
+) -> SearchError {
+    let error = classify_lance_error(raw);
+    if is_definitive_open_absence(raw) {
+        negative_opens.insert(negative_key, error.clone()).await;
+    }
+    error
+}
+
+/// Validates that a catalog route stays inside the deployment-owned storage prefix.
+fn validate_serving_route(base_uri: &str, route: &ServingRoute) -> Result<(), SearchError> {
+    if route.lance_version == 0 {
+        return Err(SearchError::internal("serving catalog contains Lance version zero"));
+    }
+    let allowed_prefix = format!("{}/", base_uri.trim_end_matches('/'));
+    if !route.lance_uri.starts_with(&allowed_prefix)
+        || route.lance_uri[allowed_prefix.len()..]
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(SearchError::internal(
+            "serving catalog URI is outside the allowed base URI",
+        ));
+    }
+    Ok(())
 }
 
 /// Opens the two disk cache tiers under the versioned stamp directory.
@@ -443,6 +537,7 @@ fn build_disk_caches(config: &Config, metrics: Arc<Metrics>) -> std::io::Result<
         index_cache: Some(Arc::new(index_backend)),
         store_cache: Some(Arc::new(store_cache)),
         disk_stores: Some((index_store, metadata_store)),
+        registry_hygiene_task: None,
     })
 }
 
@@ -481,7 +576,8 @@ async fn build_redis_caches(config: &Config, metrics: Arc<Metrics>) -> Result<Bu
         )
         .await?,
     );
-    drop(index_store.spawn_registry_hygiene(Duration::from_secs(crate::config::REDIS_REGISTRY_HYGIENE_SECS)));
+    let registry_hygiene_task =
+        index_store.spawn_registry_hygiene(Duration::from_secs(crate::config::REDIS_REGISTRY_HYGIENE_SECS));
     let index_backend = HybridIndexCacheBackend::new(index_store, config.index_cache_bytes, metrics.clone());
     let store_cache = MetadataByteCache::new(
         metadata_store,
@@ -492,6 +588,7 @@ async fn build_redis_caches(config: &Config, metrics: Arc<Metrics>) -> Result<Bu
         index_cache: Some(Arc::new(index_backend)),
         store_cache: Some(Arc::new(store_cache)),
         disk_stores: None,
+        registry_hygiene_task: Some(registry_hygiene_task),
     })
 }
 
@@ -504,16 +601,13 @@ impl CachingDatasetProvider {
     /// `serve.cold_open` metric) — it is passed explicitly by the two trait entry points
     /// because serving requests can pin the same tag/version references prewarm uses.
     ///
-    /// A NotFound open is negatively cached for a short TTL (`negative_opens`), so a hot loop of
-    /// requests for a nonexistent dataset does not hammer the object store. Transient failures
-    /// are never negatively cached.
+    /// A definitive absent dataset, reference, or version is negatively cached for a short TTL
+    /// (`negative_opens`), so a hot loop does not hammer the object store. Generic missing-object
+    /// and other transient failures are never negatively cached.
     #[tracing::instrument(
         name = "provider.dataset",
         skip_all,
         fields(
-            org_id = %target.org_id,
-            tenant_id = %target.tenant_id,
-            namespace = %target.namespace,
             dataset.version = tracing::field::Empty,
             cache.dataset_handle_hit = tracing::field::Empty,
         )
@@ -523,22 +617,40 @@ impl CachingDatasetProvider {
         target: &DatasetTarget,
         reference: DatasetRef,
         warm_intent: bool,
+        route_override: Option<ServingRoute>,
     ) -> Result<Arc<Dataset>, SearchError> {
         target.validate()?;
         let started = std::time::Instant::now();
-        let uri = self.dataset_uri(target);
-        let negative_key = self.negative_open_key(&uri, &reference);
+        if let Some(route) = &route_override {
+            validate_serving_route(&self.base_uri, route)?;
+        }
+        let catalog_route = if route_override.is_some() {
+            route_override
+        } else if reference == DatasetRef::Serve && self.catalog.is_some() {
+            Some(self.serving_route(target).await?)
+        } else {
+            None
+        };
+        let uri = catalog_route
+            .as_ref()
+            .map(|route| route.lance_uri.clone())
+            .unwrap_or_else(|| self.dataset_uri(target));
+        let negative_key = match &catalog_route {
+            Some(route) => (uri.clone(), format!("version:{}", route.lance_version)),
+            None => self.negative_open_key(&uri, &reference),
+        };
         if let Some(cached) = self.negative_opens.get(&negative_key).await {
             return Err(cached);
         }
-        let version = match self.resolve_reference(&uri, reference).await {
-            Ok(version) => version,
-            Err(err) => {
-                if matches!(err, SearchError::NotFound(_)) {
-                    self.negative_opens.insert(negative_key, err.clone()).await;
+        let version = match catalog_route {
+            Some(route) => Some(route.lance_version),
+            None => match self.resolve_reference(&uri, reference).await {
+                Ok(version) => version,
+                Err(raw) => {
+                    let error = classify_open_failure(&self.negative_opens, negative_key, raw.as_ref()).await;
+                    return Err(error);
                 }
-                return Err(err);
-            }
+            },
         };
         let key = (uri.clone(), version);
         let session = self.session.clone();
@@ -546,7 +658,7 @@ impl CachingDatasetProvider {
         let store_params = self.store_params.clone();
         let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let opened_flag = opened.clone();
-        let result = self
+        let loaded = self
             .datasets
             .try_get_with(key, async move {
                 opened_flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -559,13 +671,11 @@ impl CachingDatasetProvider {
                 }
                 builder.load().await.map(Arc::new)
             })
-            .await
-            .map_err(|err: Arc<lance::Error>| classify_lance_error(err.as_ref()));
-        if let Err(err) = &result
-            && matches!(err, SearchError::NotFound(_))
-        {
-            self.negative_opens.insert(negative_key, err.clone()).await;
-        }
+            .await;
+        let result = match loaded {
+            Ok(dataset) => Ok(dataset),
+            Err(raw) => Err(classify_open_failure(&self.negative_opens, negative_key, raw.as_ref()).await),
+        };
         let cold = opened.load(std::sync::atomic::Ordering::Relaxed);
         tracing::Span::current().record("cache.dataset_handle_hit", !cold);
         self.metrics.cache_lookup(CacheName::Handles, Tier::Memory, !cold);
@@ -584,7 +694,7 @@ impl CachingDatasetProvider {
 impl DatasetProvider for CachingDatasetProvider {
     /// Returns an open dataset handle for a serving open, counting cold-open telemetry.
     async fn dataset(&self, target: &DatasetTarget, reference: DatasetRef) -> Result<Arc<Dataset>, SearchError> {
-        self.open(target, reference, false).await
+        self.open(target, reference, false, None).await
     }
 
     /// Returns an open dataset handle for a prewarm open, recording the warmed version.
@@ -593,7 +703,17 @@ impl DatasetProvider for CachingDatasetProvider {
         target: &DatasetTarget,
         reference: DatasetRef,
     ) -> Result<Arc<Dataset>, SearchError> {
-        self.open(target, reference, true).await
+        self.open(target, reference, true, None).await
+    }
+
+    /// Opens and records one unauthenticated exact candidate route without consulting mutable state.
+    async fn dataset_for_exact_prewarm(
+        &self,
+        target: &DatasetTarget,
+        route: ServingRoute,
+    ) -> Result<Arc<Dataset>, SearchError> {
+        self.open(target, DatasetRef::Version(route.lance_version), true, Some(route))
+            .await
     }
 
     /// Approximate bytes resident in the shared index cache (memory tier plus persistent tier).
@@ -602,5 +722,35 @@ impl DatasetProvider for CachingDatasetProvider {
             .as_ref()
             .map(|backend| backend.approx_size_bytes() as u64)
             .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds the small negative cache used by provenance tests.
+    fn negative_cache() -> Cache<(String, String), SearchError> {
+        Cache::builder().max_capacity(8).build()
+    }
+
+    #[tokio::test]
+    async fn generic_missing_object_does_not_poison_the_negative_cache() {
+        let cache = negative_cache();
+        let key = ("memory://live".to_string(), "version:3".to_string());
+        let raw = lance::Error::not_found("memory://live/_versions/3.manifest");
+        let error = classify_open_failure(&cache, key.clone(), &raw).await;
+        assert!(matches!(error, SearchError::NotFound(_)));
+        assert!(cache.get(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn definitive_dataset_absence_is_recorded_in_the_negative_cache() {
+        let cache = negative_cache();
+        let key = ("memory://absent".to_string(), "latest".to_string());
+        let raw = lance::Error::dataset_not_found("memory://absent", "no manifest".into());
+        let error = classify_open_failure(&cache, key.clone(), &raw).await;
+        assert!(matches!(error, SearchError::NotFound(_)));
+        assert_eq!(cache.get(&key).await, Some(error));
     }
 }

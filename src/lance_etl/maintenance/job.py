@@ -1,10 +1,10 @@
-"""Fleet maintenance job: TTL expiration, unified task-based compaction, and version cleanup.
+"""Fleet maintenance job: retention expiry, unified task-based compaction, and version cleanup.
 
 Owns :class:`MaintenanceConfig`, :class:`MaintenanceJob`, and the three phase functions of the
 unified compaction flow. Every dataset, regardless of size, follows the same
 plan-execute-commit path built on the same Lance APIs:
 
-- Phase P (:func:`plan_one_dataset`): a per-dataset executor fan-out runs the TTL delete, the
+- Phase P (:func:`plan_one_dataset`): a per-dataset executor fan-out runs the retention delete, the
   derived-state skip check, and ``Compaction.plan``, returning serialized rewrite tasks. A
   small dataset yields one task and a large one yields many.
 - Phase E (:meth:`MaintenanceJob.execute_fleet_tasks`): every dataset's rewrite tasks run in
@@ -83,13 +83,29 @@ class MaintenanceConfig:
     Attributes:
         telemetry: Telemetry configuration.
         storage_options: Object-store options forwarded to pylance.
-        ttl_column: Per-row TTL column holding each row's lifetime as an Arrow ``Duration``.
-            ``None`` (default) turns TTL off. When set, rows where
-            ``ts_column + ttl_column < now`` are deleted before compaction.
-        ts_column: Event timestamp column used as the TTL clock; must match ``ETLConfig.ts_col``.
+        retention_seconds: Retention window in seconds derived from the spec revision policy.
+            ``None`` (default) turns record expiry off. When set, rows where
+            ``ts_column < now - retention_seconds`` are deleted before compaction.
+        deleted_column: The boolean tombstone column, or ``None`` (default) for a tombstone-unaware
+            dataset. When set, the retention predicate expires live rows and tombstones on separate
+            clocks: a live row is deleted at ``ts < now - retention_seconds`` as usual, while a
+            tombstone is deleted only once its ``ts`` is past both the record-retention window and
+            the source replay horizon (see :attr:`replay_horizon_seconds`). A tombstone carries the
+            delete mutation's event ``ts`` precisely so it can be expired on this clock. Datasets
+            without a tombstone column leave this ``None`` and keep the plain ``ts < cutoff`` predicate.
+        replay_horizon_seconds: The source replay horizon in seconds. Only consulted when
+            :attr:`deleted_column` is set. A tombstone is expired only when its ``ts`` is older than
+            ``max(retention_seconds, replay_horizon_seconds)`` so its source-sequence anti-resurrection
+            watermark outlives every window a replay could still re-apply. ``None`` means the horizon
+            is unbounded and tombstones are never expired, which keeps replay safe at the cost of
+            unbounded tombstone storage.
+        ts_column: The ``ts`` column used as the retention clock.
         target_rows_per_fragment: Desired rows per compacted fragment; matches lance's
             ``CompactionOptions`` default of ``1_048_576`` so the default is explicit and immune
             to upstream shifts.
+        materialize_deletions: Whether compaction physically removes deleted rows.
+        materialize_deletions_threshold: Deleted-row fraction that makes a fragment eligible.
+        compaction_mode: Lance rewrite strategy, normally ``try_binary_copy`` or ``reencode``.
         defer_index_remap: Defer index remap at commit time through the options passed to
             ``Compaction.commit``.
         max_source_fragments: Cap on source fragments consumed per run for incremental
@@ -103,7 +119,7 @@ class MaintenanceConfig:
             replica mid-scan still holds it. ``None`` defers to lance's 14-day default. Values below
             :data:`MIN_CLEANUP_HORIZON_SECONDS` are rejected.
         retain_versions: Number of recent versions to retain regardless of age.
-        commit_retries: Retry budget for TTL delete commit conflicts.
+        commit_retries: Retry budget for retention delete commit conflicts.
         commit_backoff_seconds: Base backoff between commit retries.
         large_commit_retries: Retry budget around ``Compaction.commit``; kept small because
             semantic conflicts re-fail deterministically and only the raw manifest-write race
@@ -116,19 +132,18 @@ class MaintenanceConfig:
             this run.
         cluster_column: Explicit vector column to cluster on; ``None`` auto-selects the single
             vector-role column from the dataset's stored column roles.
-        cluster_serve_tag: REMOVED behavior, rejected at construction when set. Flipping ``HEAD``
-            right after the clustered rewrite's vector-index rebuild exposed a generation whose
-            scalar and FTS indexes were not rebuilt yet (they are left to the next indexing run),
-            so a text query could see a clustered-but-unindexed generation as the served one.
-            Promotion happens exclusively through the pipeline stamp phase, which runs after the
-            index phase (ADR 0041).
     """
 
     telemetry: TelemetryConfig
     storage_options: dict[str, Any] | None = None
-    ttl_column: str | None = None
-    ts_column: str = "event_timestamp"
+    retention_seconds: int | None = None
+    deleted_column: str | None = None
+    replay_horizon_seconds: int | None = None
+    ts_column: str = "ts"
     target_rows_per_fragment: int = 1_048_576
+    materialize_deletions: bool = True
+    materialize_deletions_threshold: float = MATERIALIZE_DELETIONS_THRESHOLD
+    compaction_mode: str = COMPACTION_MODE
     defer_index_remap: bool = False
     max_source_fragments: int | None = 256
     num_threads: int | None = None
@@ -141,31 +156,15 @@ class MaintenanceConfig:
     cleanup_rotation_cadence_hours: int = 1
     cluster_rewrite: bool = False
     cluster_column: str | None = None
-    cluster_serve_tag: bool = False
 
-    def __post_init__(self) -> None:
-        """Reject configurations that request the removed post-rebuild HEAD flip.
-
-        Raises:
-            ValueError: If ``cluster_serve_tag`` is set. The clustered rewrite never advances any
-                serving tag itself, so a stale ``True`` here would silently serve a
-                text-unindexed generation if honored, or silently not promote if ignored. Failing
-                loudly directs the operator to the pipeline stamp phase, the only promotion path.
-        """
-        if self.cluster_serve_tag:
-            raise ValueError(
-                "cluster_serve_tag was removed: a HEAD flip right after the vector rebuild exposes a generation "
-                "without scalar/FTS indexes. Promote through the pipeline stamp phase instead (ADR 0041)."
-            )
-
-    def ttl_active(self) -> bool:
-        """Report whether the TTL step runs for this configuration.
+    def retention_active(self) -> bool:
+        """Report whether the record-retention step runs for this configuration.
 
         Returns:
-            ``True`` when a per-row TTL column is configured, ``False`` otherwise (the default
+            ``True`` when a retention window is configured, ``False`` otherwise (the default
             no-op).
         """
-        return self.ttl_column is not None
+        return self.retention_seconds is not None
 
     def execute_options(self) -> dict[str, Any]:
         """Build the compaction options dict shared by ``execute``, ``plan``, and ``commit``.
@@ -185,11 +184,11 @@ class MaintenanceConfig:
             raise ValueError("max_source_fragments=0 is not supported; use None to disable the limit")
         candidates: dict[str, Any] = {
             "target_rows_per_fragment": self.target_rows_per_fragment,
-            "materialize_deletions": True,
-            "materialize_deletions_threshold": MATERIALIZE_DELETIONS_THRESHOLD,
+            "materialize_deletions": self.materialize_deletions,
+            "materialize_deletions_threshold": self.materialize_deletions_threshold,
             "max_source_fragments": self.max_source_fragments,
             "num_threads": self.num_threads,
-            "compaction_mode": COMPACTION_MODE,
+            "compaction_mode": self.compaction_mode,
         }
         if self.defer_index_remap:
             candidates["defer_index_remap"] = True
@@ -197,14 +196,13 @@ class MaintenanceConfig:
 
 
 def validate_column_name(column: str, schema: Any) -> None:
-    """Validate that a TTL predicate column exists in the dataset schema.
+    """Validate that a retention predicate column exists in the dataset schema.
 
     Catches silent misconfigurations where the column name was changed but the config was not
     updated, before any predicate is constructed.
 
     Args:
-        column: The column name from :attr:`MaintenanceConfig.ttl_column` or
-            :attr:`MaintenanceConfig.ts_column`.
+        column: The column name from :attr:`MaintenanceConfig.ts_column`.
         schema: The pyarrow schema of the target dataset.
 
     Raises:
@@ -215,14 +213,13 @@ def validate_column_name(column: str, schema: Any) -> None:
         raise KeyError(f"column {column!r} is not present in the dataset schema. Available columns: {column_names}")
 
 
-def build_ttl_predicate(ts_column: str, ttl_column: str, cutoff: datetime) -> str:
-    """Build the Lance SQL delete predicate for per-row TTL expiration.
+def build_retention_predicate(ts_column: str, cutoff: datetime) -> str:
+    """Build the Lance SQL delete predicate for retention-window expiration.
 
     The predicate is
-    ``arrow_cast({ts_column} + {ttl_column}, 'Timestamp(Microsecond, "UTC")') <
+    ``arrow_cast({ts_column}, 'Timestamp(Microsecond, "UTC")') <
     arrow_cast('{iso_cutoff}', 'Timestamp(Microsecond, "UTC")')`` which deletes every row whose
-    event timestamp plus its own lifetime is strictly before the cutoff instant. Lance evaluates
-    the timestamp-plus-duration column arithmetic natively. Both column names have already been
+    ``ts`` is strictly before the retention cutoff instant. The column name has already been
     validated against the dataset schema by :func:`validate_column_name` before this function is
     called.
 
@@ -236,30 +233,100 @@ def build_ttl_predicate(ts_column: str, ttl_column: str, cutoff: datetime) -> st
     UTC wall-clock instant because :attr:`cutoff` is UTC, so attaching UTC on the cast is correct.
 
     Args:
-        ts_column: The validated event timestamp column name.
-        ttl_column: The validated per-row TTL (``Duration``) column name.
-        cutoff: The UTC cutoff instant. Rows whose timestamp plus lifetime is strictly before this
-            are expired.
+        ts_column: The validated ``ts`` column name.
+        cutoff: The UTC cutoff instant. Rows whose ``ts`` is strictly before this are expired.
 
     Returns:
         A Lance SQL predicate string safe for passing to :meth:`lance.LanceDataset.delete`.
     """
     literal: str = cutoff.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")
-    utc_sum: str = f"arrow_cast({ts_column} + {ttl_column}, 'Timestamp(Microsecond, \"UTC\")')"
+    utc_ts: str = f"arrow_cast({ts_column}, 'Timestamp(Microsecond, \"UTC\")')"
     utc_cutoff: str = f"arrow_cast('{literal}', 'Timestamp(Microsecond, \"UTC\")')"
-    return f"{utc_sum} < {utc_cutoff}"
+    return f"{utc_ts} < {utc_cutoff}"
 
 
-def compute_cutoff() -> datetime:
-    """Compute the TTL cutoff as the current instant in UTC.
+def retention_predicate(config: MaintenanceConfig, cutoff: datetime) -> str:
+    """Build the retention delete predicate, tombstone-aware when a deleted column is configured.
 
-    Per-row expiry is decided by each row's own timestamp plus lifetime against this single
-    instant, so the cutoff is simply now in UTC rather than a global ``now - retention`` window.
+    With no :attr:`MaintenanceConfig.deleted_column` the predicate is the plain
+    ``ts < cutoff`` clause. When a deleted column is configured, live rows and tombstones expire
+    on separate clocks:
+
+    - A live row is deleted at ``ts < now - retention_seconds`` exactly as before (ADR 0018).
+    - A tombstone is deleted only when its ``ts`` is older than BOTH the record-retention window
+      AND the source replay horizon, that is ``ts < now - max(retention_seconds,
+      replay_horizon_seconds)``. Since a tombstone carries the delete mutation's event ``ts``, and
+      any window that could resurrect the deleted row carries an older or equal source sequence
+      (hence an equal-or-older event ``ts``), keeping the tombstone until it is past the replay
+      horizon guarantees its source-sequence anti-resurrection watermark outlives every window a
+      replay could still re-apply. The tombstone is therefore always strictly longer-lived than
+      the live row it shadowed.
+
+    Safety is relative, not absolute: the retention clock is the event ``ts`` while the replay
+    horizon is enforced on the control-plane snapshot ingest time (``source_snapshots.created_at``).
+    The bound is exact only under the assumption that event ``ts`` tracks ingest time, which is the
+    same assumption ADR 0018's event-``ts`` live-row retention already relies on. This change does
+    not introduce that divergence, it only makes tombstones at least as protected as the live rows
+    the system already expires.
+
+    When :attr:`MaintenanceConfig.replay_horizon_seconds` is ``None`` the horizon is unbounded and
+    the predicate never matches a tombstone, so tombstones are retained forever rather than risk a
+    premature GC that could resurrect a deleted row.
+
+    Args:
+        config: Maintenance configuration carrying the retention window, optional deleted column,
+            and optional replay horizon.
+        cutoff: The record-retention cutoff instant, ``now - retention_seconds``.
 
     Returns:
-        The current UTC instant.
+        A Lance SQL predicate string safe for passing to :meth:`lance.LanceDataset.delete`.
     """
-    return datetime.now(tz=UTC)
+    validate_retention_seconds(config.retention_seconds)
+    record_clause: str = build_retention_predicate(config.ts_column, cutoff)
+    if config.deleted_column is None:
+        return record_clause
+    live_clause: str = f"(NOT {config.deleted_column} AND {record_clause})"
+    if config.replay_horizon_seconds is None:
+        return live_clause
+    record_seconds: int = int(config.retention_seconds or 0)
+    extra_seconds: int = max(0, config.replay_horizon_seconds - record_seconds)
+    tombstone_cutoff: datetime = cutoff - timedelta(seconds=extra_seconds)
+    tombstone_clause: str = (
+        f"({config.deleted_column} AND {build_retention_predicate(config.ts_column, tombstone_cutoff)})"
+    )
+    return f"({live_clause} OR {tombstone_clause})"
+
+
+def compute_cutoff(retention_seconds: int) -> datetime:
+    """Compute the retention cutoff as ``now - retention_seconds`` in UTC.
+
+    Every row whose ``ts`` is strictly before this instant is expired, so the retention window is
+    applied uniformly against a single wall-clock cutoff.
+
+    Args:
+        retention_seconds: Retention window in seconds from the spec revision policy.
+
+    Returns:
+        The UTC instant marking the oldest ``ts`` that survives.
+
+    Raises:
+        ValueError: If the retention window is not positive.
+    """
+    validate_retention_seconds(retention_seconds)
+    return datetime.now(tz=UTC) - timedelta(seconds=retention_seconds)
+
+
+def validate_retention_seconds(retention_seconds: int | None) -> None:
+    """Reject a configured retention window that can expire current or future rows.
+
+    Args:
+        retention_seconds: Optional retention window.
+
+    Raises:
+        ValueError: If a configured window is zero or negative.
+    """
+    if retention_seconds is not None and retention_seconds <= 0:
+        raise ValueError("retention_seconds must be positive when configured")
 
 
 def dataset_cleanup_slot(uri: str, slots: int) -> int:
@@ -327,40 +394,43 @@ def should_clean_idle(uri: str, config: MaintenanceConfig, cleanup_slot: int | N
     return dataset_cleanup_slot(uri, config.cleanup_rotation_slots) == cleanup_slot
 
 
-def run_ttl_on_open_dataset(
+def run_retention_on_open_dataset(
     dataset: lance.LanceDataset,
     uri: str,
     config: MaintenanceConfig,
     cutoff: datetime,
     telemetry: Telemetry,
 ) -> dict[str, Any]:
-    """Run the TTL delete step against an already-open dataset handle for schema validation.
+    """Run the retention delete step against an already-open dataset handle for schema validation.
 
-    Validates the TTL and timestamp column names against the schema of the supplied open handle,
-    then delegates the actual delete to a re-opening retry action so each commit attempt operates
-    against the latest version (required for rebase correctness). A dataset that lacks the TTL or
-    timestamp column is skipped with a warning and a metric rather than failing the task.
+    Validates the ``ts`` column name against the schema of the supplied open handle, then delegates
+    the actual delete to a re-opening retry action so each commit attempt operates against the
+    latest version (required for rebase correctness). A dataset whose configured ``ts`` or
+    ``deleted`` column is absent from its schema is a genuine contract violation between the
+    supplied :class:`MaintenanceConfig` and the dataset, not benign "nothing to do", so it is
+    reported as a counted failure rather than a silent skip.
 
     Args:
         dataset: An already-open Lance dataset handle used only for schema validation.
         uri: Dataset URI matching the open handle.
-        config: Maintenance configuration with ``ttl_column`` set.
+        config: Maintenance configuration with ``retention_seconds`` set.
         cutoff: The precomputed cutoff instant shared across the run.
         telemetry: Telemetry facade for the current executor process.
 
     Returns:
-        A result dictionary with keys ``uri``, ``ttl_rows_deleted``, and ``skipped``.
+        A result dictionary with keys ``uri``, ``retention_rows_deleted``, and, on a missing
+        configured column, ``error`` and ``phase``.
     """
-    ttl_column: str = config.ttl_column if config.ttl_column is not None else ""
     try:
         validate_column_name(config.ts_column, dataset.schema)
-        validate_column_name(ttl_column, dataset.schema)
+        if config.deleted_column is not None:
+            validate_column_name(config.deleted_column, dataset.schema)
     except KeyError as exc:
-        logger.warning("ttl: TTL column missing in %s, skipping expiration: %s", uri, exc)
-        telemetry.incr("dataset.ttl_column_missing")
-        return {"uri": uri, "ttl_rows_deleted": 0, "skipped": str(exc)}
+        logger.warning("retention: configured column missing in %s, failing retention: %s", uri, exc)
+        telemetry.incr("dataset.retention_column_missing")
+        return {"uri": uri, "retention_rows_deleted": 0, "error": str(exc), "phase": "retention-config"}
 
-    predicate: str = build_ttl_predicate(config.ts_column, ttl_column, cutoff)
+    predicate: str = retention_predicate(config, cutoff)
 
     def action() -> int:
         """Re-open the dataset and execute the delete on the latest version.
@@ -372,17 +442,17 @@ def run_ttl_on_open_dataset(
         delete_result: dict[str, Any] = fresh.delete(predicate, conflict_retries=config.commit_retries)
         return int(delete_result.get("num_deleted_rows", 0))
 
-    with telemetry.timed("dataset.ttl_delete_ms"):
+    with telemetry.timed("dataset.retention_delete_ms"):
         rows_deleted: int = commit_with_retries(
             action,
             config.commit_retries,
             config.commit_backoff_seconds,
-            lambda: telemetry.incr("dataset.ttl_commit_conflict"),
+            lambda: telemetry.incr("dataset.retention_commit_conflict"),
         )
-    telemetry.distribution("dataset.ttl_rows_deleted", float(rows_deleted))
+    telemetry.distribution("dataset.retention_rows_deleted", float(rows_deleted))
     if rows_deleted:
-        telemetry.incr("dataset.ttl_expired")
-    return {"uri": uri, "ttl_rows_deleted": rows_deleted, "skipped": ""}
+        telemetry.incr("dataset.retention_expired")
+    return {"uri": uri, "retention_rows_deleted": rows_deleted}
 
 
 def compaction_metrics_dict(metrics: CompactionMetrics) -> dict[str, int]:
@@ -400,6 +470,24 @@ def compaction_metrics_dict(metrics: CompactionMetrics) -> dict[str, int]:
         "files_removed": metrics.files_removed,
         "files_added": metrics.files_added,
     }
+
+
+def validate_cleanup_horizon(config: MaintenanceConfig) -> None:
+    """Reject cleanup horizons that could race with a concurrent job.
+
+    Args:
+        config: Maintenance configuration carrying the cleanup horizon.
+
+    Raises:
+        ValueError: If ``cleanup_older_than_seconds`` is set below
+            :data:`MIN_CLEANUP_HORIZON_SECONDS`.
+    """
+    cleanup_horizon: int | None = config.cleanup_older_than_seconds
+    if cleanup_horizon is not None and cleanup_horizon < MIN_CLEANUP_HORIZON_SECONDS:
+        raise ValueError(
+            f"cleanup_older_than_seconds={cleanup_horizon} is below the safe floor of "
+            f"{MIN_CLEANUP_HORIZON_SECONDS}; cleanup horizons must exceed the longest concurrent job"
+        )
 
 
 def cleanup_dataset(
@@ -432,21 +520,14 @@ def cleanup_dataset(
             :data:`MIN_CLEANUP_HORIZON_SECONDS`. The horizon must exceed the
             longest-running concurrent job so its rebase can still read old transaction files.
     """
-    if (
-        config.cleanup_older_than_seconds is not None
-        and config.cleanup_older_than_seconds < MIN_CLEANUP_HORIZON_SECONDS
-    ):
-        raise ValueError(
-            f"cleanup_older_than_seconds={config.cleanup_older_than_seconds} is below the safe floor of "
-            f"{MIN_CLEANUP_HORIZON_SECONDS}; cleanup horizons must exceed the longest concurrent job"
-        )
+    validate_cleanup_horizon(config)
     older_than: timedelta | None = (
         timedelta(seconds=config.cleanup_older_than_seconds) if config.cleanup_older_than_seconds is not None else None
     )
     if dataset is None:
         dataset = lance.dataset(uri, storage_options=config.storage_options)
     with telemetry.timed("dataset.cleanup_ms"):
-        stats = dataset.cleanup_old_versions(
+        stats: Any = dataset.cleanup_old_versions(
             older_than=older_than,
             retain_versions=config.retain_versions,
             error_if_tagged_old_versions=False,
@@ -455,6 +536,24 @@ def cleanup_dataset(
     telemetry.distribution("dataset.old_versions_removed", stats.old_versions)
     telemetry.incr("dataset.cleaned")
     return int(stats.bytes_removed)
+
+
+def cleanup_hot_dataset(uri: str, config: MaintenanceConfig, telemetry: Telemetry) -> dict[str, Any]:
+    """Clean versions created by same-run retention work after compaction conflicts exhaust.
+
+    The cleanup opens the latest dataset version on its executor. It does not reuse any handle
+    from a conflicted compaction plan and does not attempt to commit those stale rewrites.
+
+    Args:
+        uri: Dataset URI whose compaction was deferred as hot.
+        config: Maintenance configuration.
+        telemetry: Telemetry facade for the current executor process.
+
+    Returns:
+        A result carrying the dataset URI and reclaimed byte count.
+    """
+    bytes_removed: int = cleanup_dataset(uri, config, telemetry)
+    return {"uri": uri, "bytes_removed": bytes_removed}
 
 
 def compaction_skip_reason(dataset: lance.LanceDataset) -> str | None:
@@ -466,7 +565,7 @@ def compaction_skip_reason(dataset: lance.LanceDataset) -> str | None:
     one fragment has nothing to compact ONLY when it also carries no soft-deletions: Lance's
     planner marks a single fragment as a genuine ``CompactItself`` candidate once its deletion
     fraction exceeds :data:`MATERIALIZE_DELETIONS_THRESHOLD`, so a lone fragment
-    accumulating TTL or merge-insert deletions must still reach ``Compaction.plan`` or its
+    accumulating retention or merge-insert deletions must still reach ``Compaction.plan`` or its
     reclaimable space never gets recovered. The check reads ``dataset.stats.dataset_stats()``,
     which returns ``num_fragments`` and ``num_deleted_rows`` from the in-memory manifest (the
     latter via ``count_deleted_rows()`` over already-loaded deletion-file metadata), so consuming
@@ -505,7 +604,7 @@ def idle_cleanup_bytes(
 ) -> int:
     """Clean an idle dataset's old versions unless the rotation defers it to a later run.
 
-    A dataset that did real work this run (``did_work``, currently a TTL delete) always cleans
+    A dataset that did real work this run (``did_work``, currently a retention delete) always cleans
     regardless of rotation, because its own commit just created reclaimable versions. Otherwise
     the deterministic per-dataset rotation slot from :func:`should_clean_idle` decides, and a
     deferred dataset increments ``dataset.cleanup_rotation_skipped`` so the savings are directly
@@ -516,7 +615,7 @@ def idle_cleanup_bytes(
         config: Maintenance configuration.
         telemetry: Telemetry facade for the current executor process.
         dataset: The already-open dataset handle to reuse for cleanup.
-        did_work: Whether this dataset had rows deleted (TTL) during this run.
+        did_work: Whether this dataset had rows deleted (retention) during this run.
         cleanup_slot: The active rotation slot for this run, or ``None`` to always clean.
 
     Returns:
@@ -535,10 +634,10 @@ def plan_one_dataset(
     telemetry: Telemetry,
     cleanup_slot: int | None = None,
 ) -> dict[str, Any]:
-    """Run phase P for one dataset on an executor: TTL delete, skip check, and compaction plan.
+    """Run phase P for one dataset on an executor: retention delete, skip check, and compaction plan.
 
     Opens the dataset once and reuses that handle for the skip check, the early-exit cleanup, and
-    ``Compaction.plan`` — refreshing it exactly once only when the TTL step committed a delete
+    ``Compaction.plan`` — refreshing it exactly once only when the retention step committed a delete
     (``ttl_rows_deleted > 0``), so the plan sees the rows it must materialize. An idle tiny
     dataset therefore costs one object-store open per maintenance run instead of two, and an
     active one costs one instead of three, which is what keeps a mostly-idle million-dataset
@@ -546,19 +645,21 @@ def plan_one_dataset(
     absorbed by the stale-plan conflict replan in the commit phase.
 
     The two early-exit cleanup calls (the derived-state skip path and the empty-plan path) are
-    gated by :func:`idle_cleanup_bytes`: a dataset that TTL-deleted rows this run
+    gated by :func:`idle_cleanup_bytes`: a dataset that retention-deleted rows this run
     (``did_work``) is always cleaned, and every other idle dataset is cleaned only once per
     ``cleanup_rotation_slots`` runs via its deterministic rotation slot, which is what removes the
     per-run object-store LIST cost for a fleet of mostly-idle datasets. ``cleanup_slot=None`` (the
     default) always cleans, preserving the exact pre-rotation behavior for direct callers such as
     unit tests that do not thread a fleet-wide rotation slot.
 
-    Failure isolation: a missing, corrupt, or unreadable dataset returns a skip dict and never
-    aborts the fleet run. When TTL is active and a cutoff is supplied, expired rows are deleted
-    first because the delete creates compaction work. The derived-state
+    Failure isolation: a missing, corrupt, or unreadable dataset returns a counted ``error`` marker
+    and never aborts the fleet run. When retention is active and a cutoff is supplied, expired rows
+    are deleted first because the delete creates compaction work; a missing configured retention
+    column is likewise a counted ``error`` (a real contract violation), while compaction still
+    proceeds against the same open handle since the dataset itself is readable. The derived-state
     :func:`compaction_skip_reason` check and an empty ``Compaction.plan`` both end the dataset's
-    run early with a cleanup pass. Otherwise the plan's rewrite tasks are serialized for the
-    fleet-wide execute phase.
+    run early with a cleanup pass and a genuine ``skipped`` marker (nothing to compact). Otherwise
+    the plan's rewrite tasks are serialized for the fleet-wide execute phase.
 
     The same function serves every dataset size: a small dataset yields one rewrite task and a
     large one yields many, so no separate in-process compaction path exists.
@@ -566,34 +667,35 @@ def plan_one_dataset(
     Args:
         uri: Dataset URI.
         config: Maintenance configuration.
-        cutoff: TTL cutoff instant, or ``None`` to skip the TTL step (replan rounds pass None so
-            TTL runs exactly once per fleet run).
+        cutoff: retention cutoff instant, or ``None`` to skip the retention step (replan rounds pass None so
+            retention runs exactly once per fleet run).
         telemetry: Telemetry facade for the current executor process.
         cleanup_slot: The active fleet-wide rotation slot for this run, or ``None`` to always
             clean idle datasets (the pre-rotation behavior direct callers rely on).
 
     Returns:
-        A terminal result dict (``skipped`` or ``tasks: 0``), or a planned dict carrying
-        ``read_version`` and ``task_jsons`` for the execute phase.
+        A terminal result dict (``error``, ``skipped``, or ``tasks: 0``), or a planned dict
+        carrying ``read_version`` and ``task_jsons`` for the execute phase.
     """
     try:
         dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
     except (FileNotFoundError, OSError, ValueError) as exc:
-        logger.warning("maintenance: cannot open dataset %s, skipping: %s", uri, exc)
+        logger.warning("maintenance: cannot open dataset %s, failing: %s", uri, exc)
         telemetry.incr("dataset.maintenance_open_error")
-        return {"uri": uri, "skipped": str(exc), "bytes_removed": 0}
+        return {"uri": uri, "error": str(exc), "phase": "open", "bytes_removed": 0}
 
     result: dict[str, Any] = {"uri": uri}
 
-    if config.ttl_active() and cutoff is not None:
-        ttl_result: dict[str, Any] = run_ttl_on_open_dataset(dataset, uri, config, cutoff, telemetry)
-        result["ttl_rows_deleted"] = ttl_result.get("ttl_rows_deleted", 0)
-        if ttl_result.get("skipped"):
-            result["ttl_skipped"] = ttl_result["skipped"]
-        if int(result["ttl_rows_deleted"]) > 0:
+    if config.retention_active() and cutoff is not None:
+        retention_result: dict[str, Any] = run_retention_on_open_dataset(dataset, uri, config, cutoff, telemetry)
+        result["retention_rows_deleted"] = retention_result.get("retention_rows_deleted", 0)
+        if retention_result.get("error"):
+            result["error"] = retention_result["error"]
+            result["phase"] = retention_result.get("phase", "retention-config")
+        if int(result["retention_rows_deleted"]) > 0:
             dataset = lance.dataset(uri, storage_options=config.storage_options)
 
-    did_work: bool = int(result.get("ttl_rows_deleted", 0)) > 0
+    did_work: bool = int(result.get("retention_rows_deleted", 0)) > 0
 
     skip: str | None = compaction_skip_reason(dataset)
     if skip is not None:
@@ -602,7 +704,7 @@ def plan_one_dataset(
         result.update({"skipped": skip, "tasks": 0, "bytes_removed": bytes_removed})
         return result
 
-    plan = Compaction.plan(dataset, options=config.execute_options())
+    plan: Any = Compaction.plan(dataset, options=config.execute_options())
     task_jsons: list[str] = [task.json() for task in plan.tasks]
     if not task_jsons:
         bytes_removed = idle_cleanup_bytes(uri, config, telemetry, dataset, did_work, cleanup_slot)
@@ -696,20 +798,15 @@ def commit_one_dataset(
     return result
 
 
+@dataclass
 class MaintenanceJob:
-    """Runs TTL expiration, unified task-based compaction, and version cleanup over a Lance fleet.
+    """Runs retention expiry, unified task-based compaction, and version cleanup over a Lance fleet.
 
     Also runs the opt-in clustered rewrite (:attr:`MaintenanceConfig.cluster_rewrite`) ahead of
     the plan-execute-commit rounds, subsuming normal compaction for the datasets it rewrites.
     """
 
-    def __init__(self, config: MaintenanceConfig) -> None:
-        """Initialize the maintenance job.
-
-        Args:
-            config: Maintenance configuration.
-        """
-        self.config: MaintenanceConfig = config
+    config: MaintenanceConfig
 
     def execute_fleet_tasks(
         self, spark: SparkSession, tasks: list[tuple[str, int, str]]
@@ -749,6 +846,8 @@ class MaintenanceJob:
                 the rewrite raised, so the driver can isolate the failing dataset.
             """
             try:
+                uri: Any
+                rewrite_json: Any
                 uri, rewrite_json = execute_rewrite_task(item[0], item[1], item[2], storage_options)
                 return FLAT_OK, uri, rewrite_json
             except Exception as exc:
@@ -783,6 +882,8 @@ class MaintenanceJob:
                 One outcome dict per dataset, an error marker when the commit raised.
             """
             executor_telemetry: Telemetry = Telemetry.create(config.telemetry)
+            uri: Any
+            rewrite_jsons: Any
             for uri, rewrite_jsons in items:
                 try:
                     yield commit_one_dataset(uri, rewrite_jsons, config, executor_telemetry)
@@ -808,17 +909,17 @@ class MaintenanceJob:
     ) -> list[str]:
         """Run one plan-execute-commit round over the pending datasets.
 
-        Phase P fans out per dataset (TTL runs only in the first round, so ``cutoff`` is dropped
+        Phase P fans out per dataset (retention runs only in the first round, so ``cutoff`` is dropped
         after it), phase E runs the round's rewrite tasks in one flat Spark job, and phase C fans
         the commits out per dataset. Terminal outcomes land in ``results_by_uri`` and the first
-        round's TTL fields are kept in ``base_by_uri`` so later rounds merge onto them.
+        round's retention fields are kept in ``base_by_uri`` so later rounds merge onto them.
 
         Args:
             spark: Active Spark session.
-            round_index: Zero-based round number, for logging and the TTL first-round gate.
+            round_index: Zero-based round number, for logging and the retention first-round gate.
             pending_uris: Datasets to plan and compact this round.
-            cutoff: The TTL cutoff, applied only when ``round_index`` is zero.
-            base_by_uri: First-round TTL fields per dataset, populated in round zero.
+            cutoff: The retention cutoff, applied only when ``round_index`` is zero.
+            base_by_uri: First-round retention fields per dataset, populated in round zero.
             results_by_uri: Per-dataset terminal outcomes, mutated in place.
             driver_telemetry: The driver's telemetry facade.
             cleanup_slot: The fleet-wide rotation slot active for this run, threaded into
@@ -841,12 +942,19 @@ class MaintenanceJob:
             phase="plan",
         )
         planned: list[dict[str, Any]] = []
+        plan: Any
         for plan in plans:
             uri: str = plan["uri"]
             if round_index == 0:
-                base_by_uri[uri] = {
-                    field: plan[field] for field in ("ttl_rows_deleted", "ttl_skipped") if field in plan
+                round_base: dict[str, Any] = {
+                    field: plan[field] for field in ("retention_rows_deleted", "error", "phase") if field in plan
                 }
+                prior_deleted: int = int(base_by_uri.get(uri, {}).get("retention_rows_deleted", 0))
+                if prior_deleted:
+                    combined_deleted: int = prior_deleted + int(round_base.get("retention_rows_deleted", 0))
+                    round_base["retention_rows_deleted"] = combined_deleted
+                    plan["retention_rows_deleted"] = combined_deleted
+                base_by_uri[uri] = {**base_by_uri.get(uri, {}), **round_base}
             if plan.get("task_jsons"):
                 planned.append(plan)
             else:
@@ -865,6 +973,8 @@ class MaintenanceJob:
             len(flat_tasks),
         )
         with driver_telemetry.timed("run.rewrite_ms"):
+            rewrites_by_uri: Any
+            errors_by_uri: Any
             rewrites_by_uri, errors_by_uri = self.execute_fleet_tasks(spark, flat_tasks)
 
         commit_pairs: list[tuple[str, list[str]]] = []
@@ -882,6 +992,7 @@ class MaintenanceJob:
             commit_pairs.append((planned_uri, rewrites_by_uri.get(planned_uri, [])))
         outcomes: list[dict[str, Any]] = self.commit_fleet(spark, commit_pairs)
         conflicted: list[str] = []
+        outcome: Any
         for outcome in outcomes:
             uri = outcome["uri"]
             if outcome.get("conflict"):
@@ -899,7 +1010,7 @@ class MaintenanceJob:
         the final aggregation and that dataset never enters the plan-execute-commit rounds below;
         only the cluster-ineligible passthrough datasets do, exactly as if clustering were off.
 
-        Round structure: phase P fans out per dataset (TTL runs only in the first round),
+        Round structure: phase P fans out per dataset (retention runs only in the first round),
         phase E runs the whole fleet's rewrite tasks in one flat Spark job, and phase C fans the
         commits out per dataset. Datasets whose commit hit a semantic conflict re-enter the next
         round to be re-planned against the latest version, up to :data:`REPLAN_BUDGET` rounds, after
@@ -913,13 +1024,17 @@ class MaintenanceJob:
         A misconfigured cleanup horizon is the one loud exception: it fails the whole run fast
         before any dataset is touched, because it would otherwise mark every dataset identically.
 
+        Duplicate URIs are maintained once, in first-occurrence order. This prevents two Spark
+        tasks from planning or committing rewrites for the same dataset concurrently within one
+        run.
+
         Args:
             spark: Active Spark session.
             dataset_uris: Datasets to maintain, typically those changed recently.
 
         Returns:
-            One statistics dictionary per dataset, in input order. A failed dataset's dictionary
-            carries an ``"error"`` message and a ``"phase"`` label.
+            One statistics dictionary per unique dataset, in first-occurrence order. A failed
+            dataset's dictionary carries an ``"error"`` message and a ``"phase"`` label.
 
         Raises:
             ValueError: If ``cleanup_older_than_seconds`` is set below
@@ -927,23 +1042,17 @@ class MaintenanceJob:
                 whole run rather than mark every dataset with the same error.
         """
         config: MaintenanceConfig = self.config
-        if (
-            config.cleanup_older_than_seconds is not None
-            and config.cleanup_older_than_seconds < MIN_CLEANUP_HORIZON_SECONDS
-        ):
-            raise ValueError(
-                f"cleanup_older_than_seconds={config.cleanup_older_than_seconds} is below the safe floor of "
-                f"{MIN_CLEANUP_HORIZON_SECONDS}; cleanup horizons must exceed the longest concurrent job"
-            )
+        validate_retention_seconds(config.retention_seconds)
+        validate_cleanup_horizon(config)
         driver_telemetry: Telemetry = Telemetry.create(config.telemetry)
         with driver_telemetry.span("lance.maintenance.run") as run_span:
-            uris: list[str] = list(dataset_uris)
+            uris: list[str] = list(dict.fromkeys(dataset_uris))
             run_span.set_tag("dataset_count", len(uris))
-            run_span.set_tag("ttl_active", config.ttl_active())
+            run_span.set_tag("retention_active", config.retention_active())
             if not uris:
                 return []
 
-            cutoff: datetime | None = compute_cutoff() if config.ttl_active() else None
+            cutoff: datetime | None = compute_cutoff(config.retention_seconds) if config.retention_active() else None
             cleanup_slot: int = active_cleanup_slot(config, datetime.now(tz=UTC))
             driver_telemetry.gauge("run.cleanup_slot", cleanup_slot)
             results_by_uri: dict[str, dict[str, Any]] = {}
@@ -951,12 +1060,21 @@ class MaintenanceJob:
             pending_uris: list[str] = uris
 
             if config.cluster_rewrite:
+                cluster_results: Any
                 cluster_results, pending_uris = maintenance_cluster.run_cluster_rewrites(
                     spark, uris, config, cutoff, driver_telemetry, cleanup_slot
                 )
                 results_by_uri.update(cluster_results)
+                base_by_uri.update(
+                    {
+                        uri: {"retention_rows_deleted": cluster_results[uri]["retention_rows_deleted"]}
+                        for uri in pending_uris
+                        if int(cluster_results.get(uri, {}).get("retention_rows_deleted", 0)) > 0
+                    }
+                )
 
             with driver_telemetry.timed("run.maintain_ms"):
+                round_index: Any
                 for round_index in range(REPLAN_BUDGET):
                     pending_uris = self.run_round(
                         spark,
@@ -971,6 +1089,23 @@ class MaintenanceJob:
                     if not pending_uris:
                         break
 
+            did_work_hot_uris: list[str] = [
+                uri for uri in pending_uris if int(base_by_uri.get(uri, {}).get("retention_rows_deleted", 0)) > 0
+            ]
+            cleanup_partitions: int = derive_partitions(spark, FANOUT_PARTITION_FACTOR)
+            hot_cleanup_outcomes: list[dict[str, Any]] = fan_out_per_dataset(
+                spark,
+                did_work_hot_uris,
+                config.telemetry,
+                lambda uri, telemetry: cleanup_hot_dataset(uri, config, telemetry),
+                cleanup_partitions,
+                phase="cleanup",
+            )
+            hot_cleanup_by_uri: dict[str, dict[str, Any]] = {
+                str(outcome["uri"]): outcome for outcome in hot_cleanup_outcomes
+            }
+
+            uri: Any
             for uri in pending_uris:
                 driver_telemetry.incr("dataset.hot_skipped")
                 logger.warning(
@@ -978,22 +1113,24 @@ class MaintenanceJob:
                     uri,
                     REPLAN_BUDGET,
                 )
+                cleanup_outcome: dict[str, Any] = hot_cleanup_by_uri.get(uri, {})
                 results_by_uri[uri] = {
                     **base_by_uri.get(uri, {}),
+                    **cleanup_outcome,
                     "uri": uri,
-                    "bytes_removed": 0,
+                    "bytes_removed": int(cleanup_outcome.get("bytes_removed", 0)),
                     "skipped": f"commit conflicted in all {REPLAN_BUDGET} re-plan rounds",
                 }
 
             results: list[dict[str, Any]] = [results_by_uri[uri] for uri in uris]
 
-            if config.ttl_active():
-                rows_deleted: int = sum(int(item.get("ttl_rows_deleted", 0)) for item in results)
-                datasets_expired: int = sum(1 for item in results if int(item.get("ttl_rows_deleted", 0)) > 0)
-                run_span.set_tag("ttl_rows_deleted", rows_deleted)
-                driver_telemetry.gauge("run.ttl_rows_deleted", rows_deleted)
-                driver_telemetry.gauge("run.ttl_datasets_expired", datasets_expired)
-                logger.info("ttl: %d datasets expired, %d rows deleted", datasets_expired, rows_deleted)
+            if config.retention_active():
+                rows_deleted: int = sum(int(item.get("retention_rows_deleted", 0)) for item in results)
+                datasets_expired: int = sum(1 for item in results if int(item.get("retention_rows_deleted", 0)) > 0)
+                run_span.set_tag("retention_rows_deleted", rows_deleted)
+                driver_telemetry.gauge("run.retention_rows_deleted", rows_deleted)
+                driver_telemetry.gauge("run.retention_datasets_expired", datasets_expired)
+                logger.info("retention: %d datasets expired, %d rows deleted", datasets_expired, rows_deleted)
 
             bytes_removed: int = sum(int(item.get("bytes_removed", 0)) for item in results)
             fragments_removed: int = sum(int(item.get("fragments_removed", 0)) for item in results)

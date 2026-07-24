@@ -4,46 +4,53 @@ use crate::domain::SearchError;
 
 /// Generic client-facing message for an unclassified Lance failure.
 ///
-/// The raw Lance error (which can carry object-store paths, schema detail, or other internal
-/// state) is logged server-side via `tracing::error!` at the call site instead of being forwarded
-/// to the client, so a caller never sees more than "an internal error occurred."
+/// Raw Lance errors can carry object-store paths, schema detail, or other private state, so only
+/// a closed error class is logged and clients receive this bounded message.
 const GENERIC_INTERNAL_MESSAGE: &str = "an internal error occurred while executing the request";
 
 /// Client-facing message for a missing dataset.
 ///
 /// Lance's `DatasetNotFound` display includes the full dataset URI (bucket, org, tenant paths),
-/// which must never reach a client. The full error is logged server-side instead, and the RPC
-/// failure log already carries the dataset target triplet for correlation.
+/// which must never reach either clients or normal telemetry.
 const DATASET_NOT_FOUND_MESSAGE: &str = "Dataset not found";
 
 /// Client-facing message for a missing non-dataset resource.
 ///
 /// Lance's generic `NotFound` display also embeds the object URI, so it gets the same
-/// log-full-return-sanitized treatment as `DatasetNotFound`.
+/// bounded-class logging treatment as `DatasetNotFound`.
 const RESOURCE_NOT_FOUND_MESSAGE: &str = "a required resource was not found";
 
 /// Client-facing message for an engine-internal timeout.
 const ENGINE_TIMEOUT_MESSAGE: &str = "the storage engine timed out executing the request";
 
+/// Returns whether a failed dataset open proves the selected dataset, reference, or version is
+/// absent rather than exposing a transient missing object inside an otherwise live dataset.
+pub fn is_definitive_open_absence(err: &lance::Error) -> bool {
+    matches!(
+        err,
+        lance::Error::DatasetNotFound { .. } | lance::Error::RefNotFound { .. } | lance::Error::VersionNotFound { .. }
+    )
+}
+
 /// Classifies a Lance error by reference into the closest domain error.
 ///
 /// Not-found conditions map to [`SearchError::NotFound`]: `DatasetNotFound` and `NotFound` carry
-/// object-store URIs in their display form, so they are logged in full server-side and returned
-/// with a sanitized message, while `RefNotFound` and `VersionNotFound` messages only echo the
+/// object-store URIs in their display form, so only their closed class is logged and they are
+/// returned with a sanitized message, while `RefNotFound` and `VersionNotFound` messages echo the
 /// client-supplied tag or version and are forwarded as-is. `InvalidInput`/`IndexNotFound` carry
 /// client-safe detail and are forwarded as [`SearchError::InvalidArgument`]. `Timeout` becomes a
 /// retriable [`SearchError::Unavailable`] with a generic message. Every other Lance error is
-/// logged in full server-side (`tracing::error!`) and mapped to a generic
+/// logged by closed class and mapped to a generic
 /// [`SearchError::Internal`] message, so internal engine detail never reaches a client through
 /// the gRPC status.
 pub fn classify_lance_error(err: &lance::Error) -> SearchError {
     match err {
         lance::Error::DatasetNotFound { .. } => {
-            tracing::warn!(error = %err, "dataset not found");
+            tracing::warn!(error_class = "dataset_not_found", "lance request failed");
             SearchError::not_found(DATASET_NOT_FOUND_MESSAGE)
         }
         lance::Error::NotFound { .. } => {
-            tracing::warn!(error = %err, "resource not found");
+            tracing::warn!(error_class = "resource_not_found", "lance request failed");
             SearchError::not_found(RESOURCE_NOT_FOUND_MESSAGE)
         }
         lance::Error::RefNotFound { .. } | lance::Error::VersionNotFound { .. } => {
@@ -53,11 +60,11 @@ pub fn classify_lance_error(err: &lance::Error) -> SearchError {
             SearchError::invalid_argument(err.to_string())
         }
         lance::Error::Timeout { .. } => {
-            tracing::warn!(error = %err, "lance operation timed out");
+            tracing::warn!(error_class = "timeout", "lance request failed");
             SearchError::unavailable(ENGINE_TIMEOUT_MESSAGE)
         }
-        other => {
-            tracing::error!(error = %other, "unclassified lance error");
+        _ => {
+            tracing::error!(error_class = "internal", "lance request failed");
             SearchError::internal(GENERIC_INTERNAL_MESSAGE)
         }
     }
@@ -65,7 +72,64 @@ pub fn classify_lance_error(err: &lance::Error) -> SearchError {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+
+    /// Process-global no-op subscriber that keeps every callsite dynamically interested.
+    ///
+    /// A callsite first touched while no admitting subscriber is installed (a sibling test calling
+    /// [`classify_lance_error`] without one) can cache its interest as `never`, which permanently
+    /// suppresses that event for any later scoped capture subscriber. Registering a global default
+    /// whose `register_callsite` returns [`Interest::sometimes`] forces per-event evaluation against
+    /// the currently active dispatcher, so a subsequent
+    /// [`rebuild_interest_cache`](tracing::callsite::rebuild_interest_cache) lifts any stale `never`
+    /// and the scoped capture subscriber sees the events. It emits nothing itself.
+    struct AlwaysInterestedSubscriber;
+
+    impl tracing::Subscriber for AlwaysInterestedSubscriber {
+        fn register_callsite(&self, _: &tracing::Metadata<'_>) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {}
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Cloneable writer collecting one subscriber's formatted events.
+    ///
+    /// Subscribers writing here must disable ANSI styling (`with_ansi(false)`): the default fmt
+    /// layer wraps `field=value` pairs in escape codes, which splits substrings such as
+    /// `error_class="internal"` and defeats a `contains` assertion.
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn unclassified_errors_are_generic_and_do_not_leak_internal_detail() {
@@ -114,6 +178,22 @@ mod tests {
     }
 
     #[test]
+    fn only_dataset_reference_and_version_absence_are_definitive_open_misses() {
+        let dataset = lance::Error::dataset_not_found("memory://missing", "no manifest".into());
+        let reference = lance::Error::RefNotFound {
+            message: "tag HEAD does not exist".to_string(),
+        };
+        let version = lance::Error::VersionNotFound {
+            message: "version 17 does not exist".to_string(),
+        };
+        let transient_object = lance::Error::not_found("memory://live/_versions/17.manifest");
+        assert!(is_definitive_open_absence(&dataset));
+        assert!(is_definitive_open_absence(&reference));
+        assert!(is_definitive_open_absence(&version));
+        assert!(!is_definitive_open_absence(&transient_object));
+    }
+
+    #[test]
     fn ref_and_version_not_found_are_not_found_with_client_safe_detail() {
         let raw = lance::Error::RefNotFound {
             message: "tag 20260611T120000Z does not exist".to_string(),
@@ -145,5 +225,35 @@ mod tests {
             }
             other => panic!("expected unavailable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn emitted_logs_never_contain_raw_uri_or_engine_detail() {
+        let tracing_guard = crate::telemetry::TRACING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = tracing::subscriber::set_global_default(AlwaysInterestedSubscriber);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = CaptureWriter(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            classify_lance_error(&lance::Error::dataset_not_found(
+                "s3://secret-bucket/private-target.lance",
+                "private detail".into(),
+            ));
+            classify_lance_error(&lance::Error::internal(
+                "corrupt s3://secret-bucket/private-target.lance",
+            ));
+        });
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("dataset_not_found"));
+        assert!(output.contains("error_class=\"internal\""));
+        assert!(!output.contains("secret-bucket"));
+        assert!(!output.contains("private detail"));
+        drop(tracing_guard);
     }
 }

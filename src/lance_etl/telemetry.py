@@ -39,10 +39,10 @@ except ImportError:
 logger: logging.Logger = logging.getLogger(__name__)
 
 DEFAULT_CONFLICT_RETRIES: int = 10
-"""Conflict-retry budget for the ETL ``merge_insert`` / ``delete`` commit loop.
+"""Conflict-retry budget for the replay-safe ETL merge commit loop.
 
 Mirrors Lance's own ``merge_insert`` ``conflict_retries`` so the strictly-additive Python wrapper never thins the
-inner budget. Shared by :class:`lance_etl.etl.ETLConfig` rather than duplicated as a literal.
+inner budget.
 """
 
 DEFAULT_RETRY_TIMEOUT: timedelta = timedelta(seconds=120)
@@ -52,13 +52,13 @@ Raised above the 30-second Lance default to give headroom on hot multi-tenant da
 """
 
 DEFAULT_COMMIT_RETRIES: int = 20
-"""Conflict-retry budget for index commits and the per-row TTL-delete commit.
+"""Conflict-retry budget for index commits and the retention-delete commit.
 
 This is the single home for the budget that was duplicated across :class:`lance_etl.indexing.IndexJobConfig` and
 :class:`lance_etl.maintenance.MaintenanceConfig`. It sizes the only retry layer the binding-less segment-index
-commits and the TTL ``delete`` commit have. The fleet ``Compaction.commit`` call is a separate, smaller layer sized by
-:data:`DEFAULT_LARGE_COMMIT_RETRIES` instead, because its conflict scan is pinned to the plan version so a semantic
-conflict re-fails deterministically and only the raw manifest-write race benefits from a retry.
+commits and the retention ``delete`` commit have. The fleet ``Compaction.commit`` call is a separate, smaller layer
+sized by :data:`DEFAULT_LARGE_COMMIT_RETRIES` instead, because its conflict scan is pinned to the plan version so a
+semantic conflict re-fails deterministically and only the raw manifest-write race benefits from a retry.
 """
 
 DEFAULT_LARGE_COMMIT_RETRIES: int = 2
@@ -306,17 +306,11 @@ def attach_lance_event_bridge(telemetry: Telemetry) -> bool:
     return True
 
 
+@dataclass(eq=False)
 class TraceContextFilter(logging.Filter):
     """Logging filter that injects the active Datadog trace and span ids."""
 
-    def __init__(self, tracer: object) -> None:
-        """Initialize the filter.
-
-        Args:
-            tracer: The ddtrace tracer to read the active context from.
-        """
-        super().__init__()
-        self.tracer: object = tracer
+    tracer: object
 
     def filter(self, record: logging.LogRecord) -> bool:
         """Attach ``dd_trace_id`` and ``dd_span_id`` to the record.
@@ -353,20 +347,13 @@ def configure_logging(config: TelemetryConfig, level: int = logging.INFO) -> Non
     root.setLevel(level)
 
 
+@dataclass
 class Telemetry:
     """Thin facade over the ddtrace tracer and a DogStatsD client."""
 
-    def __init__(self, config: TelemetryConfig, statsd: DogStatsd, tracer: object) -> None:
-        """Initialize the facade.
-
-        Args:
-            config: Telemetry configuration.
-            statsd: A configured DogStatsD client.
-            tracer: The ddtrace tracer.
-        """
-        self.config: TelemetryConfig = config
-        self.statsd: DogStatsd = statsd
-        self.tracer: object = tracer
+    config: TelemetryConfig
+    statsd: DogStatsd
+    tracer: object
 
     @classmethod
     def create(cls, config: TelemetryConfig, attach_lance_bridge: bool = True) -> Telemetry:

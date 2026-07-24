@@ -5,7 +5,7 @@ multiset preservation, non-decreasing partition ids across fragment order, survi
 an identically-centroided rebuilt vector index, and true nearest-neighbor correctness against a
 brute-force numpy check), null-vector rows landing in the tail region, the derived-state skip (a
 second run over an unwritten dataset is a cheap no-op and a post-rewrite write re-enables
-eligibility), the removed cluster_serve_tag knob being rejected at construction, and per-dataset
+eligibility), the internal-only production-disabled configuration, and per-dataset
 failure isolation at the rebuild-commit, rewrite-read, and segment-build phases that keeps every
 healthy dataset clustering and every poisoned dataset intact while the run never raises.
 """
@@ -13,22 +13,33 @@ healthy dataset clustering and every poisoned dataset intact while the run never
 from __future__ import annotations
 
 import json
+import os
 import random
+import sys
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import lance
 import numpy as np
 import pyarrow as pa
 import pytest
 from conftest import FakeSpark, make_vector_table, write_fragmented_dataset
+from pyspark.sql import SparkSession
 
 from lance_etl.column_roles import COLUMN_ROLES_KEY, VECTOR_ROLE, merge_column_roles
+from lance_etl.fanout import count_failed
 from lance_etl.indexing import IndexJobConfig, bootstrap_vector_index, load_vector_config, plan_dataset_indexes
 from lance_etl.maintenance import MaintenanceConfig, MaintenanceJob, plan_cluster_rewrite
 from lance_etl.maintenance import cluster as cluster_module
 from lance_etl.maintenance import job as maintenance_job_module
-from lance_etl.maintenance.cli import count_failed
-from lance_etl.maintenance.cluster import centroids_to_matrix, commit_cluster_overwrite, partition_ids_for_batch
+from lance_etl.maintenance.cluster import (
+    ClusterRunState,
+    centroids_to_matrix,
+    commit_cluster_overwrite,
+    partition_ids_for_batch,
+)
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
 ROWS: int = 512
@@ -40,6 +51,27 @@ CLUSTER_TARGET_ROWS_PER_FRAGMENT: int = 80
 several fragments instead of one, since cluster_max_rows_per_file was removed and the rewrite now
 always sizes its output fragments off target_rows_per_fragment."""
 INDEX_NAME: str = "vector_idx"
+
+
+@pytest.fixture(scope="module")
+def cluster_spark() -> Iterator[SparkSession]:
+    """Provide a two-core local Spark session pinned to the test interpreter.
+
+    Yields:
+        A local Spark session with a small deterministic shuffle width.
+    """
+    os.environ["PYSPARK_PYTHON"] = sys.executable
+    os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+    session: SparkSession = (
+        SparkSession.builder.master("local[2]")
+        .appName("lance-etl-cluster-rewrite-tests")
+        .config("spark.sql.shuffle.partitions", "4")
+        .config("spark.sql.session.timeZone", "UTC")
+        .config("spark.ui.enabled", "false")
+        .getOrCreate()
+    )
+    yield session
+    session.stop()
 
 
 def vector_index_config(**overrides: object) -> IndexJobConfig:
@@ -164,7 +196,7 @@ def assert_pids_non_decreasing_across_fragments(
 
     Recomputes each row's partition id from the pre-rewrite centroids (independent of whatever the
     rewrite itself computed) and walks the dataset's fragments in order, so a passing assertion
-    proves the global sort by partition id survived the write-fragments split into files.
+    proves global partition-range ordering survived the write-fragments split into files.
 
     Args:
         dataset: The post-rewrite dataset handle.
@@ -177,6 +209,7 @@ def assert_pids_non_decreasing_across_fragments(
         table: pa.Table = dataset.scanner(columns=["vector"], fragments=[fragment]).to_table()
         vectors: pa.FixedSizeListArray = table.column("vector").combine_chunks()
         pids: np.ndarray = partition_ids_for_batch(vectors, centroids, distance_type, num_partitions)
+        assert np.all(pids[:-1] <= pids[1:]), "partition ids regress within one rewritten fragment"
         assert int(pids.min()) >= running_max, "a fragment's partition ids regressed against the previous fragment"
         running_max = int(pids.max())
 
@@ -247,6 +280,39 @@ def test_cluster_rewrite_end_to_end_preserves_and_reindexes(tmp_path: Path, tele
         nearest={"column": "vector", "q": query, "k": 1, "nprobes": NUM_PARTITIONS, "refine_factor": ROWS},
     )
     assert nearest["id"][0].as_py() == expected_id
+
+
+@pytest.mark.integration
+def test_cluster_rewrite_runs_on_real_local_spark(
+    cluster_spark: SparkSession,
+    tmp_path: Path,
+    telemetry: Telemetry,
+) -> None:
+    """The clustered phase graph serializes and executes correctly on real local Spark.
+
+    Args:
+        cluster_spark: Two-core local Spark session.
+        tmp_path: Isolated dataset root.
+        telemetry: Driver telemetry fixture.
+    """
+    rows: int = 128
+    uri: str = str(tmp_path / "cluster_real_spark.lance")
+    build_cluster_ready_dataset(uri, rows, DIM, telemetry)
+    before: lance.LanceDataset = lance.dataset(uri)
+    before_ids: set[int] = set(before.to_table(columns=["id"])["id"].to_pylist())
+    centroids: np.ndarray = centroids_to_matrix(before.get_ivf_model(INDEX_NAME).centroids)
+
+    results: list[dict[str, object]] = MaintenanceJob(cluster_config(target_rows_per_fragment=24)).run(
+        cluster_spark, [uri]
+    )
+
+    assert len(results) == 1
+    assert "error" not in results[0]
+    assert results[0]["clustered"] is True
+    after: lance.LanceDataset = lance.dataset(uri)
+    assert set(after.to_table(columns=["id"])["id"].to_pylist()) == before_ids
+    assert INDEX_NAME in {description.name for description in after.describe_indices()}
+    assert_pids_non_decreasing_across_fragments(after, centroids, "l2")
 
 
 def test_null_vector_rows_placed_in_tail(tmp_path: Path, telemetry: Telemetry) -> None:
@@ -336,12 +402,6 @@ def test_write_after_cluster_reenables_eligibility(tmp_path: Path, telemetry: Te
     assert_pids_non_decreasing_across_fragments(post_dataset, pre_centroids, "l2")
 
 
-def test_cluster_serve_tag_rejected_at_construction() -> None:
-    """The removed cluster_serve_tag knob fails loudly instead of silently mis-promoting."""
-    with pytest.raises(ValueError, match="cluster_serve_tag"):
-        MaintenanceConfig(telemetry=TelemetryConfig(), cluster_rewrite=True, cluster_serve_tag=True)
-
-
 def test_already_clustered_dataset_not_passed_to_normal_compaction(tmp_path: Path, telemetry: Telemetry) -> None:
     """A generation-stamped dataset is terminal-skipped, never compacted back toward insertion order."""
     uri: str = str(tmp_path / "cluster_no_compact.lance")
@@ -385,6 +445,48 @@ def test_rebuild_failure_is_isolated_and_data_intact(
     assert set(post_dataset.to_table(columns=["id"]).column("id").to_pylist()) == pre_ids
     names: set[str] = {description.name for description in post_dataset.describe_indices()}
     assert INDEX_NAME not in names
+    assert cluster_module.CLUSTER_GENERATION_KEY not in post_dataset.config()
+
+
+def test_stamp_failure_after_overwrite_still_rebuilds_index(
+    tmp_path: Path,
+    telemetry: Telemetry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed derived stamp cannot strand a committed overwrite without its vector index.
+
+    Args:
+        tmp_path: Isolated dataset root.
+        telemetry: Telemetry facade fixture.
+        monkeypatch: Scoped generation-stamp failure injection.
+    """
+    uri: str = str(tmp_path / "cluster_stamp_failure.lance")
+    build_cluster_ready_dataset(uri, ROWS, DIM, telemetry)
+    stamp_attempts: list[int] = []
+
+    def fail_stamp(*args: object, **kwargs: object) -> None:
+        """Fail every generation-stamp attempt after the data commit.
+
+        Args:
+            *args: Ignored positional arguments.
+            **kwargs: Ignored keyword arguments.
+        """
+        del args, kwargs
+        stamp_attempts.append(1)
+        raise RuntimeError("simulated generation stamp failure")
+
+    monkeypatch.setattr(cluster_module, "stamp_cluster_generation", fail_stamp)
+
+    results: list[dict[str, object]] = MaintenanceJob(cluster_config()).run(FakeSpark(), [uri])
+
+    assert len(results) == 1
+    assert results[0]["clustered"] is True
+    assert results[0]["phase"] == "cluster_stamp"
+    assert results[0]["error"] == "simulated generation stamp failure"
+    assert len(stamp_attempts) == 1
+    dataset: lance.LanceDataset = lance.dataset(uri)
+    assert INDEX_NAME in {description.name for description in dataset.describe_indices()}
+    assert cluster_module.CLUSTER_GENERATION_KEY not in dataset.config()
 
 
 def test_read_task_failure_is_isolated_per_dataset(
@@ -400,7 +502,7 @@ def test_read_task_failure_is_isolated_per_dataset(
 
     real_read = cluster_module.read_rewrite_chunks
 
-    def failing_read(uri: str, *args: object, **kwargs: object) -> list[tuple[int, bytes]]:
+    def failing_read(uri: str, *args: object, **kwargs: object) -> Iterator[tuple[int, bytes]]:
         """Fail every read task of the poisoned dataset while the healthy dataset reads normally."""
         if uri == poisoned_uri:
             raise RuntimeError("simulated read failure")
@@ -429,6 +531,57 @@ def test_read_task_failure_is_isolated_per_dataset(
     assert healthy["clustered"] is True
     healthy_names: set[str] = {description.name for description in lance.dataset(healthy_uri).describe_indices()}
     assert INDEX_NAME in healthy_names
+
+
+def test_rewrite_error_blocks_commit_even_when_emitted_rows_match(telemetry: Telemetry) -> None:
+    """A late read failure cannot pass validation only because its earlier chunks covered every row.
+
+    Args:
+        telemetry: Driver telemetry fixture.
+    """
+    results: dict[str, dict[str, Any]] = {}
+    state: ClusterRunState = ClusterRunState(FakeSpark(), cluster_config(), telemetry, results, [])
+    plans: list[dict[str, Any]] = [{"uri": "memory://broken.lance", "total_rows": 3}]
+    collected: list[tuple[Any, ...]] = [
+        (cluster_module.REWRITE_OK, "memory://broken.lance", 0, 0, "fragment", 3),
+        (cluster_module.REWRITE_ERROR, "memory://broken.lance", "late scanner failure"),
+    ]
+
+    documents: dict[str, list[str]] = state.validate_rewrite(plans, collected)
+
+    assert documents == {}
+    assert results["memory://broken.lance"]["error"] == "late scanner failure"
+
+
+def test_rewrite_reader_yields_bounded_chunks_incrementally(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A shard reader emits IPC chunks instead of retaining its full serialized output.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        monkeypatch: Pytest monkeypatch used to force an immediate soft-cap flush.
+    """
+    uri: str = str(tmp_path / "cluster_streamed_read.lance")
+    write_fragmented_dataset(uri, make_vector_table(rows=32, dim=DIM), max_rows_per_file=8)
+    dataset: lance.LanceDataset = lance.dataset(uri)
+    fragment_ids: list[int] = [fragment.fragment_id for fragment in dataset.get_fragments()]
+    centroid: pa.Array = pa.array([[0.0] * DIM], pa.list_(pa.float32(), DIM))
+    monkeypatch.setattr(cluster_module, "SHUFFLE_CHUNK_BYTES", 1)
+
+    chunks: Iterator[tuple[tuple[int, int], bytes]] = cluster_module.read_rewrite_chunks(
+        uri,
+        dataset.version,
+        fragment_ids,
+        "vector",
+        cluster_module.encode_centroids(centroid),
+        "l2",
+        [(0, 0, 0, 0, 1)],
+        None,
+    )
+    first: tuple[tuple[int, int], bytes] = next(chunks)
+    emitted: list[tuple[tuple[int, int], bytes]] = [first, *chunks]
+
+    assert {entry[0] for entry in emitted} == {(0, 0)}
+    assert sum(cluster_module.table_from_ipc(entry[1]).num_rows for entry in emitted) == 32
 
 
 def test_segment_build_failure_is_isolated_per_dataset(
@@ -496,6 +649,184 @@ def test_commit_cluster_overwrite_preserves_config(tmp_path: Path, telemetry: Te
     refreshed: lance.LanceDataset = lance.dataset(uri)
     assert refreshed.count_rows() == 64
     assert refreshed.config().get(COLUMN_ROLES_KEY) is not None
+
+
+def test_commit_cluster_overwrite_refuses_post_plan_append(tmp_path: Path, telemetry: Telemetry) -> None:
+    """A clustered overwrite cannot silently discard a write committed after its scan.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        telemetry: The telemetry facade fixture.
+    """
+    uri: str = str(tmp_path / "cluster_concurrent_append.lance")
+    table: pa.Table = make_vector_table(rows=64, dim=DIM)
+    lance.write_dataset(table, uri, max_rows_per_file=16)
+    planned: lance.LanceDataset = lance.dataset(uri)
+    metadatas = lance.fragment.write_fragments(
+        planned.to_table().to_reader(),
+        uri,
+        schema=planned.schema,
+        mode="overwrite",
+        data_storage_version="2.1",
+    )
+    fragment_documents: list[str] = [json.dumps(metadata.to_json()) for metadata in metadatas]
+
+    appended: pa.Table = make_vector_table(rows=1, dim=DIM, seed=91).set_column(0, "id", pa.array([64], pa.int64()))
+    lance.write_dataset(appended, uri, mode="append")
+    config: MaintenanceConfig = MaintenanceConfig(
+        telemetry=TelemetryConfig(), commit_backoff_seconds=0.0, large_commit_retries=2
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to overwrite concurrent writes"):
+        commit_cluster_overwrite(
+            uri,
+            fragment_documents,
+            planned.schema,
+            config,
+            telemetry,
+            read_version=planned.version,
+        )
+
+    current: lance.LanceDataset = lance.dataset(uri)
+    assert current.count_rows() == 65
+    assert 64 in current.to_table(columns=["id"])["id"].to_pylist()
+
+
+def test_commit_cluster_overwrite_refuses_append_in_commit_gap(
+    tmp_path: Path,
+    telemetry: Telemetry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lance cannot internally rebase an overwrite across the final version-check gap.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        telemetry: The telemetry facade fixture.
+        monkeypatch: Scoped Lance commit race injection.
+    """
+    uri: str = str(tmp_path / "cluster_commit_gap.lance")
+    table: pa.Table = make_vector_table(rows=64, dim=DIM)
+    lance.write_dataset(table, uri, max_rows_per_file=16)
+    planned: lance.LanceDataset = lance.dataset(uri)
+    metadatas = lance.fragment.write_fragments(
+        planned.to_table().to_reader(),
+        uri,
+        schema=planned.schema,
+        mode="overwrite",
+        data_storage_version="2.1",
+    )
+    documents: list[str] = [json.dumps(metadata.to_json()) for metadata in metadatas]
+    original_commit: Any = lance.LanceDataset.commit
+    injected: bool = False
+
+    def racing_commit(base_uri: str, operation: object, **kwargs: object) -> lance.LanceDataset:
+        """Append after the outer guard, then invoke the real strict commit.
+
+        Args:
+            base_uri: Dataset URI passed to Lance.
+            operation: Planned overwrite operation.
+            **kwargs: Commit options under test.
+
+        Returns:
+            The real commit result when it succeeds.
+        """
+        nonlocal injected
+        if not injected:
+            injected = True
+            appended: pa.Table = make_vector_table(rows=1, dim=DIM, seed=92).set_column(
+                0, "id", pa.array([64], pa.int64())
+            )
+            lance.write_dataset(appended, uri, mode="append")
+        return original_commit(base_uri, operation, **kwargs)
+
+    monkeypatch.setattr(lance.LanceDataset, "commit", racing_commit)
+    config: MaintenanceConfig = MaintenanceConfig(
+        telemetry=TelemetryConfig(), commit_backoff_seconds=0.0, large_commit_retries=2
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to overwrite concurrent writes"):
+        commit_cluster_overwrite(uri, documents, planned.schema, config, telemetry, read_version=planned.version)
+
+    current: lance.LanceDataset = lance.dataset(uri)
+    assert current.count_rows() == 65
+    assert 64 in current.to_table(columns=["id"])["id"].to_pylist()
+
+
+def test_cluster_stamp_rejects_post_overwrite_data_change(tmp_path: Path, telemetry: Telemetry) -> None:
+    """The generation stamp cannot bless rows appended after a clustered overwrite.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        telemetry: The telemetry facade fixture.
+    """
+    uri: str = str(tmp_path / "cluster_stamp_race.lance")
+    lance.write_dataset(make_vector_table(rows=16, dim=DIM), uri)
+    committed: lance.LanceDataset = lance.dataset(uri)
+    expected_fragment_ids: list[int] = cluster_module.fragment_id_signature(committed)
+    expected_num_rows: int = committed.count_rows()
+    appended: pa.Table = make_vector_table(rows=1, dim=DIM, seed=92).set_column(0, "id", pa.array([16], pa.int64()))
+    lance.write_dataset(appended, uri, mode="append")
+
+    with pytest.raises(RuntimeError, match="generation changed"):
+        cluster_module.stamp_cluster_generation(
+            uri,
+            cluster_config(),
+            telemetry,
+            expected_fragment_ids,
+            expected_num_rows,
+        )
+
+    assert cluster_module.CLUSTER_GENERATION_KEY not in lance.dataset(uri).config()
+
+
+def test_cluster_current_still_applies_retention(tmp_path: Path, telemetry: Telemetry) -> None:
+    """A matching cluster-generation stamp cannot bypass wall-clock row expiry.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        telemetry: The telemetry facade fixture.
+    """
+    uri: str = str(tmp_path / "cluster_current_retention.lance")
+    old_rows: int = ROWS // 2
+    now: datetime = datetime.now(tz=UTC)
+    timestamps: pa.Array = pa.array(
+        [now - timedelta(days=60)] * old_rows + [now - timedelta(days=1)] * (ROWS - old_rows),
+        pa.timestamp("us", tz="UTC"),
+    )
+    table: pa.Table = make_vector_table(rows=ROWS, dim=DIM).append_column("ts", timestamps)
+    write_fragmented_dataset(uri, table, max_rows_per_file=ROWS_PER_FRAGMENT)
+    bootstrap_vector_index(uri, "vector", INDEX_NAME, vector_index_config(), telemetry)
+    merge_column_roles(uri, {"vector": VECTOR_ROLE}, None, retries=3, backoff_seconds=0.0)
+    initial_config: MaintenanceConfig = cluster_config()
+    cluster_module.stamp_cluster_generation(uri, initial_config, telemetry)
+    assert cluster_module.cluster_generation_skip_reason(lance.dataset(uri)) is not None
+
+    retention_config: MaintenanceConfig = cluster_config(retention_seconds=30 * 24 * 3600, ts_column="ts")
+    cutoff: datetime = now - timedelta(days=30)
+    plan: dict[str, object] = plan_cluster_rewrite(uri, retention_config, cutoff, telemetry)
+
+    assert "error" not in plan
+    assert plan["retention_rows_deleted"] == old_rows
+    assert lance.dataset(uri).count_rows() == ROWS - old_rows
+    assert "cluster_current" not in plan
+
+
+def test_cluster_current_reports_missing_retention_column(tmp_path: Path, telemetry: Telemetry) -> None:
+    """A current cluster generation still surfaces an invalid retention column contract.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        telemetry: The telemetry facade fixture.
+    """
+    uri: str = str(tmp_path / "cluster_current_missing_ts.lance")
+    build_cluster_ready_dataset(uri, ROWS, DIM, telemetry)
+    config: MaintenanceConfig = cluster_config(retention_seconds=30 * 24 * 3600, ts_column="ts")
+    cluster_module.stamp_cluster_generation(uri, config, telemetry)
+
+    plan: dict[str, object] = plan_cluster_rewrite(uri, config, datetime.now(tz=UTC) - timedelta(days=30), telemetry)
+
+    assert plan["phase"] == "retention-config"
+    assert "not present" in str(plan["error"])
 
 
 def test_idle_clustered_dataset_still_runs_version_cleanup(

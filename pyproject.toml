@@ -3,21 +3,21 @@ name = "lance-etl"
 version = "0.2.0"
 requires-python = ">=3.12"
 dependencies = [
-    "pylance>=8.0.0,<9",
+    "pylance==8.0.0",
     "pyarrow>=23",
-    "pyspark>=4.1",
+    "pyspark==4.0.1",
+    "psutil>=7,<8",
     "pandas>=2.2.0",
     "numpy",
     "datadog",
     "ddtrace",
+    "psycopg[binary]>=3.2,<4",
+    "sqlalchemy>=2.0,<3",
+    "alembic>=1.16,<2",
 ]
 
 [project.scripts]
-lance-etl-etl = "lance_etl.etl.cli:main"
-lance-etl-index = "lance_etl.indexing.cli:main"
-lance-etl-maintenance = "lance_etl.maintenance.cli:main"
-lance-etl-pipeline = "lance_etl.pipeline.cli:main"
-lance-etl-tools = "lance_etl.tools.cli:main"
+lance-etl-reconcile = "lance_etl.reconciler.launcher:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -29,7 +29,6 @@ packages = ["src/lance_etl"]
 [dependency-groups]
 dev = ["pytest", "ruff"]
 bench = ["matplotlib", "grpcio", "grpcio-tools", "opentelemetry-proto"]
-airflow = ["apache-airflow>=3.3.0", "apache-airflow-providers-apache-spark>=6.2.0"]
 
 [tool.ruff]
 line-length = 120

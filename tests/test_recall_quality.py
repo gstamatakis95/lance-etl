@@ -55,7 +55,7 @@ def text_table(ids: list[int], bodies: list[str], vectors: np.ndarray) -> pa.Tab
     fsl: pa.Array = pa.FixedSizeListArray.from_arrays(flat, vectors.shape[1])
     return pa.table(
         {
-            "vector_id": pa.array(ids, pa.int64()),
+            "record_id": pa.array(ids, pa.int64()),
             "vector": fsl,
             "body": pa.array(bodies),
         }
@@ -112,6 +112,15 @@ class TestRankingQuality:
         recall, ndcg, mrr = ranking_quality(["a", "b"], ["a", "b"], 5, 2)
         assert (recall, ndcg, mrr) == (1.0, 1.0, 1.0)
 
+    def test_duplicate_served_ids_have_no_repeated_gain(self) -> None:
+        """Repeating a relevant served id cannot inflate nDCG above the ideal ranking."""
+        recall, ndcg, mrr = ranking_quality(["a", "b"], ["a", "a"], 2, 2)
+        idcg: float = 2 / math.log2(2) + 1 / math.log2(3)
+        assert recall == pytest.approx(0.5)
+        assert ndcg == pytest.approx(2.0 / idcg)
+        assert ndcg <= 1.0
+        assert mrr == 1.0
+
 
 class TestBm25:
     """Exact BM25 ranks documents by term saturation and length normalization."""
@@ -137,16 +146,48 @@ class TestBm25:
         bodies: list[str] = ["apple apple apple", "apple apple", "apple", "banana"]
         lance.write_dataset(text_table([0, 1, 2, 3], bodies, np.zeros((4, DIM), dtype=np.float32)), uri)
         dataset: lance.LanceDataset = lance.dataset(uri)
-        ids, scores, count = bm25_top_k(dataset, [("body", ["apple"], "or", 1.0)], 10, "vector_id", None, 16)
+        ids, scores, count = bm25_top_k(dataset, [("body", ["apple"], "or", 1.0)], 10, "record_id", None, 16)
         assert ids == [0, 1, 2]
         assert count == 3
         assert scores[0] > scores[1] > scores[2]
+
+    def test_two_pass_streaming_matches_materialized_multi_column_reference(self, tmp_path: Path) -> None:
+        """Multi-column scoring across several batches matches the materialized exact oracle."""
+        uri: str = str(tmp_path / "bm25-multi.lance")
+        ids: list[int] = [5, 2, 9, 1, 7, 3]
+        bodies: list[str] = ["apple pie", "apple apple", "pie", "banana", "apple pie pie", "apple"]
+        titles: list[str] = ["fresh", "pie", "apple", "apple pie", "fresh apple", "banana"]
+        lance.write_dataset(pa.table({"record_id": ids, "body": bodies, "title": titles}), uri)
+        dataset: lance.LanceDataset = lance.dataset(uri)
+        clauses: list[tuple[str, list[str], str, float]] = [
+            ("body", ["apple", "pie"], "or", 1.5),
+            ("title", ["apple", "pie"], "and", 0.75),
+        ]
+        body_scores, body_matches = bm25_column_scores(
+            [[token.lower() for token in body.split()] for body in bodies], ["apple", "pie"], "or"
+        )
+        title_scores, title_matches = bm25_column_scores(
+            [[token.lower() for token in title.split()] for title in titles], ["apple", "pie"], "and"
+        )
+        expected_scores: np.ndarray = 1.5 * np.where(body_matches, body_scores, 0.0) + 0.75 * np.where(
+            title_matches, title_scores, 0.0
+        )
+        expected_matches: np.ndarray = body_matches | title_matches
+        expected_indices: list[int] = [index for index, matched in enumerate(expected_matches) if matched]
+        expected_indices.sort(key=lambda index: (-expected_scores[index], ids[index]))
+
+        actual_ids, actual_scores, count = bm25_top_k(dataset, clauses, 4, "record_id", None, 2)
+
+        expected_top: list[int] = expected_indices[:4]
+        assert actual_ids == [ids[index] for index in expected_top]
+        assert actual_scores == pytest.approx([float(expected_scores[index]) for index in expected_top])
+        assert count == len(expected_indices)
 
 
 class TestTextQueryExtraction:
     """The text-query AST extracts validated per-column scoring clauses."""
 
-    COLUMNS: frozenset[str] = frozenset({"body", "title", "vector_id"})
+    COLUMNS: frozenset[str] = frozenset({"body", "title", "record_id"})
 
     def test_match_without_column_uses_default_columns(self) -> None:
         """A match clause without a column fans out across the default text columns."""
@@ -177,6 +218,12 @@ class TestTextQueryExtraction:
             {"multi_match": {"terms": "apple", "columns": [], "operator": "or"}},
             {"multi_match": {"terms": "apple", "columns": ["body"], "boosts": [1.0, 2.0], "operator": "or"}},
             {"match": {"terms": "apple", "operator": "maybe"}},
+            {"match": {"terms": "apple", "column": "body", "boost": "high"}},
+            {"match": {"terms": "apple", "column": "body", "boost": True}},
+            {"match": {"terms": "apple", "column": "body", "boost": float("inf")}},
+            {"match": {"terms": "apple", "column": "body", "boost": 10**400}},
+            {"multi_match": {"terms": "apple", "columns": ["body"], "boosts": ["high"]}},
+            {"multi_match": {"terms": "apple", "columns": ["body"], "boosts": [float("nan")]}},
             "not a node",
         ],
     )
@@ -409,6 +456,59 @@ class TestTextScoringEndToEnd:
         assert score.recall == pytest.approx(1.0)
         assert score.ndcg is not None and score.ndcg < 1.0
         assert score.mrr == pytest.approx(1.0 / 3.0)
+
+    def test_text_only_dataset_does_not_require_vector_column(self, job_config: RecallJobConfig) -> None:
+        """A pure text query scores when the dataset intentionally has no vector column."""
+        uri: str = f"{job_config.base_uri}/acme/tenant1/txt.lance"
+        lance.write_dataset(
+            pa.table(
+                {
+                    "record_id": pa.array([0, 1, 2, 3], pa.int64()),
+                    "body": pa.array(["apple apple apple", "apple apple", "apple", "banana"]),
+                }
+            ),
+            uri,
+        )
+        version: int = lance.dataset(uri).version
+        source: InMemorySpanSource = InMemorySpanSource(records=[self.record(version, [0, 1, 2])])
+
+        report: RecallReport = RecallAuditJob(job_config).run(FakeSpark(), source, 1000, 2000)
+
+        assert report.scores[0].recall == pytest.approx(1.0)
+        assert report.scores[0].skip_reason is None
+
+    def test_mixed_group_scores_text_when_vector_column_is_missing(self, job_config: RecallJobConfig) -> None:
+        """One invalid vector capture cannot suppress a valid text query for the same dataset version."""
+        uri: str = f"{job_config.base_uri}/acme/tenant1/txt.lance"
+        lance.write_dataset(
+            pa.table(
+                {
+                    "record_id": pa.array([0, 1, 2, 3], pa.int64()),
+                    "body": pa.array(["apple apple apple", "apple apple", "apple", "banana"]),
+                }
+            ),
+            uri,
+        )
+        version: int = lance.dataset(uri).version
+        text_record: dict[str, Any] = self.record(version, [0, 1, 2])
+        vector_record: dict[str, Any] = dict(text_record)
+        vector_record.update(
+            {
+                "recall.sample_id": "vec-1",
+                "recall.query_type": "vector",
+                "recall.query_vector": json.dumps([0.0] * DIM),
+            }
+        )
+        del vector_record["recall.text_query"]
+        del vector_record["recall.text_columns"]
+        source: InMemorySpanSource = InMemorySpanSource(records=[text_record, vector_record])
+
+        report: RecallReport = RecallAuditJob(job_config).run(FakeSpark(), source, 1000, 2000)
+
+        scores: dict[str, SampleScore] = {score.sample_id: score for score in report.scores}
+        assert scores["txt-1"].recall == pytest.approx(1.0)
+        assert scores["txt-1"].skip_reason is None
+        assert scores["vec-1"].skip_reason == "missing_columns"
 
 
 class TestHybridScoringEndToEnd:

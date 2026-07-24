@@ -8,6 +8,7 @@ the steps they specialise.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import lance
@@ -15,12 +16,7 @@ import pyarrow as pa
 from lance.dataset import Index
 from lance.indices import IndicesBuilder
 
-from lance_etl.indexing.config import (
-    IVF_RQ_NUM_BITS,
-    IndexJobConfig,
-    config_reusable,
-    growth_exceeds_retrain_factor,
-)
+from lance_etl.indexing.config import IndexJobConfig, config_reusable, growth_exceeds_retrain_factor
 from lance_etl.indexing.optimize import (
     load_centroids,
     load_vector_config,
@@ -39,25 +35,17 @@ from lance_etl.telemetry import Telemetry
 logger: logging.Logger = logging.getLogger(__name__)
 
 
+@dataclass
 class IndexHandler:
-    """Base handler that builds one index over a dataset's fragments.
+    """Base policy for planning one index over a dataset's fragments.
 
-    The default :meth:`build` implements the segment-API flow shared by the vector handler: split
-    target fragments into shards, build one uncommitted segment per shard across executors, and
-    commit the collected segments. Subclasses override the build steps or the whole flow.
+    Subclasses validate type-specific prerequisites, select uncovered fragments, prepare build
+    artifacts, and declare whether uncommitted segments merge before publication.
     """
 
-    def __init__(self, config: IndexJobConfig, column: str, index_name: str) -> None:
-        """Initialize the handler.
-
-        Args:
-            config: Indexing configuration.
-            column: The column to index.
-            index_name: The index name to publish under.
-        """
-        self.config: IndexJobConfig = config
-        self.column: str = column
-        self.index_name: str = index_name
+    config: IndexJobConfig
+    column: str
+    index_name: str
 
     def index_type(self) -> str:
         """Return the Lance index type string.
@@ -111,8 +99,10 @@ class IndexHandler:
             The set of covered fragment ids.
         """
         covered: set[int] = set()
+        description: Any
         for description in dataset.describe_indices():
             if description.name == self.index_name and self.column in description.field_names:
+                segment: Any
                 for segment in description.segments:
                     covered.update(segment.fragment_ids)
         return covered
@@ -185,22 +175,9 @@ class VectorIndexHandler(IndexHandler):
     back with :func:`~lance_etl.indexing.optimize.load_vector_config` and the centroids are read
     sidecar-first with :func:`~lance_etl.indexing.optimize.load_centroids`, falling back to the
     committed index via :meth:`lance.LanceDataset.get_ivf_model` and backfilling the sidecar
-    best-effort on a miss. The ``cached_artifacts`` field memoizes the prepare result within one
-    build call so the replan loop does not re-read when a stale-fragment rebuild triggers a second
-    ``prepare``.
+    best-effort on a miss. Each executor shard creates one handler and calls ``prepare`` once, so
+    artifacts are resolved directly without per-instance memoization.
     """
-
-    def __init__(self, config: IndexJobConfig, column: str, index_name: str) -> None:
-        """Initialize the handler.
-
-        Args:
-            config: Indexing configuration.
-            column: The vector column to index.
-            index_name: The index name to publish under.
-        """
-        super().__init__(config, column, index_name)
-        self.reused_artifacts: bool = False
-        self.cached_artifacts: tuple | None = None
 
     def index_type(self) -> str:
         """Return the vector index type.
@@ -273,7 +250,7 @@ class VectorIndexHandler(IndexHandler):
         rows_at_train: Any = cfg.get("rows_at_train")
         if rows_at_train is None:
             return True
-        return growth_exceeds_retrain_factor(rows, int(rows_at_train))
+        return growth_exceeds_retrain_factor(rows, int(rows_at_train), self.config.retrain_growth_factor)
 
     def needs_bootstrap(self, dataset: lance.LanceDataset) -> bool:
         """Decide whether this index must be rebuilt through a streaming bootstrap.
@@ -305,9 +282,8 @@ class VectorIndexHandler(IndexHandler):
                     self.index_name,
                     dataset.uri,
                 )
-                return True
-            return False
-        if not config_reusable(cfg, self.dimension(dataset), self.config.metric, IVF_RQ_NUM_BITS):
+            return True
+        if not config_reusable(cfg, self.dimension(dataset), self.config.metric, self.config.num_bits):
             logger.warning(
                 "stored vector config for %s on %s no longer matches the current configuration; "
                 "the index will be retrained and fully rebuilt",
@@ -348,7 +324,7 @@ class VectorIndexHandler(IndexHandler):
             cached: pa.Array | None = load_centroids(uri, self.index_name, int(rows_at_train), config.storage_options)
             if cached is not None:
                 return cached
-        ivf_model = dataset.get_ivf_model(self.index_name)
+        ivf_model: Any = dataset.get_ivf_model(self.index_name)
         if ivf_model is None or ivf_model.centroids is None:
             raise RuntimeError(
                 f"vector artifacts for {self.index_name} on {uri} are not reusable; "
@@ -369,8 +345,7 @@ class VectorIndexHandler(IndexHandler):
     def prepare(self, dataset: lance.LanceDataset, uri: str, telemetry: Telemetry) -> tuple:
         """Resolve this dataset's reusable IVF_RQ artifacts, reading centroids sidecar-first.
 
-        Returns the memoized result immediately on subsequent calls within the same build. The
-        centroids come from :meth:`resolve_centroids` (sidecar cache first, committed-index
+        The centroids come from :meth:`resolve_centroids` (sidecar cache first, committed-index
         fallback with best-effort backfill), the ``rabitq_model`` string from the stored config,
         and the partition count as ``len(centroids)`` (equal to the stored ``num_partitions`` by
         the bootstrap invariant, and always consistent with the centroid array).
@@ -393,15 +368,12 @@ class VectorIndexHandler(IndexHandler):
             RuntimeError: If the artifacts are not reusable. The plan phase should have chosen
                 a bootstrap build for this index.
         """
-        if self.cached_artifacts is not None:
-            return self.cached_artifacts
-
         config: IndexJobConfig = self.config
         cfg: dict[str, Any] | None = load_vector_config(dataset, self.column)
         committed: set[str] = {description.name for description in dataset.describe_indices()}
         reusable: bool = (
             cfg is not None
-            and config_reusable(cfg, self.dimension(dataset), config.metric, IVF_RQ_NUM_BITS)
+            and config_reusable(cfg, self.dimension(dataset), config.metric, config.num_bits)
             and self.index_name in committed
         )
         if not reusable or cfg is None:
@@ -410,15 +382,13 @@ class VectorIndexHandler(IndexHandler):
                 "the plan phase should have chosen a streaming bootstrap build"
             )
         centroids: pa.Array = self.resolve_centroids(dataset, uri, cfg, telemetry)
-        self.reused_artifacts = True
         telemetry.incr("artifacts.reused")
-        self.cached_artifacts = (
+        return (
             centroids,
             cfg["rabitq_model"],
-            IVF_RQ_NUM_BITS,
+            config.num_bits,
             len(centroids),
         )
-        return self.cached_artifacts
 
     def build_segment(self, dataset: lance.LanceDataset, fragment_ids: list[int], artifacts: object | None) -> Index:
         """Build one IVF_RQ segment over a shard of fragments.
@@ -696,7 +666,7 @@ def publish_fts_index(
             fragment_ids=fragments,
             index_version=0,
         )
-        operation = lance.LanceOperation.CreateIndex(new_indices=[index], removed_indices=removed)
+        operation: Any = lance.LanceOperation.CreateIndex(new_indices=[index], removed_indices=removed)
         lance.LanceDataset.commit(uri, operation, read_version=current.version, storage_options=storage_options)
         telemetry.incr("index.committed", tags=tags)
 

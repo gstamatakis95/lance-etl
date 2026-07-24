@@ -4,7 +4,7 @@ Covers the deterministic per-dataset rotation slot (:func:`dataset_cleanup_slot`
 active-slot derivation (:func:`active_cleanup_slot`), the rotation gate
 (:func:`should_clean_idle`), and the two integration properties that make rotation safe at fleet
 scale: every dataset is still cleaned within ``cleanup_rotation_slots`` runs, and a dataset that
-did real work (a TTL delete) this run is always cleaned regardless of its slot.
+did real work (a retention delete) this run is always cleaned regardless of its slot.
 """
 
 from __future__ import annotations
@@ -104,7 +104,7 @@ def test_active_cleanup_slot_pins_to_supplied_now(telemetry_config: TelemetryCon
 def test_did_work_dataset_always_cleaned(
     tmp_path: Path, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A dataset with TTL deletions this run is always cleaned even off its rotation slot.
+    """A dataset with retention deletions this run is always cleaned even off its rotation slot.
 
     Args:
         tmp_path: Pytest-provided temporary directory.
@@ -114,18 +114,18 @@ def test_did_work_dataset_always_cleaned(
     uri: str = str(tmp_path / "did_work.lance")
     lance.write_dataset(pa.table({"id": pa.array(range(10), pa.int64())}), uri)
 
-    def fake_ttl(
+    def fake_retention(
         dataset: lance.LanceDataset,
         uri_arg: str,
         config: MaintenanceConfig,
         cutoff: datetime,
         telemetry: Telemetry,
     ) -> dict[str, object]:
-        """Simulate a TTL step that deleted rows this run without touching the real column."""
+        """Simulate a retention step that deleted rows this run without touching the real column."""
         del dataset, config, cutoff, telemetry
-        return {"uri": uri_arg, "ttl_rows_deleted": 5, "skipped": ""}
+        return {"uri": uri_arg, "retention_rows_deleted": 5, "skipped": ""}
 
-    monkeypatch.setattr(maintenance_job, "run_ttl_on_open_dataset", fake_ttl)
+    monkeypatch.setattr(maintenance_job, "run_retention_on_open_dataset", fake_retention)
 
     cleaned: list[str] = []
 
@@ -145,13 +145,16 @@ def test_did_work_dataset_always_cleaned(
     slots: int = 8
     off_slot: int = (dataset_cleanup_slot(uri, slots) + 1) % slots
     config: MaintenanceConfig = MaintenanceConfig(
-        telemetry=telemetry_config, ttl_column="ttl", cleanup_rotation_slots=slots, commit_backoff_seconds=0.0
+        telemetry=telemetry_config,
+        retention_seconds=10 * 24 * 3600,
+        cleanup_rotation_slots=slots,
+        commit_backoff_seconds=0.0,
     )
     result: dict[str, object] = plan_one_dataset(
-        uri, config, compute_cutoff(), Telemetry.create(telemetry_config), off_slot
+        uri, config, compute_cutoff(config.retention_seconds), Telemetry.create(telemetry_config), off_slot
     )
 
-    assert result["ttl_rows_deleted"] == 5
+    assert result["retention_rows_deleted"] == 5
     assert result["bytes_removed"] == 999
     assert cleaned == [uri]
 

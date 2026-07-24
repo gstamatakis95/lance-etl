@@ -11,6 +11,7 @@ horizon floor. Spark is replaced with a minimal in-process fake since only
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import lance
@@ -95,12 +96,87 @@ def test_run_replans_until_budget_then_defers(
     assert "fragments_removed" not in results[0]
 
 
+def test_hot_skip_cleans_versions_created_by_same_run_retention(
+    dataset_uri: str, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retention-active hot dataset still cleans its same-run obsolete versions after deferral."""
+    config: MaintenanceConfig = replan_config(telemetry_config, retention_seconds=10 * 24 * 3600)
+    cleanup_calls: list[str] = []
+
+    def retention_delete(
+        dataset: lance.LanceDataset,
+        uri: str,
+        cfg: MaintenanceConfig,
+        cutoff: object,
+        telemetry: Telemetry,
+    ) -> dict[str, object]:
+        """Report same-run retention work without mutating the compaction fixture.
+
+        Args:
+            dataset: Open dataset handle.
+            uri: Dataset URI.
+            cfg: Maintenance configuration.
+            cutoff: Run cutoff instant.
+            telemetry: Executor telemetry facade.
+
+        Returns:
+            Retention evidence showing that this run created an obsolete version.
+        """
+        del dataset, cfg, cutoff, telemetry
+        return {"uri": uri, "retention_rows_deleted": 1, "skipped": ""}
+
+    def conflicting_commit(
+        uri: str, rewrite_jsons: list[str], cfg: MaintenanceConfig, telemetry: Telemetry
+    ) -> dict[str, object]:
+        """Always defer the stale compaction rewrites.
+
+        Args:
+            uri: Dataset URI.
+            rewrite_jsons: Serialized stale rewrites.
+            cfg: Maintenance configuration.
+            telemetry: Executor telemetry facade.
+
+        Returns:
+            A semantic conflict marker.
+        """
+        del rewrite_jsons, cfg, telemetry
+        return {"uri": uri, "conflict": True}
+
+    def record_cleanup(uri: str, cfg: MaintenanceConfig, telemetry: Telemetry) -> int:
+        """Record the fresh post-conflict cleanup.
+
+        Args:
+            uri: Dataset URI.
+            cfg: Maintenance configuration.
+            telemetry: Executor telemetry facade.
+
+        Returns:
+            A distinctive reclaimed byte count.
+        """
+        del cfg, telemetry
+        cleanup_calls.append(uri)
+        return 321
+
+    monkeypatch.setattr(maintenance_job, "run_retention_on_open_dataset", retention_delete)
+    monkeypatch.setattr(maintenance_job, "commit_one_dataset", conflicting_commit)
+    monkeypatch.setattr(maintenance_job, "cleanup_dataset", record_cleanup)
+
+    results: list[dict[str, object]] = MaintenanceJob(config).run(FakeSpark(), [dataset_uri])
+
+    assert cleanup_calls == [dataset_uri]
+    assert results[0]["retention_rows_deleted"] == 1
+    assert results[0]["bytes_removed"] == 321
+    assert f"conflicted in all {maintenance_job.REPLAN_BUDGET}" in str(results[0]["skipped"])
+
+
 def test_run_commits_after_one_conflict(
     dataset_uri: str, telemetry_config: TelemetryConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A conflict in the first round is resolved by the second round's fresh plan and commit."""
     config: MaintenanceConfig = replan_config(telemetry_config)
-    real_commit = maintenance_job.commit_one_dataset
+    real_commit: Callable[[str, list[str], MaintenanceConfig, Telemetry], dict[str, object]] = (
+        maintenance_job.commit_one_dataset
+    )
     commits: list[str] = []
 
     def commit_once_conflicting(
@@ -145,7 +221,9 @@ def test_run_isolates_non_conflict_errors(
     )
     lance.write_dataset(other_table, other_uri, max_rows_per_file=ROWS_PER_FRAGMENT)
     config: MaintenanceConfig = replan_config(telemetry_config)
-    real_commit = maintenance_job.commit_one_dataset
+    real_commit: Callable[[str, list[str], MaintenanceConfig, Telemetry], dict[str, object]] = (
+        maintenance_job.commit_one_dataset
+    )
 
     def selective_commit(
         uri: str, rewrite_jsons: list[str], cfg: MaintenanceConfig, telemetry: Telemetry

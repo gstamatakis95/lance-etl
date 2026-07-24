@@ -66,7 +66,17 @@ Agent that might be running locally.  The defaults are:
 ## Running the benchmark with capture
 
 Pass `--capture-telemetry` to any `e2e` invocation.  The listeners start before the first batch
-and stop after the last recall sweep.
+and stop after the search leg completes.
+
+`e2e`'s control plane lives in an ephemeral PostgreSQL schema, so `e2e` self-hosts its own
+`search-api` subprocess inside that isolation window rather than dialing an external one (see
+`bench/README.md`, "Local search measurement"). The subprocess inherits the capture-overridden
+process environment, so `SEARCH_API_STATSD_ADDR` and `OTEL_EXPORTER_OTLP_ENDPOINT` are set for it
+automatically — nothing to configure manually for `e2e`. A plain local `e2e --capture-telemetry`
+run therefore produces `search_api.rpc.*`, `search_api.cache.*`, and `search_api.prewarm.*` events
+in `metrics.jsonl`/`traces.jsonl` whenever `--search-api-binary` resolves to a real binary (the
+default), alongside the Python pipeline and control-plane reconciler events. Pass
+`--search-api-binary ""` to disable the search leg and its telemetry explicitly.
 
 ```bash
 python -m bench e2e \
@@ -81,20 +91,22 @@ python -m bench e2e \
   --results-root bench/results
 ```
 
-Output files appear under `bench/workspace/telemetry/` when the run completes.
+Output files appear under `bench/workspace/telemetry/` when the run completes, including
+`search-api.log` (the self-hosted subprocess's stdout, redirected automatically by
+`bench/search_server.py:self_hosted_search_api`).
 
 ---
 
-## Running the Rust search server with capture
+## Running a user-managed Rust search server with capture
 
-When `--capture-telemetry` is active the Python e2e orchestrator sets `SEARCH_API_STATSD_ADDR`
-and `OTEL_EXPORTER_OTLP_ENDPOINT` in its own process environment.  If you start the Rust server
-as a child process or in a separate terminal you must set these variables manually.
-
-### User-managed server (separate terminal)
+`e2e` never needs a manually started server. A manually started server is only relevant to the
+standalone `search --endpoint host:port` path (an already-running server pointed at a control
+plane kept alive with `e2e --keep-control-plane`, see `bench/README.md`). Set the capture
+variables yourself in that case, since there is no orchestrator setting them for you:
 
 ```bash
 export LANCE_ETL_BASE_URI="bench/workspace/lance"
+export LANCE_ETL_DATABASE_URL='<the kept schema URL from control_plane.json>'
 export SEARCH_API_PORT=50051
 export SEARCH_API_STATSD_ADDR="127.0.0.1:19125"
 export OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:14317"
@@ -102,6 +114,9 @@ export OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:14317"
 ./rust/search-api/target/release/search-api \
   2>&1 | tee bench/workspace/telemetry/search-api.log
 ```
+
+See `rust/search-api/README.md` and `rust/search-api/AGENTS.md` for the current full set of
+required and optional startup environment variables.
 
 The `tee` command writes JSON log lines to `search-api.log` while also printing to the terminal.
 If you want logs only in the file (no terminal output) replace `tee` with a redirect:
@@ -111,18 +126,8 @@ If you want logs only in the file (no terminal output) replace `tee` with a redi
   >> bench/workspace/telemetry/search-api.log 2>&1
 ```
 
-### Start the server before the benchmark
-
-Build the binary once:
-
-```bash
-cd rust/search-api && cargo build --release && cd ../..
-```
-
-Then run the server with capture variables set, capturing its stdout to the telemetry directory.
-Start the `--capture-telemetry` benchmark run in a second terminal (the listeners start before
-the first batch, so start the server only after the Python run has logged "DogStatsD listener
-bound" and "OTLP gRPC receiver bound").
+Start the `--capture-telemetry search --endpoint ...` run only after this server has logged
+"DogStatsD listener bound" and "OTLP gRPC receiver bound" in a separate terminal.
 
 ---
 
@@ -261,11 +266,15 @@ The intended workflow for iterating on pipeline performance:
    Rust service writes one JSON log line per event with the `trace_id` and `span_id` fields
    populated when an active OTel span is present.
 
-5. Adjust the relevant knobs (index cache budget, nprobes, refine factor, shard count, compaction
-   target rows) in `bench/config.py` flags or the Rust service env vars and re-run.  The
+5. Adjust the relevant knobs (shard count, compaction target rows, IVF partition count) via
+   `bench/config.py` flags, or the Rust cache-directory and cache-backend env vars, and re-run.
+   Index/metadata cache budgets, nprobes, and refine factor are fixed Rust constants in the
+   current search service and are not configurable from either side of the benchmark.  The
    `bench/results/` directory keeps a separate artifact directory per `run_id` so previous runs
    are never overwritten.
 
 6. Compare `metrics.jsonl` across runs by filtering on metric name and computing aggregate
    statistics with the jq recipes above.  The `e2e.json` artifact in the run directory records
-   per-batch ETL, index, and compaction wall times alongside gRPC recall scores.
+   per-batch reconcile drain seconds and cycle counts (`batches[].seconds`, `batches[].reconcile`)
+   alongside the self-hosted catalog gRPC recall/FTS/hybrid (`final_catalog_grpc`), which reads
+   `NOT_RUN` only when no `search-api` binary was found at `--search-api-binary`.

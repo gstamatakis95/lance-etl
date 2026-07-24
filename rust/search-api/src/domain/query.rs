@@ -10,7 +10,6 @@ use serde_json::{Map, Value};
 
 use crate::domain::filter::Filter;
 use crate::domain::fusion::FusionSpec;
-use crate::domain::target::DatasetRef;
 
 /// Distance metric for nearest-neighbor search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,16 +90,6 @@ pub struct VectorQuery {
     pub time_range: Option<TimeRange>,
     /// Columns to return. Empty selects all non-vector columns.
     pub projection: Vec<String>,
-    /// Include the physical `_rowid` row-address column in each returned row. It changes across compaction and is
-    /// valid only for the duration of the request.
-    pub with_row_id: bool,
-    /// Number of leading hits to skip.
-    pub offset: Option<usize>,
-    /// Which committed version of the dataset to open for this query. Defaults to
-    /// [`DatasetRef::Serve`], which follows the provider's configured serve policy (the serve tag
-    /// when enabled, otherwise the latest committed version). Setting an explicit version id or tag
-    /// name pins the search to that snapshot without affecting other in-flight requests.
-    pub reference: DatasetRef,
 }
 
 /// How match-query terms combine.
@@ -231,11 +220,6 @@ pub struct TextQuery {
     pub time_range: Option<TimeRange>,
     /// Columns to return. Empty selects all non-vector columns.
     pub projection: Vec<String>,
-    /// Include the physical `_rowid` row-address column in each returned row. It changes across compaction and is
-    /// valid only for the duration of the request.
-    pub with_row_id: bool,
-    /// Number of leading hits to skip.
-    pub offset: Option<usize>,
     /// Search only indexed (INVERTED) data, skipping fragments appended after the last FTS index
     /// build. `Some(true)` forces fast search on; `Some(false)` forces it off; `None` lets the
     /// server apply its configured default, gated on whether the dataset has an FTS index for the
@@ -243,11 +227,6 @@ pub struct TextQuery {
     /// `true` — callers that need read-after-write freshness must set `Some(false)` or leave it
     /// `None` on datasets where the server default is off.
     pub fast_search: Option<bool>,
-    /// Which committed version of the dataset to open for this query. Defaults to
-    /// [`DatasetRef::Serve`], which follows the provider's configured serve policy (the serve tag
-    /// when enabled, otherwise the latest committed version). Setting an explicit version id or tag
-    /// name pins the search to that snapshot without affecting other in-flight requests.
-    pub reference: DatasetRef,
 }
 
 impl TextQuery {
@@ -262,10 +241,7 @@ impl TextQuery {
             filter_mode: FilterMode::default(),
             time_range: None,
             projection: Vec::new(),
-            with_row_id: false,
-            offset: None,
             fast_search: None,
-            reference: DatasetRef::default(),
         }
     }
 }
@@ -281,12 +257,13 @@ pub struct HybridQuery {
     pub k: usize,
     /// Fusion strategy for merging the legs.
     pub fusion: FusionSpec,
-    /// Which committed version of the dataset to open for both legs. Defaults to
-    /// [`DatasetRef::Serve`], which follows the provider's configured serve policy (the serve tag
-    /// when enabled, otherwise the latest committed version). Both legs are always opened at the
-    /// same resolved version so fusion dedup is consistent. Setting an explicit version id or tag
-    /// name pins the search to that snapshot without affecting other in-flight requests.
-    pub reference: DatasetRef,
+}
+
+/// Closed reason code accompanying a permitted partial response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchWarning {
+    /// Deduplication left fewer than the requested number of logical results.
+    ResultsUnderfilled,
 }
 
 /// The result of one vector search: ranked hits plus dataset provenance for recall capture.
@@ -294,9 +271,12 @@ pub struct HybridQuery {
 pub struct VectorSearchOutcome {
     /// Hits ordered nearest-first.
     pub hits: Vec<Hit>,
-    /// The committed version of the Lance dataset that served the query. `None` when the
-    /// serving version was not recorded.
-    pub dataset_version: Option<u64>,
+    /// Exact committed Lance version selected by the serving catalog.
+    pub served_version: u64,
+    /// True only when `warnings` describes a permitted degraded result.
+    pub partial: bool,
+    /// Bounded closed warning codes.
+    pub warnings: Vec<SearchWarning>,
 }
 
 /// The result of one full-text search: ranked hits plus dataset provenance for recall capture.
@@ -304,9 +284,12 @@ pub struct VectorSearchOutcome {
 pub struct TextSearchOutcome {
     /// Hits ordered best-first.
     pub hits: Vec<Hit>,
-    /// The committed version of the Lance dataset that served the query. `None` when the
-    /// serving version was not recorded.
-    pub dataset_version: Option<u64>,
+    /// Exact committed Lance version selected by the serving catalog.
+    pub served_version: u64,
+    /// True only when `warnings` describes a permitted degraded result.
+    pub partial: bool,
+    /// Bounded closed warning codes.
+    pub warnings: Vec<SearchWarning>,
 }
 
 /// The result of one hybrid search: fused hits plus dataset provenance for recall capture.
@@ -314,29 +297,30 @@ pub struct TextSearchOutcome {
 pub struct HybridSearchOutcome {
     /// Fused hits ordered best-first.
     pub hits: Vec<FusedHit>,
-    /// The committed version of the Lance dataset that served the query. `None` when the
-    /// serving version was not recorded.
-    pub dataset_version: Option<u64>,
+    /// Exact committed Lance version selected by the serving catalog.
+    pub served_version: u64,
+    /// True only when `warnings` describes a permitted degraded result.
+    pub partial: bool,
+    /// Bounded closed warning codes.
+    pub warnings: Vec<SearchWarning>,
 }
 
 /// One ranked hit from a single search leg.
 #[derive(Debug, Clone)]
 pub struct Hit {
-    /// Physical Lance row address (`_rowid`). Valid only for the duration of this request — changes across
-    /// compaction and across dataset opens. Used internally for within-dataset cross-leg fusion dedup only.
-    pub row_id: u64,
+    /// Stable logical record identifier.
+    pub record_id: String,
     /// Leg-specific score: distance for vector legs, BM25 score for text legs.
     pub score: f64,
     /// Projected columns of the row as a JSON object.
     pub row: Map<String, Value>,
 }
 
-/// One fused hit produced by a [`crate::domain::fusion::Fusion`] strategy.
+/// One fused hit produced by a [`crate::domain::fusion::FusionSpec`] strategy.
 #[derive(Debug, Clone)]
 pub struct FusedHit {
-    /// Physical Lance row address (`_rowid`). Valid only for the duration of this request — changes across
-    /// compaction and across dataset opens. Used internally for within-dataset cross-leg fusion dedup only.
-    pub row_id: u64,
+    /// Stable logical record identifier.
+    pub record_id: String,
     /// Fused score (larger is better).
     pub score: f64,
     /// Union of the projected columns of the legs that contained the row.

@@ -1,6 +1,6 @@
 """Unit tests for the bench recall helpers fixed in the retrospective review.
 
-Covers the ground-truth alignment of :func:`bench.e2e.org_recall_at_tag` when individual
+Covers the ground-truth alignment of :func:`bench.e2e.org_catalog_recall` when individual
 queries error mid-sweep, and the deterministic id tie-breaking plus ragged-width handling of
 :func:`bench.groundtruth.merge_topk_partials`. Both were review findings: the former silently
 deflated recall by comparing surviving results against the wrong ground-truth rows, and the
@@ -37,7 +37,7 @@ def alignment_config(tmp_path_str: str) -> BenchConfig:
 
 
 class TestOrgRecallAlignment:
-    """org_recall_at_tag scores surviving queries against their own ground-truth rows."""
+    """org_catalog_recall scores surviving queries against their own ground-truth rows."""
 
     def test_failed_query_does_not_shift_ground_truth(self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
         """A query that errors mid-sweep is excluded by index, not by truncation.
@@ -50,10 +50,15 @@ class TestOrgRecallAlignment:
         queries: np.ndarray = np.zeros((4, 8), dtype=np.float32)
 
         def fake_search(
-            stub: Any, pb2: Any, org: str, query: np.ndarray, k: int, nprobes: int, tag: str
+            stub: Any,
+            pb2: Any,
+            org: str,
+            query: np.ndarray,
+            k: int,
+            expected_version: int,
         ) -> tuple[Any, float]:
             """Return each query's own truth, failing on query index 1."""
-            del stub, pb2, org, query, k, nprobes, tag
+            del stub, pb2, org, query, k, expected_version
             index: int = fake_search.calls
             fake_search.calls += 1
             if index == 1:
@@ -61,11 +66,11 @@ class TestOrgRecallAlignment:
             return SimpleNamespace(results=ground_truth[index]), 1.0
 
         fake_search.calls = 0
-        monkeypatch.setattr(bench_e2e, "vector_search_at_tag", fake_search)
-        monkeypatch.setattr(bench_e2e, "result_vector_ids", lambda results: np.asarray(results, dtype=np.int64))
+        monkeypatch.setattr(bench_e2e, "vector_search", fake_search)
+        monkeypatch.setattr(bench_e2e, "result_record_ids", lambda results: np.asarray(results, dtype=np.int64))
 
-        point = bench_e2e.org_recall_at_tag(
-            object(), object(), alignment_config(str(tmp_path)), "org0", queries, ground_truth, "t1", 10
+        point = bench_e2e.org_catalog_recall(
+            object(), object(), alignment_config(str(tmp_path)), "org0", queries, ground_truth, 1
         )
         assert point is not None
         assert point["queries"] == 3
@@ -80,16 +85,15 @@ class TestOrgRecallAlignment:
             del args, kwargs
             raise RuntimeError("server down")
 
-        monkeypatch.setattr(bench_e2e, "vector_search_at_tag", always_fail)
-        point = bench_e2e.org_recall_at_tag(
+        monkeypatch.setattr(bench_e2e, "vector_search", always_fail)
+        point = bench_e2e.org_catalog_recall(
             object(),
             object(),
             alignment_config(str(tmp_path)),
             "org0",
             np.zeros((2, 8), dtype=np.float32),
             np.zeros((2, 3), dtype=np.int64),
-            "t1",
-            10,
+            1,
         )
         assert point is None
 

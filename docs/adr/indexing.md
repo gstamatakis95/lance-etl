@@ -59,7 +59,8 @@ calls plain `create_index` or an unsharded `create_scalar_index` build (the sole
 exception is ADR 0030's streaming bootstrap, which carries an explicit rotation and stores its
 config). The pre-unification small tier showed how an in-process build path corrupts vector
 indexes by pairing deltas with mismatched models. Enforcement lives in AGENTS.md hard rule 6,
-the unified runner being the only entry point, and the coexistence suite.
+the unified runner being the only entry point, focused segment-API tests, and the local reconciler
+end-to-end test.
 
 Second, role discovery covers all three roles. When no explicit column lists are configured,
 every `vector` role column gets an IVF_RQ index, every `scalar` role column (pivoted from the
@@ -113,7 +114,7 @@ time the way BTREE and BITMAP deltas are, so leaving ZONEMAP unmerged would leav
 pruning degraded across shards instead of merely deferred to the delta-merge maintenance pass.
 As with BTREE and BITMAP, `create_scalar_index(fragment_ids=)` and `merge_index_metadata` are
 never used for ZONEMAP — both raise on current lance main. No version gate is needed:
-the repository pins `pylance>=8.0.0,<9`, the first release with the ZONEMAP type and segment
+the repository pins `pylance==8.0.0`, the first release with the ZONEMAP type and segment
 merging.
 
 ## ADR 0040 — Object-store centroid cache for distributed vector builds

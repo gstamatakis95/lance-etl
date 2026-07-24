@@ -1,15 +1,11 @@
-"""Fleet-level manifest-migration, serving-tag, and interval-tag-retention helpers for Lance datasets.
+"""Fleet-level serving-tag and interval-tag-retention helpers for Lance datasets.
 
 These operations are embarrassingly parallel one-call-per-dataset functions.
-Their fleet drivers (:func:`migrate_manifest_paths`, :func:`update_serving_tags`,
-:func:`prune_interval_tags_fleet`) are thin adapters over :func:`~lance_etl.fanout.run_fleet_fanout`,
+Their fleet driver (:func:`update_serving_tags`)
+are thin adapters over :func:`~lance_etl.fanout.run_fleet_fanout`,
 which owns the shared span/tag/timer/gauge/log driver shell around
 :func:`~lance_etl.fanout.fan_out_per_dataset` and spreads the per-dataset work across Spark
 executors without any additional orchestration.
-
-:func:`migrate_dataset_manifest_paths` and :func:`migrate_manifest_paths` upgrade
-existing V1 manifest paths to the V2 naming scheme, which makes every dataset open
-cost one object-store request instead of a version-count-proportional LIST.
 
 :func:`update_serving_tag` and :func:`update_serving_tags` flip one or more named serving
 tags to a target version for blue-green promotion, opening the dataset exactly once per
@@ -17,7 +13,7 @@ call regardless of how many tags are flipped. A tagged version is exempt from
 :func:`~lance_etl.maintenance.job.cleanup_dataset` pruning, so the version a serving
 layer reads stays readable until the tag moves to a newer one.
 
-:func:`prune_interval_tags` and :func:`prune_interval_tags_fleet` delete old interval
+:func:`prune_interval_tags` deletes old interval
 tags whose names are classified by :func:`datetime.strptime` against the
 ``%Y%m%dT%H%M%SZ`` format, keeping only the newest ``tag_keep_last`` tags.  Tags that
 do not match the format (``HEAD`` and other non-interval tags) are never touched.
@@ -52,92 +48,6 @@ TAG_EXISTS_MARKER: str = "already exists"
 TAG_MISSING_MARKER: str = "does not exist"
 MAX_TAG_RACE_ATTEMPTS: int = 3
 TAG_RACE_BACKOFF_SECONDS: float = 0.05
-
-
-def migrate_dataset_manifest_paths(
-    uri: str, storage_options: dict[str, Any] | None, telemetry: Telemetry
-) -> dict[str, Any]:
-    """Migrate one existing dataset's manifest paths to the V2 naming scheme in place.
-
-    Datasets bootstrapped by the ETL are always created with V2 manifest paths, which
-    makes every open one object-store request instead of a version-count-proportional
-    LIST. Datasets created before that default still carry V1 names. This helper calls
-    ``LanceDataset.migrate_manifest_paths_v2``, which renames every V1 manifest to the
-    V2 inverted-version name. The call is idempotent, so re-running it on an
-    already-migrated or freshly-bootstrapped dataset is a cheap no-op. It needs no
-    lost-race resolver of its own: a manifest-path rename has no commit-conflict
-    surface to lose a race against, so a retried task simply converges instead of
-    corrupting state, the same idempotency the fleet-level fan-out in
-    :func:`migrate_manifest_paths` already relies on. A single dataset's migration failure is
-    isolated by that fan-out into a ``{"uri", "error", "phase": "migrate"}`` marker and does not
-    abort the run, so the other datasets still migrate.
-
-    DANGER: this is not transactional. Lance documents that it must not run while other
-    operations touch the dataset and must run to completion before any resume. Schedule
-    it in a maintenance window with ingestion, compaction, and indexing paused for the
-    targeted datasets.
-
-    Args:
-        uri: Dataset URI.
-        storage_options: Object-store options forwarded to pylance.
-        telemetry: Telemetry facade for the current process.
-
-    Returns:
-        A statistics dictionary with keys ``uri`` and ``migrated`` set to ``True``.
-    """
-    dataset: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
-    with telemetry.timed("dataset.migrate_manifest_ms"):
-        dataset.migrate_manifest_paths_v2()
-    telemetry.incr("dataset.manifest_migrated")
-    return {"uri": uri, "migrated": True}
-
-
-def migrate_manifest_paths(
-    spark: SparkSession,
-    dataset_uris: Iterable[str],
-    telemetry_config: TelemetryConfig,
-    storage_options: dict[str, Any] | None,
-    partitions: int = TAG_FANOUT_PARTITIONS,
-) -> list[dict[str, Any]]:
-    """Migrate a fleet of datasets to V2 manifest paths, one task per executor partition.
-
-    Each dataset is independent, so the migration fans out across executors through the
-    shared per-dataset fan-out. The per-dataset call is idempotent, so a retried task
-    converges instead of corrupting state. This is a maintenance operation: run it only
-    with the targeted datasets quiesced.
-
-    Args:
-        spark: Active Spark session.
-        dataset_uris: Datasets whose manifest paths should be migrated to V2.
-        telemetry_config: Telemetry configuration created per executor process.
-        storage_options: Object-store options forwarded to pylance.
-        partitions: Maximum Spark partitions for the migration job.
-
-    Returns:
-        One statistics dictionary per dataset.
-    """
-
-    def per_dataset(uri: str, telemetry: Telemetry) -> dict[str, Any]:
-        """Migrate one dataset's manifest paths, closing over ``storage_options``."""
-        return migrate_dataset_manifest_paths(uri, storage_options, telemetry)
-
-    def log_results(results: list[dict[str, Any]]) -> None:
-        """Log the manifest migration summary."""
-        logger.info("manifest migration: %d datasets migrated to V2 paths", len(results))
-
-    return run_fleet_fanout(
-        spark,
-        dataset_uris,
-        telemetry_config,
-        per_dataset,
-        partitions,
-        span_name="lance.manifest_migration.run",
-        phase="migrate",
-        timer_metric="run.migrate_manifest_ms",
-        gauge_metric="run.manifests_migrated",
-        gauge_value=len,
-        log_results=log_results,
-    )
 
 
 def resolve_serving_tag(dataset: lance.LanceDataset, tag: str, version: int, created: bool) -> bool:
@@ -218,6 +128,7 @@ def flip_one_tag(dataset: lance.LanceDataset, tag: str, version: int, telemetry:
     actual_created: bool = created
     last_exc: ValueError | None = None
     with telemetry.timed("dataset.tag_update_ms", tags=[f"tag:{tag}"]):
+        attempt: Any
         for attempt in range(MAX_TAG_RACE_ATTEMPTS):
             attempt_created: bool = created if attempt == 0 else tag not in dataset.tags.list()
             try:
@@ -250,8 +161,8 @@ def update_serving_tag(
     """Point one or more serving tags at a target dataset version for blue-green promotion.
 
     Opens the dataset exactly once and flips every tag in ``tags`` against that single open
-    handle, so promoting an interval tag alongside ``HEAD`` (the pipeline stamp phase's common
-    case) costs one dataset open instead of one per tag. Each tag is created when it does not
+    handle, so an internal caller moving several tags costs one dataset open instead of one per
+    tag. Each tag is created when it does not
     exist yet, otherwise updated in place, through the Lance tags API. A tagged version is exempt
     from version cleanup: :func:`~lance_etl.maintenance.job.cleanup_dataset` passes
     ``error_if_tagged_old_versions=False`` and Lance never prunes a tagged version regardless of
@@ -276,7 +187,7 @@ def update_serving_tag(
     Args:
         uri: Dataset URI.
         target_version: The dataset version to point every tag at. ``None`` selects the
-            dataset's latest version.
+            dataset's latest version only when the tag set does not contain ``HEAD``.
         storage_options: Object-store options forwarded to pylance.
         telemetry: Telemetry facade for the current process.
         tags: Serving-tag names to create or move, all against the same resolved version.
@@ -286,10 +197,15 @@ def update_serving_tag(
         A statistics dictionary with keys ``uri``, ``tags`` (the deduplicated list of tag names
         flipped), ``version``, and ``created`` (a dict mapping each flipped tag name to whether a
         create or an update actually landed for it).
+
+    Raises:
+        ValueError: If ``HEAD`` is requested without an explicit target version.
     """
+    unique_tags: list[str] = list(dict.fromkeys(tags))
+    if "HEAD" in unique_tags and target_version is None:
+        raise ValueError("target_version is required when publishing HEAD")
     dataset: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
     version: int = dataset.version if target_version is None else target_version
-    unique_tags: list[str] = list(dict.fromkeys(tags))
     logger.info(
         "blue-green tag flip for %s: 1) build green version %d, 2) prewarm the serving layer against version %d, "
         "3) flip tag(s) %r to version %d. A tag move does not refresh a running serving process: prewarm and "
@@ -316,13 +232,12 @@ def update_serving_tags(
     """Flip one or more serving tags across a fleet of datasets, one task per executor partition.
 
     Each dataset's tag flip is an independent cheap metadata commit, so the work fans
-    out across executors exactly like the manifest migration. Every tag in ``tags`` is flipped
-    against the same single dataset open (see :func:`update_serving_tag`), so a caller that needs
-    to advance both an interval tag and ``HEAD`` on the same run does so in one fan-out instead of
-    two. With ``target_version`` set, every dataset is pointed at that same version number, which
-    only makes sense for a single dataset. With ``target_version=None`` (the common fleet case)
-    each dataset's tags are moved to its own latest version, promoting the freshly built green
-    version of each.
+    out across executors. Every tag in ``tags`` is flipped
+    against the same single dataset open (see :func:`update_serving_tag`). With
+    ``target_version`` set, every dataset is pointed at that same version number, which
+    only makes sense when every selected dataset has the intended version number. With
+    ``target_version=None`` each dataset's non-HEAD interval tags are moved to its own latest
+    version. Publishing ``HEAD`` without an exact version is rejected.
 
     Args:
         spark: Active Spark session.
@@ -330,8 +245,8 @@ def update_serving_tags(
         telemetry_config: Telemetry configuration created per executor process.
         storage_options: Object-store options forwarded to pylance.
         tags: Serving-tag names to create or move. Defaults to ``("HEAD",)``.
-        target_version: Target version for every dataset, or ``None`` to use each
-            dataset's latest version.
+        target_version: Target version for every dataset, or ``None`` to use each dataset's latest
+            version for non-HEAD interval tags only.
         partitions: Maximum Spark partitions for the tag-flip job.
 
     Returns:
@@ -391,14 +306,13 @@ def prune_interval_tags(
         telemetry: Telemetry facade for the current process.
 
     Returns:
-        A statistics dictionary with keys ``uri``, ``tags_pruned``, ``tags_kept``, and
-        optionally ``skipped`` when ``tag_keep_last`` is ``None`` (though callers
-        checking ``None`` should skip calling this function entirely).
+        A statistics dictionary with keys ``uri``, ``tags_pruned``, and ``tags_kept``.
     """
     dataset: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
     all_tags: list[str] = list(dataset.tags.list())
 
     interval_tags: list[tuple[datetime, str]] = []
+    name: Any
     for name in all_tags:
         try:
             parsed: datetime = datetime.strptime(name, "%Y%m%dT%H%M%SZ")
@@ -428,57 +342,3 @@ def prune_interval_tags(
         len(to_delete),
     )
     return {"uri": uri, "tags_pruned": len(to_delete), "tags_kept": len(to_keep)}
-
-
-def prune_interval_tags_fleet(
-    spark: SparkSession,
-    dataset_uris: Iterable[str],
-    telemetry_config: TelemetryConfig,
-    storage_options: dict[str, Any] | None,
-    tag_keep_last: int,
-    partitions: int = TAG_FANOUT_PARTITIONS,
-) -> list[dict[str, Any]]:
-    """Prune old interval tags across a fleet of datasets, one task per executor partition.
-
-    Each dataset's tag pruning is an independent metadata operation, so the work fans
-    out across executors exactly like the manifest migration.  ``tag_keep_last`` is
-    broadcast implicitly through the closure captured by the per-dataset callable.
-
-    Args:
-        spark: Active Spark session.
-        dataset_uris: Datasets whose old interval tags should be pruned.
-        telemetry_config: Telemetry configuration created per executor process.
-        storage_options: Object-store options forwarded to pylance.
-        tag_keep_last: Number of newest interval tags to retain per dataset.
-        partitions: Maximum Spark partitions for the prune job.
-
-    Returns:
-        One statistics dictionary per dataset.
-    """
-
-    def per_dataset(uri: str, telemetry: Telemetry) -> dict[str, Any]:
-        """Prune one dataset's interval tags, closing over ``storage_options``/``tag_keep_last``."""
-        return prune_interval_tags(uri, storage_options, tag_keep_last, telemetry)
-
-    def pruned_total(results: list[dict[str, Any]]) -> int:
-        """Sum the pruned-tag counts across every dataset result."""
-        return sum(int(r.get("tags_pruned", 0)) for r in results)
-
-    def log_results(results: list[dict[str, Any]]) -> None:
-        """Log the interval-tag prune summary."""
-        logger.info("interval-tag prune: %d tags pruned across %d datasets", pruned_total(results), len(results))
-
-    return run_fleet_fanout(
-        spark,
-        dataset_uris,
-        telemetry_config,
-        per_dataset,
-        partitions,
-        span_name="lance.interval_tag_prune.run",
-        phase="prune",
-        timer_metric="run.prune_tags_ms",
-        gauge_metric="run.interval_tags_pruned",
-        gauge_value=pruned_total,
-        log_results=log_results,
-        span_tags={"tag_keep_last": tag_keep_last},
-    )

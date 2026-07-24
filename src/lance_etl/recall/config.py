@@ -15,7 +15,6 @@ from typing import Any
 from lance_etl.telemetry import TelemetryConfig
 
 FILTER_COLUMN_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-PATH_COMPONENT_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z0-9._-]+$")
 COMPARE_OPS: dict[str, str] = {"eq": "=", "ne": "<>", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
 DISTANCE_TYPES: frozenset[str] = frozenset({"l2", "cosine", "dot", "hamming"})
 QUERY_TYPES: frozenset[str] = frozenset({"vector", "text", "hybrid"})
@@ -46,13 +45,13 @@ class RecallJobConfig:
         small_tier_slices: Spark partition count for the classification probe job and the packed small-tier scoring
             job. Fewer slices than groups packs many small groups per task, amortizing task scheduling and cold opens.
         large_tier_slices: Spark partition cap for the per-fragment fan-out job. One task scores one fragment up to
-            this cap, beyond which fragments share tasks while the driver still reduces them exactly.
+            this cap, beyond which fragments share tasks before keyed executor reduction.
     """
 
     base_uri: str
     telemetry: TelemetryConfig
     storage_options: dict[str, Any] | None = None
-    id_column: str = "vector_id"
+    id_column: str = "record_id"
     vector_column: str = "vector"
     max_samples: int = 10_000
     large_group_fragment_threshold: int = 32

@@ -5,7 +5,7 @@ full before making any change.
 
 The four rules most likely to cause a review failure if missed:
 
-1. No `#` inline comments anywhere in `src/`, `tests/`, or `airflow/` — use docstrings only.
+1. No `#` inline comments anywhere in `src/`, `tests/`, `bench/`, or `migrations/` — use docstrings only.
    No leading underscores on any defined name in those directories either. Note that `__version__`
    was removed from `src/lance_etl/__init__.py` for exactly this reason.
 2. Lance indexes are built exclusively via the segment API (`create_index_uncommitted` /

@@ -286,11 +286,11 @@ impl Visit for JsonEventVisitor<'_> {
 /// Tracing layer that promotes Lance trace events into DogStatsD metrics.
 ///
 /// It matches events on four Lance targets and forwards each through the [`Metrics`] facade:
-/// - [`THROTTLE_TARGET`]: a throttle-error count and the AIMD limiter's freshly reduced fill rate.
-/// - [`IO_EVENTS_TARGET`]: an IO-event counter tagged by the `type` field (index open or part load).
-/// - [`DATASET_EVENTS_TARGET`]: a dataset-lifecycle counter tagged by the `event` field
+/// - `THROTTLE_TARGET`: a throttle-error count and the AIMD limiter's freshly reduced fill rate.
+/// - `IO_EVENTS_TARGET`: an IO-event counter tagged by the `type` field (index open or part load).
+/// - `DATASET_EVENTS_TARGET`: a dataset-lifecycle counter tagged by the `event` field
 ///   (`loading` on open, plus writing/committed/dropping_column/deleting/compacting/cleaning).
-/// - [`FILE_AUDIT_TARGET`]: a file-audit counter tagged by the `mode` and `type` fields.
+/// - `FILE_AUDIT_TARGET`: a file-audit counter tagged by the `mode` and `type` fields.
 ///
 /// The layer only reads event fields and emits metrics, so it never panics, never blocks the traced
 /// task, and adds nothing for events on any other target.
@@ -402,15 +402,22 @@ mod tests {
 
     #[test]
     fn init_tracing_disabled_is_idempotent_and_panic_free() {
+        let tracing_guard = crate::telemetry::TRACING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let first = init_tracing(true, Arc::new(Metrics::disabled()));
         let second = init_tracing(true, Arc::new(Metrics::disabled()));
         tracing::info!(org_id = "org-test", "telemetry smoke event");
         drop(second);
         drop(first);
+        drop(tracing_guard);
     }
 
     #[test]
     fn lance_event_layer_emits_throttle_error_counter_and_rate_gauge_on_matching_events() {
+        let tracing_guard = crate::telemetry::TRACING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (receiver, sink) = SpyMetricSink::new();
         let metrics = Arc::new(Metrics::from_sink(sink));
         let subscriber = tracing_subscriber::registry().with(LanceEventMetricsLayer::new(metrics));
@@ -445,10 +452,14 @@ mod tests {
             2,
             "only the matching throttle event must produce metrics: {lines:?}"
         );
+        drop(tracing_guard);
     }
 
     #[test]
     fn lance_event_layer_maps_io_dataset_and_file_audit_events_to_metrics() {
+        let tracing_guard = crate::telemetry::TRACING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (receiver, sink) = SpyMetricSink::new();
         let metrics = Arc::new(Metrics::from_sink(sink));
         let subscriber = tracing_subscriber::registry().with(LanceEventMetricsLayer::new(metrics));
@@ -489,5 +500,6 @@ mod tests {
             1,
             "only the Lance dataset target must emit dataset metrics: {lines:?}"
         );
+        drop(tracing_guard);
     }
 }

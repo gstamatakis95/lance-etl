@@ -1,22 +1,21 @@
-"""Batch-major end-to-end benchmark orchestration with per-batch tagging and historical-tag verification.
+"""End-to-end benchmark that qualifies the production PostgreSQL reconciler path.
 
-Drives the full pipeline in batch-major order: for each ETL window the orchestrator runs ETL then
-the production ``lance_etl.pipeline.PipelineJob`` (compaction, index build, and interval-tag stamp
-in one serialized fleet run), then optionally prewarms and queries the gRPC server at the new tag.
-Tag pruning is disabled in the bench driver (``tag_keep_last=None``) so every batch's interval tag
-is retained for the historical-tag verification pass at the end of the run.  After all batches
-complete the verification pass opens every tagged dataset version and asserts the row count matches
-what was recorded at tag time.  A final recall measurement runs at the last tag when the gRPC server
-is reachable and the adapter supplies official ground truth (or the benchmark brute-forces a
-ground-truth subset).
+The benchmark stands up the exact local control plane the release runbook documents: an isolated
+migrated PostgreSQL schema, a partitioned Iceberg source table matching the fixed source contract,
+source registration through :class:`~lance_etl.state.ControlPlaneRepository`, and a wired
+:class:`~lance_etl.reconciler.service.ReconcilerApplication`. Each batch appends one ordinal window
+of corpus rows as a new Iceberg snapshot, then reconciliation cycles carry every dataset through
+ingest, compaction, indexing, validation, prewarm, and publication. The benchmark reads the
+resulting publications back through
+:meth:`~lance_etl.state.ControlPlaneRepository.resolve_serving_dataset` and verifies each
+organization's published dataset opens at its exact version with the expected terminal row count
+and every index the installed specification declares present.
 
-This subcommand is complementary to ``all``: ``all`` is phase-major (full ingest, then full index,
-then compact), whereas ``e2e`` is batch-major (ingest batch i, pipeline batch i, repeat). Per-stage
-index timings are no longer emitted by the e2e path because all index types now run inside a single
-``LanceIndexer.run`` call within the pipeline job.
-
-The ``--no-text`` flag is fully respected: the FTS index column is omitted from the union config
-and the gRPC FTS/hybrid legs are skipped, matching the behaviour of the individual phase commands.
+This subcommand replaces the retired batch-major pipeline path. The catalog search leg (recall,
+first-query latency, FTS, and hybrid) self-hosts a search-api subprocess inside the PostgreSQL
+isolation window whenever ``config.search_api_binary`` exists, and is recorded as ``NOT_RUN``
+otherwise so a bare ``e2e`` run never manufactures search coverage. An externally started server
+cannot see the ephemeral control-plane schema, so ``e2e`` never dials ``--endpoint``.
 """
 
 from __future__ import annotations
@@ -24,204 +23,164 @@ from __future__ import annotations
 import logging
 import os
 import time
-from datetime import UTC, datetime
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-import grpc
 import lance
 import numpy as np
 
 from bench.config import RECALL_CUTOFFS, BenchConfig
 from bench.groundtruth import recall_at
 from bench.grpc_client import (
-    generate_stubs,
-    load_stubs,
-    prewarm_dataset,
-    result_vector_ids,
-    vector_search_at_tag,
+    generate_and_load_stubs,
+    open_stub,
+    result_record_ids,
+    vector_search,
 )
-from bench.indexes import union_index_config
-from bench.ingest import batch_windows, run_etl_window
-from bench.results import ensure_dir, save_phase
-from bench.spark_session import bench_telemetry_config, build_spark
-from bench.telemetry_capture import CaptureConfig, TelemetryCapture
-from lance_etl.maintenance import MaintenanceConfig
-from lance_etl.pipeline import PipelineConfig, PipelineJob
+from bench.reconcile import (
+    append_production_batch,
+    batch_windows_by_ordinal,
+    bench_spec_index_names,
+    bench_workspace_spark,
+    benchmark_adapter,
+    build_reconciler_application,
+    create_production_source_table,
+    drain_reconciler,
+    expected_org_rows,
+    expected_versions_from_repository,
+    isolated_control_plane,
+    resolve_database_url,
+    resolve_org_serving,
+    source_table_identifier,
+)
+from bench.results import ensure_dir, save_phase, write_json
+from bench.search import load_artifacts, run_fts_leg, run_hybrid_leg
+from bench.search_server import self_hosted_search_api
+from bench.telemetry_capture import CaptureConfig, telemetry_capture_session
+from lance_etl.state import ControlPlaneRepository, ServingDataset
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-E2E_NPROBES: int = 10
-"""Fallback nprobes for gRPC legs when config.nprobes is empty."""
 
-
-def window_tag_name(window_end: str) -> str:
-    """Convert a window-end timestamp string into a Lance tag name.
-
-    Lance tag names allow only ``[A-Za-z0-9._-]``, so colons are replaced. The input
-    is a Spark timestamp literal such as ``"2024-01-01 12:00:00"`` which is formatted
-    to ``"20240101T120000Z"`` following the ISO-8601 basic format without colons.
+def serving_row_count(serving: ServingDataset) -> int:
+    """Count rows of one published dataset at its exact served version.
 
     Args:
-        window_end: The window-end timestamp literal from :func:`batch_windows`.
+        serving: Resolved active publication.
 
     Returns:
-        A colon-free tag name suitable for Lance.
+        The exact row count at the published Lance version.
     """
-    dt: datetime = datetime.strptime(window_end, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-    return dt.strftime("%Y%m%dT%H%M%SZ")
+    return int(lance.dataset(serving.lance_uri, version=serving.lance_version).count_rows())
 
 
-def run_e2e_pipeline_batch(config: BenchConfig, batch_index: int, tag: str) -> dict[str, Any]:
-    """Run the production PipelineJob for one ETL batch: compact, index, and stamp in order.
+def serving_index_names(serving: ServingDataset) -> list[str]:
+    """List the built index names of one published dataset.
 
-    Builds a :class:`~lance_etl.pipeline.PipelineConfig` with ``tag_keep_last=None`` so every
-    batch's interval tag is retained for the historical-tag verification pass.  Pruning is
-    disabled in the bench driver intentionally: all interval tags must survive for the
-    post-run verification to read their pinned versions.
+    Args:
+        serving: Resolved active publication.
 
-    The maintenance sub-config mirrors the phase-major ``compact`` command:
-    ``defer_index_remap=False`` so covering IVF indexes are remapped inline during the commit.
-    The indexing sub-config is the union of all column types produced by
-    :func:`~bench.indexes.union_index_config`.
+    Returns:
+        Sorted index names present at the published Lance version.
+    """
+    dataset: Any = lance.dataset(serving.lance_uri, version=serving.lance_version)
+    return sorted(description.name for description in dataset.describe_indices())
 
-    After ``PipelineJob.run`` returns, each dataset's row count is read via
-    ``lance.dataset(uri).count_rows()`` and stored in ``tag_stats`` so
-    :func:`verify_historical_tags` can verify the pinned version without arithmetic
-    approximation.
+
+def collect_batch_servings(config: BenchConfig, repository: ControlPlaneRepository) -> list[dict[str, Any]]:
+    """Read the active publication of every organization after one batch.
 
     Args:
         config: Benchmark configuration.
-        batch_index: Zero-based batch index, used for the Spark application name.
-        tag: The colon-free interval tag name to stamp after the pipeline completes.
+        repository: Migrated PostgreSQL repository.
 
     Returns:
-        A dictionary with keys:
-
-        - ``tag_stats``: list of per-dataset dicts with ``uri``, ``tag``, ``version``,
-          ``created``, and ``row_count`` (the actual count at the tagged version).
-        - ``pipeline``: lean summary dict with ``seconds`` (total wall time), ``counts``
-          (from the pipeline return doc), ``maintenance_datasets`` (count), and
-          ``index_datasets`` (count).
+        One serving record per organization with its published URI, version, and row count.
     """
-    telemetry_cfg = bench_telemetry_config()
-    pipeline_cfg = PipelineConfig(
-        telemetry=telemetry_cfg,
-        maintenance=MaintenanceConfig(
-            telemetry=telemetry_cfg,
-            target_rows_per_fragment=config.compact_target_rows,
-            defer_index_remap=False,
-        ),
-        indexing=union_index_config(config),
-        tag_stamp=tag,
-        tag_keep_last=None,
-        serve_tag=False,
-    )
-    uris: list[str] = config.dataset_uris()
-    spark = build_spark(config, f"bench-e2e-pipeline-{batch_index}")
-    try:
-        started: float = time.perf_counter()
-        pipeline_result: dict[str, Any] = PipelineJob(pipeline_cfg).run(spark, uris)
-        elapsed: float = time.perf_counter() - started
-    finally:
-        spark.stop()
-
-    stamp_by_uri: dict[str, dict[str, Any]] = {
-        r["uri"]: r for r in pipeline_result.get("stamp_results", []) if r.get("tag") == tag
-    }
-    tag_stats: list[dict[str, Any]] = []
-    for uri in uris:
-        stamp = stamp_by_uri.get(uri, {"uri": uri, "tag": tag, "version": None, "created": False})
-        record: dict[str, Any] = {
-            "uri": uri,
-            "tag": stamp.get("tag", tag),
-            "version": stamp.get("version"),
-            "created": stamp.get("created", False),
-            "row_count": lance.dataset(uri).count_rows(),
-        }
-        tag_stats.append(record)
-
-    counts: dict[str, Any] = pipeline_result.get("counts", {})
-    pipeline_summary: dict[str, Any] = {
-        "seconds": round(elapsed, 3),
-        "counts": counts,
-        "maintenance_datasets": len(pipeline_result.get("maintenance_results", [])),
-        "index_datasets": len(pipeline_result.get("index_results", [])),
-    }
-    return {"tag_stats": tag_stats, "pipeline": pipeline_summary}
+    servings: list[dict[str, Any]] = []
+    for org in config.org_ids():
+        serving: ServingDataset | None = resolve_org_serving(repository, org)
+        if serving is None:
+            servings.append({"org": org, "published": False})
+            continue
+        servings.append(
+            {
+                "org": org,
+                "published": True,
+                "lance_uri": serving.lance_uri,
+                "lance_version": serving.lance_version,
+                "row_count": serving_row_count(serving),
+            }
+        )
+    return servings
 
 
-def verify_historical_tags(tag_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Open every tagged version and assert it resolves to the expected dataset version.
+def verify_publications(config: BenchConfig, repository: ControlPlaneRepository) -> list[dict[str, Any]]:
+    """Verify every organization's terminal publication cardinality and full index coverage.
 
-    For each tag-dataset pair, the dataset is re-opened at the tag's resolved version via
-    ``lance.dataset(uri, version=tag)`` and ``ds.version`` is compared against the version
-    number recorded in the tag statistics at stamp time. This verifies that the tag is still
-    accessible and has not been pruned or moved without triggering a full row-count scan
-    (which loads index statistics and fragment metadata into memory — prohibitively expensive
-    at 10M+ rows and flaky under Spark JVM memory pressure).
+    Each organization's published dataset must hold the exact expected row count and carry every
+    index name the installed bench specification declares, not merely the vector index. The expected
+    index names are derived from the frozen bench spec revision through
+    :func:`~bench.reconcile.bench_spec_index_names`, so re-identifying or extending the spec keeps
+    the check honest without a hardcoded list.
 
     Args:
-        tag_records: Records produced by :func:`run_e2e_pipeline_batch`, one per (batch, dataset).
+        config: Benchmark configuration.
+        repository: Migrated PostgreSQL repository.
 
     Returns:
-        One verification outcome per (tag, URI) pair with ``ok``, ``expected_version``, and
-        ``actual_version`` keys.
+        One verification outcome per organization with ``ok``, expected and actual row counts, the
+        expected and built index names, any missing indexes, and the published URI and version.
     """
-    outcomes: list[dict[str, Any]] = []
-    for record in tag_records:
-        tag: str = record["tag"]
-        uri: str = record["uri"]
-        expected_version: int | None = record.get("version")
-        try:
-            ds = lance.dataset(uri, version=tag)
-            actual_version: int = ds.version
-            ok: bool = expected_version is None or actual_version == expected_version
-        except Exception as exc:
-            outcomes.append({"tag": tag, "uri": uri, "ok": False, "error": str(exc)[:500]})
+    expected: dict[str, int] = expected_org_rows(config)
+    expected_indexes: frozenset[str] = bench_spec_index_names(config)
+    checks: list[dict[str, Any]] = []
+    for org in config.org_ids():
+        want: int = expected[org]
+        serving: ServingDataset | None = resolve_org_serving(repository, org)
+        if serving is None:
+            checks.append({"org": org, "ok": want == 0, "published": False, "expected_rows": want})
             continue
-        outcomes.append(
-            {"tag": tag, "uri": uri, "ok": ok, "expected_version": expected_version, "actual_version": actual_version}
+        actual: int = serving_row_count(serving)
+        indexes: list[str] = serving_index_names(serving)
+        missing: list[str] = sorted(expected_indexes - set(indexes))
+        ok: bool = actual == want and not missing
+        checks.append(
+            {
+                "org": org,
+                "ok": ok,
+                "published": True,
+                "expected_rows": want,
+                "row_count": actual,
+                "expected_indexes": sorted(expected_indexes),
+                "indexes": indexes,
+                "missing_indexes": missing,
+                "lance_uri": serving.lance_uri,
+                "lance_version": serving.lance_version,
+            }
         )
         if not ok:
             logger.warning(
-                "historical tag %r on %s: expected version %s, got %d", tag, uri, expected_version, actual_version
+                "publication verification failed for org %s: expected %d rows, got %d, missing indexes %s",
+                org,
+                want,
+                actual,
+                missing,
             )
-    return outcomes
+    return checks
 
 
-def prewarm_orgs_at_tag(stub: Any, pb2: Any, config: BenchConfig, tag: str) -> dict[str, Any]:
-    """Prewarm every org's dataset pinned to a serve tag, capturing per-org outcomes.
-
-    Args:
-        stub: The connected ``SearchServiceStub``.
-        pb2: The generated protobuf module.
-        config: Benchmark configuration.
-        tag: The serve tag to prewarm at.
-
-    Returns:
-        Per-org prewarm reports, with failures recorded as ``error`` strings.
-    """
-    outcomes: dict[str, Any] = {}
-    for org in config.org_ids():
-        try:
-            outcomes[org] = prewarm_dataset(stub, pb2, org, fts_with_position=False, tag=tag)
-        except Exception as exc:
-            outcomes[org] = {"error": str(exc)[:500]}
-    return outcomes
-
-
-def org_recall_at_tag(
+def org_catalog_recall(
     stub: Any,
     pb2: Any,
     config: BenchConfig,
     org: str,
     queries: np.ndarray,
     org_gt: np.ndarray,
-    tag: str,
-    nprobes: int,
+    expected_version: int,
 ) -> dict[str, Any] | None:
-    """Run the vector recall sweep for one org pinned to a serve tag.
+    """Measure vector recall for one org through its current catalog publication.
 
     Args:
         stub: The connected ``SearchServiceStub``.
@@ -230,8 +189,7 @@ def org_recall_at_tag(
         org: The org to sweep.
         queries: The query matrix.
         org_gt: The org's ground-truth global ids.
-        tag: The serve tag to query at.
-        nprobes: The IVF nprobes to search with.
+        expected_version: Operator-approved exact Lance publication.
 
     Returns:
         The org's recall point with per-cutoff recall and mean latency, or ``None`` when every
@@ -244,19 +202,19 @@ def org_recall_at_tag(
     kept_indices: list[int] = []
     for index, query in enumerate(queries):
         try:
-            response, elapsed_ms = vector_search_at_tag(stub, pb2, org, query, config.search_k, nprobes, tag=tag)
+            response, elapsed_ms = vector_search(stub, pb2, org, query, config.search_k, expected_version)
         except Exception as exc:
             logger.warning("gRPC error during tag recall sweep for org %s: %s", org, exc)
             continue
         latencies.append(elapsed_ms)
-        retrieved.append(result_vector_ids(response.results))
+        retrieved.append(result_record_ids(response.results))
         kept_indices.append(index)
     if not retrieved:
         return None
     expected: np.ndarray = org_gt[np.asarray(kept_indices, dtype=np.int64)]
     point: dict[str, Any] = {
         "org": org,
-        "tag": tag,
+        "execution_policy": "catalog_profile",
         "queries": len(retrieved),
         "failed_queries": len(queries) - len(retrieved),
     }
@@ -267,98 +225,153 @@ def org_recall_at_tag(
     return point
 
 
-def run_grpc_legs_at_tag(
+def run_catalog_grpc_legs(
     config: BenchConfig,
-    tag: str,
+    expected_versions: dict[str, int],
     queries: np.ndarray,
     ground_truth: dict[str, np.ndarray],
-    grpc_gen_dir: Path,
+    stub: Any,
+    pb2: Any,
 ) -> dict[str, Any]:
-    """Run prewarm-at-tag and a vector recall leg pinned to a serve tag via gRPC.
-
-    Probes the server before attempting any RPCs. If the server is unreachable the call
-    returns a skipped record with a descriptive reason so callers can treat the absence of a
-    running server as a non-fatal condition (used in tests and in the ``all`` chain).
+    """Run first-query latency and recall through the final catalog publication.
 
     Args:
         config: Benchmark configuration.
-        tag: The serve tag to query at.
+        expected_versions: Operator-approved exact publication per organization, resolved directly
+            from the control-plane repository rather than an external evidence file.
         queries: The query matrix (capped by ``--max-queries`` if set).
         ground_truth: Per-org ground-truth global ids.
-        grpc_gen_dir: Directory holding the compiled gRPC stubs.
+        stub: The connected ``SearchServiceStub`` against the self-hosted server.
+        pb2: The generated protobuf module.
 
     Returns:
-        Prewarm outcome (per org), recall results at the tag, and cold/warm first-query latency.
+        Catalog recall and cold plus warm first-query latency.
     """
-    try:
-        pb2, pb2_grpc = load_stubs(generate_stubs(grpc_gen_dir))
-        channel = grpc.insecure_channel(config.endpoint)
-        grpc.channel_ready_future(channel).result(timeout=3.0)
-        stub = pb2_grpc.SearchServiceStub(channel)
-    except Exception as exc:
-        return {"skipped": f"gRPC server unreachable at {config.endpoint}: {exc}"}
-
-    nprobes: int = config.nprobes[0] if config.nprobes else E2E_NPROBES
-
-    prewarm_outcomes: dict[str, Any] = prewarm_orgs_at_tag(stub, pb2, config, tag)
-
     first_latencies: dict[str, Any] = {}
     for org in config.org_ids():
         try:
-            resp, cold_ms = vector_search_at_tag(stub, pb2, org, queries[0], 10, nprobes, tag=tag)
+            resp, cold_ms = vector_search(stub, pb2, org, queries[0], 10, expected_versions[org])
             del resp
-            _, warm_ms = vector_search_at_tag(stub, pb2, org, queries[0], 10, nprobes, tag=tag)
+            _, warm_ms = vector_search(stub, pb2, org, queries[0], 10, expected_versions[org])
             first_latencies[org] = {"cold_ms": round(cold_ms, 3), "warm_ms": round(warm_ms, 3)}
         except Exception as exc:
             first_latencies[org] = {"error": str(exc)[:500]}
 
     sweep_recalls: list[dict[str, Any]] = []
+    recall_failures: list[str] = []
     for org in config.org_ids():
         if org not in ground_truth:
             continue
-        point: dict[str, Any] | None = org_recall_at_tag(
-            stub, pb2, config, org, queries, ground_truth[org], tag, nprobes
+        point: dict[str, Any] | None = org_catalog_recall(
+            stub, pb2, config, org, queries, ground_truth[org], expected_versions[org]
         )
         if point is not None:
             sweep_recalls.append(point)
+            if point["failed_queries"]:
+                recall_failures.append(org)
+        else:
+            recall_failures.append(org)
 
-    return {"prewarm": prewarm_outcomes, "first_latencies": first_latencies, "recall": sweep_recalls}
+    failed_targets: list[str] = [org for org, timing in first_latencies.items() if "error" in timing]
+    failed_targets = sorted(set(failed_targets + recall_failures))
+    return {
+        "status": "FAILED" if failed_targets else "MEASURED",
+        "failed_targets": failed_targets,
+        "expected_versions": expected_versions,
+        "first_latencies": first_latencies,
+        "recall": sweep_recalls,
+    }
 
 
-def load_queries_and_gt(config: BenchConfig) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """Load the query matrix and per-org ground truth from the prepared artifact directory.
+def catalog_search_leg(
+    config: BenchConfig,
+    repository: ControlPlaneRepository,
+    database_url: str,
+    grpc_gen_dir: Path,
+) -> dict[str, Any]:
+    """Self-host search-api inside the isolation window and measure recall, FTS, and hybrid.
+
+    An externally started server can never see ``e2e``'s ephemeral control-plane schema, so this
+    is the only way ``e2e`` can measure a real search leg: the release binary named by
+    ``config.search_api_binary`` is spawned as a subprocess from inside the still-open PostgreSQL
+    isolation window, pointed at the exact isolated ``database_url``, and torn down before this
+    function returns so the caller's ``with isolated_control_plane(...)`` block can safely drop the
+    schema afterwards. Must be called from inside that block.
 
     Args:
         config: Benchmark configuration.
+        repository: Migrated PostgreSQL repository, still inside its isolation window.
+        database_url: The isolated control-plane URL yielded by ``isolated_control_plane``.
+        grpc_gen_dir: Directory holding the compiled gRPC stubs.
 
     Returns:
-        The query matrix (possibly capped by ``--max-queries``) and per-org ground-truth arrays.
+        A measured catalog result (recall, first-query latency, FTS, hybrid), a ``NOT_RUN`` record
+        when no search-api binary is configured, or a ``FAILED`` record on any startup or RPC
+        error. Never fabricates coverage: any failure is reported, not swallowed. The prepared
+        query, ground-truth, cluster, and vocabulary artifacts are loaded exactly once through
+        :func:`~bench.search.load_artifacts` and shared by the recall, FTS, and hybrid legs.
     """
-    prepared: Path = config.prepared_dir()
-    queries: np.ndarray = np.load(prepared / "queries.npy")
-    ground_truth_file = np.load(prepared / "ground_truth.npz")
-    ground_truth: dict[str, np.ndarray] = {org: ground_truth_file[org] for org in ground_truth_file.files}
+    binary: Path | None = config.search_api_binary
+    if binary is None or not binary.exists():
+        return {
+            "status": "NOT_RUN",
+            "reason": (
+                f"no search-api binary at {binary}; build rust/search-api with "
+                "`cargo build --release`, or pass --search-api-binary, or an empty string to "
+                "disable the leg explicitly"
+            ),
+        }
+    expected_versions: dict[str, int] = expected_versions_from_repository(config, repository)
+    if not expected_versions:
+        return {"status": "FAILED", "reason": "no organization has an active publication to search"}
+    try:
+        artifacts: dict[str, Any] = load_artifacts(config)
+    except (OSError, ValueError) as exc:
+        return {"status": "FAILED", "reason": f"cannot load prepared query artifacts: {exc}"}
+    queries: np.ndarray = artifacts["queries"]
     if config.max_queries is not None:
         queries = queries[: config.max_queries]
-    return queries, ground_truth
+    ground_truth: dict[str, np.ndarray] = artifacts["ground_truth"]
+
+    log_path: Path = config.telemetry_dir() / "search-api.log"
+    try:
+        pb2, pb2_grpc = generate_and_load_stubs(grpc_gen_dir)
+        with self_hosted_search_api(
+            binary=binary,
+            database_url=database_url,
+            base_uri=config.lance_root(),
+            port=config.search_api_port,
+            log_path=log_path,
+        ) as endpoint:
+            hosted_config: BenchConfig = replace(config, endpoint=endpoint)
+            channel, stub = open_stub(hosted_config, pb2_grpc, timeout_seconds=5.0)
+            try:
+                result: dict[str, Any] = run_catalog_grpc_legs(
+                    hosted_config, expected_versions, queries, ground_truth, stub, pb2
+                )
+                if config.no_text:
+                    result["fts"] = {"skipped": "no_text mode; FTS leg disabled"}
+                    result["hybrid"] = {"skipped": "no_text mode; hybrid leg disabled"}
+                else:
+                    result["fts"] = run_fts_leg(stub, pb2, hosted_config, artifacts, expected_versions)
+                    result["hybrid"] = run_hybrid_leg(stub, pb2, hosted_config, artifacts, expected_versions)
+                return result
+            finally:
+                channel.close()
+    except Exception as exc:
+        return {"status": "FAILED", "reason": str(exc)}
 
 
 def run_e2e(config: BenchConfig) -> dict[str, Any]:
-    """Run the batch-major end-to-end benchmark with per-batch tagging.
+    """Run the reconciler-driven end-to-end benchmark, optionally capturing telemetry.
 
-    For each batch window: ETL, index, compact, tag. After all batches: historical-tag
-    verification, optional gRPC recall legs at each tag, and a final full recall sweep at
-    the last tag.
-
-    When ``config.capture_telemetry`` is True, a :class:`~bench.telemetry_capture.TelemetryCapture`
-    session is started before the first batch and torn down after the final recall sweep. The
-    session binds a DogStatsD UDP listener on ``127.0.0.1:{config.statsd_port}`` and an OTLP
-    gRPC receiver on ``127.0.0.1:{config.otlp_port}``, writes all received telemetry to
-    ``{config.workspace}/telemetry/``, and injects the required environment variables into
-    the current process so all Spark executors and the gRPC client channel can reach the
-    listeners. Failure to bind either listener logs a warning and is non-fatal: the emitters
-    on both the Python and Rust sides are fire-and-forget UDP/gRPC, so a missing listener
-    never fails a pipeline run.
+    When ``config.capture_telemetry`` is True, :func:`~bench.telemetry_capture.telemetry_capture_session`
+    starts before the first batch and stops after verification. The session binds a
+    DogStatsD UDP listener on ``127.0.0.1:{config.statsd_port}`` and an OTLP gRPC receiver on
+    ``127.0.0.1:{config.otlp_port}``, writes all received telemetry to ``{config.workspace}/telemetry/``,
+    and injects the required environment variables so all Spark executors and the reconciler emit to
+    the listeners. Failure to bind either listener logs a warning and is non-fatal: the emitters on
+    both the Python and Rust sides are fire-and-forget, so a missing listener never fails a run.
 
     Args:
         config: Benchmark configuration.
@@ -372,7 +385,7 @@ def run_e2e(config: BenchConfig) -> dict[str, Any]:
             statsd_port=config.statsd_port,
             otlp_port=config.otlp_port,
         )
-        with TelemetryCapture(capture_cfg) as capture:
+        with telemetry_capture_session(capture_cfg) as capture:
             prev_env: dict[str, str | None] = {}
             for key, val in capture.env_overrides.items():
                 prev_env[key] = os.environ.get(key)
@@ -388,83 +401,118 @@ def run_e2e(config: BenchConfig) -> dict[str, Any]:
     return run_e2e_body(config)
 
 
-def run_e2e_body(config: BenchConfig) -> dict[str, Any]:
-    """Execute the e2e benchmark body without managing capture lifecycle.
+def run_reconciled_batches(config: BenchConfig, repository: ControlPlaneRepository) -> list[dict[str, Any]]:
+    """Append and reconcile every corpus batch through the production control plane.
 
-    Called by :func:`run_e2e` after the capture context has been entered (when capture is
-    enabled) or directly (when capture is disabled).
+    Builds a fresh partitioned source table, appends the first ordinal window as the canonical
+    baseline, wires the reconciler around the migrated repository, and then drains each batch's
+    snapshot to publication. Row generation runs inside Spark executors and the shared session is
+    stopped when the batches finish.
+
+    Args:
+        config: Benchmark configuration.
+        repository: Migrated PostgreSQL repository.
+
+    Returns:
+        One record per batch with its ordinal window, reconciliation counts, and per-org servings.
+    """
+    adapter = benchmark_adapter(config)
+    windows: list[tuple[int, int]] = batch_windows_by_ordinal(config)
+    spark = bench_workspace_spark(config)
+    batch_records: list[dict[str, Any]] = []
+    try:
+        table: str = source_table_identifier(config)
+        create_production_source_table(spark, table)
+        baseline_snapshot_id: int = append_production_batch(spark, config, table, adapter, windows[0])
+        application = build_reconciler_application(
+            spark,
+            repository,
+            table,
+            baseline_snapshot_id,
+            config,
+        )
+        for batch_index, window in enumerate(windows):
+            started: float = time.perf_counter()
+            if batch_index > 0:
+                append_production_batch(spark, config, table, adapter, window)
+            logger.info("e2e batch %d/%d ordinals [%d, %d)", batch_index + 1, len(windows), window[0], window[1])
+            reconcile_totals: dict[str, int] = drain_reconciler(application)
+            elapsed: float = time.perf_counter() - started
+            batch_records.append(
+                {
+                    "batch": batch_index,
+                    "first": window[0],
+                    "last": window[1],
+                    "seconds": round(elapsed, 3),
+                    "reconcile": reconcile_totals,
+                    "servings": collect_batch_servings(config, repository),
+                }
+            )
+    finally:
+        spark.stop()
+    return batch_records
+
+
+def run_e2e_body(config: BenchConfig) -> dict[str, Any]:
+    """Execute the reconciler-driven benchmark body without managing capture lifecycle.
+
+    The catalog search leg runs *inside* the PostgreSQL isolation window, immediately after
+    publication verification and before the ephemeral schema is dropped: a self-hosted search-api
+    subprocess is spawned against the exact isolated schema, queried, and torn down before the
+    ``with`` block exits. Passing ``--keep-control-plane`` skips dropping that schema afterwards so
+    a later standalone ``search --control-plane-url`` run can self-host against the same published
+    catalog; its URL is then written to ``control_plane.json`` in the run directory.
 
     Args:
         config: Benchmark configuration.
 
     Returns:
         The phase result document saved as ``e2e.json`` in the run directory.
+
+    Raises:
+        RuntimeError: If publication verification fails, or if a configured search-api binary
+            could not be self-hosted or measured (an absent binary is not an error: it records
+            ``NOT_RUN``).
     """
     ensure_dir(config.run_dir())
-    windows: list[tuple[str, str]] = batch_windows(config.batches)
-    batch_records: list[dict[str, Any]] = []
-    all_tag_records: list[dict[str, Any]] = []
     grpc_gen_dir: Path = config.workspace / "grpc_gen"
+    base_database_url: str = resolve_database_url()
+    with isolated_control_plane(base_database_url, keep=config.keep_control_plane) as (
+        repository,
+        engine,
+        isolated_url,
+    ):
+        del engine
+        batch_records: list[dict[str, Any]] = run_reconciled_batches(config, repository)
+        publications: list[dict[str, Any]] = verify_publications(config, repository)
+        all_ok: bool = all(check["ok"] for check in publications)
+        if not all_ok:
+            logger.warning("publication verification: some organizations did not converge (see e2e.json)")
+        catalog_grpc: dict[str, Any] = catalog_search_leg(config, repository, isolated_url, grpc_gen_dir)
 
-    for batch_index, window in enumerate(windows):
-        window_start: str
-        window_end: str
-        window_start, window_end = window
-        tag: str = window_tag_name(window_end)
-        logger.info(
-            "e2e batch %d/%d window [%s, %s) tag=%s",
-            batch_index + 1,
-            len(windows),
-            window_start,
-            window_end,
-            tag,
+    if config.keep_control_plane:
+        write_json(
+            config.run_dir() / "control_plane.json",
+            {"database_url": isolated_url, "base_uri": str(config.lance_root())},
         )
+        logger.info("control plane kept alive; see %s for --control-plane-url", config.run_dir() / "control_plane.json")
 
-        etl_start: float = time.perf_counter()
-        run_etl_window(config, batch_index, window)
-        etl_seconds: float = time.perf_counter() - etl_start
+    final_recall: dict[str, Any] = catalog_grpc if catalog_grpc.get("status") == "MEASURED" else {}
 
-        pipeline_batch_result: dict[str, Any] = run_e2e_pipeline_batch(config, batch_index, tag)
-        tag_stats: list[dict[str, Any]] = pipeline_batch_result["tag_stats"]
-        all_tag_records.extend(tag_stats)
-
-        batch_records.append(
-            {
-                "batch": batch_index,
-                "window_start": window_start,
-                "window_end": window_end,
-                "tag": tag,
-                "etl_seconds": round(etl_seconds, 3),
-                "pipeline": pipeline_batch_result["pipeline"],
-                "tag_stats": tag_stats,
-            }
-        )
-
-    verification: list[dict[str, Any]] = verify_historical_tags(all_tag_records)
-    all_ok: bool = all(rec.get("ok", False) for rec in verification)
-    if not all_ok:
-        logger.warning("historical-tag verification: some row counts did not match (see e2e.json)")
-
-    queries, ground_truth = load_queries_and_gt(config)
-    grpc_legs_per_tag: dict[str, Any] = {}
-    for batch_record in batch_records:
-        current_tag: str = batch_record["tag"]
-        grpc_legs_per_tag[current_tag] = run_grpc_legs_at_tag(config, current_tag, queries, ground_truth, grpc_gen_dir)
-
-    last_tag: str = window_tag_name(windows[-1][1])
-    last_grpc: dict[str, Any] = grpc_legs_per_tag.get(last_tag) or run_grpc_legs_at_tag(
-        config, last_tag, queries, ground_truth, grpc_gen_dir
-    )
-    final_recall: dict[str, Any] = {} if "skipped" in last_grpc else last_grpc
-
-    return save_phase(
+    result: dict[str, Any] = save_phase(
         config,
         "e2e",
         {
             "batches": batch_records,
-            "tags_created": [r["tag"] for r in all_tag_records if r.get("created")],
-            "historical_tag_verification": {"ok": all_ok, "checks": verification},
-            "grpc_legs_per_tag": grpc_legs_per_tag,
-            "final_recall_at_last_tag": final_recall,
+            "publications": publications,
+            "publication_verification": {"ok": all_ok, "checks": publications},
+            "final_catalog_grpc": catalog_grpc,
+            "final_catalog_recall": final_recall,
+            "control_plane_kept": config.keep_control_plane,
         },
     )
+    if not all_ok:
+        raise RuntimeError("benchmark publication verification failed")
+    if catalog_grpc.get("status") == "FAILED":
+        raise RuntimeError(f"self-hosted search leg failed: {catalog_grpc.get('reason', catalog_grpc)}")
+    return result

@@ -4,17 +4,18 @@ The driver groups parsed samples by ``(dataset_uri, dataset_version)`` and fans 
 with ``parallelize().map()``, mirroring the established executor patterns in ``etl.py`` and ``indexing.py``. A probe
 job classifies each group by fragment count: the tail of tiny groups is packed into the small tier where one task
 scores many datasets end to end, and big groups go to the large tier where the vector brute force fans out per
-fragment and is reduced exactly on the driver, while the BM25 leg (whose corpus-global statistics cannot be sharded)
-stays whole-dataset. Each executor opens its dataset checked out at the recorded version (falling back to the latest
-version with a drift flag when the recorded version was cleaned up) and scores every sample in the group. The driver
-aggregates the per-sample scores into a report table (overall, per RPC-parameter bucket, per query-type bucket, per
-organization), logs it, and emits bounded-cardinality Datadog gauges per RPC and query-type bucket.
+fragment and reduces keyed partials exactly on executors, while the BM25 leg (whose corpus-global statistics cannot
+be sharded) stays whole-dataset. Each executor opens its dataset only at the recorded version and
+skips samples whose exact version is unavailable. The driver receives one reduced leg per sample,
+aggregates the scores into a report table, logs it, and emits bounded-cardinality Datadog gauges per
+RPC and query-type bucket.
 """
 
 from __future__ import annotations
 
 import logging
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,6 +26,7 @@ from pyspark.sql import SparkSession
 from lance_etl.recall.config import BATCH_SIZE, RecallJobConfig
 from lance_etl.recall.queries import TextQueryTranslationError, resolve_filter_sql, text_query_field_queries
 from lance_etl.recall.scoring import (
+    DatasetOpenError,
     SampleScore,
     bm25_top_k,
     brute_force_top_k,
@@ -41,6 +43,20 @@ from lance_etl.telemetry import Telemetry
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+MAX_PARTIAL_CANDIDATES_PER_TASK: int = 20_000
+"""Maximum sum of requested top-k candidates retained by one exact-scoring task."""
+
+RPC_PARAMETER_BUCKET_RANGES: tuple[tuple[int, int], ...] = (
+    (1, 1),
+    (2, 2),
+    (3, 4),
+    (5, 8),
+    (9, 16),
+    (17, 32),
+    (33, 64),
+)
+"""Finite exponential ranges used to bound RPC report groups and metric tags."""
+
 
 @dataclass(frozen=True)
 class AggregateRow:
@@ -54,11 +70,10 @@ class AggregateRow:
         mean_mrr: Mean MRR over scored samples, or None when none scored.
         p50: Median recall@k over scored samples, or None when none scored.
         p95: 95th-percentile recall@k over scored samples, or None when none scored.
-        drift_count: Samples in the bucket scored against a drifted (latest) version.
         skip_count: Samples in the bucket that were skipped.
-        nprobes_min: RPC bucket key carried for metric tagging, None outside RPC buckets.
-        nprobes_max: RPC bucket key carried for metric tagging, None outside RPC buckets.
-        refine_factor: RPC bucket key carried for metric tagging, None outside RPC buckets.
+        nprobes_min: Bounded lower-nprobes range label, or None outside RPC buckets.
+        nprobes_max: Bounded upper-nprobes range label, or None outside RPC buckets.
+        refine_factor: Bounded refine-factor range label, or None outside RPC buckets.
         query_type: Query-type bucket key carried for metric tagging, None outside query-type buckets.
         is_rpc_bucket: True for RPC-parameter buckets, which are emitted as metrics tagged with the RPC parameters.
         is_query_type_bucket: True for query-type buckets, which are emitted as metrics tagged with the query type.
@@ -71,11 +86,10 @@ class AggregateRow:
     mean_mrr: float | None
     p50: float | None
     p95: float | None
-    drift_count: int
     skip_count: int
-    nprobes_min: int | None = None
-    nprobes_max: int | None = None
-    refine_factor: int | None = None
+    nprobes_min: str | None = None
+    nprobes_max: str | None = None
+    refine_factor: str | None = None
     query_type: str | None = None
     is_rpc_bucket: bool = False
     is_query_type_bucket: bool = False
@@ -119,17 +133,15 @@ def score_vector_sample(
     filter_sql: str | None,
     default_distance: str,
     config: RecallJobConfig,
-    version_drift: bool,
 ) -> SampleScore:
     """Score one vector sample against an already-opened dataset.
 
     Args:
-        dataset: The dataset checked out at the sample's recorded version, or at latest on drift.
+        dataset: The dataset checked out at the sample's recorded version.
         sample: The vector sample to score.
         filter_sql: The translated scanner filter, or None for an unfiltered scan.
         default_distance: The index-metric default used when the sample omits a distance type.
         config: The job configuration.
-        version_drift: Whether the dataset was opened at a drifted version.
 
     Returns:
         The sample's score, with a skip reason when scoring was not possible.
@@ -148,8 +160,8 @@ def score_vector_sample(
             BATCH_SIZE,
         )
     except (ValueError, OSError, RuntimeError):
-        return skipped_score(sample, "scan_error", version_drift)
-    return grade_against_reference(sample, true_ids, candidate_count, version_drift)
+        return skipped_score(sample, "scan_error")
+    return grade_against_reference(sample, true_ids, candidate_count)
 
 
 def score_text_sample(
@@ -158,17 +170,15 @@ def score_text_sample(
     filter_sql: str | None,
     schema_columns: frozenset[str],
     config: RecallJobConfig,
-    version_drift: bool,
 ) -> SampleScore:
     """Score one text sample against the exact BM25 reference at the pinned version.
 
     Args:
-        dataset: The dataset checked out at the sample's recorded version, or at latest on drift.
+        dataset: The dataset checked out at the sample's recorded version.
         sample: The text sample to score.
         filter_sql: The translated scanner filter, or None for an unfiltered scan.
         schema_columns: The dataset schema's column names, for text-column validation.
         config: The job configuration.
-        version_drift: Whether the dataset was opened at a drifted version.
 
     Returns:
         The sample's score, with a skip reason when scoring was not possible.
@@ -178,15 +188,15 @@ def score_text_sample(
             sample.text_query, sample.text_columns, schema_columns
         )
     except TextQueryTranslationError:
-        return skipped_score(sample, "text_query_translation", version_drift)
+        return skipped_score(sample, "text_query_translation")
     try:
         true_ids, true_scores, candidate_count = bm25_top_k(
             dataset, field_queries, sample.k, config.id_column, filter_sql, BATCH_SIZE
         )
     except (ValueError, OSError, RuntimeError):
-        return skipped_score(sample, "scan_error", version_drift)
+        return skipped_score(sample, "scan_error")
     del true_scores
-    return grade_against_reference(sample, true_ids, candidate_count, version_drift)
+    return grade_against_reference(sample, true_ids, candidate_count)
 
 
 def score_hybrid_sample(
@@ -196,7 +206,6 @@ def score_hybrid_sample(
     schema_columns: frozenset[str],
     default_distance: str,
     config: RecallJobConfig,
-    version_drift: bool,
 ) -> SampleScore:
     """Score one hybrid sample by fusing exact vector and exact BM25 references at the pinned version.
 
@@ -204,13 +213,12 @@ def score_hybrid_sample(
     fused ``k``), then merged with the recorded fusion strategy before grading the served ids.
 
     Args:
-        dataset: The dataset checked out at the sample's recorded version, or at latest on drift.
+        dataset: The dataset checked out at the sample's recorded version.
         sample: The hybrid sample to score.
         filter_sql: The translated scanner filter, or None for an unfiltered scan.
         schema_columns: The dataset schema's column names, for text-column validation.
         default_distance: The index-metric default used when the sample omits a distance type.
         config: The job configuration.
-        version_drift: Whether the dataset was opened at a drifted version.
 
     Returns:
         The sample's score, with a skip reason when scoring was not possible.
@@ -220,11 +228,11 @@ def score_hybrid_sample(
             sample.text_query, sample.text_columns, schema_columns
         )
     except TextQueryTranslationError:
-        return skipped_score(sample, "text_query_translation", version_drift)
+        return skipped_score(sample, "text_query_translation")
     distance_type: str = sample.distance_type or default_distance
     query: np.ndarray = np.asarray(sample.query_vector, dtype=np.float64)
     try:
-        vector_ids, vector_scores, vector_count = brute_force_top_k_scored(
+        record_ids, vector_scores, vector_count = brute_force_top_k_scored(
             dataset,
             query,
             sample.k,
@@ -238,10 +246,8 @@ def score_hybrid_sample(
             dataset, field_queries, sample.k, config.id_column, filter_sql, BATCH_SIZE
         )
     except (ValueError, OSError, RuntimeError):
-        return skipped_score(sample, "scan_error", version_drift)
-    return grade_hybrid_reference(
-        sample, vector_ids, vector_scores, vector_count, text_ids, text_scores, text_count, version_drift
-    )
+        return skipped_score(sample, "scan_error")
+    return grade_hybrid_reference(sample, record_ids, vector_scores, vector_count, text_ids, text_scores, text_count)
 
 
 def score_sample(
@@ -250,31 +256,29 @@ def score_sample(
     schema_columns: frozenset[str],
     default_distance: str,
     config: RecallJobConfig,
-    version_drift: bool,
 ) -> SampleScore:
     """Score one sample against an already-opened dataset, dispatching on the query type.
 
     Args:
-        dataset: The dataset checked out at the sample's recorded version, or at latest on drift.
+        dataset: The dataset checked out at the sample's recorded version.
         sample: The sample to score.
         schema_columns: The dataset schema's column names, for filter and text-column validation.
         default_distance: The index-metric default used when the sample omits a distance type.
         config: The job configuration.
-        version_drift: Whether the dataset was opened at a drifted version.
 
     Returns:
         The sample's score, with ``recall=None`` and a reason when the sample had to be skipped.
     """
     if sample.result_ids is None:
-        return skipped_score(sample, "null_result_ids", version_drift)
+        return skipped_score(sample, "null_result_ids")
     filter_sql, filter_skip = resolve_filter_sql(sample, schema_columns)
     if filter_skip is not None:
-        return skipped_score(sample, filter_skip, version_drift)
+        return skipped_score(sample, filter_skip)
     if sample.query_type == "text":
-        return score_text_sample(dataset, sample, filter_sql, schema_columns, config, version_drift)
+        return score_text_sample(dataset, sample, filter_sql, schema_columns, config)
     if sample.query_type == "hybrid":
-        return score_hybrid_sample(dataset, sample, filter_sql, schema_columns, default_distance, config, version_drift)
-    return score_vector_sample(dataset, sample, filter_sql, default_distance, config, version_drift)
+        return score_hybrid_sample(dataset, sample, filter_sql, schema_columns, default_distance, config)
+    return score_vector_sample(dataset, sample, filter_sql, default_distance, config)
 
 
 def score_version_group(
@@ -282,8 +286,8 @@ def score_version_group(
 ) -> list[SampleScore]:
     """Score every sample of one ``(uri, version)`` group on an executor.
 
-    Opens the dataset once at the recorded version (falling back to latest with a drift flag when the version was
-    cleaned up), resolves the index-metric default distance once, and then scores each sample.
+    Opens the dataset once at the recorded version, resolves the index-metric default distance once,
+    and then scores each sample. A retained-away version is skipped rather than replaced with latest.
 
     Args:
         uri: The dataset URI shared by the group.
@@ -296,20 +300,32 @@ def score_version_group(
     """
     telemetry: Telemetry = Telemetry.create(config.telemetry)
     with telemetry.timed("recall.group_ms"):
-        dataset, version_drift = resolve_dataset(uri, version, config.storage_options)
+        try:
+            dataset = resolve_dataset(uri, version, config.storage_options)
+        except DatasetOpenError:
+            telemetry.incr("recall.dataset_unavailable")
+            return [skipped_score(sample, "dataset_unavailable") for sample in samples]
         if dataset is None:
-            telemetry.incr("recall.dataset_missing")
-            return [skipped_score(sample, "dataset_missing") for sample in samples]
+            telemetry.incr("recall.version_missing")
+            return [skipped_score(sample, "version_missing") for sample in samples]
         schema_columns: frozenset[str] = frozenset(dataset.schema.names)
-        if config.id_column not in schema_columns or config.vector_column not in schema_columns:
+        scorable_samples: list[RecallSample] = [sample for sample in samples if sample.result_ids is not None]
+        needs_vector: bool = any(sample.query_type in ("vector", "hybrid") for sample in scorable_samples)
+        id_missing: bool = bool(scorable_samples) and config.id_column not in schema_columns
+        vector_missing: bool = needs_vector and config.vector_column not in schema_columns
+        if id_missing or vector_missing:
             telemetry.incr("recall.missing_columns")
-            return [skipped_score(sample, "missing_columns", version_drift) for sample in samples]
-        if version_drift:
-            telemetry.incr("recall.version_drift")
-        default_distance: str = index_default_distance_type(dataset, config.vector_column)
-        return [
-            score_sample(dataset, sample, schema_columns, default_distance, config, version_drift) for sample in samples
-        ]
+            scores: list[SampleScore] = []
+            for sample in samples:
+                if sample.result_ids is None:
+                    scores.append(skipped_score(sample, "null_result_ids"))
+                elif id_missing or sample.query_type in ("vector", "hybrid"):
+                    scores.append(skipped_score(sample, "missing_columns"))
+                else:
+                    scores.append(score_sample(dataset, sample, schema_columns, "l2", config))
+            return scores
+        default_distance: str = index_default_distance_type(dataset, config.vector_column) if needs_vector else "l2"
+        return [score_sample(dataset, sample, schema_columns, default_distance, config) for sample in samples]
 
 
 def vector_leg_samples(samples: list[RecallSample]) -> list[RecallSample]:
@@ -344,57 +360,44 @@ def text_leg_samples(samples: list[RecallSample]) -> list[RecallSample]:
 
 
 def fragment_vector_partials(
-    uri: str, version: int, fragment_index: int, samples: list[RecallSample], config: RecallJobConfig
+    uri: str, version: int, fragment_id: int, samples: list[RecallSample], config: RecallJobConfig
 ) -> dict[str, dict[str, Any]]:
     """Compute one fragment's partial vector top-k for each vector-bearing sample of a large group.
 
     Runs on an executor. Opens the dataset at the recorded version, restricts the brute-force scan to the single
-    fragment at ``fragment_index`` in the dataset's fragment order, and returns a per-sample partial top-k that the
-    driver reduces across fragments. Per-sample skip decisions that are deterministic across fragments (filter
-    translation, scan errors such as a vector-dimension mismatch) are returned as skip markers.
+    fragment identified by ``fragment_id``, and returns a per-sample partial top-k for executor-side reduction.
+    Looking up the exact fragment handle by identifier avoids re-enumerating the full fragment inventory in every
+    task. Per-sample skip decisions that are deterministic across fragments are returned as skip markers.
 
-    ``fragment_index`` was planned by :meth:`RecallAuditJob.classify_groups` against a fragment count read at a
-    possibly-earlier probe. If the recorded version has since expired and
-    :func:`~lance_etl.recall.scoring.resolve_dataset` falls back to the latest snapshot, a concurrent compaction may
-    have consolidated fragments in the meantime, so the freshly-opened dataset can carry fewer fragments than the
-    plan assumed. ``fragment_index`` is bounds-checked
-    against this dataset's own fragment count instead of indexing blindly, so a shrink degrades to a per-sample skip
-    rather than an uncaught ``IndexError`` that would otherwise kill the whole large-tier job. Growth (more fragments
-    than planned) is not compensated here: the flat per-fragment task list is sized once, upstream, from the count
-    :meth:`RecallAuditJob.classify_groups` observed, so fragments that appeared afterward are silently left
-    unscanned by this bounded fix alone. Closing that gap would mean re-probing fragment counts immediately before
-    every large-tier run, which was judged too invasive for this fix.
+    ``version`` is the exact version pinned by :meth:`RecallAuditJob.classify_groups`. If retention
+    removes it between planning and execution, the task skips. This guarantees the fragment task
+    list and every partial refer to the same immutable snapshot.
 
     Args:
         uri: The dataset URI shared by the group.
         version: The recorded dataset version shared by the group.
-        fragment_index: The position of the fragment in the dataset's fragment order, as planned upstream.
+        fragment_id: Exact fragment identifier from the pinned classification probe.
         samples: The vector-bearing samples to score against this fragment.
         config: The job configuration.
 
     Returns:
         A mapping from sample id to either ``{"status": "partial", "ids", "dists", "count"}`` or
-        ``{"status": "skip", "reason"}``. Every sample is skipped with reason ``"fragment_missing"`` when
-        ``fragment_index`` no longer exists in the freshly-opened dataset.
+        ``{"status": "skip", "reason"}``. Every sample is skipped with reason ``"version_missing"`` when the
+        pinned version disappeared.
     """
-    dataset, _ = resolve_dataset(uri, version, config.storage_options)
+    if fragment_id < 0:
+        return {sample.sample_id: {"status": "skip", "reason": "version_missing"} for sample in samples}
+    try:
+        dataset = resolve_dataset(uri, version, config.storage_options)
+    except DatasetOpenError:
+        return {sample.sample_id: {"status": "skip", "reason": "dataset_unavailable"} for sample in samples}
     if dataset is None:
-        return {sample.sample_id: {"status": "skip", "reason": "dataset_missing"} for sample in samples}
-    fragments: list[lance.LanceFragment] = dataset.get_fragments()
-    if fragment_index >= len(fragments):
-        logger.warning(
-            "recall large-tier: fragment %d no longer exists in %s at version %d (dataset now has %d fragments); "
-            "skipping %d sample(s) for this fragment instead of scoring a stale index",
-            fragment_index,
-            uri,
-            version,
-            len(fragments),
-            len(samples),
-        )
-        return {sample.sample_id: {"status": "skip", "reason": "fragment_missing"} for sample in samples}
+        return {sample.sample_id: {"status": "skip", "reason": "version_missing"} for sample in samples}
     schema_columns: frozenset[str] = frozenset(dataset.schema.names)
     default_distance: str = index_default_distance_type(dataset, config.vector_column)
-    fragment: lance.LanceFragment = fragments[fragment_index]
+    fragment: lance.LanceFragment | None = dataset.get_fragment(fragment_id)
+    if fragment is None:
+        return {sample.sample_id: {"status": "skip", "reason": "fragment_missing"} for sample in samples}
     partials: dict[str, dict[str, Any]] = {}
     for sample in samples:
         filter_sql, filter_skip = resolve_filter_sql(sample, schema_columns)
@@ -442,12 +445,209 @@ def reduce_vector_legs(sample: RecallSample, fragment_partials: list[tuple[int, 
         return {"status": "skip", "reason": "missing_partials"}
     skip_reasons: set[str] = {payload["reason"] for _, payload in fragment_partials if payload["status"] == "skip"}
     if skip_reasons:
-        return {"status": "skip", "reason": next(iter(skip_reasons))}
+        reason: str = next(iter(skip_reasons)) if len(skip_reasons) == 1 else "inconsistent_partials"
+        return {"status": "skip", "reason": reason}
     ordered: list[tuple[int, dict[str, Any]]] = sorted(fragment_partials, key=lambda item: item[0])
     partials: list[tuple[list[Any], list[float]]] = [(payload["ids"], payload["dists"]) for _, payload in ordered]
     ids, dists = reduce_partial_top_k(partials, sample.k)
     count: int = sum(int(payload["count"]) for _, payload in ordered)
     return {"status": "leg", "ids": ids, "dists": dists, "count": count}
+
+
+def vector_partial_accumulator(fragment_id: int, payload: dict[str, Any], k: int) -> dict[str, Any]:
+    """Convert one fragment payload into a bounded associative reduction state.
+
+    Candidate ordering carries the fragment identifier and within-fragment rank explicitly, so
+    arbitrary Spark reduction order preserves the same stable tie order as an ascending-fragment
+    whole-dataset scan.
+
+    Args:
+        fragment_id: Stable fragment identifier.
+        payload: Fragment partial or skip marker.
+        k: Requested result count.
+
+    Returns:
+        Bounded accumulator containing at most ``k`` candidates or a skip-reason set.
+
+    Raises:
+        ValueError: If a partial payload has inconsistent ids and distances.
+    """
+    if payload["status"] == "skip":
+        return {"status": "skip", "k": k, "reasons": (str(payload["reason"]),)}
+    ids: list[Any] = list(payload["ids"])
+    dists: list[float] = [float(value) for value in payload["dists"]]
+    if len(ids) != len(dists):
+        raise ValueError("vector partial ids and distances have different lengths")
+    candidates: list[tuple[float, int, int, Any]] = [
+        (distance, fragment_id, rank, record_id)
+        for rank, (record_id, distance) in enumerate(zip(ids, dists, strict=True))
+    ]
+    return {"status": "partial", "k": k, "candidates": candidates[:k], "count": int(payload["count"])}
+
+
+def merge_vector_accumulators(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    """Associatively merge two bounded vector-partial accumulators.
+
+    Args:
+        left: First bounded accumulator.
+        right: Second bounded accumulator.
+
+    Returns:
+        One accumulator with at most ``k`` candidates.
+
+    Raises:
+        ValueError: If the accumulators disagree on ``k``.
+    """
+    left_k: int = int(left["k"])
+    right_k: int = int(right["k"])
+    if left_k != right_k:
+        raise ValueError("vector partial accumulators disagree on k")
+    if left["status"] == "skip" or right["status"] == "skip":
+        reasons: set[str] = set(left.get("reasons", ())) | set(right.get("reasons", ()))
+        return {"status": "skip", "k": left_k, "reasons": tuple(sorted(reasons))}
+    candidates: list[tuple[float, int, int, Any]] = sorted(
+        [*left["candidates"], *right["candidates"]],
+        key=lambda candidate: (candidate[0], candidate[1], candidate[2]),
+    )[:left_k]
+    return {
+        "status": "partial",
+        "k": left_k,
+        "candidates": candidates,
+        "count": int(left["count"]) + int(right["count"]),
+    }
+
+
+def vector_accumulator_leg(accumulator: dict[str, Any]) -> dict[str, Any]:
+    """Render one reduced accumulator as the established vector-leg payload.
+
+    Args:
+        accumulator: Fully reduced sample accumulator.
+
+    Returns:
+        A leg or deterministic skip payload for :func:`combine_large_group_scores`.
+    """
+    if accumulator["status"] == "skip":
+        reasons: tuple[str, ...] = tuple(accumulator["reasons"])
+        reason: str = reasons[0] if len(reasons) == 1 else "inconsistent_partials"
+        return {"status": "skip", "reason": reason}
+    candidates: list[tuple[float, int, int, Any]] = accumulator["candidates"]
+    return {
+        "status": "leg",
+        "ids": [candidate[3] for candidate in candidates],
+        "dists": [candidate[0] for candidate in candidates],
+        "count": int(accumulator["count"]),
+    }
+
+
+@dataclass(frozen=True)
+class LargeTierWork:
+    """Bounded driver inputs and sample lookups for one large-tier execution."""
+
+    vector_groups: list[tuple[int, str, int, int]]
+    vector_sample_chunks_by_group: dict[int, list[list[RecallSample]]]
+    vector_sample_by_key: dict[tuple[int, str], RecallSample]
+    text_groups: list[tuple[int, str, int, int]]
+    text_samples_by_work: dict[tuple[int, int], list[RecallSample]]
+
+
+def chunk_samples_by_k(samples: list[RecallSample]) -> list[list[RecallSample]]:
+    """Split samples so one task retains a bounded aggregate number of top-k candidates.
+
+    Args:
+        samples: Samples in deterministic input order.
+
+    Returns:
+        Non-empty chunks whose ``sum(sample.k)`` does not exceed
+        :data:`MAX_PARTIAL_CANDIDATES_PER_TASK`.
+
+    Raises:
+        ValueError: If a programmatic sample bypassed parser bounds and exceeds the task budget.
+    """
+    chunks: list[list[RecallSample]] = []
+    current: list[RecallSample] = []
+    candidates: int = 0
+    for sample in samples:
+        if sample.k > MAX_PARTIAL_CANDIDATES_PER_TASK:
+            raise ValueError("sample k exceeds the per-task exact candidate budget")
+        if current and candidates + sample.k > MAX_PARTIAL_CANDIDATES_PER_TASK:
+            chunks.append(current)
+            current = []
+            candidates = 0
+        current.append(sample)
+        candidates += sample.k
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def prepare_large_tier_work(items: list[tuple[str, int, list[RecallSample], int]]) -> LargeTierWork:
+    """Build group-level work without expanding fragment inventories on the driver.
+
+    Args:
+        items: Classified large-tier groups.
+
+    Returns:
+        Group seeds and sample lookups for the vector and text stages.
+    """
+    vector_groups: list[tuple[int, str, int, int]] = []
+    vector_sample_chunks_by_group: dict[int, list[list[RecallSample]]] = {}
+    vector_sample_by_key: dict[tuple[int, str], RecallSample] = {}
+    text_groups: list[tuple[int, str, int, int]] = []
+    text_samples_by_work: dict[tuple[int, int], list[RecallSample]] = {}
+    for index, (uri, version, samples, fragment_count) in enumerate(items):
+        vector_samples: list[RecallSample] = vector_leg_samples(samples)
+        if vector_samples:
+            vector_groups.append((index, uri, version, fragment_count))
+            vector_sample_chunks_by_group[index] = chunk_samples_by_k(vector_samples)
+            for sample in vector_samples:
+                vector_sample_by_key[(index, sample.sample_id)] = sample
+        text_samples: list[RecallSample] = text_leg_samples(samples)
+        if text_samples:
+            for chunk_index, chunk in enumerate(chunk_samples_by_k(text_samples)):
+                text_groups.append((index, uri, version, chunk_index))
+                text_samples_by_work[(index, chunk_index)] = chunk
+    return LargeTierWork(
+        vector_groups,
+        vector_sample_chunks_by_group,
+        vector_sample_by_key,
+        text_groups,
+        text_samples_by_work,
+    )
+
+
+def enumerate_vector_fragment_work(
+    work: tuple[int, str, int, int], storage_options: dict[str, Any] | None, sample_chunk_count: int
+) -> Iterator[tuple[int, str, int, int, int]]:
+    """Enumerate one pinned group's fragment work on an executor.
+
+    Args:
+        work: Group index, URI, effective version, and probed fragment count.
+        storage_options: Object-store options forwarded to pylance.
+        sample_chunk_count: Positive number of bounded sample chunks for the group.
+
+    Yields:
+        One fragment and sample-chunk work item. A negative fragment sentinel preserves a
+        deterministic skip when the pinned dataset or its inventory disappears between stages.
+    """
+    group_index, uri, version, expected_count = work
+    try:
+        dataset = resolve_dataset(uri, version, storage_options)
+    except DatasetOpenError:
+        for chunk_index in range(sample_chunk_count):
+            yield group_index, uri, version, -1, chunk_index
+        return
+    if dataset is None:
+        for chunk_index in range(sample_chunk_count):
+            yield group_index, uri, version, -1, chunk_index
+        return
+    fragments: list[lance.LanceFragment] = dataset.get_fragments()
+    if len(fragments) != expected_count:
+        for chunk_index in range(sample_chunk_count):
+            yield group_index, uri, version, -1, chunk_index
+        return
+    for fragment in fragments:
+        for chunk_index in range(sample_chunk_count):
+            yield group_index, uri, version, int(fragment.fragment_id), chunk_index
 
 
 def whole_dataset_text_legs(
@@ -468,9 +668,12 @@ def whole_dataset_text_legs(
         A mapping from sample id to either ``{"status": "leg", "ids", "scores", "count"}`` or
         ``{"status": "skip", "reason"}``.
     """
-    dataset, _ = resolve_dataset(uri, version, config.storage_options)
+    try:
+        dataset = resolve_dataset(uri, version, config.storage_options)
+    except DatasetOpenError:
+        return {sample.sample_id: {"status": "skip", "reason": "dataset_unavailable"} for sample in samples}
     if dataset is None:
-        return {sample.sample_id: {"status": "skip", "reason": "dataset_missing"} for sample in samples}
+        return {sample.sample_id: {"status": "skip", "reason": "version_missing"} for sample in samples}
     schema_columns: frozenset[str] = frozenset(dataset.schema.names)
     legs: dict[str, dict[str, Any]] = {}
     for sample in samples:
@@ -496,7 +699,6 @@ def whole_dataset_text_legs(
 
 def combine_large_group_scores(
     samples: list[RecallSample],
-    version_drift: bool,
     vector_legs: dict[str, dict[str, Any]],
     text_legs: dict[str, dict[str, Any]],
 ) -> list[SampleScore]:
@@ -508,7 +710,6 @@ def combine_large_group_scores(
 
     Args:
         samples: The group's samples in capture order.
-        version_drift: Whether the dataset was opened at a drifted version, carried from the classification probe.
         vector_legs: The reduced vector legs keyed by sample id, for vector and hybrid samples.
         text_legs: The whole-dataset BM25 legs keyed by sample id, for text and hybrid samples.
 
@@ -518,27 +719,27 @@ def combine_large_group_scores(
     scores: list[SampleScore] = []
     for sample in samples:
         if sample.result_ids is None:
-            scores.append(skipped_score(sample, "null_result_ids", version_drift))
+            scores.append(skipped_score(sample, "null_result_ids"))
             continue
         if sample.query_type == "vector":
             leg: dict[str, Any] = vector_legs[sample.sample_id]
             if leg["status"] == "skip":
-                scores.append(skipped_score(sample, leg["reason"], version_drift))
+                scores.append(skipped_score(sample, leg["reason"]))
             else:
-                scores.append(grade_against_reference(sample, leg["ids"], leg["count"], version_drift))
+                scores.append(grade_against_reference(sample, leg["ids"], leg["count"]))
         elif sample.query_type == "text":
             leg = text_legs[sample.sample_id]
             if leg["status"] == "skip":
-                scores.append(skipped_score(sample, leg["reason"], version_drift))
+                scores.append(skipped_score(sample, leg["reason"]))
             else:
-                scores.append(grade_against_reference(sample, leg["ids"], leg["count"], version_drift))
+                scores.append(grade_against_reference(sample, leg["ids"], leg["count"]))
         else:
             vector_leg: dict[str, Any] = vector_legs[sample.sample_id]
             text_leg: dict[str, Any] = text_legs[sample.sample_id]
             if vector_leg["status"] == "skip":
-                scores.append(skipped_score(sample, vector_leg["reason"], version_drift))
+                scores.append(skipped_score(sample, vector_leg["reason"]))
             elif text_leg["status"] == "skip":
-                scores.append(skipped_score(sample, text_leg["reason"], version_drift))
+                scores.append(skipped_score(sample, text_leg["reason"]))
             else:
                 scores.append(
                     grade_hybrid_reference(
@@ -549,14 +750,13 @@ def combine_large_group_scores(
                         text_leg["ids"],
                         text_leg["scores"],
                         text_leg["count"],
-                        version_drift,
                     )
                 )
     return scores
 
 
-def optional_label(value: int | None, fallback: str) -> str:
-    """Render an optional integer bucket key for labels and tags.
+def optional_label(value: str | None, fallback: str) -> str:
+    """Render an optional bounded bucket key for labels and tags.
 
     Args:
         value: The optional value.
@@ -568,21 +768,42 @@ def optional_label(value: int | None, fallback: str) -> str:
     return fallback if value is None else str(value)
 
 
-def rpc_bucket_label(nprobes_min: int | None, nprobes_max: int | None, refine_factor: int | None) -> str:
+def rpc_parameter_bucket(value: int | None, absent: str) -> str:
+    """Map one raw RPC parameter into a finite exponential range vocabulary.
+
+    The emitted ranges are ``nonpositive``, ``1``, ``2``, ``3-4``, ``5-8``, ``9-16``, ``17-32``, ``33-64``, and
+    ``65+`` plus the caller-provided absent label. This caps each tag at ten possible values even when malformed or
+    future captures carry arbitrary integers.
+
+    Args:
+        value: Raw captured parameter, or None when absent.
+        absent: Stable label for an absent parameter.
+
+    Returns:
+        The bounded bucket label.
+    """
+    if value is None:
+        return absent
+    if value <= 0:
+        return "nonpositive"
+    for lower, upper in RPC_PARAMETER_BUCKET_RANGES:
+        if lower <= value <= upper:
+            return str(lower) if lower == upper else f"{lower}-{upper}"
+    return "65+"
+
+
+def rpc_bucket_label(nprobes_min: str, nprobes_max: str, refine_factor: str) -> str:
     """Build the table label for one RPC-parameter bucket.
 
     Args:
-        nprobes_min: Lower nprobes bound, or None for the index default.
-        nprobes_max: Upper nprobes bound, or None for the index default.
-        refine_factor: Refine factor, or None when unset.
+        nprobes_min: Bounded lower-nprobes range label.
+        nprobes_max: Bounded upper-nprobes range label.
+        refine_factor: Bounded refine-factor range label.
 
     Returns:
-        The bucket label, for example ``rpc nprobes=8..32 refine=2``.
+        The bucket label, for example ``rpc nprobes=5-8..17-32 refine=2``.
     """
-    low: str = optional_label(nprobes_min, "default")
-    high: str = optional_label(nprobes_max, "default")
-    refine: str = optional_label(refine_factor, "unset")
-    return f"rpc nprobes={low}..{high} refine={refine}"
+    return f"rpc nprobes={nprobes_min}..{nprobes_max} refine={refine_factor}"
 
 
 def mean_or_none(values: list[float]) -> float | None:
@@ -600,9 +821,9 @@ def mean_or_none(values: list[float]) -> float | None:
 def summarize_bucket(
     bucket: str,
     scores: list[SampleScore],
-    nprobes_min: int | None = None,
-    nprobes_max: int | None = None,
-    refine_factor: int | None = None,
+    nprobes_min: str | None = None,
+    nprobes_max: str | None = None,
+    refine_factor: str | None = None,
     query_type: str | None = None,
     is_rpc_bucket: bool = False,
     is_query_type_bucket: bool = False,
@@ -612,9 +833,9 @@ def summarize_bucket(
     Args:
         bucket: The bucket label.
         scores: The scores in the bucket, including skipped ones.
-        nprobes_min: RPC bucket key carried for metric tagging.
-        nprobes_max: RPC bucket key carried for metric tagging.
-        refine_factor: RPC bucket key carried for metric tagging.
+        nprobes_min: Bounded lower-nprobes range label carried for metric tagging.
+        nprobes_max: Bounded upper-nprobes range label carried for metric tagging.
+        refine_factor: Bounded refine-factor range label carried for metric tagging.
         query_type: Query-type bucket key carried for metric tagging.
         is_rpc_bucket: Whether this row is an RPC-parameter bucket eligible for metric emission.
         is_query_type_bucket: Whether this row is a query-type bucket eligible for metric emission.
@@ -634,7 +855,6 @@ def summarize_bucket(
         mean_mrr=mean_or_none(mrrs),
         p50=float(np.percentile(values, 50)) if recalls else None,
         p95=float(np.percentile(values, 95)) if recalls else None,
-        drift_count=sum(1 for score in scores if score.version_drift),
         skip_count=sum(1 for score in scores if score.skip_reason is not None),
         nprobes_min=nprobes_min,
         nprobes_max=nprobes_max,
@@ -655,11 +875,15 @@ def aggregate_scores(scores: list[SampleScore]) -> list[AggregateRow]:
         The aggregate rows in table order.
     """
     rows: list[AggregateRow] = [summarize_bucket("overall", scores)]
-    rpc_groups: dict[tuple[int | None, int | None, int | None], list[SampleScore]] = {}
+    rpc_groups: dict[tuple[str, str, str], list[SampleScore]] = {}
     query_type_groups: dict[str, list[SampleScore]] = {}
     org_groups: dict[str, list[SampleScore]] = {}
     for score in scores:
-        rpc_key: tuple[int | None, int | None, int | None] = (score.nprobes_min, score.nprobes_max, score.refine_factor)
+        rpc_key: tuple[str, str, str] = (
+            rpc_parameter_bucket(score.nprobes_min, "default"),
+            rpc_parameter_bucket(score.nprobes_max, "default"),
+            rpc_parameter_bucket(score.refine_factor, "unset"),
+        )
         rpc_groups.setdefault(rpc_key, []).append(score)
         query_type_groups.setdefault(score.query_type, []).append(score)
         org_groups.setdefault(score.org_id, []).append(score)
@@ -712,14 +936,14 @@ def format_report(report: RecallReport) -> str:
     width: int = max([len("bucket"), *(len(row.bucket) for row in report.rows)])
     header: str = (
         f"{'bucket':<{width}}  {'samples':>7}  {'recall':>8}  {'ndcg':>8}  {'mrr':>8}  "
-        f"{'p50':>8}  {'p95':>8}  {'drift':>5}  {'skipped':>7}"
+        f"{'p50':>8}  {'p95':>8}  {'skipped':>7}"
     )
     lines: list[str] = [header]
     for row in report.rows:
         lines.append(
             f"{row.bucket:<{width}}  {row.samples:>7}  {format_metric(row.mean_recall):>8}  "
             f"{format_metric(row.mean_ndcg):>8}  {format_metric(row.mean_mrr):>8}  "
-            f"{format_metric(row.p50):>8}  {format_metric(row.p95):>8}  {row.drift_count:>5}  {row.skip_count:>7}"
+            f"{format_metric(row.p50):>8}  {format_metric(row.p95):>8}  {row.skip_count:>7}"
         )
     if report.parse_skips:
         rendered: str = ", ".join(f"{reason}={count}" for reason, count in sorted(report.parse_skips.items()))
@@ -773,6 +997,7 @@ def emit_recall_metrics(telemetry: Telemetry, rows: list[AggregateRow]) -> None:
             emit_bucket_metrics(telemetry, row, [f"query_type:{row.query_type}"])
 
 
+@dataclass
 class RecallAuditJob:
     """Replays sampled vector, text, and hybrid queries against pinned dataset versions and reports retrieval quality.
 
@@ -781,25 +1006,23 @@ class RecallAuditJob:
     strategy for hybrid samples.
     """
 
-    def __init__(self, config: RecallJobConfig) -> None:
-        """Initialize the job.
-
-        Args:
-            config: The job configuration.
-        """
-        self.config: RecallJobConfig = config
+    config: RecallJobConfig
 
     def classify_groups(
         self, spark: SparkSession, items: list[tuple[str, int, list[RecallSample]]]
-    ) -> tuple[list[tuple[str, int, list[RecallSample]]], list[tuple[str, int, list[RecallSample], bool, int]]]:
+    ) -> tuple[
+        list[tuple[str, int, list[RecallSample]]],
+        list[tuple[str, int, list[RecallSample], int]],
+    ]:
         """Split ``(uri, version)`` groups into the packed small tier and the per-fragment large tier.
 
         One distributed probe job opens each group's dataset at the recorded version, reads its fragment count, and
-        records whether it is scorable and whether the version drifted, so the driver never opens a dataset itself.
-        Groups whose dataset is missing, lacks the id or vector column, or has at most
-        ``large_group_fragment_threshold`` fragments go to the small tier, where the missing-dataset and missing-column
-        cases are handled identically by :func:`score_version_group`. Larger scorable groups go to the large tier with
-        their fragment count and drift flag carried forward.
+        records whether it is scorable, so the driver never opens a dataset itself.
+        Groups whose dataset is missing, lacks a column required by its query mix, repeats a sample id, or has at most
+        ``large_group_fragment_threshold`` fragments go to the small tier. Larger scorable groups go to the large tier
+        with only the exact version and fragment count carried forward. Fragment identifiers
+        are enumerated on an executor in the large-tier job, keeping unbounded fragment inventories off the driver.
+        Pinning the version prevents later fragment tasks from mixing snapshots.
 
         Args:
             spark: Active Spark session.
@@ -807,39 +1030,52 @@ class RecallAuditJob:
 
         Returns:
             ``(small, large)`` where small items are ``(uri, version, samples)`` and large items are
-            ``(uri, version, samples, version_drift, fragments)``.
+            ``(uri, version, samples, fragment_count)``.
         """
         config: RecallJobConfig = self.config
         storage_options: dict[str, Any] | None = config.storage_options
         threshold: int = config.large_group_fragment_threshold
         id_column: str = config.id_column
         vector_column: str = config.vector_column
-        keys: list[tuple[str, int]] = [(uri, version) for uri, version, _ in items]
+        keys: list[tuple[str, int]] = [(item[0], item[1]) for item in items]
+        requirements: dict[tuple[str, int], tuple[bool, bool]] = {
+            (uri, version): (
+                any(sample.result_ids is not None for sample in samples),
+                any(sample.result_ids is not None and sample.query_type in ("vector", "hybrid") for sample in samples),
+            )
+            for uri, version, samples in items
+        }
 
-        def probe(key: tuple[str, int]) -> tuple[int, bool, bool]:
-            """Probe one group's dataset size, scorability, and version drift on an executor.
+        def probe(key: tuple[str, int]) -> tuple[int, bool]:
+            """Probe one group's exact dataset size and scorability on an executor.
 
             Args:
                 key: The ``(uri, version)`` group key.
 
             Returns:
-                ``(fragments, scorable, version_drift)`` where ``fragments`` is -1 when the dataset cannot be opened.
+                Fragment count and scorability. The count is zero when the exact version cannot be opened.
             """
             uri, version = key
-            dataset, drift = resolve_dataset(uri, version, storage_options)
+            needs_id, needs_vector = requirements[key]
+            try:
+                dataset = resolve_dataset(uri, version, storage_options)
+            except DatasetOpenError:
+                return 0, False
             if dataset is None:
-                return -1, False, False
+                return 0, False
             columns: frozenset[str] = frozenset(dataset.schema.names)
-            scorable: bool = id_column in columns and vector_column in columns
-            return len(dataset.get_fragments()), scorable, drift
+            scorable: bool = (not needs_id or id_column in columns) and (not needs_vector or vector_column in columns)
+            fragment_count: int = int(dataset.stats.dataset_stats()["num_fragments"])
+            return fragment_count, scorable
 
         slices: int = max(1, min(config.small_tier_slices, len(keys)))
-        probes: list[tuple[int, bool, bool]] = spark.sparkContext.parallelize(keys, slices).map(probe).collect()
+        probes: list[tuple[int, bool]] = spark.sparkContext.parallelize(keys, slices).map(probe).collect()
         small: list[tuple[str, int, list[RecallSample]]] = []
-        large: list[tuple[str, int, list[RecallSample], bool, int]] = []
-        for (uri, version, samples), (fragments, scorable, drift) in zip(items, probes, strict=True):
-            if scorable and fragments > threshold:
-                large.append((uri, version, samples, drift, fragments))
+        large: list[tuple[str, int, list[RecallSample], int]] = []
+        for (uri, version, samples), (fragment_count, scorable) in zip(items, probes, strict=True):
+            unique_sample_ids: bool = len({sample.sample_id for sample in samples}) == len(samples)
+            if scorable and unique_sample_ids and fragment_count > threshold:
+                large.append((uri, version, samples, fragment_count))
             else:
                 small.append((uri, version, samples))
         return small, large
@@ -882,19 +1118,21 @@ class RecallAuditJob:
         return [score for group in collected for score in group]
 
     def run_large_tier(
-        self, spark: SparkSession, items: list[tuple[str, int, list[RecallSample], bool, int]], telemetry: Telemetry
+        self,
+        spark: SparkSession,
+        items: list[tuple[str, int, list[RecallSample], int]],
+        telemetry: Telemetry,
     ) -> list[SampleScore]:
-        """Score large groups by fanning the vector brute force out per fragment and reducing exactly on the driver.
+        """Score large groups with per-fragment scans and keyed executor-side exact reduction.
 
         One Spark job computes a partial vector top-k per ``(group, fragment)`` for every vector and hybrid sample, and
-        the driver reduces the partials per sample with the same stable merge the single-stream scan uses, so the
-        reduced top-k is bit-identical to the whole-dataset brute force. A second Spark job computes the whole-dataset
-        BM25 leg for text and hybrid samples, whose corpus-global statistics cannot be sharded. The driver then grades
-        vector samples from the reduced leg, text samples from the BM25 leg, and hybrid samples from the fusion of both.
+        keyed combiners reduce each sample's partials associatively while retaining only its best ``k`` candidates.
+        The driver collects only one reduced vector leg per sample. A second Spark job computes the whole-dataset BM25
+        leg for text and hybrid samples, whose corpus-global statistics cannot be sharded.
 
         Args:
             spark: Active Spark session.
-            items: The large-tier ``(uri, version, samples, version_drift, fragments)`` groups.
+            items: The large-tier ``(uri, version, samples, fragment_count)`` groups.
             telemetry: Driver telemetry facade.
 
         Returns:
@@ -902,73 +1140,109 @@ class RecallAuditJob:
         """
         config: RecallJobConfig = self.config
         telemetry.gauge("recall.large_groups", len(items))
-        vector_work: list[tuple[int, str, int, int, list[RecallSample]]] = []
-        text_work: list[tuple[int, str, int, list[RecallSample]]] = []
-        for index, (uri, version, samples, drift, fragments) in enumerate(items):
-            del drift
-            vector_samples: list[RecallSample] = vector_leg_samples(samples)
-            if vector_samples:
-                vector_work.extend(
-                    (index, uri, version, fragment_index, vector_samples) for fragment_index in range(fragments)
-                )
-            text_samples: list[RecallSample] = text_leg_samples(samples)
-            if text_samples:
-                text_work.append((index, uri, version, text_samples))
+        prepared: LargeTierWork = prepare_large_tier_work(items)
+        expected_vector_fragments: int = sum(work[3] for work in prepared.vector_groups)
+        expected_vector_work: int = sum(
+            work[3] * len(prepared.vector_sample_chunks_by_group[work[0]]) for work in prepared.vector_groups
+        )
 
         def vector_task(
-            work: tuple[int, str, int, int, list[RecallSample]],
-        ) -> tuple[int, int, dict[str, dict[str, Any]]]:
+            work: tuple[int, str, int, int, int],
+        ) -> list[tuple[tuple[int, str], dict[str, Any]]]:
             """Compute one fragment's partial vector top-k for a large group on an executor.
 
             Args:
-                work: The ``(group_index, uri, version, fragment_index, samples)`` unit.
+                work: The ``(group_index, uri, version, fragment_id, sample_chunk_index)`` unit.
 
             Returns:
-                ``(group_index, fragment_index, partials)`` for the driver reduce.
+                One keyed partial per vector-bearing sample for the executor shuffle.
             """
-            return work[0], work[3], fragment_vector_partials(work[1], work[2], work[3], work[4], config)
+            partials: dict[str, dict[str, Any]] = fragment_vector_partials(
+                work[1],
+                work[2],
+                work[3],
+                prepared.vector_sample_chunks_by_group[work[0]][work[4]],
+                config,
+            )
+            return [
+                (
+                    (work[0], sample_id),
+                    vector_partial_accumulator(work[3], payload, prepared.vector_sample_by_key[(work[0], sample_id)].k),
+                )
+                for sample_id, payload in partials.items()
+            ]
 
-        def text_task(work: tuple[int, str, int, list[RecallSample]]) -> tuple[int, dict[str, dict[str, Any]]]:
+        def reduce_vector_sample(
+            item: tuple[tuple[int, str], dict[str, Any]],
+        ) -> tuple[int, str, dict[str, Any]]:
+            """Reduce one sample's grouped fragment partials on an executor.
+
+            Args:
+                item: ``((group_index, sample_id), accumulator)`` reduced by Spark.
+
+            Returns:
+                Group index, sample id, and exact reduced vector leg.
+            """
+            key, accumulator = item
+            return key[0], key[1], vector_accumulator_leg(accumulator)
+
+        def text_task(work: tuple[int, str, int, int]) -> tuple[int, dict[str, dict[str, Any]]]:
             """Compute the whole-dataset BM25 legs for a large group on an executor.
 
             Args:
-                work: The ``(group_index, uri, version, samples)`` unit.
+                work: The ``(group_index, uri, version, sample_chunk_index)`` unit.
 
             Returns:
                 ``(group_index, legs)`` for the driver grade.
             """
-            return work[0], whole_dataset_text_legs(work[1], work[2], work[3], config)
+            return work[0], whole_dataset_text_legs(
+                work[1],
+                work[2],
+                prepared.text_samples_by_work[(work[0], work[3])],
+                config,
+            )
 
         with telemetry.timed("recall.large_tier_ms"):
-            vector_results: list[tuple[int, int, dict[str, dict[str, Any]]]] = []
-            if vector_work:
-                vector_slices: int = max(1, min(config.large_tier_slices, len(vector_work)))
-                vector_results = spark.sparkContext.parallelize(vector_work, vector_slices).map(vector_task).collect()
+            vector_results: list[tuple[int, str, dict[str, Any]]] = []
+            if prepared.vector_groups:
+                vector_slices: int = max(1, min(config.large_tier_slices, expected_vector_work))
+                enumeration_slices: int = max(1, min(config.large_tier_slices, len(prepared.vector_groups)))
+                vector_results = (
+                    spark.sparkContext.parallelize(prepared.vector_groups, enumeration_slices)
+                    .flatMap(
+                        lambda work: enumerate_vector_fragment_work(
+                            work,
+                            config.storage_options,
+                            len(prepared.vector_sample_chunks_by_group[work[0]]),
+                        )
+                    )
+                    .repartition(vector_slices)
+                    .flatMap(vector_task)
+                    .reduceByKey(merge_vector_accumulators, vector_slices)
+                    .map(reduce_vector_sample)
+                    .collect()
+                )
             text_results: list[tuple[int, dict[str, dict[str, Any]]]] = []
-            if text_work:
-                text_slices: int = max(1, min(config.large_tier_slices, len(text_work)))
-                text_results = spark.sparkContext.parallelize(text_work, text_slices).map(text_task).collect()
+            if prepared.text_groups:
+                text_slices: int = max(1, min(config.large_tier_slices, len(prepared.text_groups)))
+                text_results = (
+                    spark.sparkContext.parallelize(prepared.text_groups, text_slices).map(text_task).collect()
+                )
 
-        partials_by_group: dict[int, dict[str, list[tuple[int, dict[str, Any]]]]] = {}
-        for group_index, fragment_index, partials in vector_results:
-            per_sample: dict[str, list[tuple[int, dict[str, Any]]]] = partials_by_group.setdefault(group_index, {})
-            for sample_id, payload in partials.items():
-                per_sample.setdefault(sample_id, []).append((fragment_index, payload))
-        text_by_group: dict[int, dict[str, dict[str, Any]]] = {index: legs for index, legs in text_results}
+        vector_by_group: dict[int, dict[str, dict[str, Any]]] = {}
+        for group_index, sample_id, leg in vector_results:
+            vector_by_group.setdefault(group_index, {})[sample_id] = leg
+        text_by_group: dict[int, dict[str, dict[str, Any]]] = {}
+        for group_index, legs in text_results:
+            text_by_group.setdefault(group_index, {}).update(legs)
 
-        telemetry.gauge("recall.large_group_fragments", len(vector_work))
+        telemetry.gauge("recall.large_group_fragments", expected_vector_fragments)
         scores: list[SampleScore] = []
         for index, item in enumerate(items):
             samples: list[RecallSample] = item[2]
-            drift: bool = item[3]
-            vector_legs: dict[str, dict[str, Any]] = {}
-            for sample in vector_leg_samples(samples):
-                fragment_partials: list[tuple[int, dict[str, Any]]] = partials_by_group.get(index, {}).get(
-                    sample.sample_id, []
-                )
-                vector_legs[sample.sample_id] = reduce_vector_legs(sample, fragment_partials)
+            vector_legs: dict[str, dict[str, Any]] = vector_by_group.get(index, {})
             text_legs: dict[str, dict[str, Any]] = text_by_group.get(index, {})
-            scores.extend(combine_large_group_scores(samples, drift, vector_legs, text_legs))
+            scores.extend(combine_large_group_scores(samples, vector_legs, text_legs))
         return scores
 
     def run(self, spark: SparkSession, source: SpanSource, from_ms: int, to_ms: int) -> RecallReport:
@@ -977,7 +1251,8 @@ class RecallAuditJob:
         The driver fetches and parses the spans and groups samples by ``(dataset_uri, dataset_version)``. A probe job
         classifies the groups by fragment count: the tail of tiny groups is packed into the small tier where one task
         scores many datasets, and big groups go to the large tier where the vector brute force fans out per fragment
-        and reduces exactly on the driver. The driver aggregates, logs the table, and emits the per-bucket gauges.
+        and reduces exactly through a keyed executor shuffle. The driver aggregates one reduced leg per sample, logs
+        the table, and emits the per-bucket gauges.
 
         Args:
             spark: Active Spark session.

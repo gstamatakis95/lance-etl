@@ -1,9 +1,8 @@
 """Unit tests for the bench experiment loop pieces that need no Spark and no server.
 
-Covers the on-disk size measurement, the ``--server-env`` parsing, the headline distillation,
-the experiment history append, and the baseline delta computation. The full experiment
-integration (Spark + spawned server) lives in ``tests/test_bench_e2e.py`` with the other heavy
-bench tests.
+Covers on-disk size measurement, unrestricted ``--endpoint`` parsing, headline distillation,
+experiment history, and baseline delta computation. The full offline experiment integration lives
+in ``tests/test_bench_e2e.py`` with the other heavy bench tests.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ import lance
 import pyarrow as pa
 import pytest
 
-from bench.config import BenchConfig, build_parser, parse_env_pairs
+from bench.config import BenchConfig, build_parser
 from bench.experiment import append_history, baseline_delta, headline_numbers, knob_vector
 from bench.sizes import measure_dataset_sizes
 
@@ -71,16 +70,6 @@ def test_measure_dataset_sizes_empty_root(tmp_path: Path) -> None:
     assert sizes["index_to_data_ratio"] == 0.0
 
 
-def test_parse_env_pairs() -> None:
-    """KEY=VALUE pairs parse, values may carry '=', and malformed pairs raise."""
-    assert parse_env_pairs(None) == {}
-    assert parse_env_pairs(["A=1", "B=x=y"]) == {"A": "1", "B": "x=y"}
-    with pytest.raises(ValueError, match="KEY=VALUE"):
-        parse_env_pairs(["NOEQUALS"])
-    with pytest.raises(ValueError, match="KEY=VALUE"):
-        parse_env_pairs(["=value"])
-
-
 def experiment_config(tmp_path: Path, run_id: str, extra: list[str] | None = None) -> BenchConfig:
     """Parse an experiment configuration rooted in the test tmp dir.
 
@@ -106,18 +95,42 @@ def experiment_config(tmp_path: Path, run_id: str, extra: list[str] | None = Non
 
 
 def test_experiment_flags_parse(tmp_path: Path) -> None:
-    """The experiment subcommand exposes the server and baseline flags."""
-    config: BenchConfig = experiment_config(
-        tmp_path,
-        "r1",
-        ["--server-env", "SEARCH_API_CACHE_BACKEND=memory", "--no-spawn-server", "--baseline", "r0"],
-    )
+    """The experiment remains offline-only and accepts baseline comparison."""
+    config: BenchConfig = experiment_config(tmp_path, "r1", ["--baseline", "r0"])
     assert config.command == "experiment"
-    assert config.server_env == {"SEARCH_API_CACHE_BACKEND": "memory"}
-    assert config.spawn_server is False
+    assert config.endpoint == ""
     assert config.baseline == "r0"
-    assert config.server_bin is None
-    assert config.build_server is False
+
+
+def test_endpoint_is_unrestricted_across_subcommands(tmp_path: Path) -> None:
+    """--endpoint takes a plaintext host:port and is not gated behind any subcommand or credential."""
+    config: BenchConfig = experiment_config(tmp_path, "with-endpoint", ["--endpoint", "127.0.0.1:50051"])
+    assert config.endpoint == "127.0.0.1:50051"
+    e2e_config: BenchConfig = BenchConfig.from_args(
+        build_parser().parse_args(
+            [
+                "e2e",
+                "--workspace",
+                str(tmp_path / "workspace"),
+                "--results-root",
+                str(tmp_path / "results"),
+                "--endpoint",
+                "127.0.0.1:50051",
+                "--search-expected-versions-path",
+                str(tmp_path / "expected.json"),
+            ]
+        )
+    )
+    assert e2e_config.endpoint == "127.0.0.1:50051"
+    assert e2e_config.search_expected_versions_path == (tmp_path / "expected.json").resolve()
+
+
+def test_obsolete_local_server_flags_removed() -> None:
+    """The retired local-server spawn flags remain absent from the experiment parser."""
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["experiment", "--build-server"])
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["experiment", "--server-env", "SEARCH_API_CACHE_BACKEND=memory"])
 
 
 def test_headline_numbers_picks_best_and_knee() -> None:
@@ -125,9 +138,7 @@ def test_headline_numbers_picks_best_and_knee() -> None:
     sweep = {
         "first_query": {"org0": {"cold_ms": 10.0, "warm_ms": 2.0}, "org1": {"cold_ms": 20.0, "warm_ms": 3.0}},
         "points": [
-            {"nprobes": 1, "refine_factor": None, "recall_at_10": 0.80, "p95_ms": 2.0},
-            {"nprobes": 10, "refine_factor": None, "recall_at_10": 0.96, "p95_ms": 5.0},
-            {"nprobes": 50, "refine_factor": 5, "recall_at_10": 0.99, "p95_ms": 12.0},
+            {"execution_policy": "catalog_profile", "recall_at_10": 0.99, "p95_ms": 12.0},
         ],
     }
     sizes = {"total_bytes": 1000, "data_bytes": 800, "index_bytes": 150}
@@ -135,9 +146,9 @@ def test_headline_numbers_picks_best_and_knee() -> None:
     headline = headline_numbers(sweep, sizes, build_seconds=42.5)
 
     assert headline["best_recall_at_10"] == 0.99
-    assert headline["best_point"] == {"nprobes": 50, "refine_factor": 5}
-    assert headline["knee_point"] == {"nprobes": 10, "refine_factor": None}
-    assert headline["knee_p95_ms"] == 5.0
+    assert headline["best_point"] == {"execution_policy": "catalog_profile"}
+    assert headline["knee_point"] == {"execution_policy": "catalog_profile"}
+    assert headline["knee_p95_ms"] == 12.0
     assert headline["cold_first_query_ms"] == 15.0
     assert headline["build_seconds"] == 42.5
     assert headline["total_bytes"] == 1000
@@ -168,7 +179,8 @@ def test_history_append_and_baseline_delta(tmp_path: Path) -> None:
     lines = [json.loads(line) for line in history_path.read_text().splitlines()]
     assert [line["run_id"] for line in lines] == ["run-a", "run-b"]
     assert lines[1]["knobs"]["dataset"] == "sift1m"
-    assert set(knob_vector(current)) >= {"ivf_partitions", "compact_target_rows", "server_env"}
+    assert set(knob_vector(current)) >= {"ivf_partitions", "compact_target_rows"}
+    assert "server_env" not in knob_vector(current)
 
     delta = baseline_delta(current, current_headline)
     assert delta is not None

@@ -13,16 +13,20 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from conftest import make_vector_table, write_fragmented_dataset
+from conftest import FakeBroadcast, make_vector_table, write_fragmented_dataset
 
 from lance_etl.indexing import IndexJobConfig, bootstrap_vector_index
 from lance_etl.maintenance.cluster import (
+    assign_global_buckets,
     assign_partition_ids,
+    assignment_block_rows,
     centroids_to_matrix,
     decode_centroids,
     derive_buckets,
     encode_centroids,
+    initial_salt_offsets,
     partition_ids_for_batch,
+    release_broadcast,
 )
 from lance_etl.telemetry import Telemetry, TelemetryConfig
 
@@ -114,6 +118,35 @@ def test_cosine_zero_vector_is_assigned_without_error() -> None:
     assert int(pids[1]) == 0
 
 
+def test_assign_respects_fixed_size_list_slice_offset() -> None:
+    """A sliced Arrow vector batch does not accidentally assign rows outside the slice."""
+    centroids: np.ndarray = np.array([[0.0, 0.0], [10.0, 10.0]], dtype=np.float32)
+    all_vectors: pa.FixedSizeListArray = fsl_from_rows([[10.0, 10.0], [0.1, 0.1], [9.9, 9.9], [0.0, 0.0]])
+    sliced: pa.FixedSizeListArray = all_vectors.slice(1, 2)
+
+    pids: np.ndarray = assign_partition_ids(sliced, centroids, "l2")
+
+    assert pids.tolist() == [0, 1]
+
+
+def test_assignment_block_scales_with_partition_count() -> None:
+    """Dense score matrices stay inside their byte budget as IVF partition count grows."""
+    assert assignment_block_rows(1, 128, "l2") == 65_536
+    assert assignment_block_rows(4_096, 128, "l2") == 4_096
+    assert assignment_block_rows(4_096, 128, "dot") == 4_096
+    assert assignment_block_rows(4_096, 1_536, "cosine") == 2_978
+
+
+def test_release_broadcast_waits_for_executor_cleanup() -> None:
+    """Cluster phase teardown blocks until executor-side broadcast copies are removed."""
+    handle: FakeBroadcast = FakeBroadcast({"dataset": b"centroids"})
+
+    release_broadcast(handle)
+
+    assert handle.destroyed is True
+    assert handle.destroy_blocking is True
+
+
 def test_null_vector_routes_to_tail_partition() -> None:
     """A null vector is assigned the tail partition id ``num_partitions`` by the batch helper."""
     centroids: np.ndarray = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
@@ -169,6 +202,33 @@ def test_derive_buckets_salts_oversized_partition() -> None:
     """A partition larger than the cap splits into evenly enumerated salted sub-buckets."""
     buckets: list[tuple[int, int, int, int]] = derive_buckets([10], rows_per_task=4)
     assert buckets == [(0, 0, 0, 3), (0, 0, 1, 3), (0, 0, 2, 3)]
+
+
+def test_salted_bucket_assignment_continues_across_arrow_batches() -> None:
+    """Tiny batches cannot repeatedly restart an oversized partition at its first salt."""
+    pid_to_global: np.ndarray = np.array([-1], dtype=np.int64)
+    salted: dict[int, np.ndarray] = {0: np.array([10, 11, 12], dtype=np.int64)}
+    offsets: dict[int, int] = {}
+
+    assignments: list[int] = [
+        int(assign_global_buckets(batch_pids, pid_to_global, salted, offsets)[0]) for batch_pids in [np.array([0])] * 6
+    ]
+
+    assert assignments == [10, 11, 12, 10, 11, 12]
+
+
+def test_salted_bucket_assignment_rotates_across_fragment_shards() -> None:
+    """One-row fragment shards do not all restart an oversized partition at its first salt."""
+    pid_to_global: np.ndarray = np.array([-1], dtype=np.int64)
+    salted: dict[int, np.ndarray] = {0: np.array([10, 11, 12], dtype=np.int64)}
+
+    assignments: list[int] = []
+    for fragment_id in range(6):
+        offsets: dict[int, int] = initial_salt_offsets(salted, [fragment_id])
+        globals_out: np.ndarray = assign_global_buckets(np.array([0]), pid_to_global, salted, offsets)
+        assignments.append(int(globals_out[0]))
+
+    assert assignments == [10, 11, 12, 10, 11, 12]
 
 
 def test_derive_buckets_includes_null_tail() -> None:

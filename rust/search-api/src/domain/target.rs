@@ -4,18 +4,17 @@ use crate::domain::error::SearchError;
 
 /// Selects which committed version of a dataset to open.
 ///
-/// `Serve` follows the provider's configured serve policy: the configured serve tag when
-/// serve-by-tag is enabled, otherwise the latest committed version. The other variants pin an
-/// explicit version, opt out of the serve tag (`Latest`), or name a tag to resolve. Pinning to a
+/// `Serve` resolves the fixed production `HEAD` tag. The other variants pin an explicit version,
+/// opt out of production serving to open `Latest`, or name a tag to resolve. Pinning to a
 /// concrete version id (directly or via tag resolution) is what lets blue and green versions of
 /// one dataset coexist in the handle cache and lets prewarm warm the exact version that will be
 /// served.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DatasetRef {
-    /// Follow the configured serve policy (serve tag when enabled, else latest). Used by serving.
+    /// Resolve the fixed production `HEAD` tag. Used by serving.
     #[default]
     Serve,
-    /// The latest committed version, ignoring any serve tag.
+    /// The latest committed version, ignoring `HEAD`.
     Latest,
     /// A specific committed version id.
     Version(u64),
@@ -26,13 +25,13 @@ pub enum DatasetRef {
 /// Addresses the dataset a request operates on.
 ///
 /// The target names the single dataset at `{base}/{org_id}/{tenant_id}/{namespace}.lance`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DatasetTarget {
-    /// Organization id. Must match `[A-Za-z0-9_-]+`.
+    /// Organization id. Must match `[A-Za-z0-9_-]{1,128}`.
     pub org_id: String,
-    /// Tenant id. Must match `[A-Za-z0-9_-]+`.
+    /// Tenant id. Must match `[A-Za-z0-9_-]{1,128}`.
     pub tenant_id: String,
-    /// Namespace. Must match `[A-Za-z0-9_-]+`.
+    /// Namespace. Must match `[A-Za-z0-9_-]{1,128}`.
     pub namespace: String,
 }
 
@@ -54,14 +53,16 @@ impl DatasetTarget {
     }
 }
 
-/// Rejects path segments that are empty or contain characters outside `[A-Za-z0-9_-]`.
+/// Rejects path segments outside the shared bounded `[A-Za-z0-9_-]{1,128}` contract.
 pub fn validate_path_segment(value: &str, field: &str) -> Result<(), SearchError> {
-    let valid = !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
     if valid {
         Ok(())
     } else {
         Err(SearchError::invalid_argument(format!(
-            "{field} must be non-empty and match [A-Za-z0-9_-]+"
+            "{field} must match [A-Za-z0-9_-]{{1,128}}"
         )))
     }
 }
@@ -76,6 +77,8 @@ mod tests {
             assert!(validate_path_segment(bad, "org_id").is_err(), "accepted {bad:?}");
         }
         assert!(validate_path_segment("org-1_A", "org_id").is_ok());
+        assert!(validate_path_segment(&"a".repeat(128), "org_id").is_ok());
+        assert!(validate_path_segment(&"a".repeat(129), "org_id").is_err());
         let mut target = DatasetTarget::new("org1", "tenant1", "ns1");
         assert!(target.validate().is_ok());
         target.namespace = "../x".to_string();

@@ -2,13 +2,13 @@
 
 Composes the existing phases into a single command an agent can loop on. Each run: chain
 download and prepare when the prepared shape is missing (cached across iterations), wipe the
-Lance root so every iteration is a clean build of the configured knobs, spawn and own the
-search-api server (:mod:`bench.server`), run the batch-major e2e body (real ETL, pipeline
-compaction, indexing, and hour tags), measure the on-disk data/index/metadata footprint
-(:mod:`bench.sizes`), restart the server for a true cold first query, run the full
-``nprobes x refine_factors`` recall sweep, and write one machine-readable ``metrics.json``
-plus a one-line summary appended to ``{results_root}/experiments.jsonl``. With ``--baseline
-RUN_ID`` the headline delta against a previous iteration is computed and logged.
+Lance root so every iteration is a clean build of the configured knobs, run the reconciler-driven
+e2e body (real Iceberg ingest, indexing, validation, prewarm, and publication through the local
+PostgreSQL control plane), measure the on-disk data/index/metadata footprint (:mod:`bench.sizes`),
+optionally measure an externally managed production service, and write one
+machine-readable ``metrics.json`` plus a one-line summary appended to
+``{results_root}/experiments.jsonl``. With ``--baseline RUN_ID`` the headline delta against a
+previous iteration is computed and logged.
 """
 
 from __future__ import annotations
@@ -22,12 +22,9 @@ from typing import Any
 
 from bench.config import BenchConfig
 from bench.download import run_download
-from bench.e2e import load_queries_and_gt, run_e2e
-from bench.grpc_client import generate_stubs, load_stubs, open_stub
+from bench.e2e import run_e2e
 from bench.prepare import run_prepare
 from bench.results import ensure_dir, read_json, save_phase, utc_now
-from bench.search import measure_first_queries, sweep_point
-from bench.server import ServerHandle, resolve_binary
 from bench.sizes import measure_dataset_sizes
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -47,10 +44,7 @@ KNOB_FIELDS: tuple[str, ...] = (
     "compact_target_rows",
     "fts_with_position",
     "no_text",
-    "nprobes",
-    "refine_factors",
     "search_k",
-    "server_env",
 )
 
 
@@ -103,57 +97,16 @@ def ensure_prepared(config: BenchConfig) -> dict[str, Any]:
     return {"reused": False, "prepared_dir": str(config.prepared_dir())}
 
 
-def run_sweep_and_first_queries(config: BenchConfig, server: ServerHandle | None) -> dict[str, Any]:
-    """Run the cold/warm first queries and the full recall sweep grid.
-
-    When the experiment owns the server it is restarted first, so the recorded ``cold_ms`` is
-    a true empty-process cold open rather than a warm-cache re-read.
-
-    Args:
-        config: Benchmark configuration (endpoint already pointing at the live server).
-        server: The owned server handle, or ``None`` when measuring an external server.
-
-    Returns:
-        First-query timings per org and one sweep record per ``(nprobes, refine_factor)``
-        point, or a skip record when no server is reachable.
-    """
-    if server is not None:
-        server.restart()
-    grpc_gen_dir: Path = config.workspace / "grpc_gen"
-    pb2, pb2_grpc = load_stubs(generate_stubs(grpc_gen_dir))
-    try:
-        stub = open_stub(config.endpoint, pb2_grpc, str(config.lance_root()))
-    except RuntimeError as exc:
-        return {"skipped": str(exc)}
-    queries, ground_truth = load_queries_and_gt(config)
-    first_query: dict[str, Any] = measure_first_queries(stub, pb2, config, queries)
-    points: list[dict[str, Any]] = []
-    for nprobes in config.nprobes:
-        for refine_factor in config.refine_factors:
-            point: dict[str, Any] = sweep_point(stub, pb2, config, queries, ground_truth, nprobes, refine_factor)
-            logger.info(
-                "sweep nprobes=%d refine=%s recall@10=%.4f p95=%.2fms",
-                nprobes,
-                refine_factor,
-                point["recall_at_10"],
-                point["p95_ms"],
-            )
-            points.append(point)
-    return {"first_query": first_query, "points": points}
-
-
 def headline_numbers(sweep: dict[str, Any], sizes: dict[str, Any], build_seconds: float) -> dict[str, Any]:
     """Distill one iteration into the numbers an agent compares across runs.
 
-    Two operating points summarize the sweep: the point with the best recall@10 (ties broken
-    by lower p95), and the fastest point reaching the recall target
-    (:data:`HEADLINE_RECALL_TARGET`), which is the latency/recall knee an agent typically
-    optimizes.
+    The single catalog-selected operating point records recall and latency. Index execution
+    policy is release-owned and therefore cannot be swept by a public request.
 
     Args:
         sweep: The sweep record from :func:`run_sweep_and_first_queries`.
         sizes: The fleet size record from :func:`bench.sizes.measure_dataset_sizes`.
-        build_seconds: Total wall seconds across ETL and pipeline batches.
+        build_seconds: Total wall seconds across every reconciled batch.
 
     Returns:
         The headline record for ``experiments.jsonl`` and baseline deltas.
@@ -167,17 +120,17 @@ def headline_numbers(sweep: dict[str, Any], sizes: dict[str, Any], build_seconds
     points: list[dict[str, Any]] = sweep.get("points", [])
     headline["recall_measured"] = bool(points)
     if not points:
-        headline["recall_skip_reason"] = str(sweep.get("skipped", "sweep produced no recall points"))
+        headline["recall_skip_reason"] = str(sweep.get("reason", "sweep produced no recall points"))
     if points:
         best = max(points, key=lambda point: (point["recall_at_10"], -point["p95_ms"]))
         headline["best_recall_at_10"] = best["recall_at_10"]
-        headline["best_point"] = {"nprobes": best["nprobes"], "refine_factor": best["refine_factor"]}
+        headline["best_point"] = {"execution_policy": best["execution_policy"]}
         headline["best_point_p95_ms"] = best["p95_ms"]
         at_target = [point for point in points if point["recall_at_10"] >= HEADLINE_RECALL_TARGET]
         if at_target:
             knee = min(at_target, key=lambda point: point["p95_ms"])
             headline["knee_p95_ms"] = knee["p95_ms"]
-            headline["knee_point"] = {"nprobes": knee["nprobes"], "refine_factor": knee["refine_factor"]}
+            headline["knee_point"] = {"execution_policy": knee["execution_policy"]}
             headline["knee_recall_at_10"] = knee["recall_at_10"]
     cold_values: list[float] = [
         timing["cold_ms"]
@@ -254,31 +207,16 @@ def run_experiment(config: BenchConfig) -> dict[str, Any]:
     if lance_root.exists():
         shutil.rmtree(lance_root)
 
-    server: ServerHandle | None = None
-    server_record: dict[str, Any]
-    if config.spawn_server:
-        binary: Path | None = resolve_binary(config)
-        if binary is None:
-            server_record = {"skipped": "no search-api binary found; build with --build-server or pass --server-bin"}
-        else:
-            server = ServerHandle(config, binary)
-            server.spawn()
-            config.endpoint = server.endpoint
-            server_record = {"binary": str(binary), "endpoint": server.endpoint, "env": config.server_env}
-    else:
-        server_record = {"external": True, "endpoint": config.endpoint}
-
-    try:
-        e2e_doc: dict[str, Any] = run_e2e(config)
-        build_seconds: float = sum(batch["etl_seconds"] + batch["pipeline"]["seconds"] for batch in e2e_doc["batches"])
-        sizes: dict[str, Any] = measure_dataset_sizes(lance_root)
-        if server is not None or not config.spawn_server:
-            sweep: dict[str, Any] = run_sweep_and_first_queries(config, server)
-        else:
-            sweep = {"skipped": server_record["skipped"]}
-    finally:
-        if server is not None:
-            server.stop()
+    service_record: dict[str, Any] = {
+        "mode": "offline_build_only",
+        "endpoint": None,
+        "status": "NOT_RUN",
+        "reason": "run the standalone search command after publishing the qualified build",
+    }
+    e2e_doc: dict[str, Any] = run_e2e(config)
+    build_seconds: float = sum(batch["seconds"] for batch in e2e_doc["batches"])
+    sizes: dict[str, Any] = measure_dataset_sizes(lance_root)
+    sweep: dict[str, Any] = {"status": "NOT_RUN", "reason": service_record["reason"]}
 
     headline: dict[str, Any] = headline_numbers(sweep, sizes, build_seconds)
     delta: dict[str, Any] | None = baseline_delta(config, headline)
@@ -288,25 +226,24 @@ def run_experiment(config: BenchConfig) -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "run_id": config.run_id,
         "knobs": config_dump(config),
-        "server": server_record,
+        "search_service": service_record,
         "prepared": prepared,
         "build": {
             "total_seconds": round(build_seconds, 3),
             "batches": [
                 {
                     "batch": batch["batch"],
-                    "tag": batch["tag"],
-                    "etl_seconds": batch["etl_seconds"],
-                    "pipeline_seconds": batch["pipeline"]["seconds"],
+                    "seconds": batch["seconds"],
+                    "reconcile": batch["reconcile"],
                 }
                 for batch in e2e_doc["batches"]
             ],
         },
         "sizes": sizes,
         "sweep": sweep,
-        "tags": {
-            "created": e2e_doc["tags_created"],
-            "verified": e2e_doc["historical_tag_verification"]["ok"],
+        "publications": {
+            "verified": e2e_doc["publication_verification"]["ok"],
+            "published": sum(1 for check in e2e_doc["publications"] if check.get("published")),
         },
         "headline": headline,
         "baseline_delta": delta,

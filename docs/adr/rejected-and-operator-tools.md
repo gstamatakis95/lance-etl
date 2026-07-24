@@ -31,8 +31,7 @@ Because the remap problem is otherwise handled (the orphan-race guard, see
 release builds, the trade is not worth it. Do not add `enable_stable_row_ids=True` to any
 dataset creation or compaction path, and do not offer it as an option. If the upstream
 `RowIdIndex` defect is ever fixed, revisiting this requires a fresh decision record, not a
-revival of this one. The evaluation evidence is preserved in
-`market-research/stable-row-ids-plan.md` and `market-research/stable-row-version-columns.md`.
+revival of this one.
 
 ## ADR 0012 — V2 manifest paths fleet-wide
 
@@ -41,11 +40,10 @@ Status: Accepted
 V1 names manifests so that finding the latest version costs a directory LIST that grows with
 version count — a large avoidable cost across 30k datasets opened repeatedly. Every dataset is
 therefore created with `enable_v2_manifest_paths=True`, making every open one object-store
-request regardless of history depth. The flag is honored only at bootstrap. Existing datasets
-migrate one-shot through `migrate_dataset_manifest_paths` / `migrate_manifest_paths`
-(non-transactional — run quiesced). Unlike stable row IDs this is a creation-time naming choice
-with no concurrency caveat, so it defaults on. The one serving-side consequence: the byte cache
-must never cache the V2 latest-version hint file (see `caching-and-observability.md`).
+request regardless of history depth. The flag is honored only at bootstrap and is mandatory.
+Legacy V1 datasets are rebuild-only because durable source state can reproduce them. The former
+non-transactional in-place migration command was removed. The serving-side consequence is that the
+byte cache must never cache the V2 latest-version hint file (see `caching-and-observability.md`).
 
 ## ADR 0015 — CLI and config knob reduction: opinionated defaults
 
@@ -72,29 +70,19 @@ parameters on `IndexJobConfig`), and `INGESTED_AT_COLUMN` was removed with the c
 
 ## ADR 0017 — Rust intake service with a pluggable record sink
 
-Status: Accepted (amended to the write vocabulary)
+Status: Superseded (2026-07-13)
 
-The `IntakeService` accepts record writes ahead of the eventual Kafka destination without
-committing to one: `Write(WriteRecordsRequest)` and `WriteStream(...)` carry
-`RecordWrite { WriteOp op; Record record; }` (`WRITE_OP_UPSERT`, `WRITE_OP_DELETE`), responses
-return `succeeded_ids` / `failed_ids` (a record whose id is itself invalid cannot be reported
-by id and is omitted). The destination sits behind the domain `RecordSink` trait with
-`StdoutSink` as the placeholder, so swapping in Kafka reshapes nothing on the wire or in the
-transport. The service shares the search side's proto file and `DatasetTarget`, its hard rules
-(no raw SQL, domain free of tonic and Lance, infallible low-cardinality telemetry), and its
-layering.
+The placeholder-only `IntakeService`, its `RecordSink` abstraction, and `StdoutSink` were removed
+before release. Accepting a write over gRPC without a durable destination could report success
+without creating replayable source state. Iceberg is now the only durable ingestion source. A
+future online-write design requires a fresh ADR with a real durable transport, idempotency keys,
+and reconciliation semantics before any public write RPC is added.
 
 ## ADR 0019 — Namespace copy/migrate utility
 
-Status: Accepted
+Status: Superseded (2026-07-22)
 
-`migrate_namespace.py` (`NamespaceMigrator`, `MigrateConfig`, run via `lance-etl-tools
-migrate-namespace`) migrates a whole namespace by copy-plus-optimize, keeping the source: every
-dataset whose namespace path component matches the source is copied to the same address with
-the component swapped, then optimized in production order — write, recompact (reusing
-`MaintenanceJob`), reindex (reusing `LanceIndexer` and its segment flows, skipped when no index
-columns are supplied because they cannot be guessed). Every path component is validated against
-the same allowlist the ETL uses, a pre-existing target fails the run unless `overwrite_target`
-is set, and the source is never deleted, so a wrong new layout has a trivial rollback. The copy
-itself scales with its own small/large dataset tiers (whole-dataset tasks versus fragment-shard
-fan-outs), independent of the unified maintenance orchestration.
+The copy-plus-optimize namespace migration library and CLI were removed. Namespace changes now
+create a new immutable specification revision and rebuild targets from the durable Iceberg source.
+This keeps one ingestion, compaction, and indexing path and avoids a second data-copy engine with
+its own overwrite, sharding, and partial-failure semantics.

@@ -30,80 +30,100 @@ validated typed data.
 
 from __future__ import annotations
 
-from lance_etl.recall.config import RecallJobConfig
+from lance_etl.recall.config import RecallJobConfig as RecallJobConfig
 from lance_etl.recall.job import (
-    AggregateRow,
-    RecallAuditJob,
-    RecallReport,
-    aggregate_scores,
-    emit_recall_metrics,
-    format_report,
-    fragment_vector_partials,
-    reduce_vector_legs,
-    sample_dataset_uri,
-    score_version_group,
+    AggregateRow as AggregateRow,
+)
+from lance_etl.recall.job import (
+    RecallAuditJob as RecallAuditJob,
+)
+from lance_etl.recall.job import (
+    RecallReport as RecallReport,
+)
+from lance_etl.recall.job import (
+    aggregate_scores as aggregate_scores,
+)
+from lance_etl.recall.job import (
+    emit_recall_metrics as emit_recall_metrics,
+)
+from lance_etl.recall.job import (
+    format_report as format_report,
+)
+from lance_etl.recall.job import (
+    fragment_vector_partials as fragment_vector_partials,
+)
+from lance_etl.recall.job import (
+    reduce_vector_legs as reduce_vector_legs,
+)
+from lance_etl.recall.job import (
+    sample_dataset_uri as sample_dataset_uri,
+)
+from lance_etl.recall.job import (
+    score_version_group as score_version_group,
 )
 from lance_etl.recall.queries import (
-    FilterTranslationError,
-    FusionReplayError,
-    TextQueryTranslationError,
-    filter_ast_to_sql,
-    fuse_legs,
-    text_query_field_queries,
+    FilterTranslationError as FilterTranslationError,
+)
+from lance_etl.recall.queries import (
+    FusionReplayError as FusionReplayError,
+)
+from lance_etl.recall.queries import (
+    TextQueryTranslationError as TextQueryTranslationError,
+)
+from lance_etl.recall.queries import (
+    filter_ast_to_sql as filter_ast_to_sql,
+)
+from lance_etl.recall.queries import (
+    fuse_legs as fuse_legs,
+)
+from lance_etl.recall.queries import (
+    text_query_field_queries as text_query_field_queries,
 )
 from lance_etl.recall.scoring import (
-    SampleScore,
-    bm25_column_scores,
-    bm25_top_k,
-    brute_force_top_k,
-    brute_force_top_k_scored,
-    compute_distances,
-    ranking_quality,
-    reduce_partial_top_k,
-    resolve_dataset,
+    SampleScore as SampleScore,
+)
+from lance_etl.recall.scoring import (
+    bm25_column_scores as bm25_column_scores,
+)
+from lance_etl.recall.scoring import (
+    bm25_top_k as bm25_top_k,
+)
+from lance_etl.recall.scoring import (
+    brute_force_top_k as brute_force_top_k,
+)
+from lance_etl.recall.scoring import (
+    brute_force_top_k_scored as brute_force_top_k_scored,
+)
+from lance_etl.recall.scoring import (
+    compute_distances as compute_distances,
+)
+from lance_etl.recall.scoring import (
+    ranking_quality as ranking_quality,
+)
+from lance_etl.recall.scoring import (
+    reduce_partial_top_k as reduce_partial_top_k,
+)
+from lance_etl.recall.scoring import (
+    resolve_dataset as resolve_dataset,
 )
 from lance_etl.recall.source import (
-    DatadogSpanSource,
-    InMemorySpanSource,
-    RecallSample,
-    build_spans_request_body,
-    flatten_recall_attributes,
-    parse_recall_sample,
-    parse_samples,
+    DatadogSpanSource as DatadogSpanSource,
 )
-
-__all__ = [
-    "AggregateRow",
-    "DatadogSpanSource",
-    "FilterTranslationError",
-    "FusionReplayError",
-    "InMemorySpanSource",
-    "RecallAuditJob",
-    "RecallJobConfig",
-    "RecallReport",
-    "RecallSample",
-    "SampleScore",
-    "TextQueryTranslationError",
-    "aggregate_scores",
-    "bm25_column_scores",
-    "bm25_top_k",
-    "brute_force_top_k",
-    "brute_force_top_k_scored",
-    "build_spans_request_body",
-    "compute_distances",
-    "emit_recall_metrics",
-    "filter_ast_to_sql",
-    "flatten_recall_attributes",
-    "format_report",
-    "fragment_vector_partials",
-    "fuse_legs",
-    "parse_recall_sample",
-    "parse_samples",
-    "ranking_quality",
-    "reduce_partial_top_k",
-    "reduce_vector_legs",
-    "resolve_dataset",
-    "sample_dataset_uri",
-    "score_version_group",
-    "text_query_field_queries",
-]
+from lance_etl.recall.source import (
+    InMemorySpanSource as InMemorySpanSource,
+)
+from lance_etl.recall.source import (
+    RecallSample as RecallSample,
+)
+from lance_etl.recall.source import (
+    build_spans_request_body as build_spans_request_body,
+)
+from lance_etl.recall.source import (
+    flatten_recall_attributes as flatten_recall_attributes,
+)
+from lance_etl.recall.source import (
+    parse_recall_sample as parse_recall_sample,
+)
+from lance_etl.recall.source import (
+    parse_samples as parse_samples,
+)

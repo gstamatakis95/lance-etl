@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import lance
 import pyarrow as pa
@@ -224,7 +226,6 @@ def test_vector_segment_path_end_to_end(dataset_uri: str, telemetry: Telemetry) 
     new_targets: list[int] = handler.target_fragments(dataset)
     assert len(new_targets) == 1
     artifacts: object | None = handler.prepare(dataset, dataset_uri, telemetry)
-    assert handler.reused_artifacts is True
     documents: list[str] = []
     for group in split_evenly(new_targets, 2):
         segment: Index = handler.build_segment(lance.dataset(dataset_uri, version=dataset.version), group, artifacts)
@@ -261,11 +262,9 @@ def test_vector_segment_path_reuses_artifacts(dataset_uri: str, telemetry: Telem
 
     first_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
     first: object | None = first_handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
-    assert first_handler.reused_artifacts is True
 
     second_handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
     second: object | None = second_handler.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
-    assert second_handler.reused_artifacts is True
 
     assert first[0].equals(second[0])
     assert second[1] == first[1] == cfg["rabitq_model"]
@@ -352,20 +351,41 @@ def test_scalar_fragment_sharding_requires_segment_api(dataset_uri: str) -> None
         )
 
 
-def test_unified_run_builds_fts_end_to_end(dataset_uri: str) -> None:
+def test_unified_run_builds_fts_end_to_end(dataset_uri: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """The unified fleet run builds a BM25 inverted index end-to-end through all phases.
 
-    Exercises plan (shard specs), the flat build job (per-fragment INVERTED builds under one
+    Exercises plan (shard specs), the flat build job (one INVERTED build per fragment shard under one
     shared index id), the commit fan-out (metadata merge plus publish), and the delta bound,
     all through the production phase functions driven by the in-process Spark fake.
 
     Args:
         dataset_uri: URI of the pre-built test dataset.
+        monkeypatch: Pytest monkeypatch used to record the fragment ids in each native build call.
     """
+    fragment_shards: list[list[int]] = []
+    real_create_scalar_index: Callable[..., Any] = lance.LanceDataset.create_scalar_index
+
+    def record_create_scalar_index(self: lance.LanceDataset, *args: Any, **kwargs: Any) -> Any:
+        """Record each INVERTED fragment shard and delegate to pylance.
+
+        Args:
+            self: Dataset instance receiving the call.
+            args: Positional arguments forwarded to pylance.
+            kwargs: Keyword arguments forwarded to pylance.
+
+        Returns:
+            The result from pylance's real implementation.
+        """
+        if kwargs.get("index_type") == "INVERTED":
+            fragment_shards.append(list(kwargs["fragment_ids"]))
+        return real_create_scalar_index(self, *args, **kwargs)
+
+    monkeypatch.setattr(lance.LanceDataset, "create_scalar_index", record_create_scalar_index)
+    expected_fragments: list[int] = fragment_ids_of(dataset_uri)
     config: IndexJobConfig = IndexJobConfig(
         telemetry=TelemetryConfig(),
         text_columns=["text"],
-        fragments_per_index_task=1,
+        fragments_per_index_task=2,
         commit_retries=5,
         commit_backoff_seconds=0.0,
     )
@@ -373,6 +393,9 @@ def test_unified_run_builds_fts_end_to_end(dataset_uri: str) -> None:
     assert "text_fts_idx" in listed_index_names(dataset_uri)
     by_index: dict[str, dict[str, object]] = {item["index"]: item for item in results[0]["indexes"]}
     assert by_index["text_fts_idx"]["segments"] == len(fragment_ids_of(dataset_uri))
+    assert len(fragment_shards) == 2
+    assert {fragment for shard in fragment_shards for fragment in shard} == set(expected_fragments)
+    assert all(1 <= len(shard) <= 2 for shard in fragment_shards)
     expected: int = sum(1 for i in range(ROWS) if i % 10 == 2)
     assert lance.dataset(dataset_uri).to_table(full_text_query="word2").num_rows == expected
 

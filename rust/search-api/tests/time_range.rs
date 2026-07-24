@@ -1,6 +1,6 @@
 //! Event-time range search and object-store scan-stats capture.
 //!
-//! Builds a tiny dataset with an `event_timestamp` column (one row per day), then drives the Lance
+//! Builds a tiny dataset with a `ts` column (one row per day), then drives the Lance
 //! backend directly to assert that a request time range restricts results to the window on the
 //! event-timestamp column (start inclusive, end exclusive, either bound optional), that an absent
 //! range behaves as before, that the range ANDs with a caller filter, and that the scan-stats
@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 
 use arrow_array::types::Float32Type;
 use arrow_array::{
-    FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray, TimestampMicrosecondArray,
+    BooleanArray, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
+    TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use common::{TEST_DATASET_PATH, test_config, test_target};
@@ -40,10 +41,12 @@ fn event_ms(index: i64) -> i64 {
     BASE_MS + index * DAY_MS
 }
 
-/// Writes a four-row dataset (id, text, vector, event_timestamp) and creates an INVERTED index on
+/// Writes a four-row dataset (id, text, vector, ts) and creates an INVERTED index on
 /// `text` so the text and hybrid legs run, with one row per day on the timestamp column.
 async fn build_timestamped_dataset(uri: &str) {
     let schema = Arc::new(Schema::new(vec![
+        Field::new("record_id", DataType::Utf8, false),
+        Field::new("is_deleted", DataType::Boolean, false),
         Field::new("id", DataType::Int32, false),
         Field::new("text", DataType::Utf8, false),
         Field::new(
@@ -52,7 +55,7 @@ async fn build_timestamped_dataset(uri: &str) {
             false,
         ),
         Field::new(
-            "event_timestamp",
+            "ts",
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
         ),
@@ -71,6 +74,8 @@ async fn build_timestamped_dataset(uri: &str) {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
+            Arc::new(StringArray::from(vec!["v1", "v2", "v3", "v4"])),
+            Arc::new(BooleanArray::from(vec![false, false, false, false])),
             Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
             Arc::new(StringArray::from(vec![
                 "red apple pie",
@@ -93,6 +98,12 @@ async fn build_timestamped_dataset(uri: &str) {
             &InvertedIndexParams::default().with_position(true),
             true,
         )
+        .await
+        .unwrap();
+    let head_version = dataset.version_id();
+    dataset
+        .tags()
+        .create(search_api::config::PRODUCTION_SERVE_TAG, head_version)
         .await
         .unwrap();
 }
@@ -248,7 +259,6 @@ async fn text_and_hybrid_time_range_restricts_the_window() {
         },
         k: 10,
         fusion: search_api::domain::FusionSpec::default(),
-        reference: search_api::domain::DatasetRef::default(),
     };
     let fused = backend.hybrid_search(&target, hybrid).await.unwrap();
     let mut ids: Vec<i64> = fused.hits.iter().map(|hit| hit_id(&hit.row)).collect();
@@ -264,7 +274,7 @@ async fn time_range_against_a_missing_event_column_is_rejected() {
     build_timestamped_dataset(&uri).await;
     let backend = build_backend(data_tmp.path(), cache_tmp.path())
         .await
-        .with_event_timestamp_column("no_such_column");
+        .with_ts_column("no_such_column");
 
     let err = backend
         .vector_search(

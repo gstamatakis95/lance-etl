@@ -251,7 +251,6 @@ pub struct RecallCapture {
     vector_sampler: RecallSampler,
     text_sampler: RecallSampler,
     hybrid_sampler: RecallSampler,
-    id_column: String,
     metrics: Arc<Metrics>,
     hook: Option<RecallHook>,
 }
@@ -268,12 +267,11 @@ impl std::fmt::Debug for RecallCapture {
 
 impl RecallCapture {
     /// Creates a capture facade with the given sample rate and result id column.
-    pub fn new(rate: f64, id_column: impl Into<String>, metrics: Arc<Metrics>) -> Self {
+    pub fn new(rate: f64, metrics: Arc<Metrics>) -> Self {
         Self {
             vector_sampler: RecallSampler::new(rate),
             text_sampler: RecallSampler::new(rate),
             hybrid_sampler: RecallSampler::new(rate),
-            id_column: id_column.into(),
             metrics,
             hook: None,
         }
@@ -281,7 +279,7 @@ impl RecallCapture {
 
     /// A capture facade that never samples, for constructors without recall wiring.
     pub fn disabled() -> Self {
-        Self::new(0.0, crate::config::DEFAULT_ID_COLUMN, Arc::new(Metrics::disabled()))
+        Self::new(0.0, Arc::new(Metrics::disabled()))
     }
 
     /// Installs an observer invoked with every finished record. Test seam.
@@ -374,10 +372,7 @@ impl RecallCapture {
     /// Vector captures record the served scores as `recall.result_distances`; text and hybrid
     /// captures record them as `recall.result_scores`.
     pub fn finish(&self, pending: PendingRecall, dataset_version: Option<u64>, hits: &[Hit]) {
-        let ids: Vec<Value> = hits
-            .iter()
-            .map(|hit| hit.row.get(&self.id_column).cloned().unwrap_or(Value::Null))
-            .collect();
+        let ids: Vec<Value> = hits.iter().map(|hit| Value::from(hit.record_id.clone())).collect();
         let scores: Vec<f64> = hits.iter().map(|hit| hit.score).collect();
         let scores_json = serde_json::to_string(&scores).unwrap_or_else(|_| "[]".to_string());
         let (result_distances_json, result_scores_json) = match pending.query_type {
@@ -481,7 +476,7 @@ mod tests {
 
     /// Builds a capture that records every finished record into `sink`.
     fn capturing(sink: Arc<Mutex<Vec<RecallRecord>>>) -> RecallCapture {
-        RecallCapture::new(1.0, "vector_id", Arc::new(Metrics::disabled()))
+        RecallCapture::new(1.0, Arc::new(Metrics::disabled()))
             .with_hook(Arc::new(move |record| sink.lock().unwrap().push(record.clone())))
     }
 
@@ -511,9 +506,9 @@ mod tests {
         let (target, query) = fixture();
         let pending = capture.begin(&target, &query).expect("rate 1.0 must sample");
         let mut row = Map::new();
-        row.insert("vector_id".to_string(), Value::from(7));
+        row.insert("record_id".to_string(), Value::from(7));
         let hits = vec![Hit {
-            row_id: 1,
+            record_id: "7".to_string(),
             score: 0.25,
             row,
         }];
@@ -534,7 +529,7 @@ mod tests {
             record.filter_json.as_deref(),
             Some(r#"{"compare":{"column":"id","op":"gt","value":{"int":1}}}"#)
         );
-        assert_eq!(record.result_ids_json, "[7]");
+        assert_eq!(record.result_ids_json, r#"["7"]"#);
         assert_eq!(record.result_distances_json.as_deref(), Some("[0.25]"));
         assert_eq!(record.result_scores_json, None);
         assert!(!record.sample_id.is_empty());
@@ -542,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_id_column_values_become_json_nulls() {
+    fn logical_record_id_is_always_recorded() {
         let captured: Arc<Mutex<Vec<RecallRecord>>> = Arc::new(Mutex::new(Vec::new()));
         let capture = capturing(captured.clone());
         let (target, mut query) = fixture();
@@ -551,13 +546,13 @@ mod tests {
         query.minimum_nprobes = Some(4);
         let pending = capture.begin(&target, &query).unwrap();
         let hits = vec![Hit {
-            row_id: 9,
+            record_id: "9".to_string(),
             score: 1.5,
             row: Map::new(),
         }];
         capture.finish(pending, Some(1), &hits);
         let records = captured.lock().unwrap();
-        assert_eq!(records[0].result_ids_json, "[null]");
+        assert_eq!(records[0].result_ids_json, r#"["9"]"#);
         assert_eq!(records[0].filter_json, None);
         assert_eq!(records[0].nprobes_min, Some(4));
         assert_eq!(records[0].nprobes_max, None);
@@ -572,9 +567,9 @@ mod tests {
         query.columns = vec!["text".to_string()];
         let pending = capture.begin_text(&target, &query).expect("rate 1.0 must sample");
         let mut row = Map::new();
-        row.insert("vector_id".to_string(), Value::from(4));
+        row.insert("record_id".to_string(), Value::from(4));
         let hits = vec![Hit {
-            row_id: 4,
+            record_id: "4".to_string(),
             score: 2.5,
             row,
         }];
@@ -590,7 +585,7 @@ mod tests {
             )
         );
         assert_eq!(record.text_columns_json.as_deref(), Some(r#"["text"]"#));
-        assert_eq!(record.result_ids_json, "[4]");
+        assert_eq!(record.result_ids_json, r#"["4"]"#);
         assert_eq!(record.result_scores_json.as_deref(), Some("[2.5]"));
         assert_eq!(record.result_distances_json, None);
         assert_eq!(record.fusion_json, None);
@@ -616,13 +611,12 @@ mod tests {
             },
             k: 2,
             fusion: FusionSpec::Weighted { vector_weight: 0.7 },
-            reference: crate::domain::DatasetRef::default(),
         };
         let pending = capture.begin_hybrid(&target, &query).expect("rate 1.0 must sample");
         let mut row = Map::new();
-        row.insert("vector_id".to_string(), Value::from(2));
+        row.insert("record_id".to_string(), Value::from(2));
         let hits = vec![Hit {
-            row_id: 2,
+            record_id: "2".to_string(),
             score: 0.42,
             row,
         }];

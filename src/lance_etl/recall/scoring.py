@@ -12,9 +12,9 @@ over those grades divided by the ideal DCG of the exact ranking, and MRR is the 
 the single exact top result (the first element of the ground-truth order) appears, or ``0`` when it is absent.
 
 A text sample is graded against an exact Okapi BM25 ranking over the named text columns at the pinned dataset
-version, recomputed here as the ground-truth top-k, then graded with the same recall/nDCG/MRR functions. A hybrid
-sample fuses the exact vector top-k and the exact BM25 top-k with the recorded fusion strategy
-(:func:`~lance_etl.recall.queries.fuse_legs`) before grading the served ids.
+version. BM25 uses two streaming passes so corpus statistics remain exact while memory stays bounded by one Arrow
+batch, the query vocabulary, and the running top-k. A hybrid sample fuses the exact vector top-k and the exact BM25
+top-k with the recorded fusion strategy (:func:`~lance_etl.recall.queries.fuse_legs`) before grading the served ids.
 """
 
 from __future__ import annotations
@@ -34,6 +34,24 @@ from lance_etl.recall.queries import FusionReplayError, fuse_legs, tokenize_text
 from lance_etl.recall.source import RecallSample
 
 
+class DatasetOpenError(RuntimeError):
+    """A recorded dataset could not be opened for a reason other than version retention."""
+
+
+def recorded_version_absent(error: BaseException, version: int) -> bool:
+    """Recognize the pinned Lance manifest-not-found error for one exact version.
+
+    Args:
+        error: Exact-version open failure.
+        version: Requested committed version.
+
+    Returns:
+        Whether the failure specifically names the missing version manifest.
+    """
+    normalized: str = str(error).replace("\\", "/")
+    return f"_versions/{version}.manifest was not found" in normalized
+
+
 @dataclass(frozen=True)
 class SampleScore:
     """The scoring outcome for one sample.
@@ -49,7 +67,6 @@ class SampleScore:
         recall: The measured recall@k, or None when the sample was skipped.
         ndcg: The measured nDCG@k, or None when the sample was skipped.
         mrr: The measured reciprocal rank of the exact top result, or None when the sample was skipped.
-        version_drift: True when the recorded version was unavailable and scoring fell back to latest.
         skip_reason: A bounded-cardinality reason when the sample was skipped, otherwise None.
     """
 
@@ -60,17 +77,14 @@ class SampleScore:
     nprobes_max: int | None
     refine_factor: int | None
     recall: float | None
-    version_drift: bool
     skip_reason: str | None
     query_type: str = "vector"
     ndcg: float | None = None
     mrr: float | None = None
 
 
-def resolve_dataset(
-    uri: str, version: int, storage_options: dict[str, Any] | None
-) -> tuple[lance.LanceDataset | None, bool]:
-    """Open a dataset checked out at the recorded version, falling back to latest on drift.
+def resolve_dataset(uri: str, version: int, storage_options: dict[str, Any] | None) -> lance.LanceDataset | None:
+    """Open a dataset only at the exact version that served the captured query.
 
     Args:
         uri: The dataset URI.
@@ -78,16 +92,19 @@ def resolve_dataset(
         storage_options: Object-store options forwarded to pylance.
 
     Returns:
-        ``(dataset, version_drift)`` where the dataset is None when the URI cannot be opened at all, and
-        ``version_drift`` is True when the recorded version was unavailable and the latest version was opened instead.
+        The exact dataset version, or ``None`` when that version was retained away.
+
+    Raises:
+        DatasetOpenError: If the recorded version is invalid or an open fails for a reason other than retention.
     """
+    if version < 1:
+        raise DatasetOpenError(f"recorded dataset version must be positive: {version}")
     try:
-        return lance.dataset(uri, version=version, storage_options=storage_options), False
-    except (ValueError, OSError, RuntimeError):
-        try:
-            return lance.dataset(uri, storage_options=storage_options), True
-        except (ValueError, OSError, RuntimeError):
-            return None, False
+        return lance.dataset(uri, version=version, storage_options=storage_options)
+    except (ValueError, OSError, RuntimeError) as error:
+        if not recorded_version_absent(error, version):
+            raise DatasetOpenError(f"exact dataset version could not be opened: {uri}@{version}") from error
+        return None
 
 
 def index_default_distance_type(dataset: lance.LanceDataset, vector_column: str) -> str:
@@ -109,7 +126,7 @@ def index_default_distance_type(dataset: lance.LanceDataset, vector_column: str)
     except (ValueError, OSError, RuntimeError):
         return "l2"
     for description in descriptions:
-        if vector_column not in getattr(description, "field_names", []):
+        if vector_column not in description.field_names:
             continue
         try:
             stats: dict[str, Any] = dataset.stats.index_stats(description.name)
@@ -346,7 +363,13 @@ def ranking_quality(
     grade_map: dict[Any, int] = {tid: n - idx for idx, tid in enumerate(true_ids_ordered)}
     hits: int = len(set(grade_map) & set(served_top))
     recall: float = hits / denominator if denominator > 0 else 0.0
-    dcg: float = sum(grade_map.get(sid, 0) / math.log2(pos + 2) for pos, sid in enumerate(served_top))
+    seen_served: set[Any] = set()
+    dcg: float = 0.0
+    for position, served_id in enumerate(served_top):
+        if served_id in seen_served:
+            continue
+        seen_served.add(served_id)
+        dcg += grade_map.get(served_id, 0) / math.log2(position + 2)
     idcg: float = sum((n - j) / math.log2(j + 2) for j in range(n))
     ndcg: float = dcg / idcg if idcg > 0 else 0.0
     mrr: float = 0.0
@@ -399,6 +422,111 @@ def bm25_column_scores(
     return scores, matched
 
 
+@dataclass(frozen=True)
+class Bm25CorpusStats:
+    """Bounded corpus-global statistics needed for exact BM25 scoring.
+
+    Attributes:
+        document_count: Number of documents passing the scanner filter.
+        average_lengths: Average token count per queried column.
+        inverse_document_frequencies: BM25 inverse document frequency per queried column and term.
+    """
+
+    document_count: int
+    average_lengths: dict[str, float]
+    inverse_document_frequencies: dict[tuple[str, str], float]
+
+
+def collect_bm25_corpus_stats(
+    dataset: lance.LanceDataset,
+    field_queries: list[tuple[str, list[str], str, float]],
+    filter_sql: str | None,
+    batch_size: int,
+) -> Bm25CorpusStats:
+    """Scan text columns once to collect exact bounded BM25 corpus statistics.
+
+    Args:
+        dataset: Opened and version-pinned dataset.
+        field_queries: Validated ``(column, terms, operator, boost)`` clauses.
+        filter_sql: Internally generated filter string, or None.
+        batch_size: Scanner batch size.
+
+    Returns:
+        Document count, per-column average lengths, and per-term inverse document frequencies.
+    """
+    needed_columns: list[str] = sorted({clause[0] for clause in field_queries})
+    terms_by_column: dict[str, set[str]] = {column: set() for column in needed_columns}
+    for column, terms, operator, boost in field_queries:
+        del operator, boost
+        terms_by_column[column].update(terms)
+    length_sums: dict[str, int] = {column: 0 for column in needed_columns}
+    document_frequencies: dict[tuple[str, str], int] = {
+        (column, term): 0 for column in needed_columns for term in terms_by_column[column]
+    }
+    scanner: lance.LanceScanner = dataset.scanner(columns=needed_columns, filter=filter_sql, batch_size=batch_size)
+    document_count: int = 0
+    for batch in scanner.to_batches():
+        if batch.num_rows == 0:
+            continue
+        table: pa.Table = pa.Table.from_batches([batch])
+        document_count += table.num_rows
+        for column in needed_columns:
+            requested_terms: set[str] = terms_by_column[column]
+            for value in table.column(column).to_pylist():
+                tokens: list[str] = tokenize_text(value)
+                length_sums[column] += len(tokens)
+                for term in requested_terms.intersection(tokens):
+                    document_frequencies[(column, term)] += 1
+    average_lengths: dict[str, float] = {}
+    for column in needed_columns:
+        total_length: int = length_sums[column]
+        average_lengths[column] = total_length / document_count if document_count > 0 and total_length > 0 else 1.0
+    inverse_document_frequencies: dict[tuple[str, str], float] = {}
+    for key, frequency in document_frequencies.items():
+        inverse_document_frequencies[key] = math.log(1.0 + (document_count - frequency + 0.5) / (frequency + 0.5))
+    return Bm25CorpusStats(document_count, average_lengths, inverse_document_frequencies)
+
+
+def score_bm25_document(
+    column_tokens: dict[str, list[str]],
+    field_queries: list[tuple[str, list[str], str, float]],
+    stats: Bm25CorpusStats,
+) -> tuple[float, bool]:
+    """Score one document exactly from precomputed corpus-global BM25 statistics.
+
+    Args:
+        column_tokens: Token list per queried text column for one document.
+        field_queries: Validated ``(column, terms, operator, boost)`` clauses.
+        stats: Corpus statistics from the first streaming pass.
+
+    Returns:
+        The summed boosted score and whether at least one clause matched.
+    """
+    counters: dict[str, Counter[str]] = {column: Counter(tokens) for column, tokens in column_tokens.items()}
+    score: float = 0.0
+    matched_any: bool = False
+    for column, terms, operator, boost in field_queries:
+        unique_terms: list[str] = sorted(set(terms))
+        if not unique_terms:
+            continue
+        counter: Counter[str] = counters[column]
+        frequencies: list[int] = [counter.get(term, 0) for term in unique_terms]
+        matched: bool = all(frequencies) if operator == "and" else any(frequencies)
+        if not matched:
+            continue
+        matched_any = True
+        average_length: float = stats.average_lengths[column]
+        normalization: float = BM25_K1 * (1.0 - BM25_B + BM25_B * len(column_tokens[column]) / average_length)
+        clause_score: float = 0.0
+        for term, frequency in zip(unique_terms, frequencies, strict=True):
+            if frequency == 0:
+                continue
+            inverse_document_frequency: float = stats.inverse_document_frequencies[(column, term)]
+            clause_score += inverse_document_frequency * (frequency * (BM25_K1 + 1.0)) / (frequency + normalization)
+        score += boost * clause_score
+    return score, matched_any
+
+
 def bm25_top_k(
     dataset: lance.LanceDataset,
     field_queries: list[tuple[str, list[str], str, float]],
@@ -409,9 +537,10 @@ def bm25_top_k(
 ) -> tuple[list[Any], list[float], int]:
     """Compute the exact BM25 top-k ids and scores over the named text columns.
 
-    Materializes the candidate text columns at the pinned version, computes per-column BM25 with
-    :func:`bm25_column_scores`, sums the boosted column scores, and ranks the documents that matched at least one
-    clause. Ties break on the id column so the reference order is deterministic.
+    The first pass collects only per-column length and document-frequency statistics. The second pass scores one
+    batch at a time and truncates the running ranking to ``k`` after every batch. Memory is bounded by the query
+    vocabulary, ``batch_size``, and ``k`` while the result remains exact. Ties break on the id column so the reference
+    order is deterministic.
 
     Args:
         dataset: The opened (possibly version-pinned) dataset.
@@ -426,40 +555,39 @@ def bm25_top_k(
         scores are aligned with them, and the count is the number of documents that matched at least one clause.
     """
     needed_columns: list[str] = sorted({clause[0] for clause in field_queries})
+    stats: Bm25CorpusStats = collect_bm25_corpus_stats(dataset, field_queries, filter_sql, batch_size)
+    if stats.document_count == 0:
+        return [], [], 0
     scanner: lance.LanceScanner = dataset.scanner(
         columns=[id_column, *needed_columns], filter=filter_sql, batch_size=batch_size
     )
-    ids: list[Any] = []
-    column_tokens: dict[str, list[list[str]]] = {column: [] for column in needed_columns}
+    top: list[tuple[Any, float]] = []
+    matched_count: int = 0
     for batch in scanner.to_batches():
         if batch.num_rows == 0:
             continue
-        table: pa.Table = pa.Table.from_batches([batch])
-        ids.extend(table.column(id_column).to_pylist())
-        for column in needed_columns:
-            column_tokens[column].extend(tokenize_text(value) for value in table.column(column).to_pylist())
-    total: int = len(ids)
-    if total == 0:
-        return [], [], 0
-    scores: np.ndarray = np.zeros(total, dtype=np.float64)
-    matched_any: np.ndarray = np.zeros(total, dtype=bool)
-    for column, terms, operator, boost in field_queries:
-        column_scores, matched = bm25_column_scores(column_tokens[column], terms, operator)
-        scores += boost * np.where(matched, column_scores, 0.0)
-        matched_any |= matched
-    matched_indices: list[int] = [index for index in range(total) if matched_any[index]]
-    matched_indices.sort(key=lambda index: (-scores[index], ids[index]))
-    top: list[int] = matched_indices[:k]
-    return [ids[index] for index in top], [float(scores[index]) for index in top], len(matched_indices)
+        table = pa.Table.from_batches([batch])
+        ids: list[Any] = table.column(id_column).to_pylist()
+        values_by_column: dict[str, list[Any]] = {column: table.column(column).to_pylist() for column in needed_columns}
+        for index, record_id in enumerate(ids):
+            column_tokens: dict[str, list[str]] = {
+                column: tokenize_text(values[index]) for column, values in values_by_column.items()
+            }
+            score, matched = score_bm25_document(column_tokens, field_queries, stats)
+            if matched:
+                matched_count += 1
+                top.append((record_id, score))
+        top.sort(key=lambda item: (-item[1], item[0]))
+        del top[k:]
+    return [item[0] for item in top], [item[1] for item in top], matched_count
 
 
-def skipped_score(sample: RecallSample, reason: str, version_drift: bool = False) -> SampleScore:
+def skipped_score(sample: RecallSample, reason: str) -> SampleScore:
     """Build the score record for a skipped sample.
 
     Args:
         sample: The sample that was skipped.
         reason: The bounded-cardinality skip reason.
-        version_drift: Whether the dataset was opened at a drifted version before the skip.
 
     Returns:
         A score with ``recall=None`` and the reason recorded.
@@ -473,12 +601,11 @@ def skipped_score(sample: RecallSample, reason: str, version_drift: bool = False
         nprobes_max=sample.nprobes_max,
         refine_factor=sample.refine_factor,
         recall=None,
-        version_drift=version_drift,
         skip_reason=reason,
     )
 
 
-def scored_sample(sample: RecallSample, recall: float, ndcg: float, mrr: float, version_drift: bool) -> SampleScore:
+def scored_sample(sample: RecallSample, recall: float, ndcg: float, mrr: float) -> SampleScore:
     """Build the score record for a successfully scored sample.
 
     Args:
@@ -486,7 +613,6 @@ def scored_sample(sample: RecallSample, recall: float, ndcg: float, mrr: float, 
         recall: The measured recall@k.
         ndcg: The measured nDCG@k.
         mrr: The measured reciprocal rank of the exact top result.
-        version_drift: Whether the dataset was opened at a drifted version.
 
     Returns:
         The populated score record.
@@ -502,14 +628,11 @@ def scored_sample(sample: RecallSample, recall: float, ndcg: float, mrr: float, 
         recall=recall,
         ndcg=ndcg,
         mrr=mrr,
-        version_drift=version_drift,
         skip_reason=None,
     )
 
 
-def grade_against_reference(
-    sample: RecallSample, true_ids: list[Any], candidate_count: int, version_drift: bool
-) -> SampleScore:
+def grade_against_reference(sample: RecallSample, true_ids: list[Any], candidate_count: int) -> SampleScore:
     """Grade one served ranking against an exact single-leg reference top-k.
 
     Shared by the vector and text scorers and by the large-tier reduce, so every path grades identically once it holds
@@ -519,26 +642,24 @@ def grade_against_reference(
         sample: The sample to grade.
         true_ids: The exact ground-truth ids in best-first order.
         candidate_count: The number of eligible candidates the reference was drawn from.
-        version_drift: Whether the dataset was opened at a drifted version.
 
     Returns:
         The sample's score, skipped with ``empty_candidate_set`` when no candidate was eligible.
     """
     if candidate_count == 0:
-        return skipped_score(sample, "empty_candidate_set", version_drift)
+        return skipped_score(sample, "empty_candidate_set")
     recall, ndcg, mrr = ranking_quality(true_ids, list(sample.result_ids or ()), sample.k, candidate_count)
-    return scored_sample(sample, recall, ndcg, mrr, version_drift)
+    return scored_sample(sample, recall, ndcg, mrr)
 
 
 def grade_hybrid_reference(
     sample: RecallSample,
-    vector_ids: list[Any],
+    record_ids: list[Any],
     vector_scores: list[float],
     vector_count: int,
     text_ids: list[Any],
     text_scores: list[float],
     text_count: int,
-    version_drift: bool,
 ) -> SampleScore:
     """Grade one served hybrid ranking against the exact vector and BM25 references fused with the recorded strategy.
 
@@ -547,25 +668,24 @@ def grade_hybrid_reference(
 
     Args:
         sample: The hybrid sample to grade.
-        vector_ids: The exact vector leg ids in best-first order.
-        vector_scores: The exact vector leg distances aligned with ``vector_ids``.
+        record_ids: The exact vector leg ids in best-first order.
+        vector_scores: The exact vector leg distances aligned with ``record_ids``.
         vector_count: The vector leg candidate count.
         text_ids: The exact BM25 leg ids in best-first order.
         text_scores: The exact BM25 leg scores aligned with ``text_ids``.
         text_count: The BM25 leg candidate count.
-        version_drift: Whether the dataset was opened at a drifted version.
 
     Returns:
         The sample's score, skipped when both legs are empty or the fusion replay fails.
     """
     if vector_count == 0 and text_count == 0:
-        return skipped_score(sample, "empty_candidate_set", version_drift)
+        return skipped_score(sample, "empty_candidate_set")
     try:
         fused_ids: list[Any] = fuse_legs(
-            sample.fusion or {}, vector_ids, vector_scores, text_ids, text_scores, sample.k
+            sample.fusion or {}, record_ids, vector_scores, text_ids, text_scores, sample.k
         )
     except FusionReplayError:
-        return skipped_score(sample, "fusion_replay", version_drift)
+        return skipped_score(sample, "fusion_replay")
     candidate_count: int = len(fused_ids)
     recall, ndcg, mrr = ranking_quality(fused_ids, list(sample.result_ids or ()), sample.k, candidate_count)
-    return scored_sample(sample, recall, ndcg, mrr, version_drift)
+    return scored_sample(sample, recall, ndcg, mrr)

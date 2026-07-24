@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -15,18 +15,16 @@ use serde_json::Value;
 
 use crate::cache::entry_store::EntryStore;
 use crate::cache::layout::{
-    META_FILE, SweepStats, atomic_write, dir_stats, gauge_sub, remove_dir_accounted, sweep_tier, touch_file,
+    META_FILE, PREFIXES_FILE, SweepStats, atomic_write, dir_stats, gauge_sub, remove_dir_accounted, sweep_tier,
+    touch_file,
 };
 use crate::telemetry::Tier;
-
-/// Sidecar file mapping full cache-key prefixes to their hashed directory names, enabling
-/// prefix invalidation to find directories by string-prefix match across process restarts.
-const PREFIXES_FILE: &str = "prefixes.json";
 
 /// Disk-backed [`EntryStore`] rooted at one tier's directory.
 pub struct DiskEntryStore {
     root: PathBuf,
-    prefix_index: RwLock<HashMap<String, String>>,
+    prefix_index: Arc<RwLock<HashMap<String, String>>>,
+    prefix_persist: Arc<Mutex<()>>,
     disk_bytes: AtomicU64,
     disk_entries: AtomicU64,
 }
@@ -48,15 +46,10 @@ impl DiskEntryStore {
         std::fs::create_dir_all(&root)?;
         let prefix_index = load_prefixes(&root.join(PREFIXES_FILE));
         let (bytes, entries) = dir_stats(&root);
-        let entries = entries.saturating_sub(if root.join(PREFIXES_FILE).exists() { 1 } else { 0 });
-        let bytes = bytes.saturating_sub(
-            std::fs::metadata(root.join(PREFIXES_FILE))
-                .map(|meta| meta.len())
-                .unwrap_or(0),
-        );
         Ok(Self {
             root,
-            prefix_index: RwLock::new(prefix_index),
+            prefix_index: Arc::new(RwLock::new(prefix_index)),
+            prefix_persist: Arc::new(Mutex::new(())),
             disk_bytes: AtomicU64::new(bytes),
             disk_entries: AtomicU64::new(entries),
         })
@@ -76,16 +69,15 @@ impl DiskEntryStore {
     /// Sweeps the store: TTL expiry plus oldest-first eviction down to `budget_bytes`, then
     /// reconciles accounting and rewrites the prefix sidecar dropping empty directories.
     ///
-    /// The sidecar is removed before the sweep walk so it is never counted or evicted as an
-    /// entry, and rewritten afterwards from the retained map. A store that never registered a
-    /// prefix (the metadata byte tier) skips the sidecar handling entirely so no stray
-    /// `prefixes.json` appears in its directory.
+    /// The sidecar is excluded from the sweep walk and every registry mutation is serialized with
+    /// this reconciliation, so a concurrent registration cannot be clobbered by an older snapshot.
     pub fn sweep(&self, ttl: Duration, budget_bytes: u64) -> SweepStats {
+        let persist_guard = self
+            .prefix_persist
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let prefixes_path = self.root.join(PREFIXES_FILE);
         let had_sidecar = prefixes_path.exists();
-        if had_sidecar {
-            let _ = std::fs::remove_file(&prefixes_path);
-        }
         let stats = sweep_tier(&self.root, ttl, budget_bytes, &self.disk_bytes, &self.disk_entries);
         let snapshot = {
             let mut map = self
@@ -98,6 +90,7 @@ impl DiskEntryStore {
         if had_sidecar || !snapshot.is_empty() {
             persist_prefixes(&prefixes_path, &snapshot);
         }
+        drop(persist_guard);
         stats
     }
 }
@@ -167,47 +160,47 @@ impl EntryStore for DiskEntryStore {
     }
 
     async fn clear(&self) {
-        let _ = tokio::fs::remove_dir_all(&self.root).await;
-        let _ = tokio::fs::create_dir_all(&self.root).await;
-        self.prefix_index
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        let root = self.root.clone();
+        let prefix_index = self.prefix_index.clone();
+        let prefix_persist = self.prefix_persist.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let persist_guard = prefix_persist.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::create_dir_all(&root);
+            prefix_index
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            drop(persist_guard);
+        })
+        .await;
         self.disk_bytes.store(0, Ordering::Relaxed);
         self.disk_entries.store(0, Ordering::Relaxed);
     }
 
-    /// The write lock is held only for the in-memory map update, then dropped before the
-    /// synchronous filesystem write. Holding the lock across `std::fs::write` would block every
-    /// concurrent insert for the entire disk-flush duration — exactly the mass-cold-open
-    /// scenario where many inserts fire at once. The sidecar is a best-effort hint, not a
-    /// reconciled index: a row lost between the lock drop and the file write (or to a crash
-    /// before the flush lands) is gone after the next process start, because directory names are
-    /// one-way hashes of their prefixes and cannot be mapped back. The sweep only *prunes* rows
-    /// whose directory no longer exists — it never rebuilds lost rows — so prefix invalidation
-    /// misses the affected directories until a fresh insert under the same prefix re-registers
-    /// them or the TTL sweep ages their entries out. That bounded staleness is the accepted
-    /// trade-off for lock-free disk flushes.
+    /// Registry mutation and persistence run on the blocking pool under one serialization lock.
+    /// This makes the returned future the durability boundary and prevents a janitor snapshot or
+    /// sibling registration from clobbering the new row.
     async fn register_prefix(&self, prefix: &str, dir: &str) {
-        {
-            let map = self
-                .prefix_index
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if map.contains_key(prefix) {
-                return;
-            }
-        }
-        let snapshot = {
-            let mut map = self
-                .prefix_index
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            map.insert(prefix.to_string(), dir.to_string());
-            map.clone()
-        };
+        let prefix = prefix.to_string();
+        let dir = dir.to_string();
         let path = self.root.join(PREFIXES_FILE);
-        tokio::task::spawn_blocking(move || persist_prefixes(&path, &snapshot));
+        let prefix_index = self.prefix_index.clone();
+        let prefix_persist = self.prefix_persist.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let persist_guard = prefix_persist.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let snapshot = {
+                let mut map = prefix_index.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if map.contains_key(&prefix) {
+                    return;
+                }
+                map.insert(prefix, dir);
+                map.clone()
+            };
+            persist_prefixes(&path, &snapshot);
+            drop(persist_guard);
+        })
+        .await;
     }
 
     async fn prefix_entries(&self) -> HashMap<String, String> {
@@ -221,17 +214,23 @@ impl EntryStore for DiskEntryStore {
         if prefixes.is_empty() {
             return;
         }
-        let snapshot = {
-            let mut map = self
-                .prefix_index
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for prefix in prefixes {
-                map.remove(prefix);
-            }
-            map.clone()
-        };
-        persist_prefixes(&self.root.join(PREFIXES_FILE), &snapshot);
+        let prefixes = prefixes.to_vec();
+        let path = self.root.join(PREFIXES_FILE);
+        let prefix_index = self.prefix_index.clone();
+        let prefix_persist = self.prefix_persist.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let persist_guard = prefix_persist.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let snapshot = {
+                let mut map = prefix_index.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+                for prefix in prefixes {
+                    map.remove(&prefix);
+                }
+                map.clone()
+            };
+            persist_prefixes(&path, &snapshot);
+            drop(persist_guard);
+        })
+        .await;
     }
 
     fn touch(&self, dir: &str, file: &str) {
@@ -276,8 +275,48 @@ fn persist_prefixes(path: &Path, map: &HashMap<String, String>) {
     let Some(parent) = path.parent() else {
         return;
     };
-    let tmp = parent.join(format!("prefixes.json.tmp-{}", std::process::id()));
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let tmp = parent.join(format!("prefixes.json.tmp-{}-{nonce}", std::process::id()));
     if std::fs::write(&tmp, Value::Object(object).to_string()).is_ok() {
         let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_registration_and_sweep_preserve_the_registry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(DiskEntryStore::open(tmp.path().to_path_buf()).unwrap());
+        let mut registrations = tokio::task::JoinSet::new();
+        for index in 0..32 {
+            let dir = format!("dir-{index}");
+            store.put(&dir, "entry.bin", b"value").await;
+            let store = store.clone();
+            registrations.spawn(async move {
+                store.register_prefix(&format!("prefix-{index}"), &dir).await;
+            });
+        }
+        let sweeping_store = store.clone();
+        let sweeper = tokio::task::spawn_blocking(move || {
+            for _ in 0..8 {
+                sweeping_store.sweep(Duration::from_secs(600), u64::MAX);
+            }
+        });
+        while let Some(result) = registrations.join_next().await {
+            result.unwrap();
+        }
+        sweeper.await.unwrap();
+        let expected = store.prefix_entries().await;
+        assert_eq!(expected.len(), 32);
+        assert!(tmp.path().join(PREFIXES_FILE).exists());
+        drop(store);
+        let reopened = DiskEntryStore::open(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(reopened.prefix_entries().await, expected);
     }
 }

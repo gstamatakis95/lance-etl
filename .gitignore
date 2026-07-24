@@ -7,3 +7,5 @@ lance-etl.iml
 
 __pycache__/
 *.pyc
+/bench/workspace/
+/bench/results/

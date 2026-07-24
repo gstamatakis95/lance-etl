@@ -11,14 +11,11 @@
 //! - [`text`]: domain text query tree to Lance FTS query translation.
 //! - [`rows`]: Arrow record batch to JSON row conversion.
 //! - [`prewarm`]: [`Prewarmer`](crate::domain::Prewarmer) over the Lance prewarm APIs.
-//! - [`index_reader`]: IVF centroid extraction and the
-//!   [`ClusterReader`](crate::domain::ClusterReader) implementation.
 //! - [`error`]: Lance error classification into the domain error type.
 
 pub mod backend;
 pub mod error;
 pub mod filter;
-pub mod index_reader;
 pub mod prewarm;
 pub mod provider;
 pub mod rows;

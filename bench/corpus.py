@@ -2,9 +2,19 @@
 
 Every base vector is assigned to a coarse k-means cluster (numpy minibatch k-means trained on a sample) and its text is
 drawn from that cluster's private vocabulary plus a small shared common-word pool, so BM25 sees realistic term
-distributions: cluster terms are discriminative, common terms are background noise. All randomness is seeded per row
-from ``(seed, cluster, global index)``, so the same seed always yields the identical corpus regardless of how rows are
-sliced across Spark tasks.
+distributions: cluster terms are discriminative, common terms are background noise.
+
+Two document-text generators are provided. :func:`row_text` seeds one generator per row from
+``(seed, cluster, global index)`` and is used by the prepare phase and by
+:meth:`~bench.datasets.DatasetAdapter.text_for_row`, so the same seed always yields the identical
+corpus regardless of how rows are sliced across Spark tasks. :func:`batch_row_texts` is the
+vectorized ingest-path equivalent used by the production reconciler benchmark: it seeds exactly one
+generator per Spark task batch (keyed by the batch's first global index) and draws every row's
+terms with one vectorized random-key top-k selection per cluster group instead of constructing a
+fresh generator per row, which otherwise dominates per-row ingest cost at scale. Both generators
+draw each row's cluster-specific terms only from that row's own cluster vocabulary, which is what
+makes the FTS hit-rate check provable. Per-row RNG-key compatibility between the two generators is
+not preserved or required, only per-run determinism.
 """
 
 from __future__ import annotations
@@ -89,6 +99,66 @@ def row_text(
     picked: list[str] = list(rng.choice(vocabulary, size=min(cluster_terms, len(vocabulary)), replace=False))
     picked.extend(rng.choice(common_vocab, size=min(common_terms, len(common_vocab)), replace=False))
     return " ".join(picked)
+
+
+def batch_row_texts(
+    cluster_vocab: list[list[str]],
+    common_vocab: list[str],
+    clusters: np.ndarray,
+    indices: np.ndarray,
+    seed: int,
+    cluster_terms: int = 8,
+    common_terms: int = 2,
+) -> list[str]:
+    """Build deterministic cluster-seeded documents for a whole ingest batch in one vectorized pass.
+
+    Exactly one seeded generator is created for the whole batch, keyed by the corpus seed and the
+    batch's first global index (``indices[0]``), which is stable across repeated runs of the same
+    seed because the ingest phase always slices the corpus into the same contiguous ordinal
+    windows. This replaces constructing a fresh :func:`numpy.random.default_rng` per row, which is
+    the dominant per-row cost of ingest at scale.
+
+    Rows are grouped by cluster so each row's cluster-specific terms are still drawn exclusively
+    from that row's own cluster vocabulary, preserving the invariant that makes the FTS hit-rate
+    check provable. Per-row sampling without replacement is vectorized with the random-key top-k
+    trick: one uniform random key is drawn per ``(row, candidate word)`` pair within a group, and
+    the ``cluster_terms`` (respectively ``common_terms``) smallest keys per row select that row's
+    words, which is equivalent in distribution to independent per-row ``rng.choice(replace=False)``
+    calls. Per-row RNG-key compatibility with :func:`row_text` is not preserved or required, only
+    per-run determinism is.
+
+    Args:
+        cluster_vocab: Per-cluster vocabularies.
+        common_vocab: Shared common-word pool.
+        clusters: Per-row coarse cluster assignment for the batch.
+        indices: Per-row global row index for the batch, the same length as ``clusters``.
+        seed: The corpus seed.
+        cluster_terms: Cluster-specific words per document.
+        common_terms: Common words per document.
+
+    Returns:
+        One space-joined document per row, in input order.
+    """
+    batch_size: int = len(clusters)
+    texts: list[str] = [""] * batch_size
+    if batch_size == 0:
+        return texts
+    rng: np.random.Generator = np.random.default_rng([seed, 2, int(indices[0])])
+    common_pool: np.ndarray = np.asarray(common_vocab)
+    common_size: int = min(common_terms, len(common_vocab))
+    common_keys: np.ndarray = rng.random((batch_size, len(common_vocab)))
+    common_order: np.ndarray = np.argsort(common_keys, axis=1)[:, :common_size]
+    common_words: np.ndarray = common_pool[common_order]
+    for cluster_id in np.unique(clusters):
+        rows: np.ndarray = np.nonzero(clusters == cluster_id)[0]
+        vocabulary: np.ndarray = np.asarray(cluster_vocab[int(cluster_id)])
+        group_size: int = min(cluster_terms, len(vocabulary))
+        cluster_keys: np.ndarray = rng.random((len(rows), len(vocabulary)))
+        cluster_order: np.ndarray = np.argsort(cluster_keys, axis=1)[:, :group_size]
+        cluster_words: np.ndarray = vocabulary[cluster_order]
+        for position, row in enumerate(rows):
+            texts[row] = " ".join([*cluster_words[position], *common_words[row]])
+    return texts
 
 
 def tenant_for_index(global_index: int, tenants: int) -> int:

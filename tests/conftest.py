@@ -11,6 +11,7 @@ import os
 import random
 import sys
 from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -21,10 +22,22 @@ import lance
 import pyarrow as pa
 import pytest
 from lance.optimize import Compaction
+from pyspark import SparkContext
 
-from lance_etl.etl.pivot import group_run_starts
 from lance_etl.maintenance import MaintenanceConfig, cleanup_dataset, compaction_metrics_dict
 from lance_etl.telemetry import Telemetry, TelemetryConfig, commit_with_retries
+
+
+@pytest.fixture
+def fresh_spark_gateway() -> None:
+    """Require a fresh process before a test resolves JVM-launch Spark packages.
+
+    Iceberg catalog classes supplied by ``spark.jars.packages`` must be present when PySpark
+    launches its JVM gateway. This fixture is the single documented test bridge to PySpark's
+    gateway state and skips package-dependent tests after another module has launched Spark.
+    """
+    if getattr(SparkContext, "_gateway", None) is not None:
+        pytest.skip("Iceberg integration needs its own pytest process before any Spark gateway launches")
 
 
 @pytest.fixture
@@ -120,58 +133,29 @@ def compact_dataset_inline(uri: str, config: MaintenanceConfig, telemetry: Telem
     return result
 
 
-def group_by_routing(table: pa.Table, routing_cols: list[str]) -> Iterator[tuple[tuple[Any, ...], pa.Table]]:
-    """Yield each routing key's rows from a partition table sorted by the routing columns.
-
-    Test-only equivalence oracle for :func:`~lance_etl.etl.pivot.stream_routing_groups`.
-    Production streams instead of materializing.
-
-    Expects the partition to arrive sorted by ``routing_cols`` (the ETL chains
-    ``sortWithinPartitions`` onto the routing shuffle), so each distinct key occupies one
-    contiguous run and every group is a zero-copy slice. Total cost is ``O(rows)`` in the run
-    scan regardless of how many distinct keys the partition holds, which is what keeps a
-    long-tail increment with tens of thousands of tiny groups per partition linear.
-
-    Degradation, not corruption, on unsorted input: a key split across non-adjacent runs is
-    yielded once per run, so its dataset receives multiple idempotent ``merge_insert`` calls
-    over disjoint row sets — correct output, extra commits.
-
-    Args:
-        table: The materialized partition table, sorted by the routing columns.
-        routing_cols: The routing key columns.
-
-    Yields:
-        ``(key_values, sub_table)`` for each contiguous routing-key run.
-    """
-    starts: list[int] = group_run_starts(table, routing_cols)
-    for position, start in enumerate(starts):
-        stop: int = starts[position + 1] if position + 1 < len(starts) else table.num_rows
-        key: tuple[Any, ...] = tuple(table.column(c)[start].as_py() for c in routing_cols)
-        yield key, table.slice(start, stop - start)
-
-
+@dataclass
 class FakeBroadcast:
     """Minimal stand-in for a Spark broadcast variable."""
 
-    def __init__(self, value: object) -> None:
-        """Wrap the broadcast value.
+    value: object
+    destroyed: bool = False
+    destroy_blocking: bool | None = None
+
+    def destroy(self, blocking: bool = False) -> None:
+        """Record broadcast destruction and whether the caller waited for executor cleanup.
 
         Args:
-            value: The value to expose.
+            blocking: Whether destruction waits for executor-side copies to be removed.
         """
-        self.value: object = value
+        self.destroyed = True
+        self.destroy_blocking = blocking
 
 
+@dataclass
 class FakeRdd:
     """Minimal stand-in for a Spark RDD running everything eagerly in process."""
 
-    def __init__(self, items: list[object]) -> None:
-        """Initialize the fake RDD.
-
-        Args:
-            items: The partitioned items.
-        """
-        self.items: list[object] = items
+    items: list[object]
 
     def map(self, fn: Callable[[object], object]) -> FakeRdd:
         """Apply a function to every item eagerly.
@@ -183,6 +167,30 @@ class FakeRdd:
             A new fake RDD with the mapped items.
         """
         return FakeRdd([fn(item) for item in self.items])
+
+    def flatMap(self, fn: Callable[[object], Iterable[object]]) -> FakeRdd:
+        """Apply a function and flatten its outputs eagerly.
+
+        Args:
+            fn: Flat mapper.
+
+        Returns:
+            A new fake RDD containing every yielded item.
+        """
+        return FakeRdd([result for item in self.items for result in fn(item)])
+
+    def repartition(self, numPartitions: int) -> FakeRdd:
+        """Return the same eager items after validating the requested width.
+
+        Args:
+            numPartitions: Positive simulated partition count.
+
+        Returns:
+            A new fake RDD with the same items.
+        """
+        if numPartitions < 1:
+            raise ValueError("partition count must be positive")
+        return FakeRdd(list(self.items))
 
     def mapPartitions(self, fn: Callable[[Iterator[object]], Iterator[object]]) -> FakeRdd:
         """Apply a partition function to the single in-process partition.
@@ -196,23 +204,64 @@ class FakeRdd:
         return FakeRdd(list(fn(iter(self.items))))
 
     def partitionBy(self, numPartitions: int, partitionFunc: Callable[[object], int] | None = None) -> FakeRdd:
-        """Return an identity stand-in for a key-partitioned shuffle.
+        """Order keyed items by their simulated shuffle partition.
 
-        A real Spark shuffle co-locates every item sharing a key onto one partition. The fake
-        keeps every item on the single in-process partition instead, which is semantically
-        sufficient here because the write side of the clustered rewrite (``write_partition`` in
-        ``maintenance/cluster.py``) groups the collected items by key itself before writing, so it
-        does not depend on the shuffle actually separating keys across partitions.
+        The following ``mapPartitions`` still sees one in-process iterator, but ordering by the
+        requested partition keeps injectively partitioned keys contiguous and preserves the
+        streaming contract of the production shuffle.
 
         Args:
-            numPartitions: Ignored; the fake carries every item on one in-process partition.
-            partitionFunc: Ignored; the write side groups items by key itself.
+            numPartitions: Positive simulated output partition count.
+            partitionFunc: Optional key-to-partition function.
 
         Returns:
-            A new fake RDD with the same items, in the same order.
+            A new fake RDD ordered by simulated partition.
         """
-        del numPartitions, partitionFunc
-        return FakeRdd(list(self.items))
+        if numPartitions < 1:
+            raise ValueError("partition count must be positive")
+        partitioner: Callable[[object], int] = partitionFunc or hash
+        return FakeRdd(sorted(self.items, key=lambda item: partitioner(item[0]) % numPartitions))
+
+    def repartitionAndSortWithinPartitions(
+        self,
+        numPartitions: int,
+        partitionFunc: Callable[[object], int] | None = None,
+    ) -> FakeRdd:
+        """Partition keyed items and sort keys within each simulated partition.
+
+        Args:
+            numPartitions: Positive simulated output partition count.
+            partitionFunc: Optional key-to-partition function.
+
+        Returns:
+            A new fake RDD ordered by partition and then by key.
+        """
+        if numPartitions < 1:
+            raise ValueError("partition count must be positive")
+        partitioner: Callable[[object], int] = partitionFunc or hash
+        return FakeRdd(
+            sorted(
+                self.items,
+                key=lambda item: (partitioner(item[0]) % numPartitions, item[0]),
+            )
+        )
+
+    def reduceByKey(self, fn: Callable[[Any, Any], Any], numPartitions: int) -> FakeRdd:
+        """Reduce keyed values eagerly with an associative function.
+
+        Args:
+            fn: Associative value reducer.
+            numPartitions: Positive requested output width.
+
+        Returns:
+            One key-value item per distinct key.
+        """
+        if numPartitions < 1:
+            raise ValueError("partition count must be positive")
+        reduced: dict[Any, Any] = {}
+        for key, value in self.items:
+            reduced[key] = fn(reduced[key], value) if key in reduced else value
+        return FakeRdd(list(reduced.items()))
 
     def collect(self) -> list[object]:
         """Return the items.
@@ -254,9 +303,11 @@ class FakeSparkContext:
         return FakeBroadcast(value)
 
 
+@dataclass
 class FakeSpark:
     """Minimal stand-in for a SparkSession driving fan-outs in the driver process."""
 
-    def __init__(self) -> None:
-        """Initialize the fake session with its fake context."""
-        self.sparkContext: FakeSparkContext = FakeSparkContext()
+    sparkContext: FakeSparkContext = field(default_factory=FakeSparkContext)
+
+    def stop(self) -> None:
+        """No-op session teardown, so callers built around a real SparkSession's lifecycle work unchanged."""

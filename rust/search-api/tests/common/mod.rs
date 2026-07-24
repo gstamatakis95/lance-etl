@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::types::Float32Type;
-use arrow_array::{FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{BooleanArray, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -26,7 +26,7 @@ use object_store::{
     PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
 };
 use search_api::config::Config;
-use search_api::domain::DatasetTarget;
+use search_api::domain::{DatasetTarget, SearchError, ServingCatalog, ServingRoute};
 
 /// Vector dimension of the test dataset.
 pub const DIM: i32 = 4;
@@ -34,6 +34,40 @@ pub const DIM: i32 = 4;
 /// The org/tenant/namespace every disk-cache test dataset lives under.
 pub fn test_target() -> DatasetTarget {
     DatasetTarget::new("org1", "tenant1", "ns1")
+}
+
+/// Exact one-target catalog fake used by search and provider integration tests.
+pub struct FakeServingCatalog {
+    target: DatasetTarget,
+    route: ServingRoute,
+    /// Number of validated catalog lookups.
+    pub calls: AtomicU64,
+}
+
+impl FakeServingCatalog {
+    /// Creates a fake returning one exact published tuple.
+    pub fn new(target: DatasetTarget, lance_uri: impl Into<String>, lance_version: u64) -> Self {
+        Self {
+            target,
+            route: ServingRoute {
+                lance_uri: lance_uri.into(),
+                lance_version,
+            },
+            calls: AtomicU64::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl ServingCatalog for FakeServingCatalog {
+    async fn resolve(&self, target: &DatasetTarget) -> Result<ServingRoute, SearchError> {
+        target.validate()?;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if target != &self.target {
+            return Err(SearchError::not_found("target is not published"));
+        }
+        Ok(self.route.clone())
+    }
 }
 
 /// Relative dataset path of [`test_target`] under the base URI.
@@ -193,6 +227,8 @@ impl ObjectStore for CountingStore {
 /// positions on `text` plus a BTree index on `id`, so prewarm has both FTS and scalar targets.
 pub async fn build_indexed_dataset(uri: &str) {
     let schema = Arc::new(Schema::new(vec![
+        Field::new("record_id", DataType::Utf8, false),
+        Field::new("is_deleted", DataType::Boolean, false),
         Field::new("id", DataType::Int32, false),
         Field::new("text", DataType::Utf8, false),
         Field::new(
@@ -213,6 +249,8 @@ pub async fn build_indexed_dataset(uri: &str) {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
+            Arc::new(StringArray::from(vec!["v1", "v2", "v3", "v4"])),
+            Arc::new(BooleanArray::from(vec![false, false, false, false])),
             Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
             Arc::new(StringArray::from(vec![
                 "red apple pie",
@@ -240,6 +278,12 @@ pub async fn build_indexed_dataset(uri: &str) {
         .create_index(&["id"], IndexType::BTree, None, &ScalarIndexParams::default(), true)
         .await
         .unwrap();
+    let head_version = dataset.version_id();
+    dataset
+        .tags()
+        .create(search_api::config::PRODUCTION_SERVE_TAG, head_version)
+        .await
+        .unwrap();
 }
 
 /// Builds a config over the given dataset root and cache dir, using the `file-object-store`
@@ -248,6 +292,8 @@ pub async fn build_indexed_dataset(uri: &str) {
 pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) -> Config {
     Config {
         base_uri: format!("file-object-store://{}", dataset_root.display()),
+        database_url: "postgresql://unused/test".to_string(),
+        replica_id: "search-api-test-0".to_owned(),
         dataset_cache_capacity: 16,
         index_cache_bytes: 64 * 1024 * 1024,
         metadata_cache_bytes: 64 * 1024 * 1024,
@@ -260,11 +306,13 @@ pub fn test_config(dataset_root: &std::path::Path, cache_dir: &std::path::Path) 
         redis_namespace: search_api::config::DEFAULT_REDIS_NAMESPACE.to_string(),
         statsd_addr: "127.0.0.1:8125".to_string(),
         telemetry_disabled: true,
-        serve_by_tag: search_api::config::DEFAULT_SERVE_BY_TAG,
-        serve_tag: search_api::config::DEFAULT_SERVE_TAG.to_string(),
         serve_tag_ttl_secs: search_api::config::DEFAULT_SERVE_TAG_TTL_SECS,
-        prewarm_targets_path: None,
     }
+}
+
+/// Creates the same bounded admission controller used by integration-test servers.
+pub fn test_admission() -> Arc<search_api::grpc::admission::AdmissionController> {
+    Arc::new(search_api::grpc::admission::AdmissionController::new(32, 4).unwrap())
 }
 
 /// Like [`test_config`] but selecting the Redis cache backend at the given URL.
@@ -277,16 +325,41 @@ pub fn redis_test_config(dataset_root: &std::path::Path, cache_dir: &std::path::
 
 /// A locally spawned `redis-server` child on a free port, killed on drop.
 pub struct RedisServerGuard {
-    child: std::process::Child,
+    child: Option<std::process::Child>,
+    external_lock: Option<tokio::sync::OwnedMutexGuard<()>>,
     /// The connection URL of the spawned server.
     pub url: String,
 }
 
 impl RedisServerGuard {
+    /// Uses the release-provided Redis URL when present, serializing tests over the shared server.
+    pub async fn spawn() -> Option<Self> {
+        if let Ok(url) = std::env::var("SEARCH_API_TEST_REDIS_URL")
+            && !url.is_empty()
+        {
+            static EXTERNAL_REDIS_LOCK: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>> = std::sync::OnceLock::new();
+            let external_lock = EXTERNAL_REDIS_LOCK
+                .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+                .lock_owned()
+                .await;
+            let guard = Self {
+                child: None,
+                external_lock: Some(external_lock),
+                url,
+            };
+            if redis_answers(&guard.url).await {
+                return Some(guard);
+            }
+            panic!("SEARCH_API_TEST_REDIS_URL did not answer PING");
+        }
+        Self::spawn_local().await
+    }
+
     /// Spawns a throwaway `redis-server` on a free localhost port and waits for it to answer
     /// `PING`. Returns `None` (after an explanatory eprintln) when the binary is not installed,
     /// so redis-backed tests skip gracefully on machines without Redis.
-    pub async fn spawn() -> Option<Self> {
+    pub async fn spawn_local() -> Option<Self> {
         let port = {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
             listener.local_addr().ok()?.port()
@@ -309,12 +382,13 @@ impl RedisServerGuard {
             }
         };
         let url = format!("redis://127.0.0.1:{port}");
-        let guard = Self { child, url };
+        let guard = Self {
+            child: Some(child),
+            external_lock: None,
+            url,
+        };
         for _ in 0..50 {
-            if let Ok(client) = redis::Client::open(guard.url.as_str())
-                && let Ok(mut conn) = client.get_multiplexed_async_connection().await
-                && redis::cmd("PING").query_async::<String>(&mut conn).await.is_ok()
-            {
+            if redis_answers(&guard.url).await {
                 return Some(guard);
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -327,16 +401,33 @@ impl RedisServerGuard {
 impl RedisServerGuard {
     /// Kills the server immediately, simulating a mid-run Redis outage.
     pub fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let child = self
+            .child
+            .as_mut()
+            .expect("outage test requires a locally spawned Redis");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
 impl Drop for RedisServerGuard {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = self.external_lock.take();
     }
+}
+
+/// Returns whether one Redis URL answers a `PING` command.
+async fn redis_answers(url: &str) -> bool {
+    if let Ok(client) = redis::Client::open(url)
+        && let Ok(mut connection) = client.get_multiplexed_async_connection().await
+    {
+        return redis::cmd("PING").query_async::<String>(&mut connection).await.is_ok();
+    }
+    false
 }
 
 /// Recursively counts `.bin` entry files under `root`.

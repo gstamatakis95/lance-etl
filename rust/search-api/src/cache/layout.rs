@@ -21,8 +21,11 @@ const FRAME_MAGIC: &[u8; 4] = b"LEC2";
 /// Bytes a frame adds ahead of the payload: the magic plus a 32-byte blake3 checksum.
 pub const FRAME_OVERHEAD: usize = 4 + 32;
 
-/// Substring marking in-progress write files which readers must ignore and sweeps may delete.
+/// Substring marking in-progress write files which readers ignore and sweeps delete after a grace period.
 const TMP_MARKER: &str = ".tmp-";
+
+/// Minimum age before an abandoned in-progress write may be removed by a directory walk.
+const TMP_FILE_GRACE: Duration = Duration::from_secs(60);
 
 /// File name of the per-object `ObjectMeta` sidecar written by the store cache.
 ///
@@ -30,6 +33,9 @@ const TMP_MARKER: &str = ".tmp-";
 /// counting them in `dir_stats` would make the in-process gauges diverge from the on-disk
 /// reality. Lone sidecars are reclaimed by `prune_empty_dirs`.
 pub const META_FILE: &str = "meta.json";
+
+/// File name of the disk index tier's durable prefix registry.
+pub const PREFIXES_FILE: &str = "prefixes.json";
 
 /// Returns the stamp directory name combining our schema version and the lance version.
 pub fn stamp_dir_name() -> String {
@@ -55,7 +61,7 @@ fn is_stamp_dir_name(name: &str) -> bool {
 /// (stale layouts from lance upgrades or our own format changes). Returns the stamp path.
 ///
 /// Deletion is restricted to entries matching the versioned stamp naming pattern
-/// ([`is_stamp_dir_name`]). Anything else in the cache directory is left untouched, so pointing
+/// (`is_stamp_dir_name`). Anything else in the cache directory is left untouched, so pointing
 /// `SEARCH_API_CACHE_DIR` at a directory that also holds unrelated data can never destroy it.
 pub fn prepare_cache_root(cache_dir: &Path) -> std::io::Result<PathBuf> {
     let stamp = stamp_dir_name();
@@ -164,7 +170,7 @@ pub fn touch_file(path: &Path) {
         .and_then(|file| file.set_modified(SystemTime::now()));
 }
 
-/// Recursively collects all regular files under `root`, deleting orphaned temp files on the way.
+/// Recursively collects regular cache entries, deleting only old orphaned temp files on the way.
 fn collect_files(root: &Path, files: &mut Vec<(PathBuf, u64, SystemTime)>) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
@@ -175,25 +181,34 @@ fn collect_files(root: &Path, files: &mut Vec<(PathBuf, u64, SystemTime)>) {
             collect_files(&path, files);
             continue;
         }
-        if path
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().contains(TMP_MARKER))
-        {
-            let _ = std::fs::remove_file(&path);
-            continue;
-        }
-        if path.file_name().is_some_and(|name| name == META_FILE) {
-            continue;
-        }
         if let Ok(meta) = entry.metadata() {
             let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            if path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().contains(TMP_MARKER))
+            {
+                let old_enough = SystemTime::now()
+                    .duration_since(mtime)
+                    .map(|age| age > TMP_FILE_GRACE)
+                    .unwrap_or(false);
+                if old_enough {
+                    let _ = std::fs::remove_file(&path);
+                }
+                continue;
+            }
+            if path
+                .file_name()
+                .is_some_and(|name| name == META_FILE || name == PREFIXES_FILE)
+            {
+                continue;
+            }
             files.push((path, meta.len(), mtime));
         }
     }
 }
 
-/// Walks `root` and returns `(total_bytes, file_count)` of all cache entry files, removing
-/// orphaned temp files as a side effect.
+/// Walks `root` and returns `(total_bytes, file_count)` of all cache entry files, removing old
+/// orphaned temp files as a side effect while leaving active writes and registry sidecars alone.
 pub fn dir_stats(root: &Path) -> (u64, u64) {
     let mut files = Vec::new();
     collect_files(root, &mut files);
@@ -379,6 +394,37 @@ mod tests {
     }
 
     #[test]
+    fn sweep_preserves_young_temps_and_registry_but_removes_old_temps() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let young = root.join("entry.bin.tmp-young");
+        let old = root.join("entry.bin.tmp-old");
+        let registry = root.join(PREFIXES_FILE);
+        std::fs::write(&young, b"active").unwrap();
+        std::fs::write(&old, b"abandoned").unwrap();
+        std::fs::write(&registry, br#"{"prefix":"dir"}"#).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(SystemTime::now() - TMP_FILE_GRACE - Duration::from_secs(1))
+            .unwrap();
+        let bytes = AtomicU64::new(0);
+        let entries = AtomicU64::new(0);
+        let stats = sweep_tier(root, Duration::from_secs(600), 0, &bytes, &entries);
+        assert!(young.exists(), "an active atomic write must survive a concurrent sweep");
+        assert!(
+            !old.exists(),
+            "an abandoned temp may be reclaimed after the grace period"
+        );
+        assert!(
+            registry.exists(),
+            "the prefix registry is not a cache entry and must survive"
+        );
+        assert_eq!(stats, SweepStats::default());
+    }
+
+    #[test]
     fn frame_round_trip_and_corruption_detection() {
         let payload = b"index page bytes".to_vec();
         let framed = frame_bytes(&payload);
@@ -404,5 +450,37 @@ mod tests {
         assert_eq!(hash_hex("abc", 16).len(), 16);
         assert_eq!(hash_hex("abc", 16), hash_hex("abc", 16));
         assert_ne!(hash_hex("abc", 16), hash_hex("abd", 16));
+    }
+
+    /// Scans a `Cargo.lock` for the resolved version of the crates.io `lance` package.
+    ///
+    /// Looks for the `[[package]]` block whose `name = "lance"` line matches exactly (not
+    /// `lance-core` or another `lance-*` sibling) and returns the `version` line that follows it.
+    fn resolved_lance_crate_version(lock_contents: &str) -> Option<String> {
+        let mut lines = lock_contents.lines();
+        while let Some(line) = lines.next() {
+            if line.trim() != "name = \"lance\"" {
+                continue;
+            }
+            let version_line = lines.next()?;
+            let version = version_line.trim().strip_prefix("version = \"")?.strip_suffix('"')?;
+            return Some(version.to_string());
+        }
+        None
+    }
+
+    #[test]
+    fn lance_cache_stamp_matches_resolved_lance_crate_version() {
+        let lock_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock");
+        let lock_contents = std::fs::read_to_string(&lock_path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", lock_path.display()));
+        let resolved_version = resolved_lance_crate_version(&lock_contents)
+            .unwrap_or_else(|| panic!("no `lance` package found in {}", lock_path.display()));
+        assert_eq!(
+            resolved_version, LANCE_CACHE_STAMP,
+            "LANCE_CACHE_STAMP in src/cache/layout.rs must be bumped in lockstep with the `lance` \
+             crate version pinned in Cargo.toml/Cargo.lock (see AGENTS.md's lance-crate \
+             version-bump coupling)"
+        );
     }
 }

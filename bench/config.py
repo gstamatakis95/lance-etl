@@ -1,8 +1,8 @@
 """Benchmark configuration and command-line parsing.
 
 Defines :class:`BenchConfig`, the single dataclass shared by every benchmark phase, and the argparse parser for the
-``python -m bench`` entry point. Every subcommand accepts the full flag set so one flag vector can drive the whole
-``all`` chain. Each phase simply reads the fields it needs.
+``python -m bench`` entry point. Every subcommand accepts the full flag set so one flag vector can drive any phase.
+Each phase simply reads the fields it needs.
 """
 
 from __future__ import annotations
@@ -13,13 +13,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lance_etl.spark_process import DEFAULT_ICEBERG_PACKAGE
+
 PACKAGE_DIR: Path = Path(__file__).resolve().parent
 REPO_ROOT: Path = PACKAGE_DIR.parent
 DEFAULT_WORKSPACE: Path = PACKAGE_DIR / "workspace"
 DEFAULT_CORPUS_ROOT: Path = PACKAGE_DIR / "corpora"
 DEFAULT_RESULTS_ROOT: Path = PACKAGE_DIR / "results"
-DEFAULT_ICEBERG_PACKAGE: str = "org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0"
 PROTO_PATH: Path = REPO_ROOT / "rust" / "search-api" / "proto" / "lance_etl" / "v1" / "lance_etl.proto"
+DEFAULT_SEARCH_API_BINARY: Path = REPO_ROOT / "rust" / "search-api" / "target" / "release" / "search-api"
 SIFT_DIM: int = 128
 SIFT_BASE_COUNT: int = 1_000_000
 SIFT_QUERY_COUNT: int = 10_000
@@ -30,16 +32,14 @@ SIFT_FILE_NAMES: tuple[str, str, str] = ("sift_base.fvecs", "sift_query.fvecs", 
 SUBCOMMANDS: tuple[str, ...] = (
     "download",
     "prepare",
-    "ingest",
-    "index",
-    "compact",
     "search",
     "report",
-    "all",
     "e2e",
     "experiment",
+    "qualify",
+    "fuzz",
 )
-PHASE_NAMES: tuple[str, ...] = ("download", "prepare", "ingest", "index", "compact", "search", "report")
+PHASE_NAMES: tuple[str, ...] = ("download", "prepare", "e2e", "search", "report")
 RECALL_CUTOFFS: tuple[int, ...] = (1, 10, 100)
 """Recall cut-off depths scored by the search and e2e legs; ``search_k`` must cover the deepest one."""
 
@@ -53,55 +53,22 @@ def default_run_id() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
-def parse_env_pairs(pairs: list[str] | None) -> dict[str, str]:
-    """Parse repeatable ``KEY=VALUE`` environment overrides into a dict.
+def validate_search_k(search_k: int) -> None:
+    """Require search depth to cover every reported recall cutoff.
 
     Args:
-        pairs: The raw flag values, or ``None`` when the flag was never given.
-
-    Returns:
-        The parsed environment mapping, empty when no pairs were given.
+        search_k: Number of neighbors requested per query.
 
     Raises:
-        ValueError: If a pair carries no ``=`` separator or an empty key.
+        ValueError: If the search depth is smaller than the deepest recall cutoff.
     """
-    env: dict[str, str] = {}
-    for pair in pairs or []:
-        key, separator, value = pair.partition("=")
-        if not separator or not key:
-            raise ValueError(f"--server-env expects KEY=VALUE, got {pair!r}")
-        env[key] = value
-    return env
-
-
-def parse_int_list(text: str) -> list[int]:
-    """Parse a comma-separated list of integers.
-
-    Args:
-        text: The raw flag value, such as ``"1,10,25"``.
-
-    Returns:
-        The parsed integers.
-    """
-    return [int(item.strip()) for item in text.split(",") if item.strip()]
-
-
-def parse_refine_list(text: str) -> list[int | None]:
-    """Parse a comma-separated refine-factor list where ``none`` means no refinement.
-
-    Args:
-        text: The raw flag value, such as ``"none,5,10"``.
-
-    Returns:
-        The parsed refine factors with ``None`` for the unrefined point.
-    """
-    result: list[int | None] = []
-    for item in text.split(","):
-        cleaned: str = item.strip().lower()
-        if not cleaned:
-            continue
-        result.append(None if cleaned in ("none", "null") else int(cleaned))
-    return result
+    deepest_cutoff: int = max(RECALL_CUTOFFS)
+    if search_k < deepest_cutoff:
+        raise ValueError(
+            f"search_k={search_k} is below the deepest recall cutoff {deepest_cutoff} "
+            f"(RECALL_CUTOFFS={RECALL_CUTOFFS}); recall_at_{deepest_cutoff} would be silently "
+            f"deflated by the shorter retrieved-id array. Pass --search-k >= {deepest_cutoff}."
+        )
 
 
 @dataclass
@@ -124,7 +91,7 @@ class BenchConfig:
         words_per_text: Cluster-specific words per document.
         rows_per_slice: Base vectors generated per Spark task during prepare.
         batches: Sequential ETL merge batches during ingest. Values above 1 create extra fragments for compaction.
-        etl_partitions: Shuffle partition count handed to the ETL job.
+        etl_partitions: Shuffle partition count handed to the reconciler ingest run.
         ivf_partitions: Explicit IVF partition count. ``None`` uses the indexer's size-aware policy.
         num_shards: Fragments covered by one segment-build task during indexing.
         vector_row_floor: Row floor below which the vector index is skipped. Lowered from the production default so
@@ -136,17 +103,26 @@ class BenchConfig:
         driver_memory: Spark driver memory for the local-mode JVM.
         catalog: Name of the local Hadoop Iceberg catalog.
         table_name: Bare Iceberg table name under ``<catalog>.db``.
-        endpoint: gRPC endpoint of the Rust search service.
-        nprobes: Probed-partition sweep values for the recall mode.
-        refine_factors: Refine-factor sweep values. ``None`` disables re-ranking.
+        endpoint: gRPC endpoint of an already-running search-api server, plaintext, no TLS or authentication. Only
+            meaningful for the standalone ``search`` command: an external server cannot see ``e2e``'s ephemeral
+            control-plane schema, so ``e2e`` always self-hosts instead of reading this field.
+        search_api_binary: Path to the search-api release binary self-hosted by ``e2e`` (and by ``search`` when
+            ``control_plane_url`` is set instead of ``endpoint``). ``None`` explicitly disables self-hosting; the
+            search leg then records ``NOT_RUN`` instead of measuring anything.
+        search_api_port: Search gRPC port bound by a self-hosted server. The health port is the binary's own fixed
+            8081 and is not configurable.
+        keep_control_plane: When True, ``e2e`` does not drop its ephemeral PostgreSQL schema on exit, so a later
+            standalone ``search --control-plane-url`` run can self-host against the same published catalog.
+        control_plane_url: An isolated control-plane URL (as printed by an ``e2e --keep-control-plane`` run) the
+            standalone ``search`` command self-hosts a fresh search-api subprocess against. Ignored when
+            ``endpoint`` is set.
+        search_expected_versions_path: JSON mapping every exact benchmark target to its expected published version.
+            Optional version evidence, independent of ``endpoint``. When set alongside ``endpoint`` the catalog
+            search leg validates every response's ``served_version`` against it.
         search_k: Neighbors requested per query. Must cover the deepest recall cut-off.
         max_queries: Cap on query vectors per sweep point. ``None`` sends all 10k.
         fts_query_count: Deterministic full-text queries drawn from cluster vocabularies in the FTS leg.
         hybrid_query_count: Queries in the hybrid (vector + text, RRF) leg.
-        concurrency: ghz concurrency levels for the load mode.
-        load_duration: ghz test duration per concurrency level.
-        load_nprobes: nprobes used by the load and hybrid legs.
-        prewarm: Call the prewarm hook before timing first queries.
         sha256: Optional pinned checksum for the downloaded sift archive.
         force: Rebuild prepared artifacts even when a manifest already exists.
         warmup_queries: Queries issued at the maximum nprobes before the timed sweep. Set to 0 to skip warmup.
@@ -157,15 +133,19 @@ class BenchConfig:
             on 8125).
         otlp_port: gRPC port for the local OTLP trace capture receiver (default 14317, avoids clash with a real agent
             on 4317).
-        server_bin: Explicit path of the search-api binary the experiment spawns. ``None`` resolves the release
-            build then the debug build.
-        build_server: When True, run ``cargo build --release`` for search-api before spawning it.
-        spawn_server: When True (the default) the experiment spawns and owns a server. Disable to measure against
-            an externally managed server at ``endpoint``.
-        server_env: Extra environment variables for the spawned server, from repeatable ``--server-env KEY=VALUE``
-            flags. This is how an iteration varies server-side knobs such as the cache backend or cache budgets.
         baseline: Run id of a previous experiment whose ``metrics.json`` is diffed against this run's headline
             numbers.
+        qualification_rows: Rows in the bounded deterministic scale and fault cohort.
+        allow_large_qualification: Explicit opt-in for a synthetic cohort above the local safety bound.
+        fuzz_ops: Total randomized CRUD ops distributed across the fuzz snapshots.
+        fuzz_snapshots: Iceberg append snapshots in a fuzz run; the first seeds every org.
+        fuzz_keyspace: Distinct randomized record-id pool shared across orgs in a fuzz run.
+        fuzz_mix: Insert, update, and delete relative weights as an ``i:u:d`` string.
+        fuzz_dup_probability: Chance an accepted upsert is redelivered verbatim into a later snapshot.
+        fuzz_retention_mode: Either ``off`` or ``short`` to enable retention and the three ts bands.
+        fuzz_retention_seconds: Retention window in the fuzz short retention mode.
+        fuzz_conflict: When set, inject a same-snapshot distinct-mutation pair and assert it blocks.
+        fuzz_dim: Synthetic fuzz vector dimension, divisible by eight.
     """
 
     command: str
@@ -194,17 +174,16 @@ class BenchConfig:
     driver_memory: str = "8g"
     catalog: str = "bench"
     table_name: str = "sift"
-    endpoint: str = "localhost:50051"
-    nprobes: list[int] = field(default_factory=lambda: [1, 10, 25, 50, 100])
-    refine_factors: list[int | None] = field(default_factory=lambda: [None, 5, 10])
+    endpoint: str = ""
+    search_api_binary: Path | None = None
+    search_api_port: int = 8080
+    keep_control_plane: bool = False
+    control_plane_url: str | None = None
+    search_expected_versions_path: Path | None = None
     search_k: int = SIFT_GT_DEPTH
     max_queries: int | None = None
     fts_query_count: int = 100
     hybrid_query_count: int = 100
-    concurrency: list[int] = field(default_factory=lambda: [1, 8, 32])
-    load_duration: str = "15s"
-    load_nprobes: int = 10
-    prewarm: bool = False
     sha256: str | None = None
     force: bool = False
     warmup_queries: int = 100
@@ -212,28 +191,18 @@ class BenchConfig:
     capture_telemetry: bool = False
     statsd_port: int = 19125
     otlp_port: int = 14317
-    server_bin: str | None = None
-    build_server: bool = False
-    spawn_server: bool = True
-    server_env: dict[str, str] = field(default_factory=dict)
     baseline: str | None = None
-
-    def __post_init__(self) -> None:
-        """Validate cross-field invariants after the dataclass fields are populated.
-
-        Raises:
-            ValueError: If ``search_k`` is smaller than the deepest :data:`RECALL_CUTOFFS` depth.
-                ``recall_at`` slices the retrieved-id array to the cut-off width, so a shorter
-                array silently caps recall below its true value instead of raising, which would
-                make ``search_k`` misconfiguration masquerade as a real recall drop.
-        """
-        deepest_cutoff: int = max(RECALL_CUTOFFS)
-        if self.search_k < deepest_cutoff:
-            raise ValueError(
-                f"search_k={self.search_k} is below the deepest recall cutoff {deepest_cutoff} "
-                f"(RECALL_CUTOFFS={RECALL_CUTOFFS}); recall_at_{deepest_cutoff} would be silently "
-                f"deflated by the shorter retrieved-id array. Pass --search-k >= {deepest_cutoff}."
-            )
+    qualification_rows: int = 25_000
+    allow_large_qualification: bool = False
+    fuzz_ops: int = 200
+    fuzz_snapshots: int = 4
+    fuzz_keyspace: int = 80
+    fuzz_mix: str = "60:25:15"
+    fuzz_dup_probability: float = 0.10
+    fuzz_retention_mode: str = "off"
+    fuzz_retention_seconds: int = 3600
+    fuzz_conflict: bool = False
+    fuzz_dim: int = 32
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> BenchConfig:
@@ -247,12 +216,17 @@ class BenchConfig:
         """
         values: dict[str, Any] = {}
         nullable_fields: frozenset[str] = frozenset(
-            {"ivf_partitions", "compact_target_rows", "max_queries", "sha256", "statsd_port", "otlp_port"}
+            {
+                "ivf_partitions",
+                "compact_target_rows",
+                "max_queries",
+                "sha256",
+                "statsd_port",
+                "otlp_port",
+                "search_expected_versions_path",
+            }
         )
-        values["server_env"] = parse_env_pairs(getattr(args, "server_env", None))
         for item in fields(cls):
-            if item.name == "server_env":
-                continue
             if hasattr(args, item.name):
                 value: Any = getattr(args, item.name)
                 if value is not None or item.name in nullable_fields:
@@ -260,7 +234,13 @@ class BenchConfig:
         values["workspace"] = Path(args.workspace).resolve()
         values["corpus_root"] = Path(args.corpus_root).resolve()
         values["results_root"] = Path(args.results_root).resolve()
-        return cls(**values)
+        if values.get("search_expected_versions_path") is not None:
+            values["search_expected_versions_path"] = Path(values["search_expected_versions_path"]).resolve()
+        raw_binary: str | None = values.get("search_api_binary")
+        values["search_api_binary"] = Path(raw_binary) if raw_binary else None
+        config = cls(**values)
+        validate_search_k(config.search_k)
+        return config
 
     def table(self) -> str:
         """Return the fully qualified Iceberg table name.
@@ -331,7 +311,7 @@ class BenchConfig:
         """Return the per-tenant Lance dataset URIs the ETL routing produces.
 
         Returns:
-            One dataset URI per org, matching ``lance_etl.etl.dataset_uri``.
+            One dataset URI per organization in the fixed target layout.
         """
         base: str = str(self.lance_root())
         return [f"{base}/{org}/{TENANT_ID}/{NAMESPACE}.lance" for org in self.org_ids()]
@@ -382,10 +362,48 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--driver-memory", default="8g")
     parser.add_argument("--catalog", default="bench")
     parser.add_argument("--table-name", default="sift")
-    parser.add_argument("--endpoint", default="localhost:50051")
-    parser.add_argument("--nprobes", type=parse_int_list, default=None, help="Comma list, e.g. 1,10,25,50,100")
     parser.add_argument(
-        "--refine-factors", type=parse_refine_list, default=None, help="Comma list; 'none' disables, e.g. none,5,10"
+        "--endpoint",
+        default="",
+        help="Standalone `search` only: gRPC endpoint of an already-running search-api server, "
+        "plaintext, no TLS or authentication. `e2e` always self-hosts instead (an external server "
+        "cannot see its ephemeral control-plane schema) and ignores this flag",
+    )
+    parser.add_argument(
+        "--search-api-binary",
+        dest="search_api_binary",
+        default=str(DEFAULT_SEARCH_API_BINARY),
+        help="search-api release binary self-hosted by `e2e` (and by `search` when "
+        "--control-plane-url is set). Pass an empty string to disable the search leg explicitly; "
+        "the leg also skips with NOT_RUN when the default path does not exist",
+    )
+    parser.add_argument(
+        "--search-api-port",
+        dest="search_api_port",
+        type=int,
+        default=8080,
+        help="Search gRPC port bound by a self-hosted server; the health port is the binary's own "
+        "fixed 8081 and is not configurable",
+    )
+    parser.add_argument(
+        "--keep-control-plane",
+        dest="keep_control_plane",
+        action="store_true",
+        help="e2e only: do not drop the ephemeral control-plane schema on exit, so a later "
+        "`search --control-plane-url` run can self-host against the same published catalog",
+    )
+    parser.add_argument(
+        "--control-plane-url",
+        dest="control_plane_url",
+        default=None,
+        help="search only: isolated control-plane URL (as printed by `e2e --keep-control-plane`) "
+        "to self-host a fresh search-api subprocess against. Ignored when --endpoint is set",
+    )
+    parser.add_argument(
+        "--search-expected-versions-path",
+        type=Path,
+        default=None,
+        help="JSON mapping tenant0/ns/ORG target keys to expected positive served versions",
     )
     parser.add_argument(
         "--search-k",
@@ -396,10 +414,6 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-queries", type=int, default=None, help="Cap query vectors per sweep point")
     parser.add_argument("--fts-queries", dest="fts_query_count", type=int, default=100)
     parser.add_argument("--hybrid-queries", dest="hybrid_query_count", type=int, default=100)
-    parser.add_argument("--concurrency", type=parse_int_list, default=None, help="ghz concurrency levels, e.g. 1,8,32")
-    parser.add_argument("--load-duration", default="15s")
-    parser.add_argument("--load-nprobes", type=int, default=10)
-    parser.add_argument("--prewarm", action="store_true")
     parser.add_argument("--sha256", default=None, help="Pinned sha256 of sift.tar.gz")
     parser.add_argument("--force", action="store_true", help="Rebuild prepared artifacts")
     parser.add_argument("--warmup-queries", type=int, default=100, help="Warmup queries before timed sweep; 0 skips")
@@ -423,30 +437,6 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
         help="UDP port for the local DogStatsD capture listener (default 19125)",
     )
     parser.add_argument(
-        "--server-bin",
-        default=None,
-        help="Path to the search-api binary the experiment spawns (default: release then debug build)",
-    )
-    parser.add_argument(
-        "--build-server",
-        dest="build_server",
-        action="store_true",
-        help="Run cargo build --release for search-api before spawning it",
-    )
-    parser.add_argument(
-        "--no-spawn-server",
-        dest="spawn_server",
-        action="store_false",
-        help="Do not spawn a server; use the externally managed one at --endpoint",
-    )
-    parser.add_argument(
-        "--server-env",
-        action="append",
-        default=None,
-        metavar="KEY=VALUE",
-        help="Extra environment for the spawned server, repeatable (e.g. SEARCH_API_CACHE_BACKEND=redis)",
-    )
-    parser.add_argument(
         "--baseline",
         default=None,
         help="Run id of a previous experiment to print a metrics delta against",
@@ -458,13 +448,66 @@ def add_flags(parser: argparse.ArgumentParser) -> None:
         default=14317,
         help="gRPC port for the local OTLP trace capture receiver (default 14317)",
     )
+    parser.add_argument(
+        "--qualification-rows",
+        type=int,
+        default=25_000,
+        help="Rows in the deterministic local scale qualification cohort",
+    )
+    parser.add_argument(
+        "--allow-large-qualification",
+        action="store_true",
+        help="Allow a qualification cohort above the local one-million-row safety bound",
+    )
+    parser.add_argument("--fuzz-ops", dest="fuzz_ops", type=int, default=200, help="Total randomized CRUD ops")
+    parser.add_argument(
+        "--fuzz-snapshots",
+        dest="fuzz_snapshots",
+        type=int,
+        default=4,
+        help="Iceberg append snapshots; first seeds orgs",
+    )
+    parser.add_argument(
+        "--fuzz-keyspace", dest="fuzz_keyspace", type=int, default=80, help="Distinct record-id pool across orgs"
+    )
+    parser.add_argument("--fuzz-mix", dest="fuzz_mix", default="60:25:15", help="Insert:update:delete weights")
+    parser.add_argument(
+        "--fuzz-dup-probability",
+        dest="fuzz_dup_probability",
+        type=float,
+        default=0.10,
+        help="Exact-redelivery chance into a later snapshot",
+    )
+    parser.add_argument(
+        "--fuzz-retention-mode",
+        dest="fuzz_retention_mode",
+        choices=("off", "short"),
+        default="off",
+        help="short enables retention and the three ts-band populations",
+    )
+    parser.add_argument(
+        "--fuzz-retention-seconds",
+        dest="fuzz_retention_seconds",
+        type=int,
+        default=3600,
+        help="Retention window in short mode",
+    )
+    parser.add_argument(
+        "--fuzz-conflict",
+        dest="fuzz_conflict",
+        action="store_true",
+        help="Inject a same-snapshot distinct-mutation pair and assert it blocks",
+    )
+    parser.add_argument(
+        "--fuzz-dim", dest="fuzz_dim", type=int, default=32, help="Synthetic vector dim, divisible by 8"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level benchmark argument parser.
 
     Returns:
-        The parser with one subcommand per benchmark phase plus ``all``.
+        The parser with one subcommand per surviving benchmark phase.
     """
     parser: argparse.ArgumentParser = argparse.ArgumentParser(prog="python -m bench", description=__doc__)
     parser.add_argument("--log-level", default="INFO")
@@ -472,14 +515,15 @@ def build_parser() -> argparse.ArgumentParser:
     help_texts: dict[str, str] = {
         "download": "Fetch and verify the SIFT1M corpus",
         "prepare": "Write the Iceberg source table, cluster-seeded text corpus, and ground truth",
-        "ingest": "Run the real Iceberg-to-Lance ETL into per-tenant datasets",
-        "index": "Build IVF_RQ, BTREE, BITMAP, and INVERTED indices with LanceIndexer",
-        "compact": "Compact the datasets with MaintenanceJob and record fragment counts",
-        "search": "Run recall, FTS, hybrid, and ghz load modes against the gRPC server",
+        "search": "Run recall, FTS, hybrid, and the fixed load profile against the plaintext gRPC server",
         "report": "Aggregate run artifacts into summary.md, results.csv, and pareto.png",
-        "all": "Run the full chain: download, prepare, ingest, index, compact, search, report",
-        "e2e": "Batch-major e2e: per-batch ETL+index+compact+tag, historical-tag verification, optional gRPC legs",
-        "experiment": "One agent iteration: prepare if needed, spawn the server, e2e, sizes, sweep, metrics.json",
+        "e2e": "Reconciler-driven e2e: per-batch ingest via the control plane, historical-tag verification, gRPC legs",
+        "experiment": "One offline build iteration: prepare if needed, e2e, sizes, and metrics.json",
+        "qualify": "Measure deterministic mutation collapse, skew, shuffle width, capacity, and external scale gates",
+        "fuzz": (
+            "Randomized CRUD fuzz: seeded op sequences reconciled end-to-end, verified against an "
+            "in-memory oracle with full row-content comparison"
+        ),
     }
     for name in SUBCOMMANDS:
         sub: argparse.ArgumentParser = subparsers.add_parser(name, help=help_texts[name])

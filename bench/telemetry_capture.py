@@ -9,14 +9,14 @@ directory:
 - :class:`OtlpGrpcReceiver` — minimal gRPC server implementing ``opentelemetry.proto.collector``
   that decodes ``ExportTraceServiceRequest`` protobuf messages and appends span JSON lines to
   ``telemetry/traces.jsonl``.
-- :class:`TelemetryCapture` — context manager that starts all listeners, sets the required
-  environment variables for child processes, and stops everything cleanly on exit.
+- :class:`TelemetryCapture` — lifecycle state for listeners and child-process environment
+  variables, managed by :func:`telemetry_capture_session`.
 
 None of the components block or raise when their sockets are unavailable: the DogStatsD emitters
 in both Python and Rust are documented as infallible fire-and-forget UDP, so a missing listener
 never breaks a pipeline run.
 
-Environment variables configured by :meth:`TelemetryCapture.env_overrides`:
+Environment variables exposed by :attr:`TelemetryCapture.env_overrides`:
 
 Python (``TelemetryConfig`` fields, passed to worker processes):
   ``LANCE_BENCH_STATSD_HOST``, ``LANCE_BENCH_STATSD_PORT``
@@ -38,6 +38,7 @@ import logging
 import socket
 import threading
 import time
+from collections.abc import Iterator
 from concurrent import futures
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
@@ -118,6 +119,7 @@ def parse_dogstatsd_datagram(raw: bytes, received_at: float) -> dict[str, Any] |
     }
 
 
+@dataclass
 class DogStatsDProtocol(asyncio.DatagramProtocol):
     """asyncio datagram protocol that parses DogStatsD packets and appends them as JSON lines.
 
@@ -129,15 +131,10 @@ class DogStatsDProtocol(asyncio.DatagramProtocol):
         output_path: The file to append JSON records to.
     """
 
-    def __init__(self, output_path: Path) -> None:
-        """Initialise the protocol.
-
-        Args:
-            output_path: JSON-lines output file. Created if it does not exist.
-        """
-        self.output_path: Path = output_path
-        self.dropped: int = 0
-        self.received: int = 0
+    output_path: Path
+    dropped: int = field(default=0, init=False)
+    received: int = field(default=0, init=False)
+    transport: asyncio.BaseTransport | None = field(default=None, init=False)
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         """Record the transport reference on connection establishment.
@@ -188,6 +185,7 @@ class DogStatsDProtocol(asyncio.DatagramProtocol):
             logger.debug("DogStatsD connection lost: %s", exc)
 
 
+@dataclass
 class DogStatsDListener:
     """Asyncio UDP listener for DogStatsD datagrams.
 
@@ -205,26 +203,21 @@ class DogStatsDListener:
         port: UDP port to listen on.
     """
 
-    def __init__(
-        self,
-        telemetry_dir: Path,
-        host: str = DEFAULT_STATSD_HOST,
-        port: int = DEFAULT_STATSD_PORT,
-    ) -> None:
-        """Initialise the listener.
+    telemetry_dir: Path
+    host: str = DEFAULT_STATSD_HOST
+    port: int = DEFAULT_STATSD_PORT
+    loop: asyncio.AbstractEventLoop | None = field(default=None, init=False)
+    thread: threading.Thread | None = field(default=None, init=False)
+    transport: asyncio.BaseTransport | None = field(default=None, init=False)
 
-        Args:
-            telemetry_dir: Output directory.
-            host: Bind address.
-            port: Bind port.
+    @property
+    def output_path(self) -> Path:
+        """Return the metrics JSON-lines output path.
+
+        Returns:
+            The output file beneath the telemetry directory.
         """
-        self.telemetry_dir: Path = telemetry_dir
-        self.host: str = host
-        self.port: int = port
-        self.output_path: Path = telemetry_dir / "metrics.jsonl"
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._thread: threading.Thread | None = None
-        self._transport: asyncio.BaseTransport | None = None
+        return self.telemetry_dir / "metrics.jsonl"
 
     def start(self) -> None:
         """Start the UDP listener in a background daemon thread.
@@ -236,47 +229,48 @@ class DogStatsDListener:
         self.telemetry_dir.mkdir(parents=True, exist_ok=True)
         self.output_path.touch(exist_ok=True)
         ready: threading.Event = threading.Event()
-        self._loop = asyncio.new_event_loop()
+        self.loop = asyncio.new_event_loop()
 
         def run_loop() -> None:
             """Run the asyncio event loop until stop() signals it."""
-            asyncio.set_event_loop(self._loop)
-            self._loop.run_until_complete(self._bind_and_signal(ready))
-            self._loop.run_forever()
-            self._loop.close()
+            asyncio.set_event_loop(self.loop)
+            self.loop.run_until_complete(self.bind_and_signal(ready))
+            self.loop.run_forever()
+            self.loop.close()
 
-        self._thread = threading.Thread(target=run_loop, daemon=True, name="statsd-listener")
-        self._thread.start()
+        self.thread = threading.Thread(target=run_loop, daemon=True, name="statsd-listener")
+        self.thread.start()
         ready.wait(timeout=5.0)
         logger.info("DogStatsD listener bound on %s:%d -> %s", self.host, self.port, self.output_path)
 
-    async def _bind_and_signal(self, ready: threading.Event) -> None:
+    async def bind_and_signal(self, ready: threading.Event) -> None:
         """Bind the UDP socket and signal readiness.
 
         Args:
             ready: Event to set once the transport is created.
         """
         protocol = DogStatsDProtocol(self.output_path)
-        transport, _ = await self._loop.create_datagram_endpoint(
+        transport, _ = await self.loop.create_datagram_endpoint(
             lambda: protocol,
             local_addr=(self.host, self.port),
             family=socket.AF_INET,
             reuse_port=False,
         )
-        self._transport = transport
+        self.transport = transport
         ready.set()
 
     def stop(self) -> None:
         """Close the UDP socket and stop the background thread."""
-        if self._transport is not None:
-            self._loop.call_soon_threadsafe(self._transport.close)
-        if self._loop is not None:
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
+        if self.transport is not None:
+            self.loop.call_soon_threadsafe(self.transport.close)
+        if self.loop is not None:
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        if self.thread is not None:
+            self.thread.join(timeout=5.0)
         logger.info("DogStatsD listener stopped")
 
 
+@dataclass
 class OtlpTraceServicer(trace_service_pb2_grpc.TraceServiceServicer):
     """gRPC servicer implementing the OTLP ExportTraceService.
 
@@ -289,14 +283,8 @@ class OtlpTraceServicer(trace_service_pb2_grpc.TraceServiceServicer):
         output_path: The file to append span JSON lines to.
     """
 
-    def __init__(self, output_path: Path) -> None:
-        """Initialise the servicer.
-
-        Args:
-            output_path: JSON-lines output file for decoded spans.
-        """
-        self.output_path: Path = output_path
-        self.span_count: int = 0
+    output_path: Path
+    span_count: int = field(default=0, init=False)
 
     def Export(
         self,
@@ -340,6 +328,7 @@ class OtlpTraceServicer(trace_service_pb2_grpc.TraceServiceServicer):
         return trace_service_pb2.ExportTraceServiceResponse()
 
 
+@dataclass
 class OtlpGrpcReceiver:
     """Minimal OTLP gRPC receiver that captures Rust service spans to a JSONL file.
 
@@ -358,25 +347,20 @@ class OtlpGrpcReceiver:
         port: gRPC port to listen on.
     """
 
-    def __init__(
-        self,
-        telemetry_dir: Path,
-        host: str = DEFAULT_STATSD_HOST,
-        port: int = DEFAULT_OTLP_PORT,
-    ) -> None:
-        """Initialise the receiver.
+    telemetry_dir: Path
+    host: str = DEFAULT_STATSD_HOST
+    port: int = DEFAULT_OTLP_PORT
+    server: grpc.Server | None = field(default=None, init=False)
+    servicer: OtlpTraceServicer | None = field(default=None, init=False)
 
-        Args:
-            telemetry_dir: Output directory.
-            host: Bind address.
-            port: Bind port.
+    @property
+    def output_path(self) -> Path:
+        """Return the traces JSON-lines output path.
+
+        Returns:
+            The output file beneath the telemetry directory.
         """
-        self.telemetry_dir: Path = telemetry_dir
-        self.host: str = host
-        self.port: int = port
-        self.output_path: Path = telemetry_dir / "traces.jsonl"
-        self._server: grpc.Server | None = None
-        self._servicer: OtlpTraceServicer | None = None
+        return self.telemetry_dir / "traces.jsonl"
 
     def start(self) -> None:
         """Start the gRPC server in a background thread pool.
@@ -387,20 +371,18 @@ class OtlpGrpcReceiver:
         """
         self.telemetry_dir.mkdir(parents=True, exist_ok=True)
         self.output_path.touch(exist_ok=True)
-        self._servicer = OtlpTraceServicer(self.output_path)
-        self._server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
-        trace_service_pb2_grpc.add_TraceServiceServicer_to_server(self._servicer, self._server)
-        self._server.add_insecure_port(f"{self.host}:{self.port}")
-        self._server.start()
+        self.servicer = OtlpTraceServicer(self.output_path)
+        self.server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+        trace_service_pb2_grpc.add_TraceServiceServicer_to_server(self.servicer, self.server)
+        self.server.add_insecure_port(f"{self.host}:{self.port}")
+        self.server.start()
         logger.info("OTLP gRPC receiver bound on %s:%d -> %s", self.host, self.port, self.output_path)
 
     def stop(self) -> None:
         """Stop the gRPC server with a short grace period."""
-        if self._server is not None:
-            self._server.stop(grace=2.0)
-        logger.info(
-            "OTLP gRPC receiver stopped (captured %d spans)", self._servicer.span_count if self._servicer else 0
-        )
+        if self.server is not None:
+            self.server.stop(grace=2.0)
+        logger.info("OTLP gRPC receiver stopped (captured %d spans)", self.servicer.span_count if self.servicer else 0)
 
 
 @dataclass
@@ -425,13 +407,12 @@ class CaptureConfig:
     extra_env: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass
 class TelemetryCapture:
-    """Context manager that starts capture listeners and sets environment variables for child processes.
+    """Lifecycle state for capture listeners and child-process environment variables.
 
-    On entry, starts the configured listeners (DogStatsD and/or OTLP) and returns an
-    ``env_overrides`` dict that must be merged into the environment of any child processes
-    (Spark, gRPC server) that should emit to the capture listeners.  On exit, the listeners are
-    stopped gracefully.
+    :func:`telemetry_capture_session` starts and stops this state. ``env_overrides`` must be merged
+    into the environment of child processes that should emit to the capture listeners.
 
     When ``capture_metrics`` is False or ``capture_traces`` is False the corresponding listener
     is not started and the corresponding env var is not emitted — the child process falls back to
@@ -441,7 +422,7 @@ class TelemetryCapture:
     Usage::
 
         capture_cfg = CaptureConfig(telemetry_dir=workspace / "telemetry")
-        with TelemetryCapture(capture_cfg) as capture:
+        with telemetry_capture_session(capture_cfg) as capture:
             env = {**os.environ, **capture.env_overrides}
             subprocess.run(["python", "-m", "bench", "e2e", ...], env=env)
 
@@ -449,16 +430,10 @@ class TelemetryCapture:
         config: Capture configuration.
     """
 
-    def __init__(self, config: CaptureConfig) -> None:
-        """Initialise the capture session.
-
-        Args:
-            config: Capture configuration.
-        """
-        self.config: CaptureConfig = config
-        self._statsd_listener: DogStatsDListener | None = None
-        self._otlp_receiver: OtlpGrpcReceiver | None = None
-        self.env_overrides: dict[str, str] = {}
+    config: CaptureConfig
+    statsd_listener: DogStatsDListener | None = field(default=None, init=False)
+    otlp_receiver: OtlpGrpcReceiver | None = field(default=None, init=False)
+    env_overrides: dict[str, str] = field(default_factory=dict, init=False)
 
     def start(self) -> None:
         """Start all configured capture listeners and populate ``env_overrides``.
@@ -469,60 +444,59 @@ class TelemetryCapture:
         self.config.telemetry_dir.mkdir(parents=True, exist_ok=True)
         if self.config.capture_metrics:
             try:
-                self._statsd_listener = DogStatsDListener(
+                self.statsd_listener = DogStatsDListener(
                     self.config.telemetry_dir,
                     host=self.config.statsd_host,
                     port=self.config.statsd_port,
                 )
-                self._statsd_listener.start()
+                self.statsd_listener.start()
                 statsd_addr: str = f"{self.config.statsd_host}:{self.config.statsd_port}"
                 self.env_overrides["SEARCH_API_STATSD_ADDR"] = statsd_addr
                 self.env_overrides["LANCE_BENCH_STATSD_HOST"] = self.config.statsd_host
                 self.env_overrides["LANCE_BENCH_STATSD_PORT"] = str(self.config.statsd_port)
             except OSError as exc:
                 logger.warning("DogStatsD listener failed to start (metrics will not be captured): %s", exc)
-                self._statsd_listener = None
+                self.statsd_listener = None
         if self.config.capture_traces:
             try:
-                self._otlp_receiver = OtlpGrpcReceiver(
+                self.otlp_receiver = OtlpGrpcReceiver(
                     self.config.telemetry_dir,
                     host=self.config.statsd_host,
                     port=self.config.otlp_port,
                 )
-                self._otlp_receiver.start()
+                self.otlp_receiver.start()
                 self.env_overrides["OTEL_EXPORTER_OTLP_ENDPOINT"] = (
                     f"http://{self.config.statsd_host}:{self.config.otlp_port}"
                 )
             except Exception as exc:
                 logger.warning("OTLP gRPC receiver failed to start (traces will not be captured): %s", exc)
-                self._otlp_receiver = None
+                self.otlp_receiver = None
         self.env_overrides.update(self.config.extra_env)
 
     def stop(self) -> None:
         """Stop all running capture listeners."""
-        if self._statsd_listener is not None:
-            self._statsd_listener.stop()
-        if self._otlp_receiver is not None:
-            self._otlp_receiver.stop()
+        if self.statsd_listener is not None:
+            self.statsd_listener.stop()
+        if self.otlp_receiver is not None:
+            self.otlp_receiver.stop()
 
-    def __enter__(self) -> TelemetryCapture:
-        """Start capture and return self.
 
-        Returns:
-            This instance (access ``env_overrides`` after entry).
-        """
-        self.start()
-        return self
+@contextmanager
+def telemetry_capture_session(config: CaptureConfig) -> Iterator[TelemetryCapture]:
+    """Start a configured telemetry capture and always stop it afterward.
 
-    def __exit__(self, exc_type: type | None, exc_val: BaseException | None, exc_tb: object | None) -> None:
-        """Stop capture regardless of whether the body raised.
+    Args:
+        config: Capture configuration.
 
-        Args:
-            exc_type: Exception type, if any.
-            exc_val: Exception value, if any.
-            exc_tb: Traceback, if any.
-        """
-        self.stop()
+    Yields:
+        The running capture state.
+    """
+    capture = TelemetryCapture(config)
+    capture.start()
+    try:
+        yield capture
+    finally:
+        capture.stop()
 
 
 @contextmanager
@@ -530,7 +504,7 @@ def capture_telemetry(
     telemetry_dir: Path,
     statsd_port: int = DEFAULT_STATSD_PORT,
     otlp_port: int = DEFAULT_OTLP_PORT,
-) -> Any:
+) -> Iterator[dict[str, str]]:
     """Convenience context manager starting both listeners with default loopback binding.
 
     Yields a dictionary of environment variable overrides that must be applied to any child
@@ -549,5 +523,5 @@ def capture_telemetry(
         statsd_port=statsd_port,
         otlp_port=otlp_port,
     )
-    with TelemetryCapture(cfg) as capture:
+    with telemetry_capture_session(cfg) as capture:
         yield capture.env_overrides

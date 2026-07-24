@@ -25,6 +25,9 @@ pub const DEFAULT_DATASET_CACHE_CAPACITY: u64 = 16384;
 /// Default TCP port for the gRPC server.
 pub const DEFAULT_PORT: u16 = 8080;
 
+/// Default plaintext gRPC health port exposed without search methods or credentials.
+pub const DEFAULT_HEALTH_PORT: u16 = 8081;
+
 /// Default root directory for the persistent disk caches.
 pub const DEFAULT_CACHE_DIR: &str = "/tmp/rust-search/cache";
 
@@ -94,20 +97,15 @@ pub const DEFAULT_STORE_CACHE_MAX_RANGE_BYTES: u64 = 4 * 1024 * 1024;
 /// Hardcoded: the 300 s sweep cadence is an internal maintenance constant, no longer an env knob.
 pub const DEFAULT_DISK_CACHE_SWEEP_SECS: u64 = 300;
 
-/// Fixed number of indexes prewarmed concurrently per Prewarm RPC.
+/// Fixed number of indexes prewarmed concurrently by replica-local administration.
 ///
 /// Hardcoded: no deployment has ever retuned this, so it is no longer an env knob.
 pub const DEFAULT_PREWARM_CONCURRENCY: usize = 4;
 
-/// Fixed logical id column captured for recall scoring.
-///
-/// Hardcoded: matches the standardized ETL and recall schema, so it is no longer an env knob.
-pub const DEFAULT_ID_COLUMN: &str = "vector_id";
-
-/// Fixed event-timestamp column a search time range is applied to.
+/// Fixed time column a search time range is applied to.
 ///
 /// Hardcoded: matches the standardized ETL event clock, so it is no longer an env knob.
-pub const DEFAULT_EVENT_TIMESTAMP_COLUMN: &str = "event_timestamp";
+pub const DEFAULT_TS_COLUMN: &str = "ts";
 
 /// Default DogStatsD address when neither `SEARCH_API_STATSD_ADDR` nor `DD_AGENT_HOST` is set.
 pub const DEFAULT_STATSD_ADDR: &str = "127.0.0.1:8125";
@@ -167,9 +165,8 @@ pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 800;
 /// Fixed long request timeout in milliseconds for the drain-heavy RPCs (10 minutes).
 ///
 /// `SearchService/Prewarm` loads every requested IVF partition and BTree page over the object
-/// store, and `IntakeService/WriteStream` is bounded by the whole client stream, so neither can
-/// live under the 800 ms search budget. Hardcoded: no deployment has ever retuned this, so it is
-/// not an env knob.
+/// store, so it cannot live under the 800 ms search budget. Hardcoded: no deployment has ever
+/// retuned this, so it is not an env knob.
 pub const DEFAULT_LONG_REQUEST_TIMEOUT_MS: u64 = 600_000;
 
 /// Fixed TTL in seconds for the negative cache of failed dataset opens (NotFound only).
@@ -179,6 +176,12 @@ pub const DEFAULT_LONG_REQUEST_TIMEOUT_MS: u64 = 600_000;
 /// replica that probed it just before creation. Hardcoded: no deployment has ever retuned this,
 /// so it is not an env knob.
 pub const DEFAULT_NEGATIVE_OPEN_TTL_SECS: u64 = 5;
+
+/// Fixed TTL for an exact PostgreSQL serving tuple cached in one search process.
+///
+/// Publication can therefore leave one replica on the prior validated version for at most this
+/// interval. The cache never substitutes latest or a tag-selected version.
+pub const DEFAULT_SERVING_CATALOG_TTL_SECS: u64 = 5;
 
 /// Fixed maximum concurrent streams (and connections) the gRPC server admits.
 ///
@@ -191,15 +194,23 @@ pub const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 256;
 /// Hardcoded: no deployment has ever retuned this, so it is no longer an env knob.
 pub const DEFAULT_CONCURRENCY_LIMIT_PER_CONNECTION: usize = 256;
 
-/// Path to the startup prewarm targets file (empty = disabled).
-///
-/// When set, the service reads this file on startup and prewarms each listed dataset in a
-/// background task before it would otherwise be opened cold by a live request. The file format
-/// is one target per line: `{org_id}/{tenant_id}/{namespace}` using the same path segments the
-/// service resolves to `{base_uri}/{org_id}/{tenant_id}/{namespace}.lance`. Blank lines and lines
-/// with invalid segments are skipped with a warning. Errors per target are logged but never fatal.
-/// Env: `SEARCH_API_PREWARM_TARGETS_PATH`.
-pub const DEFAULT_PREWARM_TARGETS_PATH: &str = "";
+/// Fixed process-global number of concurrent searches admitted across all connections.
+pub const DEFAULT_GLOBAL_SEARCH_CONCURRENCY: usize = 256;
+
+/// Fixed number of concurrent searches admitted for one exact logical tenant.
+pub const DEFAULT_PER_TENANT_SEARCH_CONCURRENCY: usize = 8;
+
+/// Fixed maximum encoded response size for every public search method.
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Fixed maximum decoded request size for every public search method.
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// Fixed maximum number of projected fields in one public search request.
+pub const DEFAULT_MAX_PROJECTION_COLUMNS: usize = 64;
+
+/// Fixed maximum graceful-drain duration before in-flight work is cancelled.
+pub const DEFAULT_GRACEFUL_DRAIN_SECS: u64 = 30;
 
 /// Fixed minimum object-store request size in bytes (IO buffer / block size) — 256 KiB.
 ///
@@ -207,19 +218,12 @@ pub const DEFAULT_PREWARM_TARGETS_PATH: &str = "";
 /// varies it, so it is no longer an env knob.
 pub const DEFAULT_IO_BLOCK_SIZE_BYTES: usize = 256 * 1024;
 
-/// Default for whether serving resolves the configured serve tag instead of opening latest.
+/// Legacy fixed tag used only by non-catalog provider seams and compatibility tests.
 ///
-/// Off by default so the legacy latest-resolution behavior is preserved until an operator has
-/// verified prewarm-by-version and is ready to cut serving over to tag-based blue-green.
-pub const DEFAULT_SERVE_BY_TAG: bool = false;
+/// Production serving resolves exact URI and version through the PostgreSQL catalog.
+pub const PRODUCTION_SERVE_TAG: &str = "HEAD";
 
-/// Default serve tag resolved to a concrete version when serve-by-tag is enabled.
-pub const DEFAULT_SERVE_TAG: &str = "HEAD";
-
-/// Fixed TTL in seconds for trusting a resolved serve-tag version before re-reading the tag.
-///
-/// Bounds how long a tag flip can go unobserved by a replica. Hardcoded: no deployment has ever
-/// retuned this, so it is no longer an env knob.
+/// Fixed freshness TTL for legacy unpinned provider handles.
 pub const DEFAULT_SERVE_TAG_TTL_SECS: u64 = 10;
 
 /// Fixed object-store retry-window timeout in seconds — 120 s.
@@ -241,6 +245,12 @@ pub struct Config {
     /// Base URI under which all datasets live, e.g. `s3://bucket/lance`. Each dataset resolves to
     /// `{base}/{org_id}/{tenant_id}/{namespace}.lance`.
     pub base_uri: String,
+    /// PostgreSQL control-plane URL used to resolve exact published serving tuples, connected
+    /// as given with no TLS. Env: `LANCE_ETL_DATABASE_URL`.
+    pub database_url: String,
+    /// Stable non-secret identity returned by replica-local administration.
+    /// Env: `SEARCH_API_REPLICA_ID`.
+    pub replica_id: String,
     /// Weighted capacity of the open-`Dataset` handle LRU (default [`DEFAULT_DATASET_CACHE_CAPACITY`]).
     /// Fixed: no longer env-configurable.
     pub dataset_cache_capacity: u64,
@@ -262,8 +272,7 @@ pub struct Config {
     /// Fixed: no longer env-configurable.
     pub disk_store_cache_bytes: u64,
     /// Which persistent backend the cache tiers use (default `Disk`). Env: `SEARCH_API_CACHE_BACKEND`
-    /// (`disk`, `redis`, or `memory`). The deprecated `SEARCH_API_DISK_CACHE_DISABLED=true` is
-    /// honored as an alias for `memory` when `SEARCH_API_CACHE_BACKEND` is unset.
+    /// (`disk`, `redis`, or `memory`).
     pub cache_backend: CacheBackendKind,
     /// Redis connection URL (`redis://` or `rediss://`), required when the backend is `redis`.
     /// Env: `SEARCH_API_REDIS_URL`.
@@ -277,39 +286,25 @@ pub struct Config {
     /// Disables trace export and DogStatsD entirely (tests / local runs keep JSON logs only).
     /// Env: `SEARCH_API_TELEMETRY_DISABLED`.
     pub telemetry_disabled: bool,
-    /// Whether serving resolves the configured serve tag to a concrete version instead of opening
-    /// the latest committed version (default false). When on, the provider keys its caches on the
-    /// resolved version so blue and green coexist and a tag flip is observed within the serve-tag
-    /// TTL. Env: `SEARCH_API_SERVE_BY_TAG`.
-    pub serve_by_tag: bool,
-    /// Tag serving resolves to a committed version when `serve_by_tag` is on (default `HEAD`).
-    /// Env: `SEARCH_API_SERVE_TAG`.
-    pub serve_tag: String,
-    /// Seconds a resolved serve-tag version is trusted before the tag JSON is re-read (default
-    /// [`DEFAULT_SERVE_TAG_TTL_SECS`]). Fixed: no longer env-configurable.
+    /// Freshness TTL for legacy unpinned provider handles. Fixed: no longer env-configurable.
     pub serve_tag_ttl_secs: u64,
-    /// Path to the startup prewarm targets file (empty = disabled).
-    ///
-    /// File format: one target per line as `{org_id}/{tenant_id}/{namespace}`. The service reads
-    /// this file on startup and prewarms each dataset in a background task, eliminating cold-open
-    /// latency for designated whale datasets on rolling deploys. Blank lines and malformed segments
-    /// are skipped with a warning. Per-target errors are logged but never fatal to startup.
-    /// Env: `SEARCH_API_PREWARM_TARGETS_PATH`.
-    pub prewarm_targets_path: Option<std::path::PathBuf>,
 }
 
 impl Config {
     /// Builds a configuration from environment variables.
     ///
-    /// `LANCE_ETL_BASE_URI` is required: the base URI all dataset paths are resolved under
-    /// (a trailing slash is stripped). Optional overrides: `SEARCH_API_PORT`,
-    /// `SEARCH_API_CACHE_DIR`, `SEARCH_API_CACHE_BACKEND` (`disk`, `redis`, or `memory`, with
-    /// `SEARCH_API_DISK_CACHE_DISABLED=true` honored as a deprecated alias for `memory`),
+    /// `LANCE_ETL_BASE_URI` and `LANCE_ETL_DATABASE_URL` are required. The base URI is the only
+    /// object-store prefix catalog routes may use. The gRPC server always binds plaintext to
+    /// loopback and the PostgreSQL catalog connection is always plaintext, using the connection
+    /// string as given. There is exactly one runtime mode. `SEARCH_API_PORT` is rejected outright
+    /// when it equals [`DEFAULT_HEALTH_PORT`], since that port is a fixed constant for the
+    /// separate plaintext health service and colliding with it would otherwise surface only as a
+    /// bare address-in-use bind failure at startup. Optional overrides: `SEARCH_API_PORT`,
+    /// `SEARCH_API_CACHE_DIR`, `SEARCH_API_CACHE_BACKEND` (`disk`, `redis`, or `memory`),
     /// `SEARCH_API_REDIS_URL` (required for the `redis` backend), `SEARCH_API_REDIS_NAMESPACE`
     /// (default `search-api`), `SEARCH_API_STATSD_ADDR` (default honors `DD_AGENT_HOST`),
-    /// `SEARCH_API_TELEMETRY_DISABLED`, `SEARCH_API_SERVE_BY_TAG` (default false),
-    /// `SEARCH_API_SERVE_TAG` (default `HEAD`), and `SEARCH_API_PREWARM_TARGETS_PATH` (default
-    /// empty, disabled).
+    /// `SEARCH_API_TELEMETRY_DISABLED`, and `SEARCH_API_REPLICA_ID` (default `local`). Serving
+    /// always resolves an exact catalog URI and version from the active dataset publication.
     ///
     /// Every other knob — dataset-handle cache sizing, index/metadata/disk cache budgets,
     /// serve-tag TTL, IO concurrency, ANN probe/refine/fast-search defaults, gRPC timeout and
@@ -324,17 +319,38 @@ impl Config {
         if base_uri.is_empty() {
             return Err("LANCE_ETL_BASE_URI must be a non-empty base URI".to_string());
         }
+        let database_url =
+            std::env::var("LANCE_ETL_DATABASE_URL").map_err(|_| "LANCE_ETL_DATABASE_URL must be set".to_string())?;
+        if database_url.is_empty() {
+            return Err("LANCE_ETL_DATABASE_URL must be non-empty".to_string());
+        }
+        let replica_id = env_string("SEARCH_API_REPLICA_ID", "local");
+        if replica_id.len() > 128
+            || !replica_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err("SEARCH_API_REPLICA_ID must match [A-Za-z0-9_.-]{1,128}".to_owned());
+        }
         let cache_backend = env_cache_backend()?;
         let redis_url = std::env::var("SEARCH_API_REDIS_URL").ok().filter(|url| !url.is_empty());
         if cache_backend == CacheBackendKind::Redis && redis_url.is_none() {
             return Err("SEARCH_API_REDIS_URL must be set when SEARCH_API_CACHE_BACKEND=redis".to_string());
         }
+        let port: u16 = env_number("SEARCH_API_PORT", DEFAULT_PORT)?;
+        if port == DEFAULT_HEALTH_PORT {
+            return Err(format!(
+                "SEARCH_API_PORT must not equal {DEFAULT_HEALTH_PORT}: that port is fixed for the plaintext gRPC health service and binding the search server there would collide with it"
+            ));
+        }
         Ok(Self {
             base_uri,
+            database_url,
+            replica_id,
             dataset_cache_capacity: DEFAULT_DATASET_CACHE_CAPACITY,
             index_cache_bytes: DEFAULT_INDEX_CACHE_BYTES,
             metadata_cache_bytes: DEFAULT_METADATA_CACHE_BYTES,
-            port: env_number("SEARCH_API_PORT", DEFAULT_PORT)?,
+            port,
             cache_dir: PathBuf::from(env_string("SEARCH_API_CACHE_DIR", DEFAULT_CACHE_DIR)),
             disk_index_cache_bytes: DEFAULT_DISK_INDEX_CACHE_BYTES,
             disk_store_cache_bytes: DEFAULT_DISK_STORE_CACHE_BYTES,
@@ -343,35 +359,20 @@ impl Config {
             redis_namespace: env_string("SEARCH_API_REDIS_NAMESPACE", DEFAULT_REDIS_NAMESPACE),
             statsd_addr: env_string("SEARCH_API_STATSD_ADDR", &default_statsd_addr()),
             telemetry_disabled: env_bool("SEARCH_API_TELEMETRY_DISABLED", false)?,
-            serve_by_tag: env_bool("SEARCH_API_SERVE_BY_TAG", DEFAULT_SERVE_BY_TAG)?,
-            serve_tag: env_string("SEARCH_API_SERVE_TAG", DEFAULT_SERVE_TAG),
             serve_tag_ttl_secs: DEFAULT_SERVE_TAG_TTL_SECS,
-            prewarm_targets_path: {
-                let raw = env_string("SEARCH_API_PREWARM_TARGETS_PATH", DEFAULT_PREWARM_TARGETS_PATH);
-                if raw.is_empty() {
-                    None
-                } else {
-                    Some(std::path::PathBuf::from(raw))
-                }
-            },
         })
     }
 }
 
 /// Resolves the cache backend selection.
 ///
-/// `SEARCH_API_CACHE_BACKEND` wins when set. Otherwise the deprecated
-/// `SEARCH_API_DISK_CACHE_DISABLED=true` alias maps to [`CacheBackendKind::Memory`] (with a
-/// deprecation warning), and the default is [`CacheBackendKind::Disk`].
+/// `SEARCH_API_CACHE_BACKEND` selects the backend when set. Otherwise the default is
+/// [`CacheBackendKind::Disk`].
 fn env_cache_backend() -> Result<CacheBackendKind, String> {
     if let Ok(raw) = std::env::var("SEARCH_API_CACHE_BACKEND") {
         return raw
             .parse::<CacheBackendKind>()
             .map_err(|err| format!("SEARCH_API_CACHE_BACKEND {err}"));
-    }
-    if env_bool("SEARCH_API_DISK_CACHE_DISABLED", false)? {
-        tracing::warn!("SEARCH_API_DISK_CACHE_DISABLED is deprecated, use SEARCH_API_CACHE_BACKEND=memory");
-        return Ok(CacheBackendKind::Memory);
     }
     Ok(CacheBackendKind::Disk)
 }
@@ -423,11 +424,15 @@ mod tests {
     /// Runs `body` with the given env vars set, restoring the previous state afterwards.
     fn with_env(vars: &[(&str, Option<&str>)], body: impl FnOnce()) {
         let guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous: Vec<(String, Option<String>)> = vars
+        let mut effective = vars.to_vec();
+        if !effective.iter().any(|(name, _)| *name == "LANCE_ETL_DATABASE_URL") {
+            effective.push(("LANCE_ETL_DATABASE_URL", Some("postgresql://catalog/test")));
+        }
+        let previous: Vec<(String, Option<String>)> = effective
             .iter()
             .map(|(name, _)| ((*name).to_string(), std::env::var(name).ok()))
             .collect();
-        for (name, value) in vars {
+        for (name, value) in &effective {
             match value {
                 Some(value) => unsafe { std::env::set_var(name, value) },
                 None => unsafe { std::env::remove_var(name) },
@@ -444,28 +449,27 @@ mod tests {
     }
 
     /// Env var names cleared so defaults apply in tests.
-    const OPTIONAL_VARS: [&str; 12] = [
+    const OPTIONAL_VARS: [&str; 6] = [
         "SEARCH_API_CACHE_BACKEND",
         "SEARCH_API_REDIS_URL",
         "SEARCH_API_REDIS_NAMESPACE",
-        "SEARCH_API_SERVE_BY_TAG",
-        "SEARCH_API_SERVE_TAG",
         "SEARCH_API_PORT",
         "SEARCH_API_CACHE_DIR",
-        "SEARCH_API_DISK_CACHE_DISABLED",
         "SEARCH_API_STATSD_ADDR",
-        "SEARCH_API_TELEMETRY_DISABLED",
-        "DD_AGENT_HOST",
-        "SEARCH_API_PREWARM_TARGETS_PATH",
     ];
 
     #[test]
     fn defaults_apply_when_env_unset() {
         let mut vars: Vec<(&str, Option<&str>)> = vec![("LANCE_ETL_BASE_URI", Some("/data/lance/"))];
         vars.extend(OPTIONAL_VARS.iter().map(|name| (*name, None)));
+        vars.push(("SEARCH_API_TELEMETRY_DISABLED", None));
+        vars.push(("DD_AGENT_HOST", None));
+        vars.push(("SEARCH_API_REPLICA_ID", None));
         with_env(&vars, || {
             let config = Config::from_env().unwrap();
             assert_eq!(config.base_uri, "/data/lance", "trailing slash must be stripped");
+            assert_eq!(config.database_url, "postgresql://catalog/test");
+            assert_eq!(config.replica_id, "local");
             assert_eq!(config.dataset_cache_capacity, DEFAULT_DATASET_CACHE_CAPACITY);
             assert_eq!(config.index_cache_bytes, DEFAULT_INDEX_CACHE_BYTES);
             assert_eq!(config.metadata_cache_bytes, DEFAULT_METADATA_CACHE_BYTES);
@@ -477,29 +481,51 @@ mod tests {
             assert_eq!(config.redis_namespace, DEFAULT_REDIS_NAMESPACE);
             assert_eq!(config.statsd_addr, DEFAULT_STATSD_ADDR);
             assert!(!config.telemetry_disabled);
-            assert_eq!(config.serve_by_tag, DEFAULT_SERVE_BY_TAG);
-            assert_eq!(config.serve_tag, DEFAULT_SERVE_TAG);
-            assert_eq!(config.serve_tag, "HEAD", "the default serve tag is HEAD");
             assert_eq!(config.serve_tag_ttl_secs, DEFAULT_SERVE_TAG_TTL_SECS);
-            assert!(config.prewarm_targets_path.is_none());
         });
     }
 
     #[test]
-    fn serve_tag_env_overrides_apply() {
+    fn replica_id_defaults_to_local_and_accepts_an_override() {
         with_env(
             &[
-                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
-                ("SEARCH_API_SERVE_BY_TAG", Some("true")),
-                ("SEARCH_API_SERVE_TAG", Some("green")),
+                ("LANCE_ETL_BASE_URI", Some("/tmp/lance")),
+                ("SEARCH_API_REPLICA_ID", None),
             ],
             || {
                 let config = Config::from_env().unwrap();
-                assert!(config.serve_by_tag);
-                assert_eq!(config.serve_tag, "green");
+                assert_eq!(config.replica_id, "local");
+            },
+        );
+        with_env(
+            &[
+                ("LANCE_ETL_BASE_URI", Some("/tmp/lance")),
+                ("SEARCH_API_REPLICA_ID", Some("search-api-0")),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.replica_id, "search-api-0");
+            },
+        );
+    }
+
+    #[test]
+    fn removed_env_surfaces_are_ignored() {
+        with_env(
+            &[
+                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
+                ("SEARCH_API_CACHE_BACKEND", None),
+                ("SEARCH_API_SERVE_BY_TAG", Some("false")),
+                ("SEARCH_API_SERVE_TAG", Some("green")),
+                ("SEARCH_API_DISK_CACHE_DISABLED", Some("true")),
+                ("SEARCH_API_PREWARM_TARGETS_PATH", Some("/tmp/targets.txt")),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.cache_backend, CacheBackendKind::Disk);
                 assert_eq!(
                     config.serve_tag_ttl_secs, DEFAULT_SERVE_TAG_TTL_SECS,
-                    "serve_tag_ttl_secs is fixed and no longer env-configurable"
+                    "legacy unpinned-handle TTL remains fixed"
                 );
             },
         );
@@ -542,8 +568,7 @@ mod tests {
             &[
                 ("LANCE_ETL_BASE_URI", Some("/data/lance")),
                 ("SEARCH_API_CACHE_DIR", Some("/var/cache/search")),
-                ("SEARCH_API_CACHE_BACKEND", None),
-                ("SEARCH_API_DISK_CACHE_DISABLED", Some("true")),
+                ("SEARCH_API_CACHE_BACKEND", Some("memory")),
             ],
             || {
                 let config = Config::from_env().unwrap();
@@ -555,28 +580,21 @@ mod tests {
 
     #[test]
     fn bool_parsing_accepts_common_spellings_and_rejects_garbage() {
-        for (raw, expected) in [
-            ("1", CacheBackendKind::Memory),
-            ("Yes", CacheBackendKind::Memory),
-            ("off", CacheBackendKind::Disk),
-            ("FALSE", CacheBackendKind::Disk),
-        ] {
+        for (raw, expected) in [("1", true), ("Yes", true), ("off", false), ("FALSE", false)] {
             with_env(
                 &[
                     ("LANCE_ETL_BASE_URI", Some("/data/lance")),
-                    ("SEARCH_API_CACHE_BACKEND", None),
-                    ("SEARCH_API_DISK_CACHE_DISABLED", Some(raw)),
+                    ("SEARCH_API_TELEMETRY_DISABLED", Some(raw)),
                 ],
                 || {
-                    assert_eq!(Config::from_env().unwrap().cache_backend, expected);
+                    assert_eq!(Config::from_env().unwrap().telemetry_disabled, expected);
                 },
             );
         }
         with_env(
             &[
                 ("LANCE_ETL_BASE_URI", Some("/data/lance")),
-                ("SEARCH_API_CACHE_BACKEND", None),
-                ("SEARCH_API_DISK_CACHE_DISABLED", Some("maybe")),
+                ("SEARCH_API_TELEMETRY_DISABLED", Some("maybe")),
             ],
             || {
                 assert!(Config::from_env().is_err());
@@ -644,20 +662,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_backend_wins_over_the_deprecated_disabled_alias() {
-        with_env(
-            &[
-                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
-                ("SEARCH_API_CACHE_BACKEND", Some("disk")),
-                ("SEARCH_API_DISK_CACHE_DISABLED", Some("true")),
-            ],
-            || {
-                assert_eq!(Config::from_env().unwrap().cache_backend, CacheBackendKind::Disk);
-            },
-        );
-    }
-
-    #[test]
     fn invalid_numbers_are_rejected() {
         with_env(
             &[
@@ -667,6 +671,37 @@ mod tests {
             || {
                 let err = Config::from_env().unwrap_err();
                 assert!(err.contains("SEARCH_API_PORT"));
+            },
+        );
+    }
+
+    #[test]
+    fn port_colliding_with_the_fixed_health_port_is_rejected() {
+        with_env(
+            &[
+                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
+                ("SEARCH_API_PORT", Some("8081")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err();
+                assert!(
+                    err.contains("SEARCH_API_PORT") && err.contains("8081"),
+                    "expected an explicit collision message naming the port, got {err:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn a_port_distinct_from_the_health_port_is_accepted() {
+        with_env(
+            &[
+                ("LANCE_ETL_BASE_URI", Some("/data/lance")),
+                ("SEARCH_API_PORT", Some("9090")),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.port, 9090);
             },
         );
     }

@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use crate::domain::catalog::ServingRoute;
 use crate::domain::error::SearchError;
 use crate::domain::target::{DatasetRef, DatasetTarget};
 
@@ -100,6 +101,16 @@ pub trait Prewarmer: Send + Sync + 'static {
         target: &DatasetTarget,
         spec: PrewarmSpec,
         reference: DatasetRef,
+    ) -> impl Future<Output = Result<PrewarmReport, SearchError>> + Send;
+}
+
+/// Unauthenticated replica-local prewarm contract over one explicit immutable serving route.
+pub trait ExactPrewarmer: Send + Sync + 'static {
+    /// Warms metadata and every committed user index for exactly `route` on the local process.
+    fn prewarm_exact(
+        &self,
+        target: &DatasetTarget,
+        route: ServingRoute,
     ) -> impl Future<Output = Result<PrewarmReport, SearchError>> + Send;
 }
 

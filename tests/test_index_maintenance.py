@@ -13,7 +13,7 @@ from pathlib import Path
 import lance
 import pyarrow as pa
 import pytest
-from conftest import make_vector_table, write_fragmented_dataset
+from conftest import FakeSpark, make_vector_table, write_fragmented_dataset
 from lance.dataset import Index
 from lance.optimize import Compaction
 
@@ -21,6 +21,7 @@ from lance_etl.indexing import (
     BTreeIndexHandler,
     FtsIndexHandler,
     IndexJobConfig,
+    LanceIndexer,
     VectorIndexHandler,
     bootstrap_vector_index,
     centroid_sidecar_uri,
@@ -206,7 +207,9 @@ def test_plan_rebuild_flag_forces_specs(dataset_uri: str, telemetry: Telemetry) 
     plan: dict[str, object] = plan_dataset_indexes(dataset_uri, rebuild_config, telemetry)
     assert "skipped" not in plan
     assert {spec["index_name"] for spec in plan["specs"]} == {"id_idx", "text_fts_idx"}
-    assert all(spec["shards"] for spec in plan["specs"])
+    assert all(int(spec["fragments"]) == len(lance.dataset(dataset_uri).get_fragments()) for spec in plan["specs"])
+    assert all(int(spec["shard_count"]) > 0 for spec in plan["specs"])
+    assert all("shards" not in spec for spec in plan["specs"])
 
 
 def test_optimize_existing_index_covers_new_fragments(dataset_uri: str, telemetry: Telemetry) -> None:
@@ -228,6 +231,68 @@ def test_merge_index_deltas_bounds_accumulation(dataset_uri: str, telemetry: Tel
     assert index_delta_count(lance.dataset(dataset_uri), "id_idx") == 1
     assert merge_index_deltas(dataset_uri, "id_idx", config, telemetry) is False
     assert lance.dataset(dataset_uri).to_table(filter="id = 7").num_rows == 1
+
+
+def test_full_coverage_index_over_delta_cap_is_merged_by_fleet_run(dataset_uri: str, telemetry: Telemetry) -> None:
+    """A delta-only plan converges even when the current run builds no new fragments.
+
+    Args:
+        dataset_uri: URI of the pre-built test dataset.
+        telemetry: The telemetry facade fixture.
+    """
+    config: IndexJobConfig = IndexJobConfig(
+        telemetry=TelemetryConfig(),
+        scalar_columns=["id"],
+        max_index_deltas=1,
+        commit_backoff_seconds=0.0,
+    )
+    build_btree_segments(dataset_uri, config, telemetry, shards=2)
+    assert index_delta_count(lance.dataset(dataset_uri), "id_idx") == 2
+
+    results: list[dict[str, object]] = LanceIndexer(config).run(FakeSpark(), [dataset_uri])
+
+    assert index_delta_count(lance.dataset(dataset_uri), "id_idx") == 1
+    by_index: dict[str, dict[str, object]] = {item["index"]: item for item in results[0]["indexes"]}
+    assert by_index["id_idx"]["segments"] == 0
+    assert by_index["id_idx"]["deltas_merged"] is True
+
+
+def test_validation_failure_isolated_from_other_index_specs(tmp_path: Path, telemetry: Telemetry) -> None:
+    """An invalid vector index does not prevent a valid scalar index from being planned.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        telemetry: The telemetry facade fixture.
+    """
+    uri: str = str(tmp_path / "invalid-vector.lance")
+    write_fragmented_dataset(uri, make_vector_table(rows=ROWS, dim=10), max_rows_per_file=ROWS_PER_FRAGMENT)
+    config: IndexJobConfig = IndexJobConfig(
+        telemetry=TelemetryConfig(),
+        vector_columns=["vector"],
+        scalar_columns=["id"],
+        vector_min_rows=1,
+        commit_backoff_seconds=0.0,
+    )
+
+    plan: dict[str, object] = plan_dataset_indexes(uri, config, telemetry)
+
+    validation: dict[str, object] = next(item for item in plan["done"] if item["index"] == "vector_idx")
+    assert validation["phase"] == "validation"
+    assert "divisible by 8" in validation["error"]
+    assert {spec["index_name"] for spec in plan["specs"]} == {"id_idx"}
+
+
+def test_missing_vector_config_always_requires_bootstrap(dataset_uri: str) -> None:
+    """Zero coverage cannot route a config-less vector index into a segment build.
+
+    Args:
+        dataset_uri: URI of the pre-built test dataset.
+    """
+    config: IndexJobConfig = vector_only_config()
+    handler: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
+    assert load_vector_config(lance.dataset(dataset_uri), "vector") is None
+    assert handler.covered_fragments(lance.dataset(dataset_uri)) == set()
+    assert handler.needs_bootstrap(lance.dataset(dataset_uri)) is True
 
 
 def test_bootstrap_records_rows_at_train(dataset_uri: str, telemetry: Telemetry) -> None:
@@ -290,8 +355,8 @@ def test_within_growth_factor_reuses_artifacts(dataset_uri: str, telemetry: Tele
     config: IndexJobConfig = maintenance_config()
     bootstrap_vector_index(dataset_uri, "vector", "vector_idx", config, telemetry)
     second: VectorIndexHandler = VectorIndexHandler(config, "vector", "vector_idx")
-    second.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
-    assert second.reused_artifacts is True
+    artifacts: tuple = second.prepare(lance.dataset(dataset_uri), dataset_uri, telemetry)
+    assert len(artifacts) == 4
 
     plan: dict[str, object] = plan_dataset_indexes(dataset_uri, vector_only_config(), telemetry)
     assert all(spec["mode"] != "bootstrap" for spec in plan.get("specs", []))
@@ -420,6 +485,16 @@ def test_fts_rebuild_swaps_old_index_atomically(dataset_uri: str, telemetry: Tel
     fragment_ids: list[int] = fragment_ids_of(dataset_uri)
     pinned: lance.LanceDataset = lance.dataset(dataset_uri, version=dataset.version)
     shared_uuid: str = "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f"
+    with pytest.raises(RuntimeError, match="use replace=True"):
+        pinned.create_scalar_index(
+            column="text",
+            index_type="INVERTED",
+            name=index_name,
+            replace=False,
+            index_uuid="1f1f1f1f-1f1f-4f1f-8f1f-1f1f1f1f1f1f",
+            fragment_ids=[fragment_ids[0]],
+            **config.fts_params(),
+        )
     for fragment_id in fragment_ids:
         pinned.create_scalar_index(
             column="text",

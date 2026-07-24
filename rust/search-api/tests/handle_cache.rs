@@ -32,7 +32,13 @@ async fn write_dataset(uri: &str, fragments: usize) {
         max_rows_per_file: 1,
         ..Default::default()
     };
-    Dataset::write(reader, uri, Some(params)).await.unwrap();
+    let dataset = Dataset::write(reader, uri, Some(params)).await.unwrap();
+    let head_version = dataset.version_id();
+    dataset
+        .tags()
+        .create(search_api::config::PRODUCTION_SERVE_TAG, head_version)
+        .await
+        .unwrap();
 }
 
 /// Builds a memory-only config (no disk tiers) over fresh temp dirs with the given handle-cache

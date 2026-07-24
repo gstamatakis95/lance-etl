@@ -17,10 +17,10 @@ tonic adapter and the only place proto types appear, and `cache` and `telemetry`
 Filtering uses a typed `Filter` AST (comparison, in-list, is-null, between, and/or/not), never a
 SQL string. Column names are validated against the dataset schema and the identifier allowlist
 `[A-Za-z_][A-Za-z0-9_]*`, literals become typed DataFusion `lit` expressions, and injection
-attempts are rejected at the allowlist (covered by tests). The `SearchService` and
-`IntakeService` share one proto file (`proto/lance_etl/v1/lance_etl.proto`) and one
-`DatasetTarget` message. `HybridSearchRequest` additionally accepts a request-level typed filter
-that is ANDed into both legs before either index search runs.
+attempts are rejected at the allowlist (covered by tests). The `SearchService` is defined in
+`proto/lance_etl/v1/lance_etl.proto` and uses one `DatasetTarget` message across its RPCs.
+`HybridSearchRequest` additionally accepts a request-level typed filter that is ANDed into both
+legs before either index search runs.
 
 ## ADR 0014 — One dataset per target, time queries as scalar filters
 
@@ -41,8 +41,8 @@ Status: Accepted
 
 An optional `TimeRange { start_ms, end_ms }` message (epoch milliseconds, start inclusive, end
 exclusive, either bound optional) rides on all three search requests and always applies to the
-event-timestamp column, fixed to the `DEFAULT_EVENT_TIMESTAMP_COLUMN` constant in `config.rs`
-(`event_timestamp`, no longer env-configurable). The
+time column, fixed to the `DEFAULT_TS_COLUMN` constant in `config.rs`
+(`ts`, no longer env-configurable). The
 range translates through the typed-filter path — each bound becomes a literal of the column's
 own Arrow type (timestamp scaled to the column `TimeUnit` with its timezone, or a plain integer
 for epoch-integer columns), so no cross-type coercion occurs. The range ANDs with any
@@ -53,7 +53,7 @@ every path unchanged.
 
 Status: Accepted (originally Proposed, since implemented and extended by ADR 0032)
 
-A serving tag (default `HEAD`, configurable) updated via `tags.update` provides O(1) cutover.
+A fixed production tag named `HEAD` updated via `tags.update` provides O(1) cutover.
 The safety rules that make it correct with version-keyed caches:
 
 - Prewarm accepts an explicit version or tag and returns the resolved version, so green is
@@ -67,8 +67,9 @@ The safety rules that make it correct with version-keyed caches:
 - Telemetry makes a flip-without-prewarm observable (`serve.cold_open` tagged `warmed`).
 - Version cleanup never deletes a tagged version, and green is tagged before cleanup runs.
 
-Serving through the tag is opt-in via `SEARCH_API_SERVE_BY_TAG`. The Python tag helper only
-writes the tag and logs the safe sequence — the serving layer is never assumed to auto-refresh.
+Production serving always resolves `HEAD`. There is no environment switch to fall back to latest
+or select another production tag. The Python tag helper requires an explicit target version for
+`HEAD` and logs the safe sequence. The serving layer is never assumed to auto-refresh.
 
 **Tag retention versus the cleanup horizon.** Interval tags pin the versions they point at, and
 the count-based prune (`tag_keep_last`, hourly by convention) unpins the oldest tag's version
@@ -97,10 +98,10 @@ Status: Accepted
 
 Every search request carries an optional `version_ref` oneof (a committed version id or a tag
 name, such as an ETL hourly interval tag). Unset means the serve policy — latest, or the
-resolved serve tag when serve-by-tag is on — so the common latest path pays nothing. The
-unpinned latest handle is itself freshness-bounded by the serve-tag TTL (per-entry expiry in
-the handle LRU), so a new commit becomes visible within one TTL window even on a low-traffic
-tenant whose handle capacity pressure would never evict. A pinned
+resolved fixed `HEAD` tag — so unvalidated latest versions are never production-visible. The
+resolved `HEAD` handle is freshness-bounded by the tag TTL (per-entry expiry in the handle LRU),
+so a promotion becomes visible within one TTL window even on a low-traffic tenant whose handle
+capacity pressure would never evict. A pinned
 request opens exactly that snapshot, and a hybrid pin opens both legs at the same resolved
 version so fusion dedup stays consistent. Open INTENT is explicit rather than inferred from the
 reference: prewarm opens route through `DatasetProvider::dataset_for_prewarm` while serving

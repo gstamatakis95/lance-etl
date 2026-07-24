@@ -20,7 +20,7 @@ from lance_etl.recall import (
     parse_samples,
 )
 
-COLUMNS: frozenset[str] = frozenset({"category", "value", "score", "flag", "vector_id"})
+COLUMNS: frozenset[str] = frozenset({"category", "value", "score", "flag", "record_id"})
 
 
 def make_attrs(**overrides: Any) -> dict[str, Any]:
@@ -106,21 +106,42 @@ class TestSampleParsing:
             ({"sample_id": None}, "missing:recall.sample_id"),
             ({"k": None}, "missing:recall.k"),
             ({"k": "0"}, "invalid:recall.k"),
+            ({"k": "10001"}, "invalid:recall.k"),
             ({"k": "ten"}, "invalid:recall.k"),
+            ({"dataset_version": "0"}, "invalid:recall.dataset_version"),
+            ({"dataset_version": "-1"}, "invalid:recall.dataset_version"),
             ({"dataset_version": "x"}, "invalid:recall.dataset_version"),
+            ({"dataset_version": True}, "invalid:recall.dataset_version"),
+            ({"dataset_version": 1.9}, "invalid:recall.dataset_version"),
+            ({"dataset_version": float("inf")}, "invalid:recall.dataset_version"),
+            ({"dataset_version": str(1 << 63)}, "invalid:recall.dataset_version"),
             ({"captured_at_unix_ms": None}, "missing:recall.captured_at_unix_ms"),
             ({"org_id": "../etc"}, "invalid:recall.org_id"),
             ({"org_id": "."}, "invalid:recall.org_id"),
             ({"org_id": ".."}, "invalid:recall.org_id"),
+            ({"org_id": "a.b"}, "invalid:recall.org_id"),
+            ({"org_id": "a" * 129}, "invalid:recall.org_id"),
             ({"tenant_id": "a/b"}, "invalid:recall.tenant_id"),
             ({"namespace": ""}, "missing:recall.namespace"),
             ({"query_vector": "not json"}, "invalid:recall.query_vector"),
             ({"query_vector": "[]"}, "invalid:recall.query_vector"),
             ({"query_vector": '["a"]'}, "invalid:recall.query_vector"),
+            ({"query_vector": "[NaN]"}, "invalid:recall.query_vector"),
+            ({"query_vector": "[Infinity]"}, "invalid:recall.query_vector"),
+            ({"query_vector": f"[{10**400}]"}, "invalid:recall.query_vector"),
             ({"query_vector": None}, "missing:recall.query_vector"),
             ({"distance_type": "manhattan"}, "invalid:recall.distance_type"),
             ({"result_ids": '{"a":1}'}, "invalid:recall.result_ids"),
+            ({"result_ids": json.dumps([[1]])}, "invalid:recall.result_ids"),
+            ({"result_ids": json.dumps([{"id": 1}])}, "invalid:recall.result_ids"),
+            ({"result_ids": json.dumps([None])}, "invalid:recall.result_ids"),
+            ({"result_ids": json.dumps([True])}, "invalid:recall.result_ids"),
+            ({"result_ids": json.dumps([1 << 64])}, "invalid:recall.result_ids"),
+            ({"result_ids": json.dumps([float("inf")])}, "invalid:recall.result_ids"),
+            ({"result_ids": json.dumps(["x" * 4097])}, "invalid:recall.result_ids"),
             ({"result_distances": '["x"]'}, "invalid:recall.result_distances"),
+            ({"result_distances": "[true]"}, "invalid:recall.result_distances"),
+            ({"result_distances": "[NaN]"}, "invalid:recall.result_distances"),
             ({"filter": "[1,2]"}, "invalid:recall.filter"),
             ({"nprobes_min": "low"}, "invalid:recall.nprobes_min"),
         ],
@@ -130,6 +151,31 @@ class TestSampleParsing:
         samples, skips = parse_samples([make_attrs(**overrides)])
         assert samples == []
         assert skips == {reason: 1}
+
+    @pytest.mark.parametrize(
+        ("overrides", "reason"),
+        [
+            ({"result_ids": json.dumps(list(range(11)))}, "invalid:recall.result_ids"),
+            ({"result_distances": json.dumps([0.0] * 11)}, "invalid:recall.result_distances"),
+            ({"result_scores": json.dumps([0.0] * 11)}, "invalid:recall.result_scores"),
+            ({"query_vector": json.dumps([0.0] * 16_385)}, "invalid:recall.query_vector"),
+        ],
+    )
+    def test_oversized_capture_arrays_are_rejected(self, overrides: dict[str, Any], reason: str) -> None:
+        """Captured arrays cannot exceed the request or defensive vector-dimension bounds.
+
+        Args:
+            overrides: Oversized capture field.
+            reason: Expected bounded parse reason.
+        """
+        samples, skips = parse_samples([make_attrs(**overrides)])
+        assert samples == []
+        assert skips == {reason: 1}
+
+    def test_bounded_scalar_result_ids_parse(self) -> None:
+        """Strings, supported integers, and finite floating ids remain accepted."""
+        sample: RecallSample = parse_recall_sample(make_attrs(result_ids=json.dumps(["abc", -1, 2.5])))
+        assert sample.result_ids == ("abc", -1, 2.5)
 
     def test_mixed_batch_counts_each_reason(self) -> None:
         """A batch of good and bad records yields the good samples plus per-reason counts."""
@@ -215,7 +261,7 @@ class TestFilterTranslation:
 
     @pytest.mark.parametrize(
         "column",
-        ["vector_id; DROP TABLE t", "1abc", "a-b", "a b", "", "col'umn", None, 42],
+        ["record_id; DROP TABLE t", "1abc", "a-b", "a b", "", "col'umn", None, 42],
     )
     def test_malicious_or_invalid_columns_rejected(self, column: Any) -> None:
         """Identifiers outside the allowlist are rejected before schema lookup."""
@@ -237,11 +283,18 @@ class TestFilterTranslation:
             {"and": []},
             {"or": "value"},
             {"in_list": {"column": "value", "values": [], "negated": False}},
+            {"in_list": {"column": "value", "values": [{"int": 1}], "negated": "false"}},
+            {"compare": []},
+            {"in_list": "value"},
+            {"is_null": None},
+            {"is_not_null": []},
+            {"between": "value"},
             {"compare": {"column": "value", "op": "eq", "value": {"int": 1}}, "extra": {}},
             "not a node",
             {"compare": {"column": "value", "op": "eq", "value": {"decimal": 1}}},
             {"compare": {"column": "value", "op": "eq", "value": {"int": True}}},
             {"compare": {"column": "value", "op": "eq", "value": {"float": float("inf")}}},
+            {"compare": {"column": "value", "op": "eq", "value": {"float": 10**400}}},
             {"compare": {"column": "value", "op": "eq", "value": {"string": 5}}},
             {"compare": {"column": "value", "op": "eq", "value": {"bool": "yes"}}},
         ],

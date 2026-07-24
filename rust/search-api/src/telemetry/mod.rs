@@ -18,9 +18,9 @@
 //! # Metric catalog
 //!
 //! All metrics flow through the typed [`Metrics`] facade (DogStatsD, prefix `search_api.`).
-//! Cardinality policy: metrics carry only the low-cardinality tags listed below. Per-org,
-//! per-tenant, and per-version detail lives on spans and logs, never on metrics. Every emitter is
-//! infallible (an unreachable Agent never panics and never fails a request).
+//! Cardinality and privacy policy: normal metrics, spans, and logs contain no target identity,
+//! storage URI, or raw engine error. Every emitter is infallible (an unreachable Agent never
+//! panics and never fails a request).
 //!
 //! RPC surface ([`metrics::Metrics::rpc`]):
 //! - `rpc.requests` (count), `rpc.duration_ms` (distribution), `rpc.errors` (count, non-ok only),
@@ -62,25 +62,28 @@
 //!   (distribution), `prewarm.last_version` (gauge: most recently warmed version).
 //! - `serve.cold_open` (count, tagged `warmed`): a serving cold open whose version had or had not
 //!   been prewarmed. `warmed:false` is the flip-without-prewarm signal.
-//! - `serve.tag_resolved` (count, tagged `changed`): a serve-tag re-resolution after the TTL
-//!   lapsed. `changed:true` marks a replica observing a tag flip.
+//! - `serve.tag_resolved` (count, tagged `changed`): a `HEAD` re-resolution after the TTL lapsed.
+//!   `changed:true` marks a replica observing a `HEAD` move.
 //!
-//! Clusters and recall ([`metrics::Metrics::clusters_read`], `clusters_centroids`,
-//! `recall_sample`):
-//! - `clusters.read.duration_ms` (distribution: centroid read duration), `clusters.centroids`
-//!   (distribution: centroid count), `recall.samples` (count, tagged `query_type`/`filtered`).
+//! Recall and index probing ([`metrics::Metrics::recall_sample`],
+//! [`metrics::Metrics::index_probe_error`]):
+//! - `recall.samples` (count, tagged `query_type`/`filtered`).
+//! - `index_probe_errors` (count, tagged `kind`): an index-metadata load failure while probing for
+//!   a committed index, which silently disables the `fast_search` default for the affected leg.
 //!
-//! Spans (via the OpenTelemetry layer) carry the high-cardinality detail: `org_id`, `tenant_id`,
-//! `namespace`, `dataset.version`, `prewarm.resolved_version`, `clusters.index`, and the gRPC
-//! status code.
+//! Normal spans carry bounded execution facts such as `search.k`, `dataset.version`, aggregate
+//! object-store counters, and the gRPC status code. Target identity and storage URI are omitted.
 
 pub mod metrics;
 pub mod recall;
 pub mod traces;
 
+#[cfg(test)]
+pub(crate) static TRACING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub use metrics::{
-    CacheName, DatasetEvent, EvictionReason, FileAuditMode, FileAuditType, IntakeRpc, LanceIoType, Metrics,
-    PrewarmIndexKind, PrewarmStatus, Rpc, StoreOp, Tier,
+    CacheName, DatasetEvent, EvictionReason, FileAuditMode, FileAuditType, LanceIoType, Metrics, PrewarmIndexKind,
+    PrewarmStatus, Rpc, StoreOp, Tier,
 };
 pub use recall::{RecallCapture, RecallHook, RecallQueryType, RecallRecord};
 pub use traces::{LanceEventMetricsLayer, TelemetryGuard, init_tracing};

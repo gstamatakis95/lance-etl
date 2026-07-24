@@ -79,9 +79,15 @@ def render_filter_literal(value: Any) -> str:
             raise FilterTranslationError(f"int literal payload must be an integer: {raw!r}")
         return str(raw)
     if tag == "float":
-        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(float(raw)):
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
             raise FilterTranslationError(f"float literal payload must be a finite number: {raw!r}")
-        return repr(float(raw))
+        try:
+            rendered_float: float = float(raw)
+        except (OverflowError, ValueError) as error:
+            raise FilterTranslationError(f"float literal payload must be a finite number: {raw!r}") from error
+        if not math.isfinite(rendered_float):
+            raise FilterTranslationError(f"float literal payload must be a finite number: {raw!r}")
+        return repr(rendered_float)
     if tag == "string":
         if not isinstance(raw, str):
             raise FilterTranslationError(f"string literal payload must be a string: {raw!r}")
@@ -92,6 +98,50 @@ def render_filter_literal(value: Any) -> str:
             raise FilterTranslationError(f"bool literal payload must be a boolean: {raw!r}")
         return "TRUE" if raw else "FALSE"
     raise FilterTranslationError(f"unknown filter literal tag: {tag!r}")
+
+
+def filter_body_object(tag: str, body: Any) -> dict[str, Any]:
+    """Validate and return an object-shaped filter node body.
+
+    Args:
+        tag: Filter node tag used in the validation error.
+        body: Captured node body.
+
+    Returns:
+        The validated dictionary body.
+
+    Raises:
+        FilterTranslationError: If the body is not an object.
+    """
+    if not isinstance(body, dict):
+        raise FilterTranslationError(f"{tag} body must be an object: {body!r}")
+    return body
+
+
+def render_in_list_filter(body: Any, columns: frozenset[str]) -> str:
+    """Validate and render one membership filter node body.
+
+    Args:
+        body: Captured ``in_list`` body.
+        columns: Dataset schema column names.
+
+    Returns:
+        The rendered membership expression.
+
+    Raises:
+        FilterTranslationError: If the body, values, or negation flag is malformed.
+    """
+    values_body: dict[str, Any] = filter_body_object("in_list", body)
+    column: str = render_filter_column(values_body.get("column"), columns)
+    values: Any = values_body.get("values")
+    if not isinstance(values, list) or not values:
+        raise FilterTranslationError("in_list requires a non-empty values list")
+    negated: Any = values_body.get("negated", False)
+    if not isinstance(negated, bool):
+        raise FilterTranslationError("in_list negated must be a boolean")
+    rendered: str = ", ".join(render_filter_literal(value) for value in values)
+    keyword: str = "NOT IN" if negated else "IN"
+    return f"({column} {keyword} ({rendered}))"
 
 
 def filter_ast_to_sql(node: Any, columns: frozenset[str]) -> str:
@@ -115,24 +165,22 @@ def filter_ast_to_sql(node: Any, columns: frozenset[str]) -> str:
         raise FilterTranslationError(f"filter node must be a single-key tagged object: {node!r}")
     tag, body = next(iter(node.items()))
     if tag == "compare":
+        body = filter_body_object(tag, body)
         op: Any = body.get("op")
         if op not in COMPARE_OPS:
             raise FilterTranslationError(f"unknown compare op: {op!r}")
         column: str = render_filter_column(body.get("column"), columns)
         return f"({column} {COMPARE_OPS[op]} {render_filter_literal(body.get('value'))})"
     if tag == "in_list":
-        column = render_filter_column(body.get("column"), columns)
-        values: Any = body.get("values")
-        if not isinstance(values, list) or not values:
-            raise FilterTranslationError("in_list requires a non-empty values list")
-        rendered: str = ", ".join(render_filter_literal(value) for value in values)
-        keyword: str = "NOT IN" if body.get("negated", False) else "IN"
-        return f"({column} {keyword} ({rendered}))"
+        return render_in_list_filter(body, columns)
     if tag == "is_null":
+        body = filter_body_object(tag, body)
         return f"({render_filter_column(body.get('column'), columns)} IS NULL)"
     if tag == "is_not_null":
+        body = filter_body_object(tag, body)
         return f"({render_filter_column(body.get('column'), columns)} IS NOT NULL)"
     if tag == "between":
+        body = filter_body_object(tag, body)
         column = render_filter_column(body.get("column"), columns)
         low: str = render_filter_literal(body.get("low"))
         high: str = render_filter_literal(body.get("high"))
@@ -185,6 +233,30 @@ def tokenize_text(text: Any) -> list[str]:
     return TOKEN_PATTERN.findall(text.lower())
 
 
+def parse_text_boost(value: Any, context: str) -> float:
+    """Parse one finite numeric text-query boost with a normalized error type.
+
+    Args:
+        value: Captured boost value.
+        context: Human-readable clause context for the validation error.
+
+    Returns:
+        The finite boost as a float.
+
+    Raises:
+        TextQueryTranslationError: If the value is not a finite JSON number.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TextQueryTranslationError(f"{context} boost must be a finite number: {value!r}")
+    try:
+        boost: float = float(value)
+    except (OverflowError, ValueError) as error:
+        raise TextQueryTranslationError(f"{context} boost must be a finite number: {value!r}") from error
+    if not math.isfinite(boost):
+        raise TextQueryTranslationError(f"{context} boost must be a finite number: {value!r}")
+    return boost
+
+
 def text_query_field_queries(
     node: Any, text_columns: tuple[str, ...], columns: frozenset[str]
 ) -> list[tuple[str, list[str], str, float]]:
@@ -216,7 +288,7 @@ def text_query_field_queries(
         operator: str = body.get("operator", "or")
         if operator not in TEXT_OPERATORS:
             raise TextQueryTranslationError(f"unknown text operator: {operator!r}")
-        boost: float = float(body.get("boost", 1.0))
+        boost: float = parse_text_boost(body.get("boost", 1.0), "match")
         column: Any = body.get("column")
         targets: tuple[str, ...] = (column,) if column is not None else text_columns
         if not targets:
@@ -230,11 +302,12 @@ def text_query_field_queries(
         target_columns: Any = body.get("columns")
         if not isinstance(target_columns, list) or not target_columns:
             raise TextQueryTranslationError("multi_match requires a non-empty columns list")
-        boosts: Any = body.get("boosts") or [1.0] * len(target_columns)
+        raw_boosts: Any = body.get("boosts")
+        boosts: Any = [1.0] * len(target_columns) if raw_boosts is None or raw_boosts == [] else raw_boosts
         if not isinstance(boosts, list) or len(boosts) != len(target_columns):
             raise TextQueryTranslationError("multi_match boosts must match the columns length")
         return [
-            (validate_text_column(target, columns), terms, operator, float(weight))
+            (validate_text_column(target, columns), terms, operator, parse_text_boost(weight, "multi_match"))
             for target, weight in zip(target_columns, boosts, strict=True)
         ]
     raise TextQueryTranslationError(f"unsupported text query node tag: {tag!r}")
@@ -287,7 +360,7 @@ def normalize_leg(ids: list[Any], scores: list[float], lower_is_better: bool) ->
 
 def fuse_legs(
     fusion_ast: dict[str, Any],
-    vector_ids: list[Any],
+    record_ids: list[Any],
     vector_scores: list[float],
     text_ids: list[Any],
     text_scores: list[float],
@@ -302,8 +375,8 @@ def fuse_legs(
 
     Args:
         fusion_ast: The single-key fusion specification, ``{"rrf": {"k": ...}}`` or ``{"weighted": {...}}``.
-        vector_ids: The exact vector leg ids in best-first order.
-        vector_scores: The exact vector leg distances aligned with ``vector_ids``.
+        record_ids: The exact vector leg ids in best-first order.
+        vector_scores: The exact vector leg distances aligned with ``record_ids``.
         text_ids: The exact BM25 leg ids in best-first order.
         text_scores: The exact BM25 leg scores aligned with ``text_ids``.
         k: The number of fused results to return.
@@ -324,7 +397,7 @@ def fuse_legs(
         if isinstance(rrf_k, bool) or not isinstance(rrf_k, (int, float)) or rrf_k <= 0:
             raise FusionReplayError(f"rrf k must be a positive number: {rrf_k!r}")
         fused: dict[Any, float] = {}
-        for leg in (vector_ids, text_ids):
+        for leg in (record_ids, text_ids):
             for rank, rid in enumerate(leg):
                 fused[rid] = fused.get(rid, 0.0) + 1.0 / (float(rrf_k) + rank + 1.0)
         return sorted(fused, key=lambda rid: (-fused[rid], rid))[:k]
@@ -332,7 +405,7 @@ def fuse_legs(
         weight: Any = body.get("vector_weight")
         if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not 0.0 <= float(weight) <= 1.0:
             raise FusionReplayError(f"weighted vector_weight must be in [0, 1]: {weight!r}")
-        vector_norm: dict[Any, float] = normalize_leg(vector_ids, vector_scores, lower_is_better=True)
+        vector_norm: dict[Any, float] = normalize_leg(record_ids, vector_scores, lower_is_better=True)
         text_norm: dict[Any, float] = normalize_leg(text_ids, text_scores, lower_is_better=False)
         weight_value: float = float(weight)
         union: set[Any] = set(vector_norm) | set(text_norm)

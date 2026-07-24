@@ -54,9 +54,9 @@ pub fn time_range_to_expr(range: &TimeRange, column: &str, data_type: &DataType)
 
 /// Which side of the half-open `[start, end)` window a bound literal sits on.
 ///
-/// Needed by resolutions coarser than a millisecond: the start bound rounds down and the end
-/// bound rounds up, so the coarse predicate covers a superset of the requested window instead of
-/// silently dropping rows whose second-resolution value truncated past a bound.
+/// Needed by resolutions coarser than a millisecond: both bounds round up. A second-resolution
+/// timestamp is an exact instant at a whole second, so this preserves the millisecond half-open
+/// interval without admitting a row from the second before a non-aligned start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimeBound {
     /// The inclusive lower bound (`column >= start`).
@@ -75,8 +75,8 @@ enum TimeBound {
 /// other column type is rejected as an invalid argument. Scaling to microsecond or nanosecond
 /// resolution goes through `checked_mul`: an epoch-millisecond bound near `i64::MAX` would
 /// otherwise wrap in release builds and silently produce the wrong time predicate, so an
-/// out-of-range bound is rejected instead. Scaling down to second resolution rounds according to
-/// `bound` (start floors, end ceils), keeping the coarse window conservative-correct.
+/// out-of-range bound is rejected instead. Scaling down to second resolution rounds both bounds
+/// up, preserving exact membership for whole-second instants.
 fn time_literal(epoch_ms: i64, data_type: &DataType, bound: TimeBound) -> Result<Expr, SearchError> {
     match data_type {
         DataType::Timestamp(unit, tz) => {
@@ -108,17 +108,14 @@ fn time_literal(epoch_ms: i64, data_type: &DataType, bound: TimeBound) -> Result
 
 /// Converts an epoch-millisecond bound to whole seconds with bound-aware rounding.
 ///
-/// The start bound floors and the end bound ceils, so the second-resolution window
-/// `[floor(start), ceil(end))` is a superset of the requested millisecond window: a
-/// second-resolution row overlapping the requested window is never excluded. Both roundings use
-/// euclidean division so negative (pre-epoch) bounds round in the same direction as positive
-/// ones.
+/// Both bounds ceil, so the second-resolution window `[ceil(start), ceil(end))` contains exactly
+/// the whole-second instants in the requested millisecond window. Euclidean division keeps
+/// negative pre-epoch bounds correct.
 fn epoch_ms_to_seconds(epoch_ms: i64, bound: TimeBound) -> i64 {
     let floor = epoch_ms.div_euclid(MILLIS_PER_SECOND);
-    match bound {
-        TimeBound::Start => floor,
-        TimeBound::End if epoch_ms.rem_euclid(MILLIS_PER_SECOND) == 0 => floor,
-        TimeBound::End => floor + 1,
+    match (bound, epoch_ms.rem_euclid(MILLIS_PER_SECOND)) {
+        (_, 0) => floor,
+        (TimeBound::Start | TimeBound::End, _) => floor + 1,
     }
 }
 
@@ -367,13 +364,13 @@ mod tests {
             start_ms: Some(1_000),
             end_ms: Some(2_000),
         };
-        let expr = time_range_to_expr(&range, "event_timestamp", &data_type)
+        let expr = time_range_to_expr(&range, "ts", &data_type)
             .unwrap()
             .expect("a bounded window must produce an expression");
         let tz: Option<std::sync::Arc<str>> = Some("UTC".into());
-        let expected = col("event_timestamp")
+        let expected = col("ts")
             .gt_eq(lit(ScalarValue::TimestampMicrosecond(Some(1_000_000), tz.clone())))
-            .and(col("event_timestamp").lt(lit(ScalarValue::TimestampMicrosecond(Some(2_000_000), tz))));
+            .and(col("ts").lt(lit(ScalarValue::TimestampMicrosecond(Some(2_000_000), tz))));
         assert_eq!(expr, expected);
     }
 
@@ -385,14 +382,14 @@ mod tests {
                 start_ms: Some(5),
                 end_ms: None,
             },
-            "event_timestamp",
+            "ts",
             &millis,
         )
         .unwrap()
         .unwrap();
         assert_eq!(
             start_only,
-            col("event_timestamp").gt_eq(lit(ScalarValue::TimestampMillisecond(Some(5), None)))
+            col("ts").gt_eq(lit(ScalarValue::TimestampMillisecond(Some(5), None)))
         );
 
         let nanos = DataType::Timestamp(TimeUnit::Nanosecond, None);
@@ -401,14 +398,14 @@ mod tests {
                 start_ms: None,
                 end_ms: Some(3),
             },
-            "event_timestamp",
+            "ts",
             &nanos,
         )
         .unwrap()
         .unwrap();
         assert_eq!(
             end_only,
-            col("event_timestamp").lt(lit(ScalarValue::TimestampNanosecond(Some(3_000_000), None)))
+            col("ts").lt(lit(ScalarValue::TimestampNanosecond(Some(3_000_000), None)))
         );
     }
 
@@ -419,19 +416,19 @@ mod tests {
                 start_ms: Some(42),
                 end_ms: None,
             },
-            "event_timestamp",
+            "ts",
             &DataType::Int64,
         )
         .unwrap()
         .unwrap();
-        assert_eq!(expr, col("event_timestamp").gt_eq(lit(42_i64)));
+        assert_eq!(expr, col("ts").gt_eq(lit(42_i64)));
     }
 
     #[test]
     fn time_range_without_bounds_produces_no_expression() {
         let none = time_range_to_expr(
             &TimeRange::default(),
-            "event_timestamp",
+            "ts",
             &DataType::Timestamp(TimeUnit::Microsecond, None),
         )
         .unwrap();
@@ -445,7 +442,7 @@ mod tests {
                 start_ms: Some(1),
                 end_ms: None,
             },
-            "event_timestamp",
+            "ts",
             &DataType::Utf8,
         )
         .unwrap_err();
@@ -459,7 +456,7 @@ mod tests {
                 start_ms: Some(i64::MAX),
                 end_ms: None,
             },
-            "event_timestamp",
+            "ts",
             &DataType::Timestamp(TimeUnit::Microsecond, None),
         )
         .unwrap_err();
@@ -470,7 +467,7 @@ mod tests {
                 start_ms: Some(i64::MIN),
                 end_ms: None,
             },
-            "event_timestamp",
+            "ts",
             &DataType::Timestamp(TimeUnit::Nanosecond, None),
         )
         .unwrap_err();
@@ -478,24 +475,24 @@ mod tests {
     }
 
     #[test]
-    fn time_range_on_a_second_resolution_column_rounds_conservatively() {
+    fn time_range_on_a_second_resolution_column_preserves_millisecond_semantics() {
         let seconds = DataType::Timestamp(TimeUnit::Second, None);
         let expr = time_range_to_expr(
             &TimeRange {
                 start_ms: Some(1_500),
                 end_ms: Some(2_500),
             },
-            "event_timestamp",
+            "ts",
             &seconds,
         )
         .unwrap()
         .unwrap();
-        let expected = col("event_timestamp")
-            .gt_eq(lit(ScalarValue::TimestampSecond(Some(1), None)))
-            .and(col("event_timestamp").lt(lit(ScalarValue::TimestampSecond(Some(3), None))));
+        let expected = col("ts")
+            .gt_eq(lit(ScalarValue::TimestampSecond(Some(2), None)))
+            .and(col("ts").lt(lit(ScalarValue::TimestampSecond(Some(3), None))));
         assert_eq!(
             expr, expected,
-            "the start bound must floor and the end bound must ceil so the coarse window is a superset"
+            "both bounds must ceil so coarse storage never admits values outside the millisecond window"
         );
 
         let exact = time_range_to_expr(
@@ -503,14 +500,14 @@ mod tests {
                 start_ms: Some(2_000),
                 end_ms: Some(3_000),
             },
-            "event_timestamp",
+            "ts",
             &seconds,
         )
         .unwrap()
         .unwrap();
-        let expected_exact = col("event_timestamp")
+        let expected_exact = col("ts")
             .gt_eq(lit(ScalarValue::TimestampSecond(Some(2), None)))
-            .and(col("event_timestamp").lt(lit(ScalarValue::TimestampSecond(Some(3), None))));
+            .and(col("ts").lt(lit(ScalarValue::TimestampSecond(Some(3), None))));
         assert_eq!(exact, expected_exact, "exact-second bounds must not be widened");
 
         let negative = time_range_to_expr(
@@ -518,17 +515,17 @@ mod tests {
                 start_ms: Some(-1_500),
                 end_ms: Some(-500),
             },
-            "event_timestamp",
+            "ts",
             &seconds,
         )
         .unwrap()
         .unwrap();
-        let expected_negative = col("event_timestamp")
-            .gt_eq(lit(ScalarValue::TimestampSecond(Some(-2), None)))
-            .and(col("event_timestamp").lt(lit(ScalarValue::TimestampSecond(Some(0), None))));
+        let expected_negative = col("ts")
+            .gt_eq(lit(ScalarValue::TimestampSecond(Some(-1), None)))
+            .and(col("ts").lt(lit(ScalarValue::TimestampSecond(Some(0), None))));
         assert_eq!(
             negative, expected_negative,
-            "pre-epoch bounds must round in the same conservative directions"
+            "pre-epoch bounds must preserve the same millisecond semantics"
         );
     }
 
@@ -539,12 +536,12 @@ mod tests {
                 start_ms: Some(42),
                 end_ms: None,
             },
-            "event_timestamp",
+            "ts",
             &DataType::Int32,
         )
         .unwrap()
         .unwrap();
-        assert_eq!(in_range, col("event_timestamp").gt_eq(lit(42_i32)));
+        assert_eq!(in_range, col("ts").gt_eq(lit(42_i32)));
 
         let realistic_epoch_ms = 1_770_000_000_000_i64;
         let err = time_range_to_expr(
@@ -552,7 +549,7 @@ mod tests {
                 start_ms: Some(realistic_epoch_ms),
                 end_ms: None,
             },
-            "event_timestamp",
+            "ts",
             &DataType::Int32,
         )
         .unwrap_err();
@@ -566,7 +563,7 @@ mod tests {
                 start_ms: None,
                 end_ms: Some(i64::MIN),
             },
-            "event_timestamp",
+            "ts",
             &DataType::Int32,
         )
         .unwrap_err();

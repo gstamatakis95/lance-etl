@@ -1,7 +1,7 @@
 """Shared per-dataset Spark fan-out used by every fleet job.
 
 One embarrassingly parallel shape covers the plan and commit phases of the maintenance and
-indexing jobs plus the operator tools (manifest migration, serving-tag flips): apply an
+indexing jobs plus serving-tag tools: apply an
 independent per-dataset callable across executors, one telemetry facade per task.
 
 :func:`run_fleet_fanout` owns the single-span driver shell (span open, dataset-count and
@@ -33,8 +33,7 @@ BUILD_PARTITION_FACTOR: int = 16
 """Driver-headroom multiple of ``defaultParallelism`` for the flat build/artifact fleet jobs."""
 
 TAG_FANOUT_PARTITIONS: int = 512
-"""Default Spark partition cap for the cheap per-dataset metadata fan-outs (tag flips, manifest
-migration, interval-tag prune, and the ETL/pipeline tag-stamp floors)."""
+"""Default Spark partition cap for tag flips, interval-tag prune, and tag-stamp floors."""
 
 FLAT_OK: str = "ok"
 """Tag on a flat-job result carrying a successful per-task value."""
@@ -151,7 +150,7 @@ def fan_out_per_dataset(
 
     Each executor task creates its own telemetry facade and applies ``per_dataset`` to every URI
     in its partition. Used by the maintenance and indexing plan and commit fan-outs, the
-    manifest migration, the serving-tag flip, and the interval-tag prune, all of which are
+    serving-tag flip and interval-tag prune, all of which are
     embarrassingly parallel one-call-per-dataset operations that differ only in the per-dataset
     callable.
 
@@ -218,8 +217,8 @@ def run_fleet_fanout(
 ) -> list[dict[str, Any]]:
     """Run one single-phase fleet job's driver shell around :func:`fan_out_per_dataset`.
 
-    Owns the shape shared by the operator tools' single-phase fleet jobs (manifest migration,
-    serving-tag flips, interval-tag pruning): open a driver telemetry span, tag it with the
+    Owns the shape shared by the operator tools' single-phase fleet jobs (serving-tag flips and
+    interval-tag pruning): open a driver telemetry span, tag it with the
     dataset count plus any caller-supplied ``span_tags``, short-circuit on an empty URI list
     before submitting any Spark job, run the per-dataset fan-out inside a timed block, gauge the
     caller's summary metric, and log the caller's summary line.

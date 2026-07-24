@@ -1,22 +1,18 @@
-//! Conversions between protobuf messages and domain types.
+//! Conversions between the production protobuf surface and domain types.
 
-use prost_types::value::Kind;
 use serde_json::{Map, Value};
 
+use crate::config::DEFAULT_MAX_PROJECTION_COLUMNS;
 use crate::domain::{
-    ClusterReport, ClusterSpec, CompareOp, DatasetRef, DatasetTarget, DistanceKind, Filter, FilterMode, FusedHit,
-    FusionSpec, Fuzziness, Hit, HybridQuery, Literal, MatchSpec, PhraseSpec, PrewarmReport, PrewarmSpec, SearchError,
-    TextOperator, TextQuery, TextQueryNode, TimeRange, VectorQuery,
+    CompareOp, DatasetTarget, Filter, FilterMode, FusedHit, FusionSpec, Fuzziness, Hit, HybridQuery, Literal,
+    MatchSpec, PhraseSpec, SearchError, SearchWarning, TextOperator, TextQuery, TextQueryNode, TimeRange, VectorQuery,
 };
 use crate::pb;
 
-/// Maximum nesting depth accepted for a proto FTS query tree (mirrors `MAX_FILTER_DEPTH` in
-/// `lance::filter`). Boost and Boolean nodes recurse, so an unbounded tree from a client could
-/// otherwise drive stack usage past prost's own default recursion limit before this layer ever
-/// gets a chance to reject it.
+/// Maximum accepted nesting depth for a full-text query tree.
 const MAX_FTS_DEPTH: usize = 32;
 
-/// Converts an optional proto dataset target into the validated domain target.
+/// Converts and validates a logical dataset target before any catalog access.
 pub fn dataset_target_from_proto(target: Option<pb::DatasetTarget>) -> Result<DatasetTarget, SearchError> {
     let target = target.ok_or_else(|| SearchError::invalid_argument("target is required"))?;
     let target = DatasetTarget {
@@ -28,117 +24,7 @@ pub fn dataset_target_from_proto(target: Option<pb::DatasetTarget>) -> Result<Da
     Ok(target)
 }
 
-/// Converts a proto prewarm request into the domain spec (the target travels separately).
-pub fn prewarm_spec_from_proto(request: &pb::PrewarmRequest) -> PrewarmSpec {
-    PrewarmSpec {
-        metadata: request.metadata,
-        all_indexes: request.all_indexes,
-        index_names: request.index_names.clone(),
-        fts_with_position: request.fts_with_position,
-    }
-}
-
-/// Maps the additive prewarm `version_ref` oneof onto the version selector.
-///
-/// An unset selector means [`DatasetRef::Latest`] (warm the latest version, the original
-/// behavior). An explicit version or tag pins the version to warm, which is what lets an operator
-/// warm a green build before flipping the serve tag onto it.
-pub fn prewarm_ref_from_proto(request: &pb::PrewarmRequest) -> DatasetRef {
-    match &request.version_ref {
-        Some(pb::prewarm_request::VersionRef::Version(version)) => DatasetRef::Version(*version),
-        Some(pb::prewarm_request::VersionRef::Tag(tag)) => DatasetRef::Tag(tag.clone()),
-        None => DatasetRef::Latest,
-    }
-}
-
-/// Defines one `version_ref` oneof mapper per search request type.
-///
-/// The three generated oneof types are structurally identical but distinct Rust types, so one
-/// macro emits the identical `Version`/`Tag`/unset mapping for each. An unset selector defaults
-/// to [`DatasetRef::Serve`] (follow the serve policy), preserving the behavior of existing
-/// clients that never set the field.
-macro_rules! search_ref_from_proto {
-    ($(#[$doc:meta])* $name:ident, $oneof:path) => {
-        $(#[$doc])*
-        pub fn $name(version_ref: &Option<$oneof>) -> DatasetRef {
-            use $oneof as Oneof;
-            match version_ref {
-                Some(Oneof::Version(version)) => DatasetRef::Version(*version),
-                Some(Oneof::Tag(tag)) => DatasetRef::Tag(tag.clone()),
-                None => DatasetRef::Serve,
-            }
-        }
-    };
-}
-
-search_ref_from_proto!(
-    /// Maps the `version_ref` oneof of a [`pb::VectorSearchRequest`] onto a [`DatasetRef`].
-    vector_search_ref_from_proto,
-    pb::vector_search_request::VersionRef
-);
-
-search_ref_from_proto!(
-    /// Maps the `version_ref` oneof of a [`pb::TextSearchRequest`] onto a [`DatasetRef`].
-    text_search_ref_from_proto,
-    pb::text_search_request::VersionRef
-);
-
-search_ref_from_proto!(
-    /// Maps the `version_ref` oneof of a [`pb::HybridSearchRequest`] onto a [`DatasetRef`].
-    hybrid_search_ref_from_proto,
-    pb::hybrid_search_request::VersionRef
-);
-
-/// Converts a proto clusters request into the domain spec (the target travels separately).
-pub fn cluster_spec_from_proto(request: &pb::ClustersRequest) -> ClusterSpec {
-    ClusterSpec {
-        index_name: request.index_name.clone().filter(|name| !name.is_empty()),
-    }
-}
-
-/// Converts a domain cluster report into the proto response.
-pub fn cluster_report_to_proto(report: ClusterReport) -> pb::ClustersResponse {
-    let num_partitions = report.num_partitions() as u32;
-    pb::ClustersResponse {
-        clusters: report
-            .centroids
-            .into_iter()
-            .enumerate()
-            .map(|(id, centroid)| pb::Cluster {
-                id: id as u32,
-                centroid,
-            })
-            .collect(),
-        dimension: report.dimension as u32,
-        index_name: report.index_name,
-        num_partitions,
-    }
-}
-
-/// Converts a domain prewarm report into the proto response.
-pub fn prewarm_report_to_proto(report: PrewarmReport) -> pb::PrewarmResponse {
-    pb::PrewarmResponse {
-        metadata_warmed: report.metadata_warmed,
-        indexes: report
-            .indexes
-            .into_iter()
-            .map(|index| pb::PrewarmedIndex {
-                name: index.name,
-                duration_ms: index.duration.as_millis() as u64,
-                error: index.error.unwrap_or_default(),
-            })
-            .collect(),
-        metadata_duration_ms: report.metadata_duration.as_millis() as u64,
-        total_duration_ms: report.total_duration.as_millis() as u64,
-        index_cache_size_bytes: report.index_cache_size_bytes,
-        resolved_version: report.resolved_version,
-    }
-}
-
-/// Converts an optional proto time range into the domain window.
-///
-/// An absent message means no window (search all event times). A present message with both bounds
-/// unset is carried through as an unbounded window, which the backend treats as a no-op.
+/// Converts an optional half-open epoch-millisecond window.
 pub fn time_range_from_proto(range: Option<pb::TimeRange>) -> Option<TimeRange> {
     range.map(|range| TimeRange {
         start_ms: range.start_ms,
@@ -146,50 +32,49 @@ pub fn time_range_from_proto(range: Option<pb::TimeRange>) -> Option<TimeRange> 
     })
 }
 
-/// Converts an optional proto vector query into the domain query, attaching the request time range
-/// and the resolved dataset reference.
+/// Builds a vector query using only server-owned execution policy.
 pub fn vector_query_from_proto(
     query: Option<pb::VectorQuery>,
+    k: u32,
+    filter: Option<pb::Filter>,
+    projection: Vec<String>,
     time_range: Option<TimeRange>,
-    reference: DatasetRef,
 ) -> Result<VectorQuery, SearchError> {
     let query = query.ok_or_else(|| SearchError::invalid_argument("query is required"))?;
+    validate_projection(&projection)?;
     Ok(VectorQuery {
         vector: query.vector,
-        k: query.k as usize,
-        column: query.column,
-        distance: distance_from_proto(query.distance_type)?,
-        nprobes: query.nprobes.map(|n| n as usize),
-        minimum_nprobes: query.minimum_nprobes.map(|n| n as usize),
-        maximum_nprobes: query.maximum_nprobes.map(|n| n as usize),
-        refine_factor: query.refine_factor,
-        ef: query.ef.map(|n| n as usize),
-        fast_search: query.fast_search,
-        bypass_vector_index: query.bypass_vector_index,
-        filter: query.filter.map(filter_from_proto).transpose()?,
-        filter_mode: filter_mode_from_proto(query.filter_mode)?,
+        k: k as usize,
+        column: None,
+        distance: None,
+        nprobes: None,
+        minimum_nprobes: None,
+        maximum_nprobes: None,
+        refine_factor: None,
+        ef: None,
+        fast_search: None,
+        bypass_vector_index: false,
+        filter: filter.map(filter_from_proto).transpose()?,
+        filter_mode: FilterMode::Prefilter,
         time_range,
-        projection: query.projection,
-        with_row_id: query.with_row_id,
-        offset: query.offset.map(|n| n as usize),
-        reference,
+        projection,
     })
 }
 
-/// Converts an optional proto text query into the domain query, attaching the request time range
-/// and the resolved dataset reference.
+/// Builds a text query using only server-owned execution policy.
 pub fn text_query_from_proto(
     query: Option<pb::TextQuery>,
+    k: u32,
+    filter: Option<pb::Filter>,
+    projection: Vec<String>,
     time_range: Option<TimeRange>,
-    reference: DatasetRef,
 ) -> Result<TextQuery, SearchError> {
     let query = query.ok_or_else(|| SearchError::invalid_argument("query is required"))?;
+    validate_projection(&projection)?;
     let node = match query.input {
-        Some(pb::text_query::Input::Simple(terms)) => {
-            if terms.is_empty() {
-                return Err(SearchError::invalid_argument("query must be non-empty"));
-            }
-            TextQueryNode::Match(MatchSpec::new(terms))
+        Some(pb::text_query::Input::Simple(terms)) if !terms.is_empty() => TextQueryNode::Match(MatchSpec::new(terms)),
+        Some(pb::text_query::Input::Simple(_)) => {
+            return Err(SearchError::invalid_argument("query must be non-empty"));
         }
         Some(pb::text_query::Input::Fts(fts)) => fts_node_from_proto(fts, 0)?,
         None => return Err(SearchError::invalid_argument("text query input is required")),
@@ -197,111 +82,56 @@ pub fn text_query_from_proto(
     Ok(TextQuery {
         node,
         columns: query.columns,
-        k: query.k as usize,
-        wand_factor: query.wand_factor,
-        filter: query.filter.map(filter_from_proto).transpose()?,
-        filter_mode: filter_mode_from_proto(query.filter_mode)?,
+        k: k as usize,
+        wand_factor: None,
+        filter: filter.map(filter_from_proto).transpose()?,
+        filter_mode: FilterMode::Prefilter,
         time_range,
-        projection: query.projection,
-        with_row_id: query.with_row_id,
-        offset: query.offset.map(|n| n as usize),
-        fast_search: query.fast_search,
-        reference,
+        projection,
+        fast_search: None,
     })
 }
 
-/// Converts a proto hybrid request into the domain query.
-///
-/// The request-level time range is applied to both legs, so the vector and text legs filter the
-/// same event-time window. When a request-level filter is present it is ANDed into both legs:
-/// if a leg already has its own filter the two are combined with [`Filter::And`]; if only one
-/// side is present that side is used alone. The request-level `filter_mode` is applied to both
-/// legs when a request-level filter is present, leaving each leg's own mode unchanged otherwise.
-/// The request-level `version_ref` is resolved once and set on the hybrid query and both legs so
-/// fusion dedup is consistent: both legs always open the same dataset snapshot.
+/// Enforces the fixed public projection-width bound before opening a dataset.
+fn validate_projection(projection: &[String]) -> Result<(), SearchError> {
+    if projection.len() > DEFAULT_MAX_PROJECTION_COLUMNS {
+        return Err(SearchError::invalid_argument(format!(
+            "projection must not exceed {DEFAULT_MAX_PROJECTION_COLUMNS} fields"
+        )));
+    }
+    Ok(())
+}
+
+/// Converts a hybrid request and applies its filter, projection, and time range to both legs.
 pub fn hybrid_query_from_proto(request: pb::HybridSearchRequest) -> Result<HybridQuery, SearchError> {
     let time_range = time_range_from_proto(request.time_range);
-    let request_filter = request.filter.map(filter_from_proto).transpose()?;
-    let request_filter_mode = filter_mode_from_proto(request.filter_mode)?;
-    let reference = hybrid_search_ref_from_proto(&request.version_ref);
-    let mut vector = vector_query_from_proto(request.vector, time_range, reference.clone())?;
-    let mut text = text_query_from_proto(request.text, time_range, reference.clone())?;
-    if let Some(req_filter) = request_filter {
-        vector.filter = Some(combine_filters(vector.filter, req_filter.clone()));
-        vector.filter_mode = request_filter_mode;
-        text.filter = Some(combine_filters(text.filter, req_filter));
-        text.filter_mode = request_filter_mode;
-    }
+    let vector = vector_query_from_proto(
+        request.vector,
+        request.k,
+        request.filter.clone(),
+        request.projection.clone(),
+        time_range,
+    )?;
+    let text = text_query_from_proto(request.text, request.k, request.filter, request.projection, time_range)?;
     Ok(HybridQuery {
         vector,
         text,
         k: request.k as usize,
-        fusion: fusion_from_proto(request.fusion)?,
-        reference,
+        fusion: fusion_mode_from_proto(request.fusion_mode)?,
     })
 }
 
-/// ANDs a request-level filter with an optional per-leg filter.
-///
-/// When both are present the result is `Filter::And([leg_filter, request_filter])`. When only
-/// one side is present it is returned unchanged. The caller guarantees at least `request_filter`
-/// is `Some` before calling this helper.
-fn combine_filters(
-    leg_filter: Option<crate::domain::Filter>,
-    request_filter: crate::domain::Filter,
-) -> crate::domain::Filter {
-    match leg_filter {
-        Some(leg) => crate::domain::Filter::And(vec![leg, request_filter]),
-        None => request_filter,
+/// Maps a small product fusion mode onto code-owned numeric policy.
+pub fn fusion_mode_from_proto(mode: i32) -> Result<FusionSpec, SearchError> {
+    match pb::HybridFusionMode::try_from(mode) {
+        Ok(pb::HybridFusionMode::Unspecified | pb::HybridFusionMode::Balanced) => Ok(FusionSpec::default()),
+        Ok(pb::HybridFusionMode::SemanticPriority) => Ok(FusionSpec::Weighted { vector_weight: 0.8 }),
+        Ok(pb::HybridFusionMode::LexicalPriority) => Ok(FusionSpec::Weighted { vector_weight: 0.2 }),
+        Err(_) => Err(SearchError::invalid_argument("unknown hybrid fusion mode")),
     }
 }
 
-/// Converts a proto fusion config into the domain spec, defaulting to RRF with `rrf_k = 60`.
-pub fn fusion_from_proto(fusion: Option<pb::Fusion>) -> Result<FusionSpec, SearchError> {
-    let Some(fusion) = fusion else {
-        return Ok(FusionSpec::default());
-    };
-    match fusion.strategy {
-        Some(pb::fusion::Strategy::Rrf(rrf)) => {
-            let rrf_k = rrf.rrf_k.unwrap_or(crate::domain::fusion::DEFAULT_RRF_K);
-            if !rrf_k.is_finite() || rrf_k <= 0.0 {
-                return Err(SearchError::invalid_argument("rrf_k must be a positive finite number"));
-            }
-            Ok(FusionSpec::Rrf { rrf_k })
-        }
-        Some(pb::fusion::Strategy::Weighted(weighted)) => {
-            let vector_weight = weighted
-                .vector_weight
-                .unwrap_or(crate::domain::fusion::DEFAULT_WEIGHTED_VECTOR_WEIGHT);
-            if !vector_weight.is_finite() || !(0.0..=1.0).contains(&vector_weight) {
-                return Err(SearchError::invalid_argument(
-                    "vector_weight must be a finite number in [0, 1]",
-                ));
-            }
-            Ok(FusionSpec::Weighted { vector_weight })
-        }
-        None => Ok(FusionSpec::default()),
-    }
-}
-
-/// Converts a proto rerank config into the optional top-n truncation count.
-///
-/// An absent message or an unset strategy means no truncation (the result order and count are
-/// returned unchanged), so existing clients that never set the field keep their behavior.
-pub fn rerank_top_n_from_proto(rerank: Option<pb::Rerank>) -> Result<Option<usize>, SearchError> {
-    let Some(rerank) = rerank else {
-        return Ok(None);
-    };
-    match rerank.strategy {
-        Some(pb::rerank::Strategy::Identity(identity)) => Ok(identity.top_n.map(|n| n as usize)),
-        None => Ok(None),
-    }
-}
-
-/// Converts a proto FTS query node tree into the domain tree, tracking nesting depth.
-///
-/// Rejects a tree past [`MAX_FTS_DEPTH`] with `InvalidArgument` rather than relying solely on
-/// prost's own default recursion limit to bound stack usage.
+/// Converts one protobuf full-text query node.
 fn fts_node_from_proto(node: pb::FtsQuery, depth: usize) -> Result<TextQueryNode, SearchError> {
     if depth > MAX_FTS_DEPTH {
         return Err(SearchError::invalid_argument(format!(
@@ -315,7 +145,7 @@ fn fts_node_from_proto(node: pb::FtsQuery, depth: usize) -> Result<TextQueryNode
             boost: query.boost.unwrap_or(1.0),
             operator: text_operator_from_proto(query.operator)?,
             fuzziness: fuzziness_from_proto(query.fuzziness),
-            max_expansions: query.max_expansions.map(|n| n as usize),
+            max_expansions: None,
             prefix_length: query.prefix_length.unwrap_or(0),
         })),
         Some(pb::fts_query::Query::Phrase(query)) => Ok(TextQueryNode::Phrase(PhraseSpec {
@@ -351,12 +181,12 @@ fn fts_node_from_proto(node: pb::FtsQuery, depth: usize) -> Result<TextQueryNode
     }
 }
 
-/// Converts a list of proto FTS query nodes at the given nesting depth.
+/// Converts a list of protobuf full-text query nodes.
 fn fts_nodes_from_proto(nodes: Vec<pb::FtsQuery>, depth: usize) -> Result<Vec<TextQueryNode>, SearchError> {
     nodes.into_iter().map(|node| fts_node_from_proto(node, depth)).collect()
 }
 
-/// Converts a proto filter AST into the domain filter AST.
+/// Converts a protobuf typed filter AST.
 pub fn filter_from_proto(filter: pb::Filter) -> Result<Filter, SearchError> {
     match filter.predicate {
         Some(pb::filter::Predicate::Comparison(comparison)) => Ok(Filter::Compare {
@@ -389,12 +219,12 @@ pub fn filter_from_proto(filter: pb::Filter) -> Result<Filter, SearchError> {
     }
 }
 
-/// Converts a list of proto filters.
+/// Converts a list of protobuf filters.
 fn filters_from_proto(filters: Vec<pb::Filter>) -> Result<Vec<Filter>, SearchError> {
     filters.into_iter().map(filter_from_proto).collect()
 }
 
-/// Converts an optional proto literal into the domain literal.
+/// Converts one protobuf literal.
 fn literal_from_proto(value: Option<pb::LiteralValue>) -> Result<Literal, SearchError> {
     let kind = value
         .and_then(|literal| literal.kind)
@@ -407,7 +237,7 @@ fn literal_from_proto(value: Option<pb::LiteralValue>) -> Result<Literal, Search
     })
 }
 
-/// Converts the proto comparison operator enum.
+/// Converts a comparison operator.
 fn compare_op_from_proto(op: i32) -> Result<CompareOp, SearchError> {
     match pb::CompareOp::try_from(op) {
         Ok(pb::CompareOp::Eq) => Ok(CompareOp::Eq),
@@ -422,37 +252,16 @@ fn compare_op_from_proto(op: i32) -> Result<CompareOp, SearchError> {
     }
 }
 
-/// Converts the proto distance type enum. Unspecified keeps the index metric.
-fn distance_from_proto(distance: i32) -> Result<Option<DistanceKind>, SearchError> {
-    match pb::DistanceType::try_from(distance) {
-        Ok(pb::DistanceType::Unspecified) => Ok(None),
-        Ok(pb::DistanceType::L2) => Ok(Some(DistanceKind::L2)),
-        Ok(pb::DistanceType::Cosine) => Ok(Some(DistanceKind::Cosine)),
-        Ok(pb::DistanceType::Dot) => Ok(Some(DistanceKind::Dot)),
-        Ok(pb::DistanceType::Hamming) => Ok(Some(DistanceKind::Hamming)),
-        Err(_) => Err(SearchError::invalid_argument("unknown distance type")),
-    }
-}
-
-/// Converts the proto filter mode enum. Unspecified defaults to prefilter.
-fn filter_mode_from_proto(mode: i32) -> Result<FilterMode, SearchError> {
-    match pb::FilterMode::try_from(mode) {
-        Ok(pb::FilterMode::Unspecified) | Ok(pb::FilterMode::Prefilter) => Ok(FilterMode::Prefilter),
-        Ok(pb::FilterMode::Postfilter) => Ok(FilterMode::Postfilter),
-        Err(_) => Err(SearchError::invalid_argument("unknown filter mode")),
-    }
-}
-
-/// Converts the proto text operator enum. Unspecified defaults to OR.
+/// Converts a text operator, defaulting to OR.
 fn text_operator_from_proto(operator: i32) -> Result<TextOperator, SearchError> {
     match pb::TextOperator::try_from(operator) {
-        Ok(pb::TextOperator::Unspecified) | Ok(pb::TextOperator::Or) => Ok(TextOperator::Or),
+        Ok(pb::TextOperator::Unspecified | pb::TextOperator::Or) => Ok(TextOperator::Or),
         Ok(pb::TextOperator::And) => Ok(TextOperator::And),
         Err(_) => Err(SearchError::invalid_argument("unknown text operator")),
     }
 }
 
-/// Converts the proto fuzziness oneof. Absent means exact matching.
+/// Converts fuzzy-match semantics.
 fn fuzziness_from_proto(fuzziness: Option<pb::match_query::Fuzziness>) -> Fuzziness {
     match fuzziness {
         Some(pb::match_query::Fuzziness::AutoFuzziness(true)) => Fuzziness::Auto,
@@ -461,62 +270,84 @@ fn fuzziness_from_proto(fuzziness: Option<pb::match_query::Fuzziness>) -> Fuzzin
     }
 }
 
-/// Converts a vector hit into its proto result message.
-pub fn vector_hit_to_proto(hit: Hit) -> pb::VectorSearchResult {
-    pb::VectorSearchResult {
+/// Converts one vector hit into a typed result.
+pub fn vector_hit_to_proto(hit: Hit) -> Result<pb::VectorSearchResult, SearchError> {
+    Ok(pb::VectorSearchResult {
         distance: hit.score as f32,
-        row: Some(json_map_to_struct(hit.row)),
-    }
+        record_id: hit.record_id,
+        projection: json_map_to_projection(hit.row)?,
+    })
 }
 
-/// Converts a text hit into its proto result message.
-pub fn text_hit_to_proto(hit: Hit) -> pb::TextSearchResult {
-    pb::TextSearchResult {
+/// Converts one text hit into a typed result.
+pub fn text_hit_to_proto(hit: Hit) -> Result<pb::TextSearchResult, SearchError> {
+    Ok(pb::TextSearchResult {
         score: hit.score as f32,
-        row: Some(json_map_to_struct(hit.row)),
-    }
+        record_id: hit.record_id,
+        projection: json_map_to_projection(hit.row)?,
+    })
 }
 
-/// Lowers a fused hit back into a single-leg hit for recall capture, preserving the score.
+/// Lowers a fused hit into a single-leg hit for recall capture.
 pub fn fused_to_hit(hit: FusedHit) -> Hit {
     Hit {
-        row_id: hit.row_id,
+        record_id: hit.record_id,
         score: hit.score,
         row: hit.row,
     }
 }
 
-/// Converts a fused hit into its proto result message.
-pub fn fused_hit_to_proto(hit: FusedHit) -> pb::HybridSearchResult {
-    pb::HybridSearchResult {
+/// Converts one fused hit into a typed result.
+pub fn fused_hit_to_proto(hit: FusedHit) -> Result<pb::HybridSearchResult, SearchError> {
+    Ok(pb::HybridSearchResult {
         fused_score: hit.score,
-        row: Some(json_map_to_struct(hit.row)),
+        record_id: hit.record_id,
+        projection: json_map_to_projection(hit.row)?,
+    })
+}
+
+/// Converts a domain warning into its closed protobuf code.
+pub fn warning_to_proto(warning: SearchWarning) -> i32 {
+    match warning {
+        SearchWarning::ResultsUnderfilled => pb::SearchWarning::ResultsUnderfilled as i32,
     }
 }
 
-/// Converts a JSON object into a `google.protobuf.Struct` for transport in gRPC responses.
-pub fn json_map_to_struct(map: Map<String, Value>) -> prost_types::Struct {
-    prost_types::Struct {
-        fields: map
-            .into_iter()
-            .map(|(key, value)| (key, json_value_to_prost(value)))
-            .collect(),
-    }
+/// Converts a JSON scalar map into an ordered typed projection.
+pub fn json_map_to_projection(map: Map<String, Value>) -> Result<Vec<pb::ProjectedField>, SearchError> {
+    map.into_iter()
+        .map(|(name, value)| {
+            Ok(pb::ProjectedField {
+                name,
+                value: Some(json_value_to_projection(value)?),
+            })
+        })
+        .collect()
 }
 
-/// Converts one JSON value into the equivalent `google.protobuf.Value`.
-fn json_value_to_prost(value: Value) -> prost_types::Value {
+/// Converts one JSON scalar without lossy number coercion.
+fn json_value_to_projection(value: Value) -> Result<pb::ProjectionValue, SearchError> {
+    use pb::projection_value::Kind;
     let kind = match value {
-        Value::Null => Kind::NullValue(0),
+        Value::Null => Kind::NullValue(pb::NullProjectionValue {}),
         Value::Bool(flag) => Kind::BoolValue(flag),
-        Value::Number(number) => Kind::NumberValue(number.as_f64().unwrap_or(f64::NAN)),
+        Value::Number(number) if number.is_u64() => Kind::Uint64Value(number.as_u64().unwrap_or_default()),
+        Value::Number(number) if number.is_i64() => Kind::Int64Value(number.as_i64().unwrap_or_default()),
+        Value::Number(number) => {
+            let value = number
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| SearchError::internal("projection contains a non-finite number"))?;
+            Kind::DoubleValue(value)
+        }
         Value::String(text) => Kind::StringValue(text),
-        Value::Array(items) => Kind::ListValue(prost_types::ListValue {
-            values: items.into_iter().map(json_value_to_prost).collect(),
-        }),
-        Value::Object(map) => Kind::StructValue(json_map_to_struct(map)),
+        Value::Array(_) | Value::Object(_) => {
+            return Err(SearchError::invalid_argument(
+                "projection contains an unsupported nested value",
+            ));
+        }
     };
-    prost_types::Value { kind: Some(kind) }
+    Ok(pb::ProjectionValue { kind: Some(kind) })
 }
 
 #[cfg(test)]
@@ -524,158 +355,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vector_search_ref_unset_is_serve() {
-        assert_eq!(vector_search_ref_from_proto(&None), DatasetRef::Serve);
-    }
-
-    #[test]
-    fn vector_search_ref_version_maps_through() {
-        let version_ref = Some(pb::vector_search_request::VersionRef::Version(42));
-        assert_eq!(vector_search_ref_from_proto(&version_ref), DatasetRef::Version(42));
-    }
-
-    #[test]
-    fn vector_search_ref_tag_maps_through() {
-        let version_ref = Some(pb::vector_search_request::VersionRef::Tag("green".to_string()));
+    fn product_fusion_modes_use_fixed_policy() {
+        assert_eq!(fusion_mode_from_proto(0).unwrap(), FusionSpec::default());
         assert_eq!(
-            vector_search_ref_from_proto(&version_ref),
-            DatasetRef::Tag("green".to_string())
+            fusion_mode_from_proto(pb::HybridFusionMode::SemanticPriority as i32).unwrap(),
+            FusionSpec::Weighted { vector_weight: 0.8 }
         );
+        assert!(fusion_mode_from_proto(99).is_err());
     }
 
     #[test]
-    fn text_search_ref_unset_is_serve() {
-        assert_eq!(text_search_ref_from_proto(&None), DatasetRef::Serve);
-    }
-
-    #[test]
-    fn text_search_ref_version_maps_through() {
-        let version_ref = Some(pb::text_search_request::VersionRef::Version(7));
-        assert_eq!(text_search_ref_from_proto(&version_ref), DatasetRef::Version(7));
-    }
-
-    #[test]
-    fn text_search_ref_tag_maps_through() {
-        let version_ref = Some(pb::text_search_request::VersionRef::Tag("stable".to_string()));
-        assert_eq!(
-            text_search_ref_from_proto(&version_ref),
-            DatasetRef::Tag("stable".to_string())
-        );
-    }
-
-    #[test]
-    fn hybrid_search_ref_unset_is_serve() {
-        assert_eq!(hybrid_search_ref_from_proto(&None), DatasetRef::Serve);
-    }
-
-    #[test]
-    fn hybrid_search_ref_version_maps_through() {
-        let version_ref = Some(pb::hybrid_search_request::VersionRef::Version(3));
-        assert_eq!(hybrid_search_ref_from_proto(&version_ref), DatasetRef::Version(3));
-    }
-
-    #[test]
-    fn hybrid_search_ref_tag_maps_through() {
-        let version_ref = Some(pb::hybrid_search_request::VersionRef::Tag("prod".to_string()));
-        assert_eq!(
-            hybrid_search_ref_from_proto(&version_ref),
-            DatasetRef::Tag("prod".to_string())
-        );
-    }
-
-    #[test]
-    fn hybrid_query_reference_fans_out_to_both_legs() {
-        let request = pb::HybridSearchRequest {
-            target: None,
-            vector: Some(pb::VectorQuery {
-                vector: vec![1.0, 0.0, 0.0, 0.0],
-                k: 2,
-                ..Default::default()
-            }),
-            text: Some(pb::TextQuery {
-                input: Some(pb::text_query::Input::Simple("hello".to_string())),
-                k: 2,
-                ..Default::default()
-            }),
-            k: 2,
-            fusion: None,
-            rerank: None,
-            time_range: None,
-            filter: None,
-            filter_mode: 0,
-            version_ref: Some(pb::hybrid_search_request::VersionRef::Tag("v2".to_string())),
-        };
-        let query = hybrid_query_from_proto(request).unwrap();
-        assert_eq!(query.reference, DatasetRef::Tag("v2".to_string()));
-        assert_eq!(query.vector.reference, DatasetRef::Tag("v2".to_string()));
-        assert_eq!(query.text.reference, DatasetRef::Tag("v2".to_string()));
-    }
-
-    #[test]
-    fn vector_query_from_proto_sets_reference() {
-        let proto_query = Some(pb::VectorQuery {
-            vector: vec![1.0, 0.0],
-            k: 1,
-            ..Default::default()
-        });
-        let reference = DatasetRef::Version(5);
-        let query = vector_query_from_proto(proto_query, None, reference.clone()).unwrap();
-        assert_eq!(query.reference, reference);
-    }
-
-    #[test]
-    fn text_query_from_proto_sets_reference() {
-        let proto_query = Some(pb::TextQuery {
-            input: Some(pb::text_query::Input::Simple("cats".to_string())),
-            k: 3,
-            ..Default::default()
-        });
-        let reference = DatasetRef::Tag("latest-prod".to_string());
-        let query = text_query_from_proto(proto_query, None, reference.clone()).unwrap();
-        assert_eq!(query.reference, reference);
-    }
-
-    /// Builds a leaf `MatchQuery` FTS node.
-    fn fts_match_leaf(terms: &str) -> pb::FtsQuery {
-        pb::FtsQuery {
-            query: Some(pb::fts_query::Query::Match(pb::MatchQuery {
-                terms: terms.to_string(),
-                ..Default::default()
-            })),
-        }
-    }
-
-    #[test]
-    fn fts_conversion_rejects_excessive_nesting() {
-        let mut node = fts_match_leaf("base");
-        for _ in 0..(MAX_FTS_DEPTH + 2) {
-            node = pb::FtsQuery {
-                query: Some(pb::fts_query::Query::Boost(Box::new(pb::BoostQuery {
-                    positive: Some(Box::new(node)),
-                    negative: Some(Box::new(fts_match_leaf("negative"))),
-                    negative_boost: None,
-                }))),
-            };
-        }
-        let err = fts_node_from_proto(node, 0).unwrap_err();
-        assert!(
-            matches!(err, SearchError::InvalidArgument(_)),
-            "deep fts nesting must be rejected"
-        );
-    }
-
-    #[test]
-    fn fts_conversion_accepts_nesting_within_the_limit() {
-        let mut node = fts_match_leaf("base");
-        for _ in 0..MAX_FTS_DEPTH {
-            node = pb::FtsQuery {
-                query: Some(pb::fts_query::Query::Boost(Box::new(pb::BoostQuery {
-                    positive: Some(Box::new(node)),
-                    negative: Some(Box::new(fts_match_leaf("negative"))),
-                    negative_boost: None,
-                }))),
-            };
-        }
-        fts_node_from_proto(node, 0).unwrap();
+    fn typed_projection_preserves_large_integers_and_rejects_nested_values() {
+        let mut map = Map::new();
+        map.insert("large".to_string(), Value::from(9_007_199_254_740_993_u64));
+        let fields = json_map_to_projection(map).unwrap();
+        assert!(matches!(
+            fields[0].value.as_ref().and_then(|value| value.kind.as_ref()),
+            Some(pb::projection_value::Kind::Uint64Value(9_007_199_254_740_993))
+        ));
+        let mut nested = Map::new();
+        nested.insert("items".to_string(), Value::Array(Vec::new()));
+        assert!(json_map_to_projection(nested).is_err());
     }
 }

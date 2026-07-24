@@ -5,11 +5,13 @@ This job optimizes the upstream Iceberg source table, which is distinct from the
 through the Spark SQL stored procedures exposed by the Iceberg Spark session extensions, issued as
 ``CALL <catalog>.system.<procedure>(...)`` statements.
 
-Four maintenance steps run in a safe order. ``rewrite_data_files`` bin-packs many small data files into fewer larger
-ones. ``rewrite_manifests`` rewrites the manifest list so manifests align with the new file layout. ``expire_snapshots``
-prunes snapshot history beyond a retention horizon, the Iceberg analog of Lance version cleanup. ``remove_orphan_files``
-deletes files that no live snapshot references and stays opt-in because it is the only destructive step that can delete
-data files outright. Each step is wrapped with telemetry timing and a metric.
+Three maintenance steps run in a safe order. ``rewrite_data_files`` bin-packs many small data files into fewer larger
+ones. ``rewrite_manifests`` rewrites the manifest list so manifests align with the new file layout.
+``remove_orphan_files`` deletes files that no live snapshot references and stays opt-in because it is the only
+destructive step that can delete data files outright. Snapshot expiration is deliberately absent from this operator
+library. Only the PostgreSQL-backed reconciler can prove the oldest exact source snapshot still needed by unfinished
+work, so an age-only operator command cannot expire source history safely. Each enabled step is wrapped with telemetry
+timing and a metric.
 
 All heavy work runs distributed inside Spark executors: each ``CALL`` plans and executes as a normal Spark job. The
 driver only issues the validated statements, so this job satisfies the executor rule the same way the ETL does.
@@ -41,12 +43,6 @@ DEFAULT_TARGET_FILE_SIZE_BYTES: int = 512 * 1024 * 1024
 
 DEFAULT_MIN_INPUT_FILES: int = 5
 """Minimum number of files in a bin-pack group before ``rewrite_data_files`` rewrites it, matching Iceberg's default."""
-
-DEFAULT_EXPIRE_RETAIN_LAST: int = 5
-"""Snapshots always kept by ``expire_snapshots`` regardless of age, so recent rollback targets survive."""
-
-DEFAULT_EXPIRE_OLDER_THAN_DAYS: int = 7
-"""Age horizon for ``expire_snapshots``: snapshots older than this and beyond the retained count are pruned."""
 
 DEFAULT_ORPHAN_OLDER_THAN_DAYS: int = 3
 """Age horizon for ``remove_orphan_files``, matching Iceberg's own three-day safety default."""
@@ -90,21 +86,15 @@ class IcebergOptimizeConfig:
         telemetry: Telemetry configuration created once per process inside :meth:`IcebergOptimizer.run`.
         rewrite_data_files: Bin-pack small data files into larger ones.
         rewrite_manifests: Rewrite manifests to align with the current file layout.
-        expire_snapshots: Prune snapshot history beyond the retention horizon.
         remove_orphan_files: Delete files no live snapshot references. Opt-in because it is the only step that can
             delete data outright. Off by default.
-        expire_retain_last: Snapshots always retained by ``expire_snapshots`` regardless of age.
-        expire_older_than_days: Age horizon in days for ``expire_snapshots``.
     """
 
     table: str
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     rewrite_data_files: bool = True
     rewrite_manifests: bool = True
-    expire_snapshots: bool = True
     remove_orphan_files: bool = False
-    expire_retain_last: int = DEFAULT_EXPIRE_RETAIN_LAST
-    expire_older_than_days: int = DEFAULT_EXPIRE_OLDER_THAN_DAYS
 
 
 @dataclass
@@ -139,38 +129,51 @@ def timestamp_literal(days_ago: int) -> str:
     """Build a UTC ``TIMESTAMP`` literal for ``now - days_ago``.
 
     Args:
-        days_ago: Whole days before the current instant. ``0`` yields the current instant.
+        days_ago: Non-negative whole days before the current instant. ``0`` yields the current instant.
 
     Returns:
         A wall-clock timestamp string in :data:`TIMESTAMP_LITERAL_FORMAT`, safe to embed in a typed ``TIMESTAMP``
         literal.
+
+    Raises:
+        ValueError: If ``days_ago`` is negative.
     """
+    if days_ago < 0:
+        raise ValueError("days_ago must be non-negative")
     moment: datetime = datetime.now(UTC) - timedelta(days=days_ago)
     return moment.strftime(TIMESTAMP_LITERAL_FORMAT)
 
 
+@dataclass
 class IcebergOptimizer:
     """Run the enabled Iceberg maintenance procedures over the source table."""
 
-    def __init__(self, config: IcebergOptimizeConfig) -> None:
-        """Initialize the optimizer and validate the table identifier.
+    config: IcebergOptimizeConfig
 
-        Args:
-            config: The optimization configuration.
+    @property
+    def catalog(self) -> str:
+        """Return the validated Iceberg catalog identifier.
 
-        Raises:
-            ValueError: If the configured table is not a well-formed qualified identifier.
+        Returns:
+            The catalog component.
         """
-        self.config: IcebergOptimizeConfig = config
-        self.catalog, self.table_argument = validate_table_identifier(config.table)
+        return validate_table_identifier(self.config.table)[0]
+
+    @property
+    def table_argument(self) -> str:
+        """Return the validated namespace-qualified table identifier.
+
+        Returns:
+            The identifier within the catalog.
+        """
+        return validate_table_identifier(self.config.table)[1]
 
     def run(self, spark: SparkSession) -> IcebergOptimizeReport:
         """Run every enabled maintenance step in a safe order and return the per-step report.
 
-        The order is fixed: bin-pack data files, then rewrite manifests so they align with the new layout, then expire
-        snapshots beyond the retention horizon, then remove orphan files when explicitly enabled. Each step is timed and
-        emits a metric. The driver only issues the validated ``CALL`` statements. The procedures plan and execute
-        distributed across Spark executors.
+        The order is fixed: bin-pack data files, then rewrite manifests so they align with the new layout, then remove
+        orphan files when explicitly enabled. Each step is timed and emits a metric. The driver only issues the
+        validated ``CALL`` statements. The procedures plan and execute distributed across Spark executors.
 
         Args:
             spark: Active Spark session whose configuration carries the Iceberg catalog and session extensions.
@@ -185,8 +188,6 @@ class IcebergOptimizer:
                 report.steps.append(self.rewrite_data_files(spark, telemetry))
             if self.config.rewrite_manifests:
                 report.steps.append(self.rewrite_manifests(spark, telemetry))
-            if self.config.expire_snapshots:
-                report.steps.append(self.expire_snapshots(spark, telemetry))
             if self.config.remove_orphan_files:
                 report.steps.append(self.remove_orphan_files(spark, telemetry))
         logger.info("iceberg optimize complete for %s: %d steps", self.config.table, len(report.steps))
@@ -207,11 +208,17 @@ class IcebergOptimizer:
         logger.info("iceberg optimize step %s on %s", step, self.config.table)
         started: float = time.perf_counter()
         with telemetry.timed(f"iceberg.optimize.{step}_ms", tags=[f"table:{self.config.table}"]):
-            rows = spark.sql(statement).collect()
+            result = spark.sql(statement)
+            if step == "remove_orphan_files":
+                rows = []
+                orphan_files_removed: int = int(result.count())
+            else:
+                rows = result.take(1)
+                orphan_files_removed = 0
         duration: float = time.perf_counter() - started
         metrics: dict[str, int] = {}
         if step == "remove_orphan_files":
-            metrics["orphan_files_removed"] = len(rows)
+            metrics["orphan_files_removed"] = orphan_files_removed
         elif rows:
             for key, value in rows[0].asDict().items():
                 if isinstance(value, int):
@@ -252,28 +259,6 @@ class IcebergOptimizer:
         """
         statement: str = f"CALL {self.catalog}.system.rewrite_manifests(table => '{self.table_argument}')"
         return self.call(spark, "rewrite_manifests", statement, telemetry)
-
-    def expire_snapshots(self, spark: SparkSession, telemetry: Telemetry) -> IcebergStepResult:
-        """Prune snapshot history beyond the retention horizon via ``expire_snapshots``.
-
-        Retains at least :attr:`IcebergOptimizeConfig.expire_retain_last` snapshots regardless of age and expires
-        snapshots older than ``now - expire_older_than_days`` beyond that count.
-
-        Args:
-            spark: Active Spark session.
-            telemetry: Telemetry facade for the current process.
-
-        Returns:
-            The step result.
-        """
-        older_than: str = timestamp_literal(self.config.expire_older_than_days)
-        statement: str = (
-            f"CALL {self.catalog}.system.expire_snapshots("
-            f"table => '{self.table_argument}', "
-            f"older_than => TIMESTAMP '{older_than}', "
-            f"retain_last => {int(self.config.expire_retain_last)})"
-        )
-        return self.call(spark, "expire_snapshots", statement, telemetry)
 
     def remove_orphan_files(self, spark: SparkSession, telemetry: Telemetry) -> IcebergStepResult:
         """Delete files no live snapshot references via ``remove_orphan_files``.

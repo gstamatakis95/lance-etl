@@ -3,13 +3,13 @@
 An operator occasionally wants to fully read and rewrite a Lance dataset so that rows assigned to
 the same IVF centroid (vector-index partition) land contiguously, in the same fragment where
 possible. Lance has no built-in clustered compaction, so the mechanism here is a manual distributed
-pipeline: nearest-centroid assignment on the raw vector, a global sort by partition id, a
-``write_fragments`` shuffle, a ``LanceOperation.Overwrite`` commit, then a vector-index rebuild that
+pipeline: nearest-centroid assignment on the raw vector, a global partition-range shuffle, a
+``write_fragments`` rewrite, a ``LanceOperation.Overwrite`` commit, then a vector-index rebuild that
 preserves the old centroids through the segment API.
 
-The flow mirrors the fleet-phase shape of :mod:`lance_etl.maintenance.job` and
-:mod:`lance_etl.migrate_namespace`: the driver plans, broadcasts read-only artifacts, and commits,
-while every row-level read and write runs inside an executor closure. The vector-index rebuild
+The flow mirrors the fleet-phase shape of :mod:`lance_etl.maintenance.job`. The driver plans,
+broadcasts read-only artifacts, and commits, while every row-level read and write runs inside an
+executor closure. The vector-index rebuild
 reuses the exact segment-API artifact tuple :meth:`VectorIndexHandler.prepare` produces, with the
 same centroids and the stored RaBitQ model, so no training happens on the rebuild path and
 ``rows_at_train`` stays unchanged (ADR 0041).
@@ -24,6 +24,9 @@ from __future__ import annotations
 import json
 import logging
 import math
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
+from itertools import groupby
 from typing import TYPE_CHECKING, Any
 
 import lance
@@ -34,7 +37,7 @@ from pyspark.sql import SparkSession
 
 import lance_etl.maintenance.job as maintenance_job
 from lance_etl.column_roles import VECTOR_ROLE, load_column_roles
-from lance_etl.etl.sink import DATA_STORAGE_VERSION
+from lance_etl.etl.storage import DATA_STORAGE_VERSION
 from lance_etl.fanout import (
     BUILD_PARTITION_FACTOR,
     FANOUT_PARTITION_FACTOR,
@@ -43,7 +46,6 @@ from lance_etl.fanout import (
     REWRITE_PARTITION_FACTOR,
     derive_partitions,
     fan_out_per_dataset,
-    run_flat_tagged_job,
 )
 from lance_etl.indexing.config import METRIC_TO_DISTANCE, IndexJobConfig, vector_index_name
 from lance_etl.indexing.optimize import load_centroids, load_vector_config, save_centroids
@@ -54,7 +56,7 @@ from lance_etl.indexing.segments import (
     serialize_segment,
     split_evenly,
 )
-from lance_etl.telemetry import DEFAULT_COMMIT_RETRIES, Telemetry, commit_with_retries
+from lance_etl.telemetry import DEFAULT_COMMIT_RETRIES, Telemetry, TelemetryConfig, commit_with_retries
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -64,30 +66,81 @@ if TYPE_CHECKING:
 logger: logging.Logger = logging.getLogger(__name__)
 
 CLUSTER_PARTITION_COLUMN: str = "lance_etl_cluster_partition"
-"""Temporary int32 partition-id column added for the sort, dropped before the fragment write."""
+"""Temporary int32 partition-id column used for bucket routing and dropped before fragment writes."""
 
 CLUSTER_READ_SHARDS: int = 64
 """Default fragment shards per dataset for the histogram and rewrite read jobs."""
 
 ASSIGN_BLOCK_ROWS: int = 65_536
-"""Rows assigned per numpy block so the centroid distance matrix stays bounded in memory."""
+"""Maximum rows assigned per numpy block."""
+
+ASSIGN_WORKING_BYTES: int = 64 * 1024 * 1024
+"""Maximum dense temporary bytes retained by one centroid-assignment block."""
 
 SHUFFLE_CHUNK_BYTES: int = 32 * 1024 * 1024
-"""Soft byte cap per Arrow IPC chunk emitted into the rewrite shuffle."""
+"""Soft byte cap across pending Arrow tables in one rewrite-shard reader."""
+
+CLUSTER_DATASET_BATCH_SIZE: int = 1
+"""Hard dataset count per clustered batch, limiting the driver to one centroid artifact at a time."""
 
 COSINE_NORM_EPS: float = 1e-12
 """Floor on a vector or centroid norm before cosine normalisation, guarding the zero vector."""
-
-REWRITE_ERROR_KEY: int = -1
-"""Shuffle key marking a read-task failure sentinel routed through the rewrite shuffle. Real global
-bucket ids start at 0, so this key never collides with a live bucket, and ``partitionBy`` hashes it
-onto a valid partition where ``write_partition`` passes it straight through."""
 
 REWRITE_OK: str = "ok"
 """Tag on a collected rewrite-shuffle result carrying a written fragment document."""
 
 REWRITE_ERROR: str = "error"
 """Tag on a collected rewrite-shuffle result carrying a per-dataset failure message."""
+
+ClusterReadSeed = tuple[str, int, int, str, str]
+"""Dataset-level seed for executor-side fragment-shard enumeration."""
+
+ClusterReadTask = tuple[str, int, list[int], str, str, str | None]
+"""Read shard or isolated inventory error emitted by executor-side enumeration."""
+
+ClusterIndexSeed = tuple[str, int, int, str, str, str, int, int]
+"""Dataset-level index-rebuild seed excluding broadcast artifacts."""
+
+ClusterIndexShardTask = tuple[str, int, list[int], str, str, str, int, int, str | None]
+"""Small rebuild shard or isolated inventory error excluding broadcast artifacts."""
+
+
+@dataclass(frozen=True)
+class ClusterCommitPayload:
+    """Minimal executor payload for one clustered overwrite commit."""
+
+    uri: str
+    fragment_documents: list[str]
+    schema: pa.Schema
+    read_version: int
+
+
+@dataclass(frozen=True)
+class ClusterOverwriteCommit:
+    """Committed clustered data fingerprint needed for safe generation stamping."""
+
+    fragments_added: int
+    fragment_ids: list[int] | None
+    num_rows: int
+    fingerprint_error: str | None
+
+
+@dataclass(frozen=True)
+class ClusterFinalisePayload:
+    """Minimal executor payload for one clustered index finalisation."""
+
+    uri: str
+    segment_documents: list[str]
+    column: str
+    index_name: str
+    metric: str
+    num_partitions: int
+    fragments_added: int
+    retention_rows_deleted: int
+    fragment_ids: list[int] | None
+    num_rows: int
+    fingerprint_error: str | None
+
 
 CLUSTER_GENERATION_KEY: str = "lance-etl.cluster_generation"
 """Dataset config KV key recording the fingerprint of the last clustered generation, used to skip
@@ -104,16 +157,13 @@ def release_broadcast(handle: Any) -> None:
     per-dataset centroid bytes, so a fleet-wide run would otherwise pin three generations of the
     (potentially ~100 MB per dataset) centroid maps on the driver heap at once. Destroying each
     broadcast right after its job's ``collect`` returns bounds the driver footprint to one live
-    generation. The in-process broadcast double used by the unit tests exposes no ``destroy``
-    method, so the call is skipped when the handle lacks one rather than requiring a test-only
-    shim on the production path.
+    generation. ``blocking=True`` waits for executor-side copies to be removed before the next
+    artifact-heavy phase starts.
 
     Args:
-        handle: The Spark broadcast handle to release, or a test double without ``destroy``.
+        handle: The Spark broadcast handle to release.
     """
-    destroy = getattr(handle, "destroy", None)
-    if destroy is not None:
-        destroy()
+    handle.destroy(blocking=True)
 
 
 def fragment_id_signature(dataset: lance.LanceDataset) -> list[int]:
@@ -138,9 +188,8 @@ def load_cluster_generation(dataset: lance.LanceDataset) -> dict[str, Any] | Non
     """Read the stored clustered-generation fingerprint from a dataset's config KV.
 
     The config KV is already in-memory from the open manifest, so this performs no additional
-    object-store I/O. Returns ``None`` when the key is absent or its value cannot be parsed. An
-    older-format value that lacks ``fragment_ids`` parses to an empty signature, which no live
-    dataset matches, so it simply re-enables clustering once rather than raising.
+    object-store I/O. Returns ``None`` when the key is absent or its exact current shape cannot be
+    parsed.
 
     Args:
         dataset: The open dataset whose config to read.
@@ -154,13 +203,12 @@ def load_cluster_generation(dataset: lance.LanceDataset) -> dict[str, Any] | Non
         return None
     try:
         parsed: dict[str, Any] = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
+        fragment_ids: list[int] = [int(value) for value in parsed["fragment_ids"]]
+        num_rows: int = int(parsed["num_rows"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         logger.warning("cluster: malformed cluster generation config on %s; treating as absent", dataset.uri)
         return None
-    return {
-        "fragment_ids": [int(value) for value in parsed.get("fragment_ids", [])],
-        "num_rows": int(parsed.get("num_rows", -1)),
-    }
+    return {"fragment_ids": fragment_ids, "num_rows": num_rows}
 
 
 def cluster_generation_skip_reason(dataset: lance.LanceDataset) -> str | None:
@@ -172,9 +220,8 @@ def cluster_generation_skip_reason(dataset: lance.LanceDataset) -> str | None:
     kinds of write: a fragment-replacing write (append, merge rewrite, compaction) mints new
     fragment ids so the id list diverges even when the count is unchanged, while a pure delete
     lowers the row count without touching the ids. Both reads come from the already-open manifest,
-    so the check costs no object-store I/O. TTL is deliberately not run before this check, so on a
-    clustered fleet with TTL active an idle already-clustered dataset defers time-based expiry
-    until a write re-enables it.
+    so the check costs no object-store I/O. The clustered plan runs time-based retention before
+    honoring a matching fingerprint, so an idle generation cannot defer record expiry indefinitely.
 
     Args:
         dataset: The open dataset to inspect.
@@ -193,27 +240,48 @@ def cluster_generation_skip_reason(dataset: lance.LanceDataset) -> str | None:
     return None
 
 
-def stamp_cluster_generation(uri: str, config: MaintenanceConfig, telemetry: Telemetry) -> None:
+def stamp_cluster_generation(
+    uri: str,
+    config: MaintenanceConfig,
+    telemetry: Telemetry,
+    expected_fragment_ids: list[int] | None = None,
+    expected_num_rows: int | None = None,
+) -> None:
     """Stamp the clustered-generation fingerprint into a dataset's config KV.
 
     Mirrors :func:`~lance_etl.indexing.optimize.write_vector_config`: the ``update_config`` write
     surfaces conflicts as ``OSError`` through the pyo3 binding, so it is wrapped in
     :func:`~lance_etl.telemetry.commit_with_retries`, which re-opens the dataset at the latest
-    version before each attempt. The fingerprint (the freshly clustered generation's sorted
-    fragment-id list and logical row count) is read from the same re-opened handle each attempt, so
-    it always reflects the version it is stamped onto, and it lets the next clustered-rewrite run
-    skip a dataset that has not been written to since it was clustered (ADR 0041).
+    version before each attempt. The overwrite path supplies its committed fragment and row
+    fingerprint. A later index-only commit may safely be rebased because it preserves that
+    fingerprint, while any append, delete, or fragment rewrite fails closed instead of being
+    mislabeled as clustered. Direct callers may omit both expected values to stamp the current
+    generation deliberately.
 
     Args:
         uri: Dataset URI.
         config: Maintenance configuration supplying the retry budget and backoff.
         telemetry: Telemetry facade for the current process.
+        expected_fragment_ids: Optional sorted data-fragment identity that must still be current.
+        expected_num_rows: Optional logical row count that must still be current.
+
+    Raises:
+        ValueError: If only one expected fingerprint component is supplied.
+        RuntimeError: If the data generation changed before the stamp committed.
     """
+    if (expected_fragment_ids is None) != (expected_num_rows is None):
+        raise ValueError("cluster generation stamp requires both expected fingerprint components")
 
     def action() -> None:
-        """Capture the fingerprint at the latest dataset version and write it into the config KV."""
+        """Verify and stamp the latest dataset generation."""
         dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
-        payload: str = json.dumps({"fragment_ids": fragment_id_signature(dataset), "num_rows": dataset.count_rows()})
+        fragment_ids: list[int] = fragment_id_signature(dataset)
+        num_rows: int = dataset.count_rows()
+        if expected_fragment_ids is not None and (
+            fragment_ids != expected_fragment_ids or num_rows != expected_num_rows
+        ):
+            raise RuntimeError(f"clustered data generation changed before it could be stamped on {uri}")
+        payload: str = json.dumps({"fragment_ids": fragment_ids, "num_rows": num_rows})
         dataset.update_config({CLUSTER_GENERATION_KEY: payload})
 
     commit_with_retries(
@@ -317,6 +385,36 @@ def normalise_rows(matrix: np.ndarray) -> np.ndarray:
     return matrix / norms[:, None]
 
 
+def assignment_block_rows(num_partitions: int, dimension: int, distance_type: str) -> int:
+    """Choose a row block that respects the dense assignment-working-set budget.
+
+    Every distance type retains one dense row-by-centroid score matrix. L2 transforms its dot
+    products into reduced squared distances in place. Cosine also retains one normalized
+    row-by-dimension matrix. The result is capped by
+    :data:`ASSIGN_BLOCK_ROWS` and floored at one row, so increasing IVF partition count cannot make
+    one assignment block consume unbounded executor memory and high-dimensional cosine input is
+    included in the same bound.
+
+    Args:
+        num_partitions: Positive IVF centroid count.
+        dimension: Positive vector dimension.
+        distance_type: Lance distance type.
+
+    Returns:
+        Maximum rows to assign in one numpy block.
+
+    Raises:
+        ValueError: If the partition count, dimension, or distance type is invalid.
+    """
+    if num_partitions < 1 or dimension < 1:
+        raise ValueError("num_partitions and dimension must be positive")
+    if distance_type not in ("l2", "cosine", "dot"):
+        raise ValueError(f"unsupported distance_type {distance_type!r}; expected l2, cosine, or dot")
+    live_values_per_row: int = num_partitions + (dimension if distance_type == "cosine" else 0)
+    bytes_per_row: int = live_values_per_row * np.dtype(np.float32).itemsize
+    return max(1, min(ASSIGN_BLOCK_ROWS, ASSIGN_WORKING_BYTES // bytes_per_row))
+
+
 def assign_block(
     block: np.ndarray,
     centroids: np.ndarray,
@@ -338,8 +436,9 @@ def assign_block(
     """
     if distance_type == "l2":
         scores: np.ndarray = block @ centroids.T
-        distances: np.ndarray = centroid_norms_sq[None, :] - 2.0 * scores
-        return np.argmin(distances, axis=1).astype(np.int64)
+        scores *= -2.0
+        scores += centroid_norms_sq[None, :]
+        return np.argmin(scores, axis=1).astype(np.int64)
     if distance_type == "cosine":
         similarities: np.ndarray = normalise_rows(block) @ normalised_centroids.T
         return np.argmax(similarities, axis=1).astype(np.int64)
@@ -352,15 +451,15 @@ def assign_partition_ids(vectors: pa.FixedSizeListArray, centroids: np.ndarray, 
 
     This is the pure, executor-side assigner that reproduces Lance's own IVF partition assignment:
     nearest centroid on the raw vector, with the RaBitQ rotation applying only to residuals after
-    assignment. The work runs in blocks of :data:`ASSIGN_BLOCK_ROWS` rows so the row-by-centroid
-    distance matrix stays bounded regardless of partition count. ``l2`` minimises the reduced
+    assignment. The work scales its row block from :data:`ASSIGN_WORKING_BYTES`, the centroid
+    count so the dense row-by-centroid matrices stay bounded. ``l2`` minimises the reduced
     squared distance ``-2 x C^T + ||C||^2`` (the per-row ``||x||^2`` term is constant and dropped),
     ``cosine`` normalises both sides with a zero-vector eps guard and maximises the dot product, and
     ``dot`` maximises the raw dot product.
 
     Null vector rows are not special-cased here: their underlying buffer values yield some
-    argmin/argmax that the caller overwrites with the tail partition id. Only assign on
-    freshly-scanned batches, since the numpy view ignores any array slice offset.
+    argmin/argmax that the caller overwrites with the tail partition id. The child-value slice is
+    aligned to the list array's offset so sliced Arrow batches are assigned from their own rows.
 
     Args:
         vectors: The vector column as a fixed-size-list array.
@@ -376,15 +475,17 @@ def assign_partition_ids(vectors: pa.FixedSizeListArray, centroids: np.ndarray, 
     if distance_type not in ("l2", "cosine", "dot"):
         raise ValueError(f"unsupported distance_type {distance_type!r}; expected l2, cosine, or dot")
     dimension: int = vectors.type.list_size
-    matrix: np.ndarray = vectors.values.to_numpy(zero_copy_only=False).astype(np.float32, copy=False)
+    values: pa.Array = vectors.values.slice(vectors.offset * dimension, len(vectors) * dimension)
+    matrix: np.ndarray = values.to_numpy(zero_copy_only=False).astype(np.float32, copy=False)
     matrix = matrix.reshape(len(vectors), dimension)
     centroid_matrix: np.ndarray = centroids.astype(np.float32, copy=False)
     centroid_norms_sq: np.ndarray = np.einsum("ij,ij->i", centroid_matrix, centroid_matrix)
-    normalised_centroids: np.ndarray = normalise_rows(centroid_matrix)
+    normalised_centroids: np.ndarray = normalise_rows(centroid_matrix) if distance_type == "cosine" else centroid_matrix
     out: np.ndarray = np.empty(len(vectors), dtype=np.int64)
-    for start in range(0, len(vectors), ASSIGN_BLOCK_ROWS):
-        block: np.ndarray = matrix[start : start + ASSIGN_BLOCK_ROWS]
-        out[start : start + ASSIGN_BLOCK_ROWS] = assign_block(
+    block_rows: int = assignment_block_rows(len(centroid_matrix), dimension, distance_type)
+    for start in range(0, len(vectors), block_rows):
+        block: np.ndarray = matrix[start : start + block_rows]
+        out[start : start + block_rows] = assign_block(
             block, centroid_matrix, normalised_centroids, centroid_norms_sq, distance_type
         )
     return out
@@ -413,20 +514,22 @@ def partition_ids_for_batch(
 
 
 def derive_buckets(counts: list[int], rows_per_task: int) -> list[tuple[int, int, int, int]]:
-    """Pack a partition-id histogram into bounded contiguous write buckets.
+    """Pack a partition-id histogram into contiguous write buckets near a target size.
 
     Contiguous partition ids are packed into buckets whose total row count stays at or below
-    ``rows_per_task``, so a global sort by partition id follows bucket order and at most one centroid
+    ``rows_per_task``, so global bucket order follows partition order and at most one centroid
     straddles a fragment boundary. A single partition larger than the cap cannot be packed with its
-    neighbours, so it splits into ``ceil(count / rows_per_task)`` salted sub-buckets: rows within one
-    centroid need no internal order, so they fan out across sub-buckets to bound every write task's
-    memory regardless of centroid skew (mirrors the ETL salted shuffle). The last histogram slot is
-    the null tail partition and is packed uniformly with the rest, so it always appears in a bucket
-    when it carries rows.
+    neighbours, so it splits into ``ceil(count / rows_per_task)`` salted sub-buckets. Rows within one
+    centroid need no internal order, so they fan out across sub-buckets near the target. Independent
+    read shards can produce a small imbalance, bounded by one row per contributing shard. The write
+    side remains memory-bounded by streamed shuffle chunks, and ``write_fragments`` enforces
+    ``rows_per_task`` as the hard per-file cap even when a salted bucket exceeds its target. The last
+    histogram slot is the null tail partition and is packed uniformly with the rest, so it always
+    appears in a bucket when it carries rows.
 
     Args:
         counts: Per-partition row counts, length ``num_partitions + 1`` with the null tail last.
-        rows_per_task: The row cap per bucket and per rewritten fragment.
+        rows_per_task: Target rows per bucket and hard row cap per rewritten fragment.
 
     Returns:
         A list of ``(start_pid, end_pid, salt, num_salts)`` tuples in ascending partition order. A
@@ -577,12 +680,13 @@ def plan_cluster_rewrite(
 ) -> dict[str, Any]:
     """Plan one dataset's clustered rewrite on an executor (phase ``cluster-plan``).
 
-    Resolves the vector column and guards eligibility, runs TTL now so expired rows are never
-    rewritten, resolves the reusable centroids sidecar-first, and pins the post-TTL read version
-    with its schema, row count, and fragment shards. A dataset already clustered and unwritten
-    since (:func:`cluster_generation_skip_reason`) returns a terminal ``cluster_current`` dict so
-    it is neither re-clustered nor routed into normal compaction, which would undo its centroid
-    ordering. It is not fully skipped, though: it first runs the same rotation-gated idle version
+    Resolves the vector column and guards eligibility, runs retention so expired rows are never
+    rewritten, resolves the reusable centroids sidecar-first, and pins the post-retention read version
+    with its schema, row count, and fragment shards. Retention runs before an already-clustered
+    fingerprint is honored, so wall-clock expiry still invalidates an otherwise unchanged generation.
+    A dataset that remains current returns a terminal ``cluster_current`` dict so it is neither
+    re-clustered nor routed into normal compaction, which would undo its centroid ordering. It is not
+    fully skipped, though: it first runs the same rotation-gated idle version
     cleanup the normal compaction-skip path uses (:func:`~lance_etl.maintenance.job.idle_cleanup_bytes`),
     so the pre-rewrite generation left by the Overwrite is reclaimed on a later run once it ages
     past the cleanup horizon and its pinning tags are gone. An otherwise-ineligible dataset returns
@@ -591,7 +695,7 @@ def plan_cluster_rewrite(
     Args:
         uri: Dataset URI.
         config: Maintenance configuration.
-        cutoff: TTL cutoff instant, or ``None`` to skip the TTL step.
+        cutoff: retention cutoff instant, or ``None`` to skip the retention step.
         telemetry: Telemetry facade for the current executor process.
         cleanup_slot: The active fleet-wide rotation slot for this run, threaded into the
             already-clustered idle cleanup, or ``None`` to always clean (the pre-rotation behavior
@@ -604,34 +708,68 @@ def plan_cluster_rewrite(
         ineligible.
     """
     dataset: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+    retention_rows_deleted: int = 0
+    retention_checked: bool = False
     current: str | None = cluster_generation_skip_reason(dataset)
+    if current is not None and config.retention_active() and cutoff is not None:
+        retention_result: dict[str, Any] = maintenance_job.run_retention_on_open_dataset(
+            dataset, uri, config, cutoff, telemetry
+        )
+        retention_checked = True
+        retention_rows_deleted = int(retention_result.get("retention_rows_deleted", 0))
+        if retention_result.get("error"):
+            return {**retention_result, "bytes_removed": 0}
+        if retention_rows_deleted > 0:
+            dataset = lance.dataset(uri, storage_options=config.storage_options)
+            current = cluster_generation_skip_reason(dataset)
     if current is not None:
         telemetry.incr("cluster.skipped_already_clustered")
-        bytes_removed: int = maintenance_job.idle_cleanup_bytes(uri, config, telemetry, dataset, False, cleanup_slot)
-        return {"uri": uri, "cluster_current": current, "bytes_removed": bytes_removed}
+        bytes_removed: int = maintenance_job.idle_cleanup_bytes(
+            uri, config, telemetry, dataset, retention_rows_deleted > 0, cleanup_slot
+        )
+        return {
+            "uri": uri,
+            "cluster_current": current,
+            "bytes_removed": bytes_removed,
+            "retention_rows_deleted": retention_rows_deleted,
+        }
     column, skip = resolve_cluster_column(dataset, config)
     if column is None:
-        return {"uri": uri, "cluster_skipped": skip}
+        return {"uri": uri, "cluster_skipped": skip, "retention_rows_deleted": retention_rows_deleted}
     index_name: str = vector_index_name(column)
     guard: str | None = cluster_guard_reason(dataset, column, index_name)
     if guard is not None:
-        return {"uri": uri, "cluster_skipped": guard}
+        return {"uri": uri, "cluster_skipped": guard, "retention_rows_deleted": retention_rows_deleted}
     cfg: dict[str, Any] | None = load_vector_config(dataset, column)
     if cfg is None:
-        return {"uri": uri, "cluster_skipped": "vector config vanished after the guard check"}
+        return {
+            "uri": uri,
+            "cluster_skipped": "vector config vanished after the guard check",
+            "retention_rows_deleted": retention_rows_deleted,
+        }
 
-    ttl_rows_deleted: int = 0
-    if config.ttl_active() and cutoff is not None:
-        ttl_result: dict[str, Any] = maintenance_job.run_ttl_on_open_dataset(dataset, uri, config, cutoff, telemetry)
-        ttl_rows_deleted = int(ttl_result.get("ttl_rows_deleted", 0))
-        if ttl_rows_deleted > 0:
+    if not retention_checked and config.retention_active() and cutoff is not None:
+        retention_result: dict[str, Any] = maintenance_job.run_retention_on_open_dataset(
+            dataset, uri, config, cutoff, telemetry
+        )
+        retention_rows_deleted = int(retention_result.get("retention_rows_deleted", 0))
+        if retention_result.get("error"):
+            return {**retention_result, "bytes_removed": 0}
+        if retention_rows_deleted > 0:
             dataset = lance.dataset(uri, storage_options=config.storage_options)
+    total_rows: int = dataset.count_rows()
+    if total_rows == 0:
+        return {
+            "uri": uri,
+            "cluster_skipped": "empty dataset after retention; normal maintenance will materialize deletions",
+            "retention_rows_deleted": retention_rows_deleted,
+        }
 
     rows_at_train: int = int(cfg["rows_at_train"])
     metric: str = str(cfg["metric"])
     distance_type: str = METRIC_TO_DISTANCE.get(metric.lower(), "l2")
     centroids: pa.Array = resolve_cluster_centroids(dataset, uri, index_name, rows_at_train, metric, config, telemetry)
-    fragment_ids: list[int] = all_fragment_ids(dataset)
+    fragment_count: int = int(dataset.stats.dataset_stats()["num_fragments"])
     telemetry.incr("cluster.planned")
     return {
         "uri": uri,
@@ -644,33 +782,109 @@ def plan_cluster_rewrite(
         "num_partitions": len(centroids),
         "rows_at_train": rows_at_train,
         "read_version": dataset.version,
-        "total_rows": dataset.count_rows(),
+        "total_rows": total_rows,
         "schema": dataset.schema,
-        "shards": split_evenly(fragment_ids, CLUSTER_READ_SHARDS),
+        "fragment_count": fragment_count,
         "centroids_ipc": encode_centroids(centroids),
-        "ttl_rows_deleted": ttl_rows_deleted,
+        "retention_rows_deleted": retention_rows_deleted,
     }
 
 
-def read_shard_tasks(plans: list[dict[str, Any]]) -> list[tuple[str, int, list[int], str, str]]:
-    """Flatten eligible plans into per-shard read tasks shared by the histogram and rewrite scans.
+def read_task_seeds(plans: list[dict[str, Any]]) -> list[ClusterReadSeed]:
+    """Build bounded dataset-level seeds for histogram and rewrite fragment enumeration.
 
-    Both the histogram scan and the rewrite scan read the same fragment shards at the same pinned
-    version, so they share one task shape: one ``(uri, read_version, shard, column, distance_type)``
-    tuple per fragment shard of every eligible dataset. Keeping the flattening in one place stops the
-    two phases from drifting apart.
+    Fragment identifiers stay off the driver. Each seed carries only the pinned version and probed
+    fragment count needed for an executor to verify and shard the inventory.
 
     Args:
         plans: The eligible plan dicts.
 
     Returns:
-        One read task per fragment shard across every eligible dataset.
+        One bounded seed per eligible dataset.
     """
     return [
-        (plan["uri"], plan["read_version"], shard, plan["column"], plan["distance_type"])
+        (
+            str(plan["uri"]),
+            int(plan["read_version"]),
+            int(plan["fragment_count"]),
+            str(plan["column"]),
+            str(plan["distance_type"]),
+        )
         for plan in plans
-        for shard in plan["shards"]
     ]
+
+
+def exact_fragment_shards(
+    uri: str,
+    version: int,
+    expected_count: int,
+    storage_options: dict[str, Any] | None,
+) -> list[list[int]]:
+    """Open one pinned dataset on an executor and verify its fragment inventory before sharding.
+
+    Args:
+        uri: Dataset URI.
+        version: Exact pinned dataset version.
+        expected_count: Fragment count observed by the plan phase.
+        storage_options: Object-store options forwarded to lance.
+
+    Returns:
+        At most :data:`CLUSTER_READ_SHARDS` non-empty fragment-id shards.
+
+    Raises:
+        RuntimeError: If the pinned inventory differs from the plan.
+    """
+    dataset: lance.LanceDataset = lance.dataset(uri, version=version, storage_options=storage_options)
+    fragment_ids: list[int] = all_fragment_ids(dataset)
+    if len(fragment_ids) != expected_count:
+        raise RuntimeError(f"fragment inventory changed for {uri}: planned {expected_count}, found {len(fragment_ids)}")
+    return split_evenly(fragment_ids, CLUSTER_READ_SHARDS)
+
+
+def enumerate_cluster_read_tasks(
+    seed: ClusterReadSeed,
+    storage_options: dict[str, Any] | None,
+) -> Iterator[ClusterReadTask]:
+    """Expand one dataset seed into fragment shards on an executor.
+
+    Args:
+        seed: Dataset URI, pinned version, fragment count, vector column, and distance type.
+        storage_options: Object-store options forwarded to lance.
+
+    Yields:
+        Read shards, or one error-bearing task when the inventory cannot be reproduced.
+    """
+    uri, version, expected_count, column, distance_type = seed
+    try:
+        shards: list[list[int]] = exact_fragment_shards(uri, version, expected_count, storage_options)
+    except Exception as exc:
+        yield uri, version, [], column, distance_type, str(exc)
+        return
+    for shard in shards:
+        yield uri, version, shard, column, distance_type, None
+
+
+def enumerate_cluster_index_tasks(
+    seed: ClusterIndexSeed,
+    storage_options: dict[str, Any] | None,
+) -> Iterator[ClusterIndexShardTask]:
+    """Expand one committed dataset's rebuild seed into verified fragment shards on an executor.
+
+    Args:
+        seed: Small index-rebuild dataset seed.
+        storage_options: Object-store options forwarded to lance.
+
+    Yields:
+        Index shard tasks, or one error-bearing task when the inventory cannot be reproduced.
+    """
+    uri, version, expected_count, column, index_name, metric, num_bits, num_partitions = seed
+    try:
+        shards: list[list[int]] = exact_fragment_shards(uri, version, expected_count, storage_options)
+    except Exception as exc:
+        yield uri, version, [], column, index_name, metric, num_bits, num_partitions, str(exc)
+        return
+    for shard in shards:
+        yield uri, version, shard, column, index_name, metric, num_bits, num_partitions, None
 
 
 def partition_histogram(
@@ -737,13 +951,40 @@ def build_bucket_lookup(
     return pid_to_global, salted
 
 
-def assign_global_buckets(pids: np.ndarray, pid_to_global: np.ndarray, salted: dict[int, np.ndarray]) -> np.ndarray:
-    """Map each row's partition id to its global bucket id, salting oversized partitions evenly.
+def initial_salt_offsets(salted: dict[int, np.ndarray], shard: list[int]) -> dict[int, int]:
+    """Choose deterministic salted-bucket offsets from one fragment shard's identity.
+
+    Each rewrite task owns its own mutable offsets, so starting every task at salt zero would send
+    the first row of every tiny fragment shard to the same global bucket. A stable weighted fragment
+    signature rotates adjacent singleton shards across salts while remaining independent of Spark
+    scheduling and Python's randomized hash seed. Batch-level assignment advances these offsets
+    normally after this initial rotation.
+
+    Args:
+        salted: Salted partition sub-bucket lookups.
+        shard: Exact fragment ids scanned by one rewrite task.
+
+    Returns:
+        Initial next-salt offsets keyed by salted partition id.
+    """
+    shard_signature: int = sum((position + 1) * fragment_id for position, fragment_id in enumerate(shard))
+    return {pid: int((shard_signature + pid) % len(sub_buckets)) for pid, sub_buckets in salted.items()}
+
+
+def assign_global_buckets(
+    pids: np.ndarray,
+    pid_to_global: np.ndarray,
+    salted: dict[int, np.ndarray],
+    salt_offsets: dict[int, int],
+) -> np.ndarray:
+    """Map rows to global buckets while continuing oversized-partition salts across batches.
 
     Args:
         pids: The per-row partition ids for one batch.
         pid_to_global: The non-salted partition-to-global lookup from :func:`build_bucket_lookup`.
         salted: The salted partition sub-bucket lookup from :func:`build_bucket_lookup`.
+        salt_offsets: Mutable next-salt offsets by partition id for the current read shard. Callers
+            seed them from :func:`initial_salt_offsets` so separate shards do not all start at zero.
 
     Returns:
         A ``(len(pids),)`` int64 array of global bucket ids.
@@ -753,8 +994,10 @@ def assign_global_buckets(pids: np.ndarray, pid_to_global: np.ndarray, salted: d
         mask: np.ndarray = pids == pid
         selected: int = int(mask.sum())
         if selected:
-            salt: np.ndarray = np.arange(selected) % len(sub_buckets)
+            offset: int = salt_offsets.get(pid, 0)
+            salt: np.ndarray = (np.arange(selected) + offset) % len(sub_buckets)
             globals_out[mask] = sub_buckets[salt]
+            salt_offsets[pid] = int((offset + selected) % len(sub_buckets))
     return globals_out
 
 
@@ -767,12 +1010,15 @@ def read_rewrite_chunks(
     distance_type: str,
     global_buckets: list[tuple[int, int, int, int, int]],
     storage_options: dict[str, Any] | None,
-) -> list[tuple[int, bytes]]:
-    """Read a fragment shard's full rows and emit them keyed by global bucket (phase ``cluster-rewrite``).
+) -> Iterator[tuple[tuple[int, int], bytes]]:
+    """Read a fragment shard and emit chunks keyed by global bucket and centroid partition.
 
     Each batch is assigned, tagged with the temporary partition-id column, and split by global
-    bucket. Per-bucket buffers flush to Arrow IPC once they exceed :data:`SHUFFLE_CHUNK_BYTES`, and
-    any remainder flushes at the end, so a shard's memory is bounded by the chunk cap.
+    bucket plus exact centroid partition. The composite shuffle key lets Spark sort partitions
+    within each output bucket without retaining the bucket in Python. The largest buffered key
+    flushes to Arrow IPC whenever the combined shard buffer reaches
+    :data:`SHUFFLE_CHUNK_BYTES`, and emitted chunks are yielded immediately rather than retained
+    until the shard scan ends.
 
     Args:
         uri: Dataset URI.
@@ -784,8 +1030,8 @@ def read_rewrite_chunks(
         global_buckets: ``(global_id, start_pid, end_pid, salt, num_salts)`` tuples for this dataset.
         storage_options: Object-store options forwarded to lance.
 
-    Returns:
-        ``(global_bucket, ipc_bytes)`` pairs carrying the tagged rows for the shuffle.
+    Yields:
+        ``((global_bucket, partition_id), ipc_bytes)`` pairs carrying tagged rows for the sorted shuffle.
     """
     centroids: np.ndarray = centroids_to_matrix(decode_centroids(centroids_ipc))
     num_partitions: int = centroids.shape[0]
@@ -793,64 +1039,93 @@ def read_rewrite_chunks(
     dataset: lance.LanceDataset = lance.dataset(uri, version=version, storage_options=storage_options)
     wanted: set[int] = set(shard)
     fragments: list[Any] = [fragment for fragment in dataset.get_fragments() if fragment.fragment_id in wanted]
-    buffers: dict[int, list[pa.Table]] = {}
-    sizes: dict[int, int] = {}
-    output: list[tuple[int, bytes]] = []
+    buffers: dict[tuple[int, int], list[pa.Table]] = {}
+    sizes: dict[tuple[int, int], int] = {}
+    buffered_bytes: int = 0
+    salt_offsets: dict[int, int] = initial_salt_offsets(salted, shard)
     reader: pa.RecordBatchReader = dataset.scanner(fragments=fragments).to_reader()
     for batch in reader:
         pids: np.ndarray = partition_ids_for_batch(batch.column(column), centroids, distance_type, num_partitions)
         tagged: pa.Table = pa.Table.from_batches([batch]).append_column(
             CLUSTER_PARTITION_COLUMN, pa.array(pids.astype(np.int32), pa.int32())
         )
-        globals_out: np.ndarray = assign_global_buckets(pids, pid_to_global, salted)
-        flush_batch_into_buckets(tagged, globals_out, buffers, sizes, output)
-    for global_id, tables in buffers.items():
-        output.append((global_id, table_to_ipc(pa.concat_tables(tables))))
-    return output
+        globals_out: np.ndarray = assign_global_buckets(pids, pid_to_global, salted, salt_offsets)
+        for global_id in np.unique(globals_out):
+            global_mask: np.ndarray = globals_out == global_id
+            for partition_id in np.unique(pids[global_mask]):
+                mask: np.ndarray = global_mask & (pids == partition_id)
+                slice_table: pa.Table = tagged.filter(pa.array(mask))
+                key: tuple[int, int] = (int(global_id), int(partition_id))
+                buffers.setdefault(key, []).append(slice_table)
+                sizes[key] = sizes.get(key, 0) + slice_table.nbytes
+                buffered_bytes += slice_table.nbytes
+                if buffered_bytes >= SHUFFLE_CHUNK_BYTES:
+                    flushed_key, chunk, released_bytes = pop_largest_bucket(buffers, sizes)
+                    buffered_bytes -= released_bytes
+                    yield flushed_key, chunk
+    while buffers:
+        flushed_key, chunk, released_bytes = pop_largest_bucket(buffers, sizes)
+        buffered_bytes -= released_bytes
+        yield flushed_key, chunk
+    if buffered_bytes != 0:
+        raise RuntimeError("rewrite bucket byte accounting did not drain to zero")
 
 
-def flush_batch_into_buckets(
-    tagged: pa.Table,
-    globals_out: np.ndarray,
-    buffers: dict[int, list[pa.Table]],
-    sizes: dict[int, int],
-    output: list[tuple[int, bytes]],
-) -> None:
-    """Split one tagged batch by global bucket into buffers, flushing oversized buckets.
+def pop_largest_bucket(
+    buffers: dict[tuple[int, int], list[pa.Table]],
+    sizes: dict[tuple[int, int], int],
+) -> tuple[tuple[int, int], bytes, int]:
+    """Remove and serialize the largest buffered rewrite bucket.
 
     Args:
-        tagged: The batch as a table already carrying the partition-id column.
-        globals_out: The per-row global bucket ids for the batch.
-        buffers: Per-bucket accumulated table slices, mutated in place.
-        sizes: Per-bucket accumulated byte sizes, mutated in place.
-        output: The emitted ``(global_bucket, ipc_bytes)`` pairs, appended to in place.
+        buffers: Non-empty per-bucket accumulated table slices, mutated in place.
+        sizes: Matching per-bucket accumulated byte sizes, mutated in place.
+
+    Returns:
+        Global bucket and partition key, serialized IPC chunk, and released approximate bytes.
+
+    Raises:
+        ValueError: If the buffers and sizes are empty or inconsistent.
     """
-    for global_id in np.unique(globals_out):
-        mask: np.ndarray = globals_out == global_id
-        slice_table: pa.Table = tagged.filter(pa.array(mask))
-        key: int = int(global_id)
-        buffers.setdefault(key, []).append(slice_table)
-        sizes[key] = sizes.get(key, 0) + slice_table.nbytes
-        if sizes[key] >= SHUFFLE_CHUNK_BYTES:
-            output.append((key, table_to_ipc(pa.concat_tables(buffers.pop(key)))))
-            sizes[key] = 0
+    if not buffers or set(buffers) != set(sizes):
+        raise ValueError("rewrite bucket buffers and sizes must be non-empty and aligned")
+    key: tuple[int, int] = max(sizes, key=lambda candidate: sizes[candidate])
+    released_bytes: int = sizes.pop(key)
+    tables: list[pa.Table] = buffers.pop(key)
+    return key, table_to_ipc(pa.concat_tables(tables)), released_bytes
+
+
+def bucket_record_batches(chunks: Iterator[bytes], schema: pa.Schema) -> Iterator[pa.RecordBatch]:
+    """Decode one centroid-sorted shuffled bucket incrementally and drop its routing column.
+
+    Args:
+        chunks: Arrow IPC chunks sorted by centroid partition for one global bucket.
+        schema: Pinned output dataset schema.
+
+    Yields:
+        Output-schema record batches while retaining only one decoded chunk at a time.
+    """
+    for chunk in chunks:
+        table: pa.Table = table_from_ipc(chunk).select(schema.names)
+        yield from table.to_batches()
 
 
 def write_bucket(
     global_bucket: int,
-    chunks: list[bytes],
+    chunks: Iterator[bytes],
     uri: str,
     schema: pa.Schema,
     rows_per_task: int,
     storage_options: dict[str, Any] | None,
 ) -> list[tuple[int, int, str, int]]:
-    """Sort one global bucket's rows by partition id and write them as new fragment files.
+    """Stream one global bucket into new fragment files.
 
-    Concatenates the shuffled chunks, sorts by the temporary partition-id column so same-centroid
-    rows stay contiguous, drops that column, and writes fragments capped at ``rows_per_task`` rows.
+    Bucket derivation assigns each global bucket a contiguous IVF partition range and caps it at
+    ``rows_per_task`` rows. The bucket therefore maps to at most one normal output fragment without
+    an in-memory sort. Streaming decoded record batches into ``write_fragments`` keeps executor
+    memory bounded by one shuffle chunk even for wide rows.
 
-    Unlike the fresh-namespace copy in :mod:`lance_etl.migrate_namespace`, ``uri`` here is the
-    dataset actually being rewritten, so it already exists. ``write_fragments`` rejects
+    ``uri`` is the dataset being rewritten, so it already exists. ``write_fragments`` rejects
     ``mode="create"`` against an existing dataset directory with ``Error::dataset_already_exists``
     (lance validates ``WriteMode::Create`` only against a destination with no committed dataset
     yet). ``mode="overwrite"`` assigns the same fresh field ids as ``"create"`` — required so the
@@ -861,7 +1136,7 @@ def write_bucket(
 
     Args:
         global_bucket: The global bucket id, for stable ordering on the driver.
-        chunks: The Arrow IPC chunks routed to this bucket.
+        chunks: Streaming Arrow IPC chunks routed to this bucket.
         uri: Target dataset URI the fragment files are written under.
         schema: The pinned dataset schema the fragments are created with.
         rows_per_task: Row cap per written fragment file.
@@ -870,9 +1145,7 @@ def write_bucket(
     Returns:
         One ``(global_bucket, seq, fragment_json, rows)`` tuple per written fragment.
     """
-    combined: pa.Table = pa.concat_tables([table_from_ipc(chunk) for chunk in chunks])
-    ordered: pa.Table = combined.sort_by(CLUSTER_PARTITION_COLUMN).select(schema.names)
-    reader: pa.RecordBatchReader = ordered.to_reader()
+    reader: pa.RecordBatchReader = pa.RecordBatchReader.from_batches(schema, bucket_record_batches(chunks, schema))
     metadatas: list[FragmentMetadata] = write_fragments(
         reader,
         uri,
@@ -894,22 +1167,20 @@ def commit_cluster_overwrite(
     schema: pa.Schema,
     config: MaintenanceConfig,
     telemetry: Telemetry,
+    read_version: int | None = None,
 ) -> int:
     """Commit the rewritten fragments over a dataset with ``LanceOperation.Overwrite``.
 
     The overwrite preserves version history, tags, and the dataset config KV (column roles and the
     vector config survive), and drops every index so the rebuild phase can re-create the vector
-    index. A concurrent write between the pinned read version and this commit is clobbered, which is
-    why a clustered rewrite requires the dataset quiesced.
+    index. The commit is pinned to the plan's read version and every retry re-opens the latest
+    dataset first. A concurrent post-plan write therefore fails the clustered rewrite instead of
+    being silently clobbered. Quiescing the dataset is still required for a successful run.
 
-    Immediately after the overwrite commits, the clustered-generation fingerprint (the sorted
-    fragment-id list and logical row count read back from the committed version) is stamped into
-    the config KV via :func:`stamp_cluster_generation`, so the next scheduled clustered-rewrite run
-    skips this dataset unless it is written to in the meantime. The stamp is written before the
-    later index rebuild deliberately: a rebuild that fails still leaves the data clustered, and the
-    fingerprint keeps the next run from wastefully re-clustering it (the indexing job repairs the
-    missing index instead). The index rebuild adds only index segments, not data fragments, so it
-    leaves the stamped fingerprint matching.
+    This primitive commits data only. The orchestrated path stamps the clustered-generation
+    fingerprint after the preserved-centroid index rebuild succeeds. A failed rebuild therefore
+    cannot leave a generation marked current while its replacement index is absent or trained from
+    different centroids.
 
     Args:
         uri: Dataset URI.
@@ -917,26 +1188,96 @@ def commit_cluster_overwrite(
         schema: The pinned dataset schema the new version is created with.
         config: Maintenance configuration.
         telemetry: Telemetry facade for the current process.
+        read_version: Dataset version the rewrite scanned. Direct callers may omit it to pin the
+            latest version visible when this function starts.
 
     Returns:
         The number of fragments committed.
     """
+    committed: ClusterOverwriteCommit = commit_cluster_data(
+        uri,
+        fragment_documents,
+        schema,
+        config,
+        telemetry,
+        read_version,
+    )
+    return committed.fragments_added
+
+
+def commit_cluster_data(
+    uri: str,
+    fragment_documents: list[str],
+    schema: pa.Schema,
+    config: MaintenanceConfig,
+    telemetry: Telemetry,
+    read_version: int | None = None,
+) -> ClusterOverwriteCommit:
+    """Commit only the clustered data overwrite and return its exact fingerprint.
+
+    Separating the destructive overwrite from the derived generation stamp lets the orchestrator
+    recover the preserved-centroid vector index before declaring the rewritten generation current.
+
+    Args:
+        uri: Dataset URI.
+        fragment_documents: JSON fragment metadata collected from the rewrite shuffle.
+        schema: Pinned dataset schema.
+        config: Maintenance configuration.
+        telemetry: Executor telemetry facade.
+        read_version: Dataset version the rewrite scanned, or the latest version for direct callers.
+
+    Returns:
+        Committed fragment count and exact data-generation fingerprint.
+    """
     fragments: list[FragmentMetadata] = [FragmentMetadata.from_json(document) for document in fragment_documents]
+    planned_version: int = (
+        read_version if read_version is not None else lance.dataset(uri, storage_options=config.storage_options).version
+    )
 
-    def action() -> None:
-        """Commit the overwrite operation against the target."""
+    def action() -> lance.LanceDataset:
+        """Verify the plan version is still current, then commit the overwrite."""
+        current: lance.LanceDataset = lance.dataset(uri, storage_options=config.storage_options)
+        if current.version != planned_version:
+            raise RuntimeError(
+                f"cluster rewrite for {uri} planned version {planned_version}, but the dataset advanced to "
+                f"version {current.version}; refusing to overwrite concurrent writes"
+            )
         operation = lance.LanceOperation.Overwrite(schema, fragments)
-        lance.LanceDataset.commit(uri, operation, storage_options=config.storage_options, enable_v2_manifest_paths=True)
+        committed: lance.LanceDataset = lance.LanceDataset.commit(
+            uri,
+            operation,
+            read_version=planned_version,
+            storage_options=config.storage_options,
+            enable_v2_manifest_paths=True,
+            max_retries=0,
+        )
         telemetry.incr("cluster.overwritten")
+        return committed
 
-    commit_with_retries(
+    committed_dataset: lance.LanceDataset = commit_with_retries(
         action,
         config.large_commit_retries,
         config.commit_backoff_seconds,
         lambda: telemetry.incr("cluster.overwrite_conflict"),
     )
-    stamp_cluster_generation(uri, config, telemetry)
-    return len(fragments)
+    fragment_ids: list[int] | None = None
+    fingerprint_error: str | None = None
+    try:
+        fragment_ids = fragment_id_signature(committed_dataset)
+    except Exception as exc:
+        fingerprint_error = str(exc)
+        telemetry.incr("cluster.committed_fingerprint_error")
+        logger.warning(
+            "cluster: committed overwrite fingerprint could not be read for %s, continuing to index recovery: %s",
+            uri,
+            exc,
+        )
+    return ClusterOverwriteCommit(
+        fragments_added=len(fragments),
+        fragment_ids=fragment_ids,
+        num_rows=sum(int(fragment.physical_rows) for fragment in fragments),
+        fingerprint_error=fingerprint_error,
+    )
 
 
 def cluster_index_config(config: MaintenanceConfig, num_partitions: int, metric: str) -> IndexJobConfig:
@@ -1011,6 +1352,59 @@ def build_cluster_index_segment(
     return serialize_segment(segment)
 
 
+def fan_out_cluster_payloads(
+    spark: SparkSession,
+    payloads: list[Any],
+    telemetry_config: TelemetryConfig,
+    per_payload: Callable[[Any, Telemetry], dict[str, Any]],
+    partitions: int,
+    phase: str,
+) -> list[dict[str, Any]]:
+    """Run phase-specific clustered payloads without capturing a driver-side lookup map.
+
+    The generic fleet fan-out accepts only URI strings, which tempts callers to close over a full
+    ``uri -> plan`` map. Cluster plans carry schemas, centroid IPC, and RaBitQ artifacts, so that
+    closure serializes every dataset's heavy plan into every Spark task. This variant parallelizes
+    already-trimmed commit or finalisation payloads directly and retains the same per-dataset
+    failure isolation and executor-local telemetry contract.
+
+    Args:
+        spark: Active Spark session.
+        payloads: Minimal phase-specific payloads carrying a ``uri`` attribute.
+        telemetry_config: Telemetry configuration created per executor process.
+        per_payload: Operation applied to one payload and executor-local telemetry facade.
+        partitions: Upper bound on Spark partitions.
+        phase: Failure phase written to isolated error results and telemetry.
+
+    Returns:
+        One outcome per payload, with raised errors converted to per-dataset error markers.
+    """
+    if not payloads:
+        return []
+
+    def run_partition(items: Iterable[Any]) -> Iterator[dict[str, Any]]:
+        """Apply one clustered phase to the payloads in an executor partition.
+
+        Args:
+            items: Phase payloads assigned to this executor partition.
+
+        Yields:
+            Successful outcomes or isolated error markers.
+        """
+        executor_telemetry: Telemetry = Telemetry.create(telemetry_config)
+        for payload in items:
+            uri: str = str(payload.uri)
+            try:
+                yield per_payload(payload, executor_telemetry)
+            except Exception as exc:
+                logger.warning("cluster: %s failed in phase %s, isolating: %s", uri, phase, exc)
+                executor_telemetry.incr("dataset.fanout_error", tags=[f"phase:{phase}"])
+                yield {"uri": uri, "error": str(exc), "phase": phase}
+
+    slices: int = min(len(payloads), partitions)
+    return spark.sparkContext.parallelize(payloads, slices).mapPartitions(run_partition).collect()
+
+
 def run_cluster_rewrites(
     spark: SparkSession,
     uris: list[str],
@@ -1021,11 +1415,11 @@ def run_cluster_rewrites(
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
     """Cluster-rewrite eligible datasets, returning results and the passthrough set.
 
-    The orchestration runs the fleet phases in order: plan fan-out, one flat histogram job, driver
-    bucket derivation, one flat rewrite shuffle, per-dataset overwrite commit, per-dataset vector
-    index rebuild, then cleanup. No serving tag is ever touched here: promotion happens exclusively
-    through the pipeline stamp phase after the index phase (ADR 0041). Per-dataset failure isolation
-    holds at every phase: a failed dataset carries an ``{"error", "phase"}`` marker and drops out of
+    The orchestration processes bounded dataset batches through plan fan-out, an executor-reduced
+    histogram job, driver bucket derivation, a flat rewrite shuffle, per-dataset overwrite commit,
+    vector-index rebuild, and cleanup. No serving tag is ever touched here: promotion happens
+    exclusively through the pipeline stamp phase after the index phase (ADR 0041). Per-dataset
+    failure isolation holds at every phase: a failed dataset carries an ``{"error", "phase"}`` marker and drops out of
     all later cluster phases and out of normal compaction. A cluster-ineligible dataset is returned
     in the passthrough list so the caller continues it into normal maintenance, while an
     already-clustered unchanged dataset (its ``lance-etl.cluster_generation`` fingerprint still
@@ -1035,7 +1429,7 @@ def run_cluster_rewrites(
         spark: Active Spark session.
         uris: Datasets to consider for a clustered rewrite.
         config: Maintenance configuration.
-        cutoff: TTL cutoff instant, or ``None`` when TTL is inactive.
+        cutoff: retention cutoff instant, or ``None`` when retention is inactive.
         driver_telemetry: The driver's telemetry facade.
         cleanup_slot: The active fleet-wide rotation slot for this run, threaded into the
             already-clustered idle cleanup, or ``None`` to always clean.
@@ -1049,48 +1443,29 @@ def run_cluster_rewrites(
     state = ClusterRunState(spark, config, driver_telemetry, results, passthrough, cleanup_slot)
     with driver_telemetry.span("lance.cluster_rewrite.run") as run_span:
         run_span.set_tag("dataset_count", len(uris))
-        eligible: list[dict[str, Any]] = state.plan(uris, cutoff)
-        if not eligible:
-            return results, passthrough
-        counts_by_uri: dict[str, list[int]] = state.histogram(eligible)
-        eligible = [plan for plan in eligible if plan["uri"] in counts_by_uri]
-        documents_by_uri: dict[str, list[str]] = state.rewrite(eligible, counts_by_uri)
-        eligible = [plan for plan in eligible if plan["uri"] in documents_by_uri]
-        state.commit_and_index(eligible, documents_by_uri)
+        for offset in range(0, len(uris), CLUSTER_DATASET_BATCH_SIZE):
+            eligible: list[dict[str, Any]] = state.plan(uris[offset : offset + CLUSTER_DATASET_BATCH_SIZE], cutoff)
+            if not eligible:
+                continue
+            counts_by_uri: dict[str, list[int]] = state.histogram(eligible)
+            eligible = [plan for plan in eligible if plan["uri"] in counts_by_uri]
+            documents_by_uri: dict[str, list[str]] = state.rewrite(eligible, counts_by_uri)
+            eligible = [plan for plan in eligible if plan["uri"] in documents_by_uri]
+            state.commit_and_index(eligible, documents_by_uri)
         run_span.set_tag("clustered", sum(1 for item in results.values() if item.get("clustered")))
     return results, passthrough
 
 
+@dataclass
 class ClusterRunState:
     """Carries the shared driver state threaded through the clustered-rewrite phases."""
 
-    def __init__(
-        self,
-        spark: SparkSession,
-        config: MaintenanceConfig,
-        driver_telemetry: Telemetry,
-        results: dict[str, dict[str, Any]],
-        passthrough: list[str],
-        cleanup_slot: int | None = None,
-    ) -> None:
-        """Initialize the run state.
-
-        Args:
-            spark: Active Spark session.
-            config: Maintenance configuration.
-            driver_telemetry: The driver's telemetry facade.
-            results: The per-dataset result accumulator, mutated in place across phases.
-            passthrough: The cluster-skipped URI accumulator, mutated in place.
-            cleanup_slot: The active fleet-wide rotation slot for this run, threaded into the
-                already-clustered idle cleanup, or ``None`` to always clean.
-        """
-        self.spark: SparkSession = spark
-        self.config: MaintenanceConfig = config
-        self.telemetry: Telemetry = driver_telemetry
-        self.results: dict[str, dict[str, Any]] = results
-        self.passthrough: list[str] = passthrough
-        self.cleanup_slot: int | None = cleanup_slot
-        self.plans_by_uri: dict[str, dict[str, Any]] = {}
+    spark: SparkSession
+    config: MaintenanceConfig
+    telemetry: Telemetry
+    results: dict[str, dict[str, Any]]
+    passthrough: list[str]
+    cleanup_slot: int | None = None
 
     def fanout_partitions(self) -> int:
         """Return the Spark partition count for the per-dataset fan-out phases.
@@ -1124,7 +1499,7 @@ class ClusterRunState:
 
         Args:
             uris: Datasets to consider.
-            cutoff: TTL cutoff instant, or ``None``.
+            cutoff: retention cutoff instant, or ``None``.
 
         Returns:
             The eligible plan dicts. Passthrough, already-clustered, and errored datasets are
@@ -1152,11 +1527,16 @@ class ClusterRunState:
                     "uri": uri,
                     "skipped": plan["cluster_current"],
                     "bytes_removed": plan.get("bytes_removed", 0),
+                    "retention_rows_deleted": plan.get("retention_rows_deleted", 0),
                 }
             elif "cluster_skipped" in plan:
+                if int(plan.get("retention_rows_deleted", 0)) > 0:
+                    self.results[uri] = {
+                        "uri": uri,
+                        "retention_rows_deleted": plan["retention_rows_deleted"],
+                    }
                 self.passthrough.append(uri)
             else:
-                self.plans_by_uri[uri] = plan
                 eligible.append(plan)
         return eligible
 
@@ -1172,7 +1552,7 @@ class ClusterRunState:
         return self.spark.sparkContext.broadcast({plan["uri"]: plan["centroids_ipc"] for plan in plans})
 
     def histogram(self, plans: list[dict[str, Any]]) -> dict[str, list[int]]:
-        """Run the flat histogram job and aggregate per-dataset partition counts.
+        """Run the flat histogram job and reduce shard counts on executors.
 
         Args:
             plans: The eligible plan dicts.
@@ -1182,40 +1562,69 @@ class ClusterRunState:
         """
         centroids = self.broadcast_centroids(plans)
         storage_options: dict[str, Any] | None = self.config.storage_options
-        tasks: list[tuple[str, int, list[int], str, str]] = read_shard_tasks(plans)
+        seeds: list[ClusterReadSeed] = read_task_seeds(plans)
+        expected_shards: int = sum(min(int(plan["fragment_count"]), CLUSTER_READ_SHARDS) for plan in plans)
 
-        def run_one(item: tuple[str, int, list[int], str, str]) -> tuple[str, str, Any]:
-            """Count one shard's histogram, tagging success or failure by dataset."""
+        def run_one(item: ClusterReadTask) -> tuple[str, tuple[str, Any]]:
+            """Count one shard's histogram, keyed and tagged by dataset."""
             uri: str = item[0]
+            if item[5] is not None:
+                return uri, (FLAT_ERROR, item[5])
             try:
                 counts: list[int] = partition_histogram(
                     uri, item[1], item[2], item[3], centroids.value[uri], item[4], storage_options
                 )
-                return FLAT_OK, uri, counts
+                return uri, (FLAT_OK, counts)
             except Exception as exc:
-                return FLAT_ERROR, uri, str(exc)
+                return uri, (FLAT_ERROR, str(exc))
 
-        grouped, errors = run_flat_tagged_job(self.spark, tasks, run_one, self.flat_partitions(len(tasks)))
-        release_broadcast(centroids)
-        return self.reduce_histograms(grouped, errors)
+        def merge_counts(left: tuple[str, Any], right: tuple[str, Any]) -> tuple[str, Any]:
+            """Associatively reduce histogram results while preserving a failure.
 
-    def reduce_histograms(self, grouped: dict[str, list[Any]], errors: dict[str, str]) -> dict[str, list[int]]:
-        """Sum per-shard histograms per dataset, error-marking any dataset with a failed shard.
+            Args:
+                left: First tagged shard result.
+                right: Second tagged shard result.
 
-        Every successful shard result is a full-width per-partition-count list, so the sum's width
-        is implied by the shard data itself rather than a separately threaded plan width.
+            Returns:
+                Summed counts or one deterministic dataset error.
+            """
+            if left[0] == FLAT_ERROR and right[0] == FLAT_ERROR:
+                return FLAT_ERROR, min(str(left[1]), str(right[1]))
+            if left[0] == FLAT_ERROR:
+                return left
+            if right[0] == FLAT_ERROR:
+                return right
+            left_counts: list[int] = left[1]
+            right_counts: list[int] = right[1]
+            if len(left_counts) != len(right_counts):
+                return FLAT_ERROR, "histogram shards returned different partition widths"
+            return FLAT_OK, [first + second for first, second in zip(left_counts, right_counts, strict=True)]
 
-        Args:
-            grouped: The per-dataset lists of successful shard histograms.
-            errors: The first failure message per dataset with any failed shard.
-
-        Returns:
-            The per-dataset summed histograms for datasets whose every shard succeeded.
-        """
-        for uri, message in errors.items():
-            self.results[uri] = {"uri": uri, "error": message, "phase": "cluster-histogram", "bytes_removed": 0}
-            grouped.pop(uri, None)
-        return {uri: np.sum(np.asarray(counts, dtype=np.int64), axis=0).tolist() for uri, counts in grouped.items()}
+        try:
+            partitions: int = self.flat_partitions(expected_shards)
+            enumeration_slices: int = max(1, min(self.flat_partitions(len(seeds)), len(seeds)))
+            reduced: list[tuple[str, tuple[str, Any]]] = (
+                self.spark.sparkContext.parallelize(seeds, enumeration_slices)
+                .flatMap(lambda seed: enumerate_cluster_read_tasks(seed, storage_options))
+                .repartition(partitions)
+                .map(run_one)
+                .reduceByKey(merge_counts, partitions)
+                .collect()
+            )
+        finally:
+            release_broadcast(centroids)
+        counts_by_uri: dict[str, list[int]] = {}
+        for uri, result in reduced:
+            if result[0] == FLAT_ERROR:
+                self.results[uri] = {
+                    "uri": uri,
+                    "error": str(result[1]),
+                    "phase": "cluster-histogram",
+                    "bytes_removed": 0,
+                }
+            else:
+                counts_by_uri[uri] = result[1]
+        return counts_by_uri
 
     def derive_global_buckets(
         self, plans: list[dict[str, Any]], counts_by_uri: dict[str, list[int]]
@@ -1265,18 +1674,20 @@ class ClusterRunState:
         }
         meta = self.spark.sparkContext.broadcast(schema_rows)
         total_buckets: int = len(owner_by_bucket)
-        collected: list[tuple[Any, ...]] = run_rewrite_shuffle(
-            self.spark,
-            plans,
-            buckets,
-            centroids,
-            owners,
-            meta,
-            total_buckets,
-            self.config.storage_options,
-        )
-        for handle in (centroids, buckets, owners, meta):
-            release_broadcast(handle)
+        try:
+            collected: list[tuple[Any, ...]] = run_rewrite_shuffle(
+                self.spark,
+                plans,
+                buckets,
+                centroids,
+                owners,
+                meta,
+                total_buckets,
+                self.config.storage_options,
+            )
+        finally:
+            for handle in (centroids, buckets, owners, meta):
+                release_broadcast(handle)
         return self.validate_rewrite(plans, collected)
 
     def validate_rewrite(self, plans: list[dict[str, Any]], collected: list[tuple[Any, ...]]) -> dict[str, list[str]]:
@@ -1285,9 +1696,8 @@ class ClusterRunState:
         The collected shuffle results are tagged: :data:`REWRITE_OK` tuples carry a written
         fragment document, while :data:`REWRITE_ERROR` tuples carry a per-dataset failure message
         emitted by an isolated read task or bucket write. A dataset with any dropped read or bucket
-        loses rows and fails the row-count check, so it is error-marked while every other dataset
-        proceeds. When such a dataset carries a captured failure message, the marker prefers it over
-        the generic row-count mismatch so the diagnostics name the real cause.
+        fails closed even if chunks emitted before the failure happen to cover the planned row
+        count. A plain count mismatch is also rejected. Every other dataset proceeds.
 
         Args:
             plans: The eligible plan dicts.
@@ -1309,7 +1719,7 @@ class ClusterRunState:
             uri: str = plan["uri"]
             entries: list[tuple[int, int, str, int]] = sorted(grouped.get(uri, []))
             written: int = sum(entry[3] for entry in entries)
-            if written != plan["total_rows"]:
+            if uri in errors or written != plan["total_rows"]:
                 fallback: str = f"rewrite wrote {written} rows but planned {plan['total_rows']}; refusing to commit"
                 self.results[uri] = {
                     "uri": uri,
@@ -1346,13 +1756,20 @@ class ClusterRunState:
         """
         config: MaintenanceConfig = self.config
         plan_by_uri: dict[str, dict[str, Any]] = {plan["uri"]: plan for plan in plans}
-        outcomes: list[dict[str, Any]] = fan_out_per_dataset(
+        payloads: list[ClusterCommitPayload] = [
+            ClusterCommitPayload(
+                uri=uri,
+                fragment_documents=documents,
+                schema=plan_by_uri[uri]["schema"],
+                read_version=int(plan_by_uri[uri]["read_version"]),
+            )
+            for uri, documents in documents_by_uri.items()
+        ]
+        outcomes: list[dict[str, Any]] = fan_out_cluster_payloads(
             self.spark,
-            list(documents_by_uri),
+            payloads,
             config.telemetry,
-            lambda uri, telemetry: commit_one_overwrite(
-                uri, documents_by_uri[uri], plan_by_uri[uri], config, telemetry
-            ),
+            lambda payload, telemetry: commit_one_overwrite(payload, config, telemetry),
             self.fanout_partitions(),
             phase="cluster-commit",
         )
@@ -1363,6 +1780,9 @@ class ClusterRunState:
                 self.results[uri] = {**outcome, "bytes_removed": 0}
             else:
                 plan_by_uri[uri]["fragments_added"] = outcome.get("fragments_added", 0)
+                plan_by_uri[uri]["cluster_fragment_ids"] = outcome["fragment_ids"]
+                plan_by_uri[uri]["cluster_num_rows"] = outcome["num_rows"]
+                plan_by_uri[uri]["cluster_fingerprint_error"] = outcome["fingerprint_error"]
                 committed.append(plan_by_uri[uri])
         return committed
 
@@ -1380,53 +1800,71 @@ class ClusterRunState:
         """
         config: MaintenanceConfig = self.config
         plan_by_uri: dict[str, dict[str, Any]] = {plan["uri"]: plan for plan in plans}
-        tasks: list[tuple[dict[str, Any], list[int]]] = self.shard_committed(plan_by_uri)
+        seeds: list[ClusterIndexSeed] = self.shard_committed(plan_by_uri)
         if not plan_by_uri:
             return
-        centroids = self.broadcast_centroids(list(plan_by_uri.values()))
-        segments_by_uri, build_errors = self.build_rebuild_segments(tasks, centroids, config.storage_options)
-        release_broadcast(centroids)
+        artifacts = self.spark.sparkContext.broadcast(
+            {uri: (plan["centroids_ipc"], plan["rabitq_model"]) for uri, plan in plan_by_uri.items()}
+        )
+        try:
+            segments_by_uri, build_errors = self.build_rebuild_segments(seeds, artifacts, config.storage_options)
+        finally:
+            release_broadcast(artifacts)
         for uri, message in build_errors.items():
             self.results[uri] = mark_rebuild_failure(plan_by_uri[uri], message)
             plan_by_uri.pop(uri, None)
         if not plan_by_uri:
             return
-        outcomes: list[dict[str, Any]] = fan_out_per_dataset(
+        payloads: list[ClusterFinalisePayload] = [
+            ClusterFinalisePayload(
+                uri=uri,
+                segment_documents=segments_by_uri.get(uri, []),
+                column=str(plan["column"]),
+                index_name=str(plan["index_name"]),
+                metric=str(plan["metric"]),
+                num_partitions=int(plan["num_partitions"]),
+                fragments_added=int(plan.get("fragments_added", 0)),
+                retention_rows_deleted=int(plan.get("retention_rows_deleted", 0)),
+                fragment_ids=list(plan["cluster_fragment_ids"]) if plan["cluster_fragment_ids"] is not None else None,
+                num_rows=int(plan["cluster_num_rows"]),
+                fingerprint_error=plan["cluster_fingerprint_error"],
+            )
+            for uri, plan in plan_by_uri.items()
+        ]
+        outcomes: list[dict[str, Any]] = fan_out_cluster_payloads(
             self.spark,
-            list(plan_by_uri),
+            payloads,
             config.telemetry,
-            lambda uri, telemetry: finalise_cluster_dataset(
-                uri, plan_by_uri[uri], segments_by_uri.get(uri, []), config, telemetry
-            ),
+            lambda payload, telemetry: finalise_cluster_dataset(payload, config, telemetry),
             self.fanout_partitions(),
             phase="cluster-index",
         )
         for outcome in outcomes:
             self.results[outcome["uri"]] = outcome
 
-    def shard_committed(self, plan_by_uri: dict[str, dict[str, Any]]) -> list[tuple[dict[str, Any], list[int]]]:
-        """Shard each committed dataset's fresh fragment ids in an executor fan-out.
+    def shard_committed(self, plan_by_uri: dict[str, dict[str, Any]]) -> list[ClusterIndexSeed]:
+        """Probe each committed dataset and return bounded rebuild seeds.
 
-        Opens each committed dataset on an executor to read its fresh fragment ids (reset from 0 by
-        the overwrite) and pins the committed version onto its plan. A dataset whose shard planning
-        fails drops out with a ``cluster_index`` error marker and its plan is removed in place.
+        Opens each committed dataset on an executor to pin its version and fragment count. Exact
+        fragment identifiers are enumerated later inside the flat rebuild job, so they never cross
+        the driver. A dataset whose probe fails drops out with a ``cluster_index`` error marker.
 
         Args:
             plan_by_uri: The committed plan dicts by URI, mutated in place to drop failed datasets.
 
         Returns:
-            The ``(plan, shard)`` rebuild tasks across every still-eligible committed dataset.
+            One small rebuild seed per still-eligible committed dataset.
         """
         config: MaintenanceConfig = self.config
         shard_plans: list[dict[str, Any]] = fan_out_per_dataset(
             self.spark,
             list(plan_by_uri),
             config.telemetry,
-            lambda uri, telemetry: plan_rebuild_shards(uri, config.storage_options, telemetry),
+            lambda uri, telemetry: plan_rebuild_inventory(uri, config.storage_options, telemetry),
             self.fanout_partitions(),
             phase="cluster-index",
         )
-        tasks: list[tuple[dict[str, Any], list[int]]] = []
+        seeds: list[ClusterIndexSeed] = []
         for shard_plan in shard_plans:
             uri: str = shard_plan["uri"]
             if "error" in shard_plan:
@@ -1434,11 +1872,23 @@ class ClusterRunState:
                 plan_by_uri.pop(uri, None)
                 continue
             plan_by_uri[uri]["committed_version"] = shard_plan["committed_version"]
-            tasks.extend((plan_by_uri[uri], shard) for shard in shard_plan["shards"])
-        return tasks
+            plan: dict[str, Any] = plan_by_uri[uri]
+            seeds.append(
+                (
+                    uri,
+                    int(shard_plan["committed_version"]),
+                    int(shard_plan["fragment_count"]),
+                    str(plan["column"]),
+                    str(plan["index_name"]),
+                    str(plan["metric"]),
+                    int(plan["num_bits"]),
+                    int(plan["num_partitions"]),
+                )
+            )
+        return seeds
 
     def build_rebuild_segments(
-        self, tasks: list[tuple[dict[str, Any], list[int]]], centroids: Any, storage_options: dict[str, Any] | None
+        self, seeds: list[ClusterIndexSeed], artifacts: Any, storage_options: dict[str, Any] | None
     ) -> tuple[dict[str, list[str]], dict[str, str]]:
         """Build every committed dataset's index segments in one flat job, isolating per dataset.
 
@@ -1451,8 +1901,8 @@ class ClusterRunState:
         segment set.
 
         Args:
-            tasks: ``(plan, shard)`` rebuild tasks over the post-commit fragment ids.
-            centroids: The broadcast centroid handle.
+            seeds: Small dataset-level rebuild seeds.
+            artifacts: Broadcast ``{uri: (centroids_ipc, rabitq_model)}`` handle.
             storage_options: Object-store options forwarded to lance.
 
         Returns:
@@ -1461,29 +1911,49 @@ class ClusterRunState:
             its first failure message.
         """
 
-        def build_one(item: tuple[dict[str, Any], list[int]]) -> tuple[str, str, str]:
+        def build_one(item: ClusterIndexShardTask) -> tuple[str, str, str]:
             """Build one shard's segment, tagging success or failure by dataset URI."""
-            plan, shard = item
-            uri: str = plan["uri"]
+            uri, version, shard, column, index_name, metric, num_bits, num_partitions, inventory_error = item
+            if inventory_error is not None:
+                return FLAT_ERROR, uri, inventory_error
+            centroids_ipc, rabitq_model = artifacts.value[uri]
             try:
                 document: str = build_cluster_index_segment(
                     uri,
-                    plan["committed_version"],
+                    version,
                     shard,
-                    plan["column"],
-                    plan["index_name"],
-                    plan["metric"],
-                    plan["num_bits"],
-                    plan["num_partitions"],
-                    centroids.value[uri],
-                    plan["rabitq_model"],
+                    column,
+                    index_name,
+                    metric,
+                    num_bits,
+                    num_partitions,
+                    centroids_ipc,
+                    rabitq_model,
                     storage_options,
                 )
                 return FLAT_OK, uri, document
             except Exception as exc:
                 return FLAT_ERROR, uri, str(exc)
 
-        grouped, errors = run_flat_tagged_job(self.spark, tasks, build_one, self.flat_partitions(len(tasks)))
+        if not seeds:
+            return {}, {}
+        expected_shards: int = sum(min(seed[2], CLUSTER_READ_SHARDS) for seed in seeds)
+        partitions: int = self.flat_partitions(expected_shards)
+        enumeration_slices: int = max(1, min(self.flat_partitions(len(seeds)), len(seeds)))
+        tagged: list[tuple[str, str, str]] = (
+            self.spark.sparkContext.parallelize(seeds, enumeration_slices)
+            .flatMap(lambda seed: enumerate_cluster_index_tasks(seed, storage_options))
+            .repartition(partitions)
+            .map(build_one)
+            .collect()
+        )
+        grouped: dict[str, list[str]] = {}
+        errors: dict[str, str] = {}
+        for tag, uri, value in tagged:
+            if tag == FLAT_OK:
+                grouped.setdefault(uri, []).append(value)
+            else:
+                errors.setdefault(uri, value)
         for uri in errors:
             grouped.pop(uri, None)
         return grouped, errors
@@ -1501,16 +1971,16 @@ def run_rewrite_shuffle(
 ) -> list[tuple[Any, ...]]:
     """Run the flat read-shuffle-write rewrite job across every eligible dataset, isolating per task.
 
-    The read job emits ``(global_bucket, ipc_bytes)`` pairs, ``partitionBy`` co-locates each global
-    bucket on one partition, and the write side groups by bucket and writes fragments. Each global
-    bucket belongs to exactly one dataset, looked up through the broadcast owner map.
+    The read job emits ``((global_bucket, partition_id), ipc_bytes)`` pairs.
+    ``repartitionAndSortWithinPartitions`` co-locates each global bucket and sorts its chunks by
+    centroid partition before the write side streams fragments. Each global bucket belongs to
+    exactly one dataset, looked up through the broadcast owner map.
 
     Per-task failures are non-fatal and attributed to their dataset rather than aborting the whole
     run. A failing read task or bucket write emits a :data:`REWRITE_ERROR` sentinel through the same
     shuffle instead of raising, so the owning dataset loses rows and fails the downstream row-count
-    validation while every other dataset still commits. Read-failure sentinels ride a reserved
-    :data:`REWRITE_ERROR_KEY` shuffle key that ``partitionBy`` hashes onto a valid partition and
-    ``write_partition`` passes straight through.
+    validation while every other dataset still commits. Read-failure sentinels use the partition
+    immediately after the last live global bucket, so they never collide with bucket data.
 
     The read fan-out is sized by :func:`~lance_etl.fanout.derive_partitions` at
     :data:`~lance_etl.fanout.REWRITE_PARTITION_FACTOR`, capped by the read task count, independent
@@ -1526,25 +1996,27 @@ def run_rewrite_shuffle(
         centroids: The broadcast centroid handle.
         owners: The broadcast global-bucket-to-URI owner map.
         meta: The broadcast per-URI ``(schema, rows_per_task)`` map.
-        total_buckets: The global bucket count, the partition width for ``partitionBy``.
+        total_buckets: The global bucket count. The shuffle adds one error partition.
         storage_options: Object-store options forwarded to lance.
 
     Returns:
         Tagged results, either ``(REWRITE_OK, uri, global_bucket, seq, fragment_json, rows)`` for a
         written fragment or ``(REWRITE_ERROR, uri, message)`` for an isolated read or write failure.
     """
-    read_tasks: list[tuple[str, int, list[int], str, str]] = read_shard_tasks(plans)
-    if not read_tasks or total_buckets == 0:
+    read_seeds: list[ClusterReadSeed] = read_task_seeds(plans)
+    if not read_seeds or total_buckets == 0:
         return []
 
     def read_partition(items: Any) -> Any:
         """Emit ``(global_bucket, ipc_bytes)`` pairs, isolating a failing read task per dataset.
 
-        A read task whose :func:`read_rewrite_chunks` raises yields one
-        ``(REWRITE_ERROR_KEY, (uri, message))`` sentinel and nothing else, so the failure travels
-        the shuffle attributed to its dataset instead of killing the job.
+        A read task whose :func:`read_rewrite_chunks` raises yields one error sentinel and nothing
+        else, so the failure travels the shuffle attributed to its dataset instead of killing the job.
         """
-        for uri, version, shard, column, distance_type in items:
+        for uri, version, shard, column, distance_type, inventory_error in items:
+            if inventory_error is not None:
+                yield ((total_buckets, -1), (uri, inventory_error))
+                continue
             try:
                 yield from read_rewrite_chunks(
                     uri,
@@ -1558,26 +2030,24 @@ def run_rewrite_shuffle(
                 )
             except Exception as exc:
                 logger.warning("cluster: rewrite read task failed for %s, dataset will fail validation: %s", uri, exc)
-                yield (REWRITE_ERROR_KEY, (uri, str(exc)))
+                yield ((total_buckets, -1), (uri, str(exc)))
 
     def write_partition(items: Any) -> Any:
         """Group co-located chunks by global bucket and write each bucket's fragments, isolating failures.
 
-        Read-failure sentinels keyed by :data:`REWRITE_ERROR_KEY` pass straight through as
-        ``(REWRITE_ERROR, uri, message)`` results. A bucket whose :func:`write_bucket` raises yields
-        one ``(REWRITE_ERROR, uri, message)`` result instead of killing the job, so only the owning
-        dataset fails validation.
+        The dedicated read-failure partition passes through ``(REWRITE_ERROR, uri, message)``
+        results. A bucket whose :func:`write_bucket` raises yields one error result instead of
+        killing the job, so only the owning dataset fails validation.
         """
-        chunks_by_bucket: dict[int, list[bytes]] = {}
-        for global_bucket, payload in items:
-            if global_bucket == REWRITE_ERROR_KEY:
-                error_uri, message = payload
-                yield (REWRITE_ERROR, error_uri, message)
+        for global_bucket, grouped_items in groupby(items, key=lambda item: item[0][0]):
+            if global_bucket == total_buckets:
+                for item in grouped_items:
+                    error_uri, message = item[1]
+                    yield (REWRITE_ERROR, error_uri, message)
                 continue
-            chunks_by_bucket.setdefault(global_bucket, []).append(payload)
-        for global_bucket, chunks in chunks_by_bucket.items():
             uri: str = owners.value[global_bucket]
             schema, rows_per_task = meta.value[uri]
+            chunks: Iterator[bytes] = (item[1] for item in grouped_items)
             try:
                 for entry in write_bucket(global_bucket, chunks, uri, schema, rows_per_task, storage_options):
                     yield (REWRITE_OK, uri, entry[0], entry[1], entry[2], entry[3])
@@ -1585,22 +2055,28 @@ def run_rewrite_shuffle(
                 logger.warning("cluster: rewrite write bucket %d failed for %s: %s", global_bucket, uri, exc)
                 yield (REWRITE_ERROR, uri, str(exc))
 
-    slices: int = max(1, min(len(read_tasks), derive_partitions(spark, REWRITE_PARTITION_FACTOR)))
+    expected_shards: int = sum(min(int(plan["fragment_count"]), CLUSTER_READ_SHARDS) for plan in plans)
+    slices: int = max(1, min(expected_shards, derive_partitions(spark, REWRITE_PARTITION_FACTOR)))
+    enumeration_slices: int = max(1, min(len(read_seeds), derive_partitions(spark, FANOUT_PARTITION_FACTOR)))
     return (
-        spark.sparkContext.parallelize(read_tasks, slices)
+        spark.sparkContext.parallelize(read_seeds, enumeration_slices)
+        .flatMap(lambda seed: enumerate_cluster_read_tasks(seed, storage_options))
+        .repartition(slices)
         .mapPartitions(read_partition)
-        .partitionBy(total_buckets)
+        .repartitionAndSortWithinPartitions(
+            numPartitions=total_buckets + 1,
+            partitionFunc=lambda key: int(key[0]),
+        )
         .mapPartitions(write_partition)
         .collect()
     )
 
 
-def plan_rebuild_shards(uri: str, storage_options: dict[str, Any] | None, telemetry: Telemetry) -> dict[str, Any]:
-    """Pin the committed version and shard a rewritten dataset's fresh fragment ids on an executor.
+def plan_rebuild_inventory(uri: str, storage_options: dict[str, Any] | None, telemetry: Telemetry) -> dict[str, Any]:
+    """Pin a rewritten dataset's committed version and fragment count on an executor.
 
-    Opens the dataset at its latest version (the just-committed overwrite), reads the fresh fragment
-    ids reset from 0, and shards them for the flat segment-build job. Runs inside the rebuild
-    fan-out so no dataset is opened on the driver.
+    Runs inside the rebuild fan-out so no dataset is opened on the driver. Fragment identifiers are
+    enumerated later inside the flat segment-build job.
 
     Args:
         uri: Dataset URI.
@@ -1608,14 +2084,14 @@ def plan_rebuild_shards(uri: str, storage_options: dict[str, Any] | None, teleme
         telemetry: Telemetry facade for the current process.
 
     Returns:
-        A ``{"uri", "committed_version", "shards"}`` dict.
+        A ``{"uri", "committed_version", "fragment_count"}`` dict.
     """
     dataset: lance.LanceDataset = lance.dataset(uri, storage_options=storage_options)
     telemetry.incr("cluster.rebuild_planned")
     return {
         "uri": uri,
         "committed_version": dataset.version,
-        "shards": split_evenly(all_fragment_ids(dataset), CLUSTER_READ_SHARDS),
+        "fragment_count": int(dataset.stats.dataset_stats()["num_fragments"]),
     }
 
 
@@ -1636,7 +2112,7 @@ def mark_rebuild_failure(plan: dict[str, Any], error: str) -> dict[str, Any]:
         "uri": plan["uri"],
         "clustered": True,
         "fragments_added": plan.get("fragments_added", 0),
-        "ttl_rows_deleted": plan.get("ttl_rows_deleted", 0),
+        "retention_rows_deleted": plan.get("retention_rows_deleted", 0),
         "error": error,
         "phase": "cluster_index",
         "bytes_removed": 0,
@@ -1644,32 +2120,39 @@ def mark_rebuild_failure(plan: dict[str, Any], error: str) -> dict[str, Any]:
 
 
 def commit_one_overwrite(
-    uri: str,
-    fragment_documents: list[str],
-    plan: dict[str, Any],
+    payload: ClusterCommitPayload,
     config: MaintenanceConfig,
     telemetry: Telemetry,
 ) -> dict[str, Any]:
     """Commit one dataset's clustered overwrite on an executor.
 
     Args:
-        uri: Dataset URI.
-        fragment_documents: The ordered fragment documents for this dataset.
-        plan: The dataset's plan dict carrying the pinned schema.
+        payload: Minimal commit payload with fragment documents and the pinned schema and version.
         config: Maintenance configuration.
         telemetry: Telemetry facade for the current process.
 
     Returns:
-        A ``{"uri", "fragments_added"}`` dict on success.
+        A committed fingerprint for index recovery and post-index generation stamping.
     """
-    fragments_added: int = commit_cluster_overwrite(uri, fragment_documents, plan["schema"], config, telemetry)
-    return {"uri": uri, "fragments_added": fragments_added}
+    committed: ClusterOverwriteCommit = commit_cluster_data(
+        payload.uri,
+        payload.fragment_documents,
+        payload.schema,
+        config,
+        telemetry,
+        read_version=payload.read_version,
+    )
+    return {
+        "uri": payload.uri,
+        "fragments_added": committed.fragments_added,
+        "fragment_ids": committed.fragment_ids,
+        "num_rows": committed.num_rows,
+        "fingerprint_error": committed.fingerprint_error,
+    }
 
 
 def finalise_cluster_dataset(
-    uri: str,
-    plan: dict[str, Any],
-    segment_documents: list[str],
+    payload: ClusterFinalisePayload,
     config: MaintenanceConfig,
     telemetry: Telemetry,
 ) -> dict[str, Any]:
@@ -1677,20 +2160,17 @@ def finalise_cluster_dataset(
 
     The vector-index commit is best-effort: a rebuild failure is non-fatal because the data is
     complete, just unindexed, so the result carries an ``{"error", "phase": "cluster_index"}`` marker
-    and the data stays committed. On success old versions are pruned.
+    and the data stays committed. The generation is stamped only after this index commit succeeds.
+    On full success old versions are pruned.
 
-    Serving promotion is deliberately NOT done here. Flipping ``HEAD`` right after the vector-index
+    Serving promotion is deliberately not done here. Flipping ``HEAD`` right after the vector-index
     commit would expose a generation whose scalar and FTS indexes have not yet been rebuilt (those
     are left to the next indexing run, ADR 0041), so a text query could see a clustered-but-unindexed
-    generation as the served one. Promotion happens exclusively through the pipeline stamp phase,
-    which runs AFTER the index phase in the ``prune -> maintenance -> index -> stamp`` sequence and
-    excludes error-marked datasets, so a dataset is HEAD-promoted only once every index it needs is
-    rebuilt.
+    generation as the served one. Exact promotion belongs to the durable reconciler after every
+    required index is rebuilt, validated, and prewarmed.
 
     Args:
-        uri: Dataset URI.
-        plan: The dataset's plan dict.
-        segment_documents: The serialised index segments built for this dataset.
+        payload: Minimal finalisation payload with index identity, segments, and result counters.
         config: Maintenance configuration.
         telemetry: Telemetry facade for the current process.
 
@@ -1698,19 +2178,59 @@ def finalise_cluster_dataset(
         A success result dict, or one carrying an ``{"error", "phase": "cluster_index"}`` marker
         while keeping the rewritten data.
     """
-    index_config: IndexJobConfig = cluster_index_config(config, plan["num_partitions"], plan["metric"])
+    index_config: IndexJobConfig = cluster_index_config(config, payload.num_partitions, payload.metric)
     try:
-        commit_segments(uri, segment_documents, plan["column"], plan["index_name"], True, index_config, telemetry)
+        commit_segments(
+            payload.uri,
+            payload.segment_documents,
+            payload.column,
+            payload.index_name,
+            True,
+            index_config,
+            telemetry,
+        )
     except Exception as exc:
         telemetry.incr("cluster.index_rebuild_failed")
-        logger.warning("cluster: vector index rebuild failed for %s, data intact: %s", uri, exc)
-        return mark_rebuild_failure(plan, str(exc))
-    bytes_removed: int = maintenance_job.cleanup_dataset(uri, config, telemetry)
+        logger.warning("cluster: vector index rebuild failed for %s, data intact: %s", payload.uri, exc)
+        return {
+            "uri": payload.uri,
+            "clustered": True,
+            "fragments_added": payload.fragments_added,
+            "retention_rows_deleted": payload.retention_rows_deleted,
+            "error": str(exc),
+            "phase": "cluster_index",
+            "bytes_removed": 0,
+        }
+    if payload.fragment_ids is None:
+        return {
+            "uri": payload.uri,
+            "clustered": True,
+            "fragments_added": payload.fragments_added,
+            "retention_rows_deleted": payload.retention_rows_deleted,
+            "error": payload.fingerprint_error or "committed overwrite fingerprint is unavailable",
+            "phase": "cluster_stamp",
+            "bytes_removed": 0,
+        }
+    try:
+        stamp_cluster_generation(payload.uri, config, telemetry, payload.fragment_ids, payload.num_rows)
+    except Exception as exc:
+        telemetry.incr("cluster.generation_stamp_failed")
+        logger.warning("cluster: generation stamp failed after index recovery for %s: %s", payload.uri, exc)
+        return {
+            "uri": payload.uri,
+            "clustered": True,
+            "fragments_added": payload.fragments_added,
+            "retention_rows_deleted": payload.retention_rows_deleted,
+            "error": str(exc),
+            "phase": "cluster_stamp",
+            "bytes_removed": 0,
+        }
+    bytes_removed: int = maintenance_job.cleanup_dataset(payload.uri, config, telemetry)
     telemetry.incr("cluster.clustered")
     return {
-        "uri": uri,
+        "uri": payload.uri,
         "clustered": True,
-        "fragments_added": plan.get("fragments_added", 0),
-        "ttl_rows_deleted": plan.get("ttl_rows_deleted", 0),
+        "fragments_added": payload.fragments_added,
+        "retention_rows_deleted": payload.retention_rows_deleted,
         "bytes_removed": bytes_removed,
     }

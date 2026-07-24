@@ -1,24 +1,35 @@
 """Proto-shape unit tests for the benchmark gRPC request construction, without a server.
 
-Generates the Python stubs from the single repository proto once per module and asserts that every request the search
-phase builds carries the final surface: a ``DatasetTarget`` (org, fixed tenant, fixed namespace, no date range) on all
-five rpcs, the ``Prewarm`` and ``Clusters`` rpcs on the service descriptor, and the protojson body ghz replays.
+Generates Python stubs from the repository proto once per module and proves the public service has only three product
+search methods. Storage paths, versions, profiles, index knobs, row identifiers, offsets, Prewarm, and Clusters are
+absent. Results carry typed logical identifiers and projections.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
+import grpc
 import numpy as np
 import pytest
-from google.protobuf import struct_pb2
 
-from bench.grpc_client import dataset_target, generate_stubs, load_stubs, result_vector_ids, text_query, vector_query
-from bench.search import ghz_payload
+from bench.config import BenchConfig
+from bench.grpc_client import (
+    dataset_target,
+    generate_stubs,
+    load_expected_versions,
+    load_stubs,
+    result_record_ids,
+    text_query,
+    timed_call,
+    validate_served_version,
+    vector_query,
+)
+from bench.search import run_load_level
 
-EXPECTED_RPCS: frozenset[str] = frozenset({"VectorSearch", "TextSearch", "HybridSearch", "Prewarm", "Clusters"})
+EXPECTED_RPCS: frozenset[str] = frozenset({"VectorSearch", "TextSearch", "HybridSearch"})
 
 
 @pytest.fixture(scope="module")
@@ -49,10 +60,10 @@ def pb2(stubs: tuple[ModuleType, ModuleType]) -> ModuleType:
 
 
 class TestServiceSurface:
-    """The generated service exposes the final five-rpc surface."""
+    """The generated service exposes only product search methods."""
 
     def test_service_has_all_rpcs(self, pb2: ModuleType) -> None:
-        """The SearchService descriptor lists all five rpcs including Prewarm and Clusters."""
+        """The SearchService descriptor lists exactly vector, text, and hybrid search."""
         service = pb2.DESCRIPTOR.services_by_name["SearchService"]
         assert set(service.methods_by_name) == EXPECTED_RPCS
 
@@ -61,6 +72,18 @@ class TestServiceSurface:
         unused_pb2, pb2_grpc = stubs
         for rpc in EXPECTED_RPCS:
             assert hasattr(pb2_grpc.SearchServiceServicer, rpc)
+
+    def test_intake_service_cannot_return(self, pb2: ModuleType) -> None:
+        """The generated descriptor proves the removed Intake service is absent."""
+        assert "IntakeService" not in pb2.DESCRIPTOR.services_by_name
+
+    def test_admin_messages_cannot_return(self, pb2: ModuleType) -> None:
+        """Public descriptors contain no cache warming or index-geometry messages."""
+        messages = pb2.DESCRIPTOR.message_types_by_name
+        assert "PrewarmRequest" not in messages
+        assert "PrewarmResponse" not in messages
+        assert "ClustersRequest" not in messages
+        assert "ClustersResponse" not in messages
 
 
 class TestDatasetTarget:
@@ -79,143 +102,295 @@ class TestDatasetTarget:
         assert (target.tenant_id, target.namespace) == ("t9", "other")
 
 
+class TestVersionEvidence:
+    """Expected-version evidence is exact-target and decoupled from any credential."""
+
+    def test_expected_publication_is_exact_and_version_mismatch_fails(self, tmp_path: Path) -> None:
+        """Evidence must cover exactly every target and every response must match it."""
+        expected_path: Path = tmp_path / "expected.json"
+        expected_path.write_text('{"tenant0/ns/org0": 17}', encoding="utf-8")
+        config = BenchConfig(
+            command="search",
+            endpoint="127.0.0.1:50051",
+            search_expected_versions_path=expected_path,
+        )
+        assert load_expected_versions(config) == {"org0": 17}
+        assert validate_served_version(SimpleNamespace(served_version=17), "org0", 17) == 17
+        with pytest.raises(RuntimeError, match="expected published version 17"):
+            validate_served_version(SimpleNamespace(served_version=16), "org0", 17)
+
+    def test_every_rpc_has_a_client_deadline(self) -> None:
+        """The shared call helper passes a bounded timeout."""
+        captured: dict[str, Any] = {}
+
+        def callable_rpc(request: Any, timeout: float) -> str:
+            """Capture invocation arguments.
+
+            Args:
+                request: Request object.
+                timeout: Client deadline.
+
+            Returns:
+                Fixed response marker.
+            """
+            captured.update(request=request, timeout=timeout)
+            return "ok"
+
+        response, unused_latency = timed_call(callable_rpc, "request")
+        assert response == "ok"
+        assert unused_latency >= 0
+        assert captured == {
+            "request": "request",
+            "timeout": 5.0,
+        }
+
+
 class TestSearchRequests:
-    """Every search request message embeds the target and the query parameters."""
+    """Search requests expose product semantics while profiles own execution policy."""
 
     def test_vector_search_request(self, pb2: ModuleType) -> None:
-        """VectorSearchRequest carries the target and a fully populated VectorQuery."""
-        query: Any = vector_query(pb2, np.asarray([1.0, 2.0], dtype=np.float32), 10, 5, 2)
-        request: Any = pb2.VectorSearchRequest(target=dataset_target(pb2, "org1"), query=query)
+        """Vector k and projection belong to the request while the query contains only vector semantics."""
+        query: Any = vector_query(pb2, np.asarray([1.0, 2.0], dtype=np.float32))
+        request: Any = pb2.VectorSearchRequest(
+            target=dataset_target(pb2, "org1"), query=query, k=10, projection=["category"]
+        )
         assert request.target.org_id == "org1"
         assert list(request.query.vector) == [1.0, 2.0]
-        assert request.query.k == 10
-        assert request.query.column == "vector"
-        assert request.query.nprobes == 5
-        assert request.query.refine_factor == 2
-        assert list(request.query.projection) == ["vector_id"]
+        assert request.k == 10
+        assert list(request.projection) == ["category"]
+        assert set(request.query.DESCRIPTOR.fields_by_name) == {"vector"}
 
-    def test_vector_query_optionals_left_unset(self, pb2: ModuleType) -> None:
-        """Nprobes and refine_factor stay absent when not requested."""
-        query: Any = vector_query(pb2, np.asarray([0.0], dtype=np.float32), 1, None, None)
-        assert not query.HasField("nprobes")
-        assert not query.HasField("refine_factor")
+    def test_request_has_no_storage_version_profile_or_execution_selectors(self, pb2: ModuleType) -> None:
+        """No public request can bypass catalog resolution or choose an index execution plan."""
+        forbidden = {
+            "uri",
+            "version",
+            "tag",
+            "profile",
+            "nprobes",
+            "refine_factor",
+            "fast_search",
+            "bypass_vector_index",
+            "offset",
+            "with_row_id",
+        }
+        for message_name in ("VectorQuery", "TextQuery", "VectorSearchRequest", "TextSearchRequest"):
+            fields = set(pb2.DESCRIPTOR.message_types_by_name[message_name].fields_by_name)
+            assert fields.isdisjoint(forbidden)
 
     def test_text_search_request(self, pb2: ModuleType) -> None:
         """TextSearchRequest carries the target and the simple text query."""
-        request: Any = pb2.TextSearchRequest(target=dataset_target(pb2, "org0"), query=text_query(pb2, "alpha beta", 7))
+        request: Any = pb2.TextSearchRequest(
+            target=dataset_target(pb2, "org0"), query=text_query(pb2, "alpha beta"), k=7
+        )
         assert request.target.namespace == "ns"
         assert request.query.simple == "alpha beta"
-        assert request.query.k == 7
+        assert request.k == 7
         assert list(request.query.columns) == ["text"]
 
     def test_hybrid_search_request(self, pb2: ModuleType) -> None:
-        """HybridSearchRequest carries the target and both legs with inherited k."""
+        """HybridSearchRequest carries one bounded k and a product fusion mode."""
         request: Any = pb2.HybridSearchRequest(
             target=dataset_target(pb2, "org1"),
-            vector=vector_query(pb2, np.asarray([1.0], dtype=np.float32), 0, 10, None),
-            text=text_query(pb2, "gamma", 0),
+            vector=vector_query(pb2, np.asarray([1.0], dtype=np.float32)),
+            text=text_query(pb2, "gamma"),
             k=10,
+            fusion_mode=pb2.HYBRID_FUSION_MODE_BALANCED,
         )
         assert request.target.org_id == "org1"
-        assert request.vector.k == 0
-        assert request.text.k == 0
         assert request.k == 10
+        assert request.fusion_mode == pb2.HYBRID_FUSION_MODE_BALANCED
 
 
-class TestPrewarmAndClusters:
-    """The Prewarm and Clusters request messages follow the final proto."""
+def fake_rpc_error(status_code: grpc.StatusCode) -> grpc.RpcError:
+    """Build a gRPC error carrying a fixed status code and stable message.
 
-    def test_prewarm_request(self, pb2: ModuleType) -> None:
-        """A full-warm PrewarmRequest carries the target, metadata, and all_indexes."""
-        request: Any = pb2.PrewarmRequest(
-            target=dataset_target(pb2, "org0"), metadata=True, all_indexes=True, fts_with_position=True
+    Args:
+        status_code: Status code returned by the error.
+
+    Returns:
+        The configured gRPC error.
+    """
+    error: grpc.RpcError = grpc.RpcError("boom")
+
+    def code() -> grpc.StatusCode:
+        """Return the configured status code.
+
+        Returns:
+            The configured status code.
+        """
+        return status_code
+
+    error.code = code
+    return error
+
+
+class TestLoad:
+    """The fixed in-process load profile preserves publication fencing over a plaintext channel."""
+
+    def test_level_measures_requests(self, pb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Every successful load response contributes latency and throughput evidence."""
+        config = BenchConfig(
+            command="search",
+            endpoint="127.0.0.1:50051",
+            search_expected_versions_path=tmp_path / "expected.json",
         )
-        assert request.target.tenant_id == "tenant0"
-        assert request.metadata is True
-        assert request.all_indexes is True
-        assert request.fts_with_position is True
-        assert list(request.index_names) == []
+        calls: list[Any] = []
 
-    def test_clusters_request_default_index(self, pb2: ModuleType) -> None:
-        """ClustersRequest leaves the optional index_name absent by default."""
-        request: Any = pb2.ClustersRequest(target=dataset_target(pb2, "org1"))
-        assert request.target.org_id == "org1"
-        assert not request.HasField("index_name")
+        def vector_search_rpc(request: Any, timeout: float) -> Any:
+            """Capture one load request.
 
-    def test_clusters_request_named_index(self, pb2: ModuleType) -> None:
-        """ClustersRequest can name an explicit index."""
-        request: Any = pb2.ClustersRequest(target=dataset_target(pb2, "org1"), index_name="vector_idx")
-        assert request.HasField("index_name")
-        assert request.index_name == "vector_idx"
+            Args:
+                request: Typed vector request.
+                timeout: Bounded RPC deadline.
 
-    def test_prewarm_response_shape(self, pb2: ModuleType) -> None:
-        """PrewarmResponse exposes the fields the prewarm summary reads."""
-        response: Any = pb2.PrewarmResponse(
-            metadata_warmed=True,
-            metadata_duration_ms=3,
-            total_duration_ms=11,
-            index_cache_size_bytes=42,
-            indexes=[pb2.PrewarmedIndex(name="vector_idx", duration_ms=8, error="")],
+            Returns:
+                Response fenced to the expected publication.
+            """
+            calls.append((request, timeout))
+            return SimpleNamespace(served_version=17)
+
+        monkeypatch.setattr("bench.search.LOAD_DURATION_SECONDS", 0.001)
+        level: dict[str, Any] = run_load_level(
+            SimpleNamespace(VectorSearch=vector_search_rpc),
+            pb2,
+            config,
+            np.asarray([1.0, 2.0], dtype=np.float32),
+            {"org0": 17},
+            2,
         )
-        assert response.metadata_warmed is True
-        assert response.indexes[0].name == "vector_idx"
 
-    def test_clusters_response_shape(self, pb2: ModuleType) -> None:
-        """ClustersResponse exposes clusters, dimension, index_name, and num_partitions."""
-        response: Any = pb2.ClustersResponse(
-            clusters=[pb2.Cluster(id=0, centroid=[0.5, 1.5])],
-            dimension=2,
-            index_name="vector_idx",
-            num_partitions=1,
+        assert level["concurrency"] == 2
+        assert level["requests"] == len(calls)
+        assert level["requests"] >= 2
+        assert level["qps"] > 0
+        assert all(call[0].target.org_id == "org0" for call in calls)
+        assert all(call[1] == 5.0 for call in calls)
+
+    def test_version_failure_propagates(self, pb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A load response from an unapproved version fails the benchmark."""
+        config = BenchConfig(
+            command="search",
+            endpoint="127.0.0.1:50051",
+            search_expected_versions_path=tmp_path / "expected.json",
         )
-        assert len(response.clusters) == response.num_partitions
-        assert len(response.clusters[0].centroid) == response.dimension
 
+        def vector_search_rpc(request: Any, timeout: float) -> Any:
+            """Return an unfenced response.
 
-class TestGhzPayload:
-    """The ghz replay body matches the final request shape."""
+            Args:
+                request: Typed vector request.
+                timeout: Bounded RPC deadline.
 
-    def test_payload_has_target(self) -> None:
-        """The body nests the full DatasetTarget and the vector query."""
-        payload: dict[str, Any] = ghz_payload(np.asarray([1.0, 2.0], dtype=np.float32), 10)
-        assert payload["target"] == {"org_id": "org0", "tenant_id": "tenant0", "namespace": "ns"}
-        assert payload["query"]["vector"] == [1.0, 2.0]
-        assert payload["query"]["nprobes"] == 10
-        assert payload["query"]["projection"] == ["vector_id"]
-        assert "org_id" not in payload
+            Returns:
+                Response from the wrong publication.
+            """
+            del request, timeout
+            return SimpleNamespace(served_version=16)
+
+        monkeypatch.setattr("bench.search.LOAD_DURATION_SECONDS", 0.0)
+        with pytest.raises(RuntimeError, match="expected published version 17"):
+            run_load_level(
+                SimpleNamespace(VectorSearch=vector_search_rpc),
+                pb2,
+                config,
+                np.asarray([1.0, 2.0], dtype=np.float32),
+                {"org0": 17},
+                1,
+            )
+
+    def test_resource_exhausted_is_recorded_as_failed(
+        self, pb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The server's admission rejection is recorded as a benign FAILED level."""
+        config = BenchConfig(
+            command="search",
+            endpoint="127.0.0.1:50051",
+            search_expected_versions_path=tmp_path / "expected.json",
+        )
+
+        def vector_search_rpc(request: Any, timeout: float) -> Any:
+            """Raise the server's admission rejection.
+
+            Args:
+                request: Typed vector request.
+                timeout: Bounded RPC deadline.
+
+            Raises:
+                grpc.RpcError: Always, tagged ``RESOURCE_EXHAUSTED``.
+            """
+            del request, timeout
+            raise fake_rpc_error(grpc.StatusCode.RESOURCE_EXHAUSTED)
+
+        monkeypatch.setattr("bench.search.LOAD_DURATION_SECONDS", 0.0)
+        level: dict[str, Any] = run_load_level(
+            SimpleNamespace(VectorSearch=vector_search_rpc),
+            pb2,
+            config,
+            np.asarray([1.0, 2.0], dtype=np.float32),
+            {"org0": 17},
+            1,
+        )
+        assert level["status"] == "FAILED"
+        assert "boom" in level["reason"]
+
+    def test_other_rpc_error_propagates(self, pb2: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A non-admission gRPC failure (for example a mid-load server crash) is never swallowed."""
+        config = BenchConfig(
+            command="search",
+            endpoint="127.0.0.1:50051",
+            search_expected_versions_path=tmp_path / "expected.json",
+        )
+
+        def vector_search_rpc(request: Any, timeout: float) -> Any:
+            """Raise a transport failure unrelated to admission control.
+
+            Args:
+                request: Typed vector request.
+                timeout: Bounded RPC deadline.
+
+            Raises:
+                grpc.RpcError: Always, tagged ``UNAVAILABLE``.
+            """
+            del request, timeout
+            raise fake_rpc_error(grpc.StatusCode.UNAVAILABLE)
+
+        monkeypatch.setattr("bench.search.LOAD_DURATION_SECONDS", 0.0)
+        with pytest.raises(grpc.RpcError):
+            run_load_level(
+                SimpleNamespace(VectorSearch=vector_search_rpc),
+                pb2,
+                config,
+                np.asarray([1.0, 2.0], dtype=np.float32),
+                {"org0": 17},
+                1,
+            )
 
 
 class TestResultParsing:
-    """Result rows decode back to global vector ids."""
+    """Result rows decode back to global record ids."""
 
-    def test_result_vector_ids_reads_string_values(self, pb2: ModuleType) -> None:
-        """vector_id arrives as a string struct value and parses to int64."""
-        results: list[Any] = []
-        for value in ("7", "11"):
-            row = struct_pb2.Struct()
-            row.fields["vector_id"].string_value = value
-            results.append(pb2.VectorSearchResult(row=row, distance=0.1))
-        ids: np.ndarray = result_vector_ids(results)
+    def test_result_record_ids_reads_string_values(self, pb2: ModuleType) -> None:
+        """Typed record_id strings parse to the integer corpus identities."""
+        results: list[Any] = [
+            pb2.VectorSearchResult(record_id="7", distance=0.1),
+            pb2.VectorSearchResult(record_id="11", distance=0.2),
+        ]
+        ids: np.ndarray = result_record_ids(results)
         assert ids.tolist() == [7, 11]
         assert ids.dtype == np.int64
 
-    def test_result_vector_ids_missing_field_raises(self, pb2: ModuleType) -> None:
-        """A result row missing vector_id raises instead of being silently dropped."""
-        row_ok = struct_pb2.Struct()
-        row_ok.fields["vector_id"].string_value = "7"
-        row_missing = struct_pb2.Struct()
-        row_missing.fields["other_column"].string_value = "unused"
+    def test_result_record_ids_missing_field_raises(self, pb2: ModuleType) -> None:
+        """An empty required logical identifier raises instead of being silently dropped."""
         results: list[Any] = [
-            pb2.VectorSearchResult(row=row_ok, distance=0.1),
-            pb2.VectorSearchResult(row=row_missing, distance=0.2),
+            pb2.VectorSearchResult(record_id="7", distance=0.1),
+            pb2.VectorSearchResult(record_id="", distance=0.2),
         ]
-        with pytest.raises(ValueError, match="vector_id"):
-            result_vector_ids(results)
+        with pytest.raises(ValueError, match="record_id"):
+            result_record_ids(results)
 
-    def test_result_vector_ids_mistyped_field_raises(self, pb2: ModuleType) -> None:
-        """A vector_id carried under a non-string oneof (e.g. server-side type drift) raises."""
-        row = struct_pb2.Struct()
-        row.fields["vector_id"].number_value = 7
-        results: list[Any] = [pb2.VectorSearchResult(row=row, distance=0.1)]
-        with pytest.raises(ValueError, match="vector_id"):
-            result_vector_ids(results)
+    def test_result_record_ids_mistyped_field_raises(self, pb2: ModuleType) -> None:
+        """A non-numeric product identifier is rejected by integer-corpus recall scoring."""
+        results: list[Any] = [pb2.VectorSearchResult(record_id="not-an-integer", distance=0.1)]
+        with pytest.raises(ValueError, match="record_id"):
+            result_record_ids(results)

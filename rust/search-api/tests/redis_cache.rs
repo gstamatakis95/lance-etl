@@ -242,7 +242,7 @@ async fn cold_process_serves_searches_from_the_shared_redis_cache() {
 
 #[tokio::test]
 async fn redis_death_mid_run_degrades_to_misses_without_failing() {
-    let Some(mut server) = RedisServerGuard::spawn().await else {
+    let Some(mut server) = RedisServerGuard::spawn_local().await else {
         return;
     };
     let codec = CacheCodec::from_impl::<Payload>();

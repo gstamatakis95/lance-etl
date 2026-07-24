@@ -1,22 +1,24 @@
 //! Binary entry point for the gRPC search service.
 
+use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
+use search_api::catalog::PostgresServingCatalog;
 use search_api::config::Config;
-use search_api::domain::{DatasetRef, DatasetTarget, PrewarmSpec, Prewarmer, StdoutSink};
-use search_api::grpc::{IntakeGrpc, RouteTimeoutLayer, SearchGrpc};
+use search_api::grpc::admin::AdminGrpc;
+use search_api::grpc::admission::AdmissionController;
+use search_api::grpc::{RouteTimeoutLayer, SearchGrpc};
+use search_api::internal_pb::admin_service_server::AdminServiceServer;
 use search_api::lance::{CachingDatasetProvider, LanceSearchBackend};
-use search_api::pb::intake_service_server::IntakeServiceServer;
 use search_api::pb::search_service_server::SearchServiceServer;
 use search_api::telemetry::{self, Metrics, RecallCapture};
-use tokio::sync::Semaphore;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
+use tonic_health::ServingStatus;
 use tonic_tracing_opentelemetry::middleware::filters::reject_healthcheck;
 use tonic_tracing_opentelemetry::middleware::server::OtelGrpcLayer;
-
-/// Backend type served by this binary: Lance over the caching base-URI-template provider.
-type Backend = LanceSearchBackend<CachingDatasetProvider>;
 
 /// Stamps process-global Lance IO tuning knobs into the environment.
 ///
@@ -31,26 +33,36 @@ type Backend = LanceSearchBackend<CachingDatasetProvider>;
 /// on `getenv` against this `set_var` is a data race under the C11/POSIX memory model.  `main`
 /// is therefore a synchronous entry point that calls this before building the runtime.
 ///
-/// Knobs stamped here must not already be set in the environment; if they are (e.g. in a
-/// Kubernetes pod spec that overrides the default), `set_var` would silently overwrite them.
-fn apply_lance_io_env() {
-    unsafe {
-        std::env::set_var(
-            "LANCE_IO_THREADS",
-            search_api::config::DEFAULT_IO_CONCURRENCY.to_string(),
-        );
-        std::env::set_var(
-            "OBJECT_STORE_CLIENT_RETRY_TIMEOUT",
-            search_api::config::DEFAULT_OBJECT_STORE_TIMEOUT_SECS.to_string(),
-        );
+/// A matching deployment value is accepted. A conflicting pre-set value fails startup before the
+/// runtime is built, so the service never silently replaces deployment state.
+fn apply_fixed_env(name: &str, expected: &str) -> std::io::Result<()> {
+    match std::env::var_os(name) {
+        Some(actual) if actual == OsStr::new(expected) => Ok(()),
+        Some(_) => Err(std::io::Error::other(format!(
+            "{name} conflicts with the search service's fixed production value"
+        ))),
+        None => {
+            unsafe { std::env::set_var(name, expected) };
+            Ok(())
+        }
     }
+}
+
+/// Applies every fixed Lance process-global environment value without overwriting a conflict.
+fn apply_lance_io_env() -> std::io::Result<()> {
+    apply_fixed_env(
+        "LANCE_IO_THREADS",
+        &search_api::config::DEFAULT_IO_CONCURRENCY.to_string(),
+    )?;
+    apply_fixed_env(
+        "OBJECT_STORE_CLIENT_RETRY_TIMEOUT",
+        &search_api::config::DEFAULT_OBJECT_STORE_TIMEOUT_SECS.to_string(),
+    )
 }
 
 /// Reads configuration from the environment, initializes Datadog telemetry (OTLP traces, JSON
 /// logs, DogStatsD metrics), wires provider -> backend -> transport, spawns the disk-cache
-/// janitor, and serves the search and intake gRPC APIs together with the standard gRPC health
-/// service. The intake service uses the placeholder [`StdoutSink`]; a future Kafka sink drops in
-/// at this construction site without any other change.
+/// janitor, and serves the search gRPC API together with the standard gRPC health service.
 ///
 /// IO tuning: two process-global Lance knobs are stamped into the environment before any
 /// dataset opens, so that Lance reads them consistently across every thread.
@@ -73,50 +85,16 @@ fn apply_lance_io_env() {
 /// fail requests.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
-    apply_lance_io_env();
+    apply_lance_io_env()?;
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(serve(config))
 }
 
-/// Parses a prewarm-targets file and returns the successfully parsed targets.
+/// Runs the async service body on the already-built runtime and serves search plus health.
 ///
-/// Each line is expected to be `{org_id}/{tenant_id}/{namespace}`. Blank lines and lines with
-/// fewer than three slash-separated segments or invalid path segment characters are skipped with
-/// a warning. A file that cannot be read at all is also warned and yields an empty list.
-fn parse_prewarm_targets(path: &std::path::Path) -> Vec<DatasetTarget> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(err) => {
-            tracing::warn!(path = %path.display(), error = %err, "failed to read prewarm targets file");
-            return Vec::new();
-        }
-    };
-    content
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return None;
-            }
-            let parts: Vec<&str> = line.splitn(3, '/').collect();
-            if parts.len() != 3 {
-                tracing::warn!(line = %line, "prewarm targets: skipping malformed line (expected org/tenant/namespace)");
-                return None;
-            }
-            let target = DatasetTarget::new(parts[0], parts[1], parts[2]);
-            match target.validate() {
-                Ok(()) => Some(target),
-                Err(err) => {
-                    tracing::warn!(line = %line, error = %err, "prewarm targets: skipping line with invalid path segment");
-                    None
-                }
-            }
-        })
-        .collect()
-}
-
-/// Runs the async service body on the already-built runtime: wires telemetry, provider, backend,
-/// and transport, then serves the gRPC API together with the standard gRPC health service.
+/// The server always binds plaintext gRPC to loopback and accepts every request without
+/// authentication: this is the local read process for a single-operator local system, and it has
+/// exactly one runtime mode.
 async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(if config.telemetry_disabled {
         Metrics::disabled()
@@ -124,96 +102,168 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         Metrics::dogstatsd(&config.statsd_addr)
     });
     let telemetry_guard = telemetry::init_tracing(config.telemetry_disabled, metrics.clone());
-    let addr: SocketAddr = ([0, 0, 0, 0], config.port).into();
-    let provider = CachingDatasetProvider::with_telemetry(&config, metrics.clone()).await;
-    if let Some(janitor) = provider.janitor(&config) {
+    let bind_ip = [127, 0, 0, 1];
+    let addr: SocketAddr = (bind_ip, config.port).into();
+    let health_addr: SocketAddr = (bind_ip, search_api::config::DEFAULT_HEALTH_PORT).into();
+    let catalog = Arc::new(PostgresServingCatalog::connect(&config.database_url).await?);
+    let admission = Arc::new(AdmissionController::new(
+        search_api::config::DEFAULT_GLOBAL_SEARCH_CONCURRENCY,
+        search_api::config::DEFAULT_PER_TENANT_SEARCH_CONCURRENCY,
+    )?);
+    let provider = CachingDatasetProvider::with_catalog_and_telemetry(&config, catalog.clone(), metrics.clone()).await;
+    let janitor_task: Option<tokio::task::JoinHandle<()>> = provider.janitor(&config).map(|janitor| {
         janitor.spawn(std::time::Duration::from_secs(
             search_api::config::DEFAULT_DISK_CACHE_SWEEP_SECS,
-        ));
-    }
+        ))
+    });
     let backend = Arc::new(LanceSearchBackend::new(provider).with_metrics(metrics.clone()));
 
-    if let Some(targets_path) = &config.prewarm_targets_path {
-        let targets = parse_prewarm_targets(targets_path);
-        if !targets.is_empty() {
-            let backend_for_prewarm = backend.clone();
-            let concurrency = search_api::config::DEFAULT_PREWARM_CONCURRENCY;
-            tokio::spawn(async move {
-                let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
-                let mut tasks = tokio::task::JoinSet::new();
-                for target in targets {
-                    let backend = backend_for_prewarm.clone();
-                    let semaphore = semaphore.clone();
-                    tasks.spawn(async move {
-                        let permit = semaphore.acquire_owned().await;
-                        let spec = PrewarmSpec {
-                            metadata: true,
-                            all_indexes: true,
-                            ..Default::default()
-                        };
-                        match backend.prewarm(&target, spec, DatasetRef::Latest).await {
-                            Ok(report) => tracing::info!(
-                                org_id = %target.org_id,
-                                tenant_id = %target.tenant_id,
-                                namespace = %target.namespace,
-                                resolved_version = report.resolved_version,
-                                indexes_warmed = report.indexes.len(),
-                                "startup prewarm succeeded"
-                            ),
-                            Err(err) => tracing::warn!(
-                                org_id = %target.org_id,
-                                tenant_id = %target.tenant_id,
-                                namespace = %target.namespace,
-                                error = %err,
-                                "startup prewarm failed"
-                            ),
-                        }
-                        drop(permit);
-                    });
-                }
-                while tasks.join_next().await.is_some() {}
-            });
-        }
-    }
-
-    let recall = RecallCapture::new(
-        search_api::config::DEFAULT_RECALL_SAMPLE_RATE,
-        search_api::config::DEFAULT_ID_COLUMN,
-        metrics.clone(),
-    );
-    let service = SearchGrpc::with_metrics(backend, metrics.clone()).with_recall(recall);
-    let intake = IntakeGrpc::with_metrics(Arc::new(StdoutSink), metrics);
+    let recall = RecallCapture::new(search_api::config::DEFAULT_RECALL_SAMPLE_RATE, metrics.clone());
+    let service = SearchGrpc::with_metrics(backend.clone(), metrics.clone(), admission).with_recall(recall);
+    let admin_service = AdminGrpc::new(backend, config.replica_id.clone());
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
-    health_reporter
-        .set_serving::<SearchServiceServer<SearchGrpc<Backend>>>()
-        .await;
-    health_reporter
-        .set_serving::<IntakeServiceServer<IntakeGrpc<StdoutSink>>>()
-        .await;
-    tracing::info!(address = %addr, "search-api listening");
+    health_reporter.set_service_status("", ServingStatus::Serving).await;
+    let search_listener = tokio::net::TcpListener::bind(addr).await?;
+    let health_listener = tokio::net::TcpListener::bind(health_addr).await?;
+    tracing::info!(address = %addr, health_address = %health_addr, "search-api listening (plaintext, unauthenticated)");
     let server_builder = Server::builder()
         .concurrency_limit_per_connection(search_api::config::DEFAULT_CONCURRENCY_LIMIT_PER_CONNECTION)
         .max_concurrent_streams(search_api::config::DEFAULT_MAX_CONCURRENT_STREAMS);
-    server_builder
-        .layer(OtelGrpcLayer::default().filter(reject_healthcheck))
-        .layer(RouteTimeoutLayer::from_defaults())
-        .add_service(health_service)
-        .add_service(SearchServiceServer::new(service))
-        .add_service(IntakeServiceServer::new(intake))
-        .serve_with_shutdown(addr, shutdown_signal())
-        .await?;
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
+    let mut search_task = tokio::spawn(
+        server_builder
+            .layer(OtelGrpcLayer::default().filter(reject_healthcheck))
+            .layer(RouteTimeoutLayer::from_defaults(metrics.clone()))
+            .add_service(
+                SearchServiceServer::new(service)
+                    .max_decoding_message_size(search_api::config::DEFAULT_MAX_REQUEST_BYTES)
+                    .max_encoding_message_size(search_api::config::DEFAULT_MAX_RESPONSE_BYTES),
+            )
+            .add_service(
+                AdminServiceServer::new(admin_service)
+                    .max_decoding_message_size(search_api::config::DEFAULT_MAX_REQUEST_BYTES)
+                    .max_encoding_message_size(search_api::config::DEFAULT_MAX_RESPONSE_BYTES),
+            )
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(search_listener),
+                wait_for_shutdown(shutdown_receiver.clone()),
+            ),
+    );
+    let mut health_task = tokio::spawn(
+        Server::builder()
+            .add_service(health_service)
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(health_listener),
+                wait_for_shutdown(shutdown_receiver.clone()),
+            ),
+    );
+    let mut readiness_task = tokio::spawn(monitor_readiness(catalog, health_reporter.clone(), shutdown_receiver));
+    tokio::select! {
+        _ = shutdown_signal() => {}
+        result = &mut search_task => {
+            health_task.abort();
+            readiness_task.abort();
+            abort_janitor_task(&janitor_task);
+            result??;
+            return Err(std::io::Error::other("search server stopped before shutdown").into());
+        }
+        result = &mut health_task => {
+            search_task.abort();
+            readiness_task.abort();
+            abort_janitor_task(&janitor_task);
+            result??;
+            return Err(std::io::Error::other("health server stopped before shutdown").into());
+        }
+        result = &mut readiness_task => {
+            search_task.abort();
+            health_task.abort();
+            abort_janitor_task(&janitor_task);
+            result?;
+            return Err(std::io::Error::other("readiness monitor stopped before shutdown").into());
+        }
+    }
+    health_reporter.set_service_status("", ServingStatus::NotServing).await;
+    let _ = shutdown_sender.send(true);
+    let drain = async {
+        (&mut search_task).await??;
+        (&mut health_task).await??;
+        (&mut readiness_task).await?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
+    if tokio::time::timeout(
+        Duration::from_secs(search_api::config::DEFAULT_GRACEFUL_DRAIN_SECS),
+        drain,
+    )
+    .await
+    .is_err()
+    {
+        search_task.abort();
+        health_task.abort();
+        readiness_task.abort();
+        tracing::warn!(
+            drain_seconds = search_api::config::DEFAULT_GRACEFUL_DRAIN_SECS,
+            "graceful drain deadline exceeded"
+        );
+    }
+    abort_janitor_task(&janitor_task);
     tracing::info!("in-flight requests drained, flushing telemetry and exiting");
     drop(telemetry_guard);
     Ok(())
 }
 
+/// Aborts the disk-cache janitor's sweep loop, if one was spawned for the configured backend.
+///
+/// The janitor loop never resolves on its own, so it must be aborted explicitly as part of the
+/// same shutdown sequence that aborts `search_task`/`health_task`/`readiness_task` rather than
+/// left to the runtime to reclaim on process exit.
+fn abort_janitor_task(janitor_task: &Option<tokio::task::JoinHandle<()>>) {
+    if let Some(task) = janitor_task {
+        task.abort();
+    }
+}
+
+/// Resolves after the shared shutdown flag becomes true.
+async fn wait_for_shutdown(mut receiver: tokio::sync::watch::Receiver<bool>) {
+    while !*receiver.borrow() {
+        if receiver.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Keeps readiness synchronized with catalog health until drain begins.
+async fn monitor_readiness(
+    catalog: Arc<PostgresServingCatalog>,
+    reporter: tonic_health::server::HealthReporter,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    reporter.set_service_status("", ServingStatus::NotServing).await;
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                let status = if catalog.health().await.is_ok() {
+                    ServingStatus::Serving
+                } else {
+                    ServingStatus::NotServing
+                };
+                reporter.set_service_status("", status).await;
+            }
+        }
+    }
+}
+
 /// Resolves when the process receives SIGTERM or ctrl-c (SIGINT), starting the graceful drain.
 ///
-/// Kubernetes (and most process supervisors) deliver SIGTERM on deploy or scale-down. Wiring the
-/// signal into `serve_with_shutdown` lets tonic stop accepting new requests while in-flight
-/// requests complete, and the explicit `drop(telemetry_guard)` afterwards flushes the tracer
-/// provider so drain-window spans are exported instead of lost. A SIGTERM handler that cannot be
-/// installed degrades to ctrl-c handling alone with a warning, never a startup failure.
+/// Process supervisors deliver SIGTERM when stopping a service. Wiring the signal into
+/// `serve_with_shutdown` lets tonic stop accepting new requests while in-flight requests complete,
+/// and the explicit `drop(telemetry_guard)` afterwards flushes the tracer provider so drain-window
+/// spans are exported instead of lost. A SIGTERM handler that cannot be installed degrades to
+/// ctrl-c handling alone with a warning, never a startup failure.
 async fn shutdown_signal() {
     tokio::select! {
         _ = terminate_signal() => {},
@@ -269,8 +319,53 @@ async fn terminate_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::degrade_on_install_error;
+    use super::{apply_fixed_env, degrade_on_install_error};
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    /// Serializes tests that mutate the process environment.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Runs one assertion with an environment value and restores its prior state.
+    fn with_env(name: &str, value: Option<&str>, body: impl FnOnce()) {
+        let guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(name);
+        match value {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+        body();
+        match previous {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn fixed_environment_value_is_set_when_absent() {
+        with_env("SEARCH_API_TEST_FIXED_ENV", None, || {
+            apply_fixed_env("SEARCH_API_TEST_FIXED_ENV", "expected").unwrap();
+            assert_eq!(std::env::var("SEARCH_API_TEST_FIXED_ENV").unwrap(), "expected");
+        });
+    }
+
+    #[test]
+    fn matching_fixed_environment_value_is_accepted() {
+        with_env("SEARCH_API_TEST_FIXED_ENV", Some("expected"), || {
+            apply_fixed_env("SEARCH_API_TEST_FIXED_ENV", "expected").unwrap();
+            assert_eq!(std::env::var("SEARCH_API_TEST_FIXED_ENV").unwrap(), "expected");
+        });
+    }
+
+    #[test]
+    fn conflicting_fixed_environment_value_fails_without_overwrite() {
+        with_env("SEARCH_API_TEST_FIXED_ENV", Some("conflict"), || {
+            let error = apply_fixed_env("SEARCH_API_TEST_FIXED_ENV", "expected").unwrap_err();
+            assert!(error.to_string().contains("SEARCH_API_TEST_FIXED_ENV"));
+            assert_eq!(std::env::var("SEARCH_API_TEST_FIXED_ENV").unwrap(), "conflict");
+        });
+    }
 
     #[tokio::test]
     async fn install_success_resolves_immediately() {

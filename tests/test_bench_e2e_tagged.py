@@ -1,36 +1,40 @@
-"""Offline tiny-data test of the e2e batch-major flow through the bigann adapter.
+"""Offline tiny-data test of the reconciler-driven benchmark e2e flow through the bigann adapter.
 
 Writes a minimal bigann workspace fixture (1200 base vectors, 128 dims, uint8, seeded rng; 30
 queries) directly into ``{tmp_path}/workspace/bigann/`` using :func:`bench.bigann_io.write_u8bin`,
 with the exact filenames :class:`bench.datasets.BigannAdapter` expects for ``limit=1200``. The
-download phase short-circuits (base and query files already present). ``gt_member_name(1200)``
-returns ``None`` so the prepare phase computes exact brute-force ground truth. The full
-``run_e2e`` flow runs with 2 batches and ``--no-text`` through Spark local mode. Asserts:
+download phase short-circuits (base and query files already present). The full ``run_e2e`` flow runs
+with 2 batches, driving the production PostgreSQL reconciler over a partitioned Iceberg source
+table. Asserts:
 
-- One tag is created per batch.
-- Tag names match the colon-free window-end format ``%Y%m%dT%H%M%SZ``.
-- ``lance.dataset(uri, version=tag).count_rows()`` equals cumulative rows for each tag.
-- The older tag is still readable after the second batch's compaction.
-- Only 3 indexes exist under ``--no-text`` (no INVERTED index).
+- One batch record per appended snapshot, each carrying reconciliation counts and per-org servings.
+- Every organization's terminal publication opens at its exact version with the cumulative row count.
+- Every index the installed bench specification declares, including the INVERTED full-text index,
+  is present on every published dataset.
 - The e2e phase artifact is saved as ``e2e.json`` in the run directory.
-- The gRPC legs are skipped gracefully (server unreachable in the test environment).
+- The gRPC legs are recorded as ``NOT_RUN`` because ``--search-api-binary ""`` explicitly disables
+  self-hosting the search leg (independent of whether a real release binary happens to be built on
+  the machine running this test).
+
+The test requires the isolated-schema integration database (``LANCE_ETL_TEST_DATABASE_URL``) and is
+skipped when it is unset, matching the other PostgreSQL-backed integration tests.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
-import lance
 import numpy as np
 import pytest
 
 from bench.bigann_io import write_u8bin
 from bench.config import BenchConfig, build_parser
 from bench.datasets import BigannAdapter
-from bench.e2e import run_e2e, window_tag_name
-from bench.ingest import batch_windows
+from bench.e2e import run_e2e
 from bench.prepare import run_prepare
+from bench.reconcile import bench_spec_index_names
 from bench.results import read_json
 
 pytestmark = pytest.mark.integration
@@ -40,16 +44,15 @@ DIMENSION: int = 128
 QUERY_ROWS: int = 30
 TENANTS: int = 2
 BATCHES: int = 2
-EXPECTED_NO_TEXT_INDEX_NAMES: frozenset[str] = frozenset({"vector_idx", "vector_id_idx", "category_bitmap_idx"})
+POSTGRES_URL_ENV: str = "LANCE_ETL_TEST_DATABASE_URL"
 
 
 def make_bigann_fixture(corpus_root: Path, seed: int = 7) -> None:
     """Write a minimal bigann corpus fixture that bypasses network download.
 
-    Creates ``{corpus_root}/bigann/base.1200.u8bin`` and
-    ``{corpus_root}/bigann/query.10K.u8bin`` using seeded random uint8 data.
-    The filenames match exactly what :class:`bench.datasets.BigannAdapter` expects
-    for ``limit=1200`` and the default query path.
+    Creates ``{corpus_root}/bigann/base.1200.u8bin`` and ``{corpus_root}/bigann/query.10K.u8bin``
+    using seeded random uint8 data. The filenames match exactly what
+    :class:`bench.datasets.BigannAdapter` expects for ``limit=1200`` and the default query path.
 
     Args:
         corpus_root: The shared corpus cache directory.
@@ -64,14 +67,14 @@ def make_bigann_fixture(corpus_root: Path, seed: int = 7) -> None:
     write_u8bin(adapter.query_path(corpus_root), queries)
 
 
-def tagged_config(tmp_path: Path) -> BenchConfig:
-    """Build a tiny benchmark config for the e2e tagged flow using the bigann adapter.
+def reconciled_config(tmp_path: Path) -> BenchConfig:
+    """Build a tiny benchmark config for the reconciler-driven e2e flow using the bigann adapter.
 
     Args:
         tmp_path: Temporary workspace root.
 
     Returns:
-        The parsed configuration targeting the bigann adapter with no_text enabled.
+        The parsed configuration targeting the bigann adapter with two batches.
     """
     argv: list[str] = [
         "e2e",
@@ -84,7 +87,7 @@ def tagged_config(tmp_path: Path) -> BenchConfig:
         "--results-root",
         str(tmp_path / "results"),
         "--run-id",
-        "e2e-tagged",
+        "e2e-reconciled",
         "--limit",
         str(BASE_ROWS),
         "--tenants",
@@ -93,10 +96,6 @@ def tagged_config(tmp_path: Path) -> BenchConfig:
         str(BATCHES),
         "--num-clusters",
         "4",
-        "--words-per-cluster",
-        "10",
-        "--common-words",
-        "5",
         "--rows-per-slice",
         "300",
         "--etl-partitions",
@@ -109,95 +108,53 @@ def tagged_config(tmp_path: Path) -> BenchConfig:
         "local[2]",
         "--driver-memory",
         "2g",
-        "--no-text",
+        "--search-api-binary",
+        "",
     ]
     return BenchConfig.from_args(build_parser().parse_args(argv))
 
 
-def test_e2e_tagged_no_text(tmp_path: Path) -> None:
-    """run_e2e with 2 batches and --no-text creates per-batch tags and passes historical verification."""
+def test_e2e_reconciler_publishes(tmp_path: Path) -> None:
+    """run_e2e drives the reconciler over two snapshots and publishes every organization."""
+    if os.environ.get(POSTGRES_URL_ENV) is None:
+        pytest.skip(f"set {POSTGRES_URL_ENV} to run the reconciler-driven benchmark e2e test")
     corpus_root: Path = tmp_path / "corpora"
     make_bigann_fixture(corpus_root)
 
-    config: BenchConfig = tagged_config(tmp_path)
+    config: BenchConfig = reconciled_config(tmp_path)
 
     download_outcome: dict[str, Any] = BigannAdapter(limit=BASE_ROWS).download(corpus_root)
     assert download_outcome["skipped"] is True, "download must short-circuit when base+query files exist"
 
-    run_prepare(config)
+    prepare_outcome: dict[str, Any] = run_prepare(config)
+    assert prepare_outcome["skipped"] is False, "fresh test workspace must build prepared benchmark artifacts"
 
     outcome: dict[str, Any] = run_e2e(config)
 
-    assert len(outcome["batches"]) == BATCHES, "expected one batch record per ETL window"
-
-    tags_created: list[str] = [b["tag"] for b in outcome["batches"]]
-    assert len(tags_created) == BATCHES
-
-    windows: list[tuple[str, str]] = batch_windows(BATCHES)
-    for batch_index, window in enumerate(windows):
-        expected_tag: str = window_tag_name(window[1])
-        assert tags_created[batch_index] == expected_tag, (
-            f"batch {batch_index}: expected tag {expected_tag!r}, got {tags_created[batch_index]!r}"
-        )
-        assert ":" not in expected_tag, f"tag {expected_tag!r} contains a colon"
-
-    uris: list[str] = config.dataset_uris()
-
-    tag_to_row_counts: dict[str, dict[str, int]] = {}
+    assert len(outcome["batches"]) == BATCHES, "expected one batch record per appended snapshot"
     for batch_record in outcome["batches"]:
-        tag: str = batch_record["tag"]
-        tag_to_row_counts[tag] = {stat["uri"]: stat["row_count"] for stat in batch_record["tag_stats"]}
-        pipeline_block: dict[str, Any] = batch_record["pipeline"]
-        assert "seconds" in pipeline_block, f"batch {batch_record['batch']}: pipeline block missing 'seconds'"
-        assert "counts" in pipeline_block, f"batch {batch_record['batch']}: pipeline block missing 'counts'"
-        assert "maintenance_datasets" in pipeline_block, (
-            f"batch {batch_record['batch']}: pipeline block missing 'maintenance_datasets'"
-        )
-        assert "index_datasets" in pipeline_block, (
-            f"batch {batch_record['batch']}: pipeline block missing 'index_datasets'"
-        )
+        assert batch_record["reconcile"]["cycles"] >= 1
+        assert batch_record["reconcile"]["blocked"] == 0
+        assert len(batch_record["servings"]) == TENANTS
 
-    for tag, uri_counts in tag_to_row_counts.items():
-        for uri, expected_count in uri_counts.items():
-            ds = lance.dataset(uri, version=tag)
-            actual: int = ds.count_rows()
-            assert actual == expected_count, f"tag {tag!r} on {uri}: expected {expected_count} rows, got {actual}"
+    verification: dict[str, Any] = outcome["publication_verification"]
+    assert verification["ok"] is True, f"publication verification failed: {verification['checks']}"
 
-    first_tag: str = tags_created[0]
-    first_tag_counts: dict[str, int] = tag_to_row_counts[first_tag]
-    for uri in uris:
-        ds_old = lance.dataset(uri, version=first_tag)
-        expected_first: int = first_tag_counts[uri]
-        assert ds_old.count_rows() == expected_first, (
-            f"older tag {first_tag!r} on {uri} is unreadable after second batch compaction"
+    per_org_rows: int = BASE_ROWS // TENANTS
+    expected_indexes: frozenset[str] = bench_spec_index_names(config)
+    assert "text_fts_idx" in expected_indexes, "bench spec must declare the INVERTED full-text index"
+    for check in outcome["publications"]:
+        assert check["published"] is True
+        assert check["row_count"] == per_org_rows, f"org {check['org']}: expected {per_org_rows} rows"
+        assert not check["missing_indexes"], f"org {check['org']}: missing indexes {check['missing_indexes']}"
+        assert expected_indexes.issubset(set(check["indexes"])), (
+            f"org {check['org']}: published indexes {check['indexes']} miss declared {sorted(expected_indexes)}"
         )
-
-    last_tag: str = tags_created[-1]
-    last_tag_counts: dict[str, int] = tag_to_row_counts[last_tag]
-    for uri in uris:
-        assert last_tag_counts[uri] >= first_tag_counts[uri], (
-            f"last tag {last_tag!r} has fewer rows than first tag {first_tag!r} on {uri}"
-        )
-
-    for uri in uris:
-        ds_latest = lance.dataset(uri)
-        index_names: set[str] = {desc.name for desc in ds_latest.describe_indices()}
-        assert index_names >= EXPECTED_NO_TEXT_INDEX_NAMES, (
-            f"{uri}: missing indexes; got {index_names}, expected superset of {EXPECTED_NO_TEXT_INDEX_NAMES}"
-        )
-        inverted_names: set[str] = {n for n in index_names if "fts" in n.lower() or "inverted" in n.lower()}
-        assert not inverted_names, f"{uri}: found unexpected FTS/INVERTED indexes: {inverted_names}"
-
-    verification: dict[str, Any] = outcome["historical_tag_verification"]
-    assert verification["ok"] is True, f"historical tag verification failed: {verification['checks']}"
 
     run_dir: Path = config.run_dir()
     assert (run_dir / "e2e.json").exists(), "e2e.json phase artifact not written"
     artifact: dict[str, Any] = read_json(run_dir / "e2e.json")
     assert artifact["phase"] == "e2e"
 
-    for batch_record in outcome["batches"]:
-        grpc_result: dict[str, Any] = outcome["grpc_legs_per_tag"].get(batch_record["tag"], {})
-        assert "skipped" in grpc_result, (
-            f"gRPC leg for tag {batch_record['tag']!r} was not skipped as expected when no server is running"
-        )
+    assert outcome["final_catalog_grpc"]["status"] == "NOT_RUN"
+    assert outcome["final_catalog_recall"] == {}

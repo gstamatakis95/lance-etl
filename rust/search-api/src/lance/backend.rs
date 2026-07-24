@@ -9,27 +9,35 @@ use lance::Dataset;
 use lance::dataset::scanner::{ExecutionStatsCallback, ExecutionSummaryCounts, Scanner};
 use lance::deps::datafusion::logical_expr::Expr;
 use lance::index::DatasetIndexExt;
-use lance_core::ROW_ID;
 use lance_linalg::distance::DistanceType;
 use serde_json::{Map, Value};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::domain::{
-    DatasetTarget, DistanceKind, FilterMode, Hit, HybridQuery, HybridSearchOutcome, SearchBackend, SearchError,
-    TextQuery, TextSearchOutcome, TimeRange, VectorQuery, VectorSearchOutcome,
+    DatasetRef, DatasetTarget, DistanceKind, Hit, HybridQuery, HybridSearchOutcome, SearchBackend, SearchError,
+    SearchWarning, TextQuery, TextSearchOutcome, TimeRange, VectorQuery, VectorSearchOutcome,
 };
 use crate::lance::error::classify_lance_error;
 use crate::lance::filter::{filter_to_expr, time_range_to_expr};
 use crate::lance::provider::DatasetProvider;
 use crate::lance::rows::batch_to_json_rows;
 use crate::lance::text::text_query_to_fts;
-use crate::telemetry::{Metrics, Rpc};
+use crate::telemetry::{Metrics, PrewarmIndexKind, Rpc};
 
 /// Column key under which Lance reports vector distances.
 const DISTANCE_KEY: &str = "_distance";
 
 /// Column key under which Lance reports BM25 scores.
 const SCORE_KEY: &str = "_score";
+
+/// Stable logical identifier column required in every served dataset.
+const RECORD_ID_COLUMN: &str = "record_id";
+
+/// Soft-delete marker excluded from every public search.
+const IS_DELETED_COLUMN: &str = "is_deleted";
+
+/// Fixed over-fetch multiplier used to recover logical `k` after vector-ID deduplication.
+const DEDUP_SURPLUS_MULTIPLIER: usize = 2;
 
 /// Object-store IO statistics captured from one Lance scan and attached to the per-query-leg span
 /// as `object_store.*` attributes, so a slow query can be drilled into by its object-store request
@@ -82,7 +90,7 @@ pub type ScanStatsHook = Arc<dyn Fn(&ScanIoStats) + Send + Sync>;
 
 /// Server-side ANN defaults applied when the corresponding request field is unset.
 ///
-/// Kept in a small struct so they can be passed as one argument to [`run_vector_query`] without
+/// Kept in a small struct so they can be passed as one argument to `run_vector_query` without
 /// extending that function's parameter list every time a new knob is added.
 #[derive(Debug, Clone, Copy)]
 pub struct AnnDefaults {
@@ -117,7 +125,7 @@ pub struct LanceSearchBackend<P: DatasetProvider> {
     pub(crate) provider: P,
     pub(crate) prewarm_concurrency: usize,
     pub(crate) metrics: Arc<crate::telemetry::Metrics>,
-    pub(crate) event_timestamp_column: String,
+    pub(crate) ts_column: String,
     pub(crate) scan_stats_hook: Option<ScanStatsHook>,
     pub(crate) ann_defaults: AnnDefaults,
     pub(crate) max_k: usize,
@@ -132,7 +140,7 @@ impl<P: DatasetProvider> LanceSearchBackend<P> {
             provider,
             prewarm_concurrency: crate::config::DEFAULT_PREWARM_CONCURRENCY,
             metrics: Arc::new(crate::telemetry::Metrics::disabled()),
-            event_timestamp_column: crate::config::DEFAULT_EVENT_TIMESTAMP_COLUMN.to_string(),
+            ts_column: crate::config::DEFAULT_TS_COLUMN.to_string(),
             scan_stats_hook: None,
             ann_defaults: AnnDefaults::default(),
             max_k: crate::config::DEFAULT_SEARCH_MAX_K,
@@ -146,8 +154,8 @@ impl<P: DatasetProvider> LanceSearchBackend<P> {
     }
 
     /// Sets the column a request time range is applied to.
-    pub fn with_event_timestamp_column(mut self, column: impl Into<String>) -> Self {
-        self.event_timestamp_column = column.into();
+    pub fn with_ts_column(mut self, column: impl Into<String>) -> Self {
+        self.ts_column = column.into();
         self
     }
 
@@ -163,7 +171,7 @@ impl<P: DatasetProvider> LanceSearchBackend<P> {
         QueryContext {
             metrics: &self.metrics,
             rpc,
-            event_timestamp_column: &self.event_timestamp_column,
+            ts_column: &self.ts_column,
             scan_stats_hook: self.scan_stats_hook.as_ref(),
             ann_defaults: self.ann_defaults,
             max_k: self.max_k,
@@ -178,7 +186,7 @@ struct QueryContext<'a> {
     /// RPC tag for metrics and the scan-stats span.
     rpc: Rpc,
     /// Column a request time range is applied to.
-    event_timestamp_column: &'a str,
+    ts_column: &'a str,
     /// Optional observer of the captured scan IO stats (test seam).
     scan_stats_hook: Option<&'a ScanStatsHook>,
     /// Server-side ANN defaults: probe counts, refine factor, and fast-search gate.
@@ -191,7 +199,7 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
     #[tracing::instrument(
         name = "backend.vector_search",
         skip_all,
-        fields(org_id = %target.org_id, search.k = query.k)
+        fields(search.k = query.k)
     )]
     async fn vector_search(
         &self,
@@ -199,33 +207,57 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
         query: VectorQuery,
     ) -> Result<VectorSearchOutcome, SearchError> {
         validate_k(query.k, self.max_k)?;
-        let dataset = self.provider.dataset(target, query.reference.clone()).await?;
-        let hits = run_vector_query(&dataset, &query, &self.context(Rpc::VectorSearch)).await?;
+        let dataset = self.provider.dataset(target, DatasetRef::Serve).await?;
+        let requested_k = query.k;
+        let mut engine_query = query;
+        engine_query.k = surplus_k(requested_k, self.max_k);
+        let deduplicated = deduplicate_hits(
+            run_vector_query(&dataset, &engine_query, &self.context(Rpc::VectorSearch)).await?,
+            requested_k,
+        );
+        let partial = deduplicated.removed_duplicate && deduplicated.hits.len() < requested_k;
         Ok(VectorSearchOutcome {
-            hits,
-            dataset_version: Some(dataset.version_id()),
+            hits: deduplicated.hits,
+            served_version: dataset.version_id(),
+            partial,
+            warnings: partial
+                .then_some(SearchWarning::ResultsUnderfilled)
+                .into_iter()
+                .collect(),
         })
     }
 
     #[tracing::instrument(
         name = "backend.text_search",
         skip_all,
-        fields(org_id = %target.org_id, search.k = query.k)
+        fields(search.k = query.k)
     )]
     async fn text_search(&self, target: &DatasetTarget, query: TextQuery) -> Result<TextSearchOutcome, SearchError> {
         validate_k(query.k, self.max_k)?;
-        let dataset = self.provider.dataset(target, query.reference.clone()).await?;
-        let hits = run_text_query(&dataset, &query, &self.context(Rpc::TextSearch)).await?;
+        let dataset = self.provider.dataset(target, DatasetRef::Serve).await?;
+        let requested_k = query.k;
+        let mut engine_query = query;
+        engine_query.k = surplus_k(requested_k, self.max_k);
+        let deduplicated = deduplicate_hits(
+            run_text_query(&dataset, &engine_query, &self.context(Rpc::TextSearch)).await?,
+            requested_k,
+        );
+        let partial = deduplicated.removed_duplicate && deduplicated.hits.len() < requested_k;
         Ok(TextSearchOutcome {
-            hits,
-            dataset_version: Some(dataset.version_id()),
+            hits: deduplicated.hits,
+            served_version: dataset.version_id(),
+            partial,
+            warnings: partial
+                .then_some(SearchWarning::ResultsUnderfilled)
+                .into_iter()
+                .collect(),
         })
     }
 
     #[tracing::instrument(
         name = "backend.hybrid_search",
         skip_all,
-        fields(org_id = %target.org_id, search.k = query.k)
+        fields(search.k = query.k)
     )]
     async fn hybrid_search(
         &self,
@@ -234,25 +266,30 @@ impl<P: DatasetProvider> SearchBackend for LanceSearchBackend<P> {
     ) -> Result<HybridSearchOutcome, SearchError> {
         validate_k(query.k, self.max_k)?;
         let mut vector_query = query.vector;
-        if vector_query.k == 0 {
-            vector_query.k = query.k;
-        }
+        vector_query.k = surplus_k(query.k, self.max_k);
         let mut text_query = query.text;
-        if text_query.k == 0 {
-            text_query.k = query.k;
-        }
+        text_query.k = surplus_k(query.k, self.max_k);
         let fusion = query.fusion;
-        let dataset = self.provider.dataset(target, query.reference.clone()).await?;
+        let dataset = self.provider.dataset(target, DatasetRef::Serve).await?;
         let context = self.context(Rpc::HybridSearch);
         let (vector_hits, text_hits) = tokio::join!(
             run_vector_query(&dataset, &vector_query, &context),
             run_text_query(&dataset, &text_query, &context),
         );
-        let (vector_hits, text_hits) = (vector_hits?, text_hits?);
+        let vector_hits = deduplicate_hits(vector_hits?, vector_query.k);
+        let text_hits = deduplicate_hits(text_hits?, text_query.k);
+        let removed_duplicate = vector_hits.removed_duplicate || text_hits.removed_duplicate;
         let fuse_span = tracing::info_span!("fusion.fuse", search.k = query.k);
+        let hits = fuse_span.in_scope(|| fusion.fuse(vec![vector_hits.hits, text_hits.hits], query.k));
+        let partial = removed_duplicate && hits.len() < query.k;
         Ok(HybridSearchOutcome {
-            hits: fuse_span.in_scope(|| fusion.fuse(vec![vector_hits, text_hits], query.k)),
-            dataset_version: Some(dataset.version_id()),
+            hits,
+            served_version: dataset.version_id(),
+            partial,
+            warnings: partial
+                .then_some(SearchWarning::ResultsUnderfilled)
+                .into_iter()
+                .collect(),
         })
     }
 }
@@ -274,9 +311,46 @@ fn scalar_output_columns(dataset: &Dataset) -> Vec<String> {
         .schema()
         .fields
         .iter()
-        .filter(|field| !matches!(field.data_type(), DataType::FixedSizeList(_, _)))
+        .filter(|field| {
+            !matches!(field.data_type(), DataType::FixedSizeList(_, _))
+                && field.name != RECORD_ID_COLUMN
+                && field.name != IS_DELETED_COLUMN
+        })
         .map(|field| field.name.clone())
         .collect()
+}
+
+/// Computes the fixed bounded candidate surplus used before logical-ID deduplication.
+fn surplus_k(k: usize, max_k: usize) -> usize {
+    k.saturating_mul(DEDUP_SURPLUS_MULTIPLIER).min(max_k)
+}
+
+/// Deduplicated candidates and whether repeated logical IDs consumed the bounded surplus.
+struct DeduplicatedHits {
+    /// Best-ranked candidate for each retained logical record ID.
+    hits: Vec<Hit>,
+    /// Whether at least one repeated logical record ID was discarded.
+    removed_duplicate: bool,
+}
+
+/// Keeps the best-ranked occurrence of each logical record ID and truncates to `k`.
+fn deduplicate_hits(hits: Vec<Hit>, k: usize) -> DeduplicatedHits {
+    let mut seen = HashSet::new();
+    let mut removed_duplicate = false;
+    let mut unique = Vec::with_capacity(k.min(hits.len()));
+    for hit in hits {
+        if seen.insert(hit.record_id.clone()) {
+            if unique.len() < k {
+                unique.push(hit);
+            }
+        } else {
+            removed_duplicate = true;
+        }
+    }
+    DeduplicatedHits {
+        hits: unique,
+        removed_duplicate,
+    }
 }
 
 /// Collects the top-level column names of the dataset schema for filter validation.
@@ -285,10 +359,6 @@ fn schema_columns(dataset: &Dataset) -> HashSet<String> {
 }
 
 /// Validates that `k` is a positive integer no greater than `max_k`.
-///
-/// Also used to bound the derived `k + offset` fetch count (see [`run_vector_query`] and
-/// [`run_text_query`]): on the flat/unindexed scan path Lance materializes up to that many full
-/// rows into one response, so an unbounded value would let a client force a multi-GB response.
 fn validate_k(k: usize, max_k: usize) -> Result<(), SearchError> {
     if k == 0 {
         return Err(SearchError::invalid_argument("k must be a positive integer"));
@@ -301,40 +371,48 @@ fn validate_k(k: usize, max_k: usize) -> Result<(), SearchError> {
     Ok(())
 }
 
-/// Applies projection, typed filter, optional event-time range, and limit/offset to a scanner.
+/// Applies projection, typed filter, optional event-time range, and limit to a scanner.
 ///
 /// The caller-provided filter and the event-time range predicate are ANDed into a single filter
 /// expression through the typed [`filter_to_expr`] / [`time_range_to_expr`] path, so no raw SQL is
 /// ever constructed. When only a time range is present it still drives the scan filter, naturally
 /// pruned by a BTREE or zone-map on the event-timestamp column.
 ///
-/// The physical `_rowid` column is not requested here: each query path enables it conditionally via
-/// [`Scanner::with_row_id`] before calling this helper, so pure single-leg searches that neither
-/// return the row id nor feed cross-leg fusion dedup skip the extra object-store read.
 fn apply_common_options(
     scanner: &mut Scanner,
     dataset: &Dataset,
     projection: &[String],
     predicate: ScanPredicate<'_>,
     k: usize,
-    offset: Option<usize>,
 ) -> Result<(), SearchError> {
-    if projection.is_empty() {
-        scanner
-            .project(&scalar_output_columns(dataset))
-            .map_err(|err| classify_lance_error(&err))?;
+    let mut output = if projection.is_empty() {
+        scalar_output_columns(dataset)
     } else {
-        scanner.project(projection).map_err(|err| classify_lance_error(&err))?;
+        if projection
+            .iter()
+            .any(|column| column == RECORD_ID_COLUMN || column == IS_DELETED_COLUMN)
+        {
+            return Err(SearchError::invalid_argument(
+                "record_id and is_deleted cannot be requested as projected fields",
+            ));
+        }
+        let unique: HashSet<&String> = projection.iter().collect();
+        if unique.len() != projection.len() {
+            return Err(SearchError::invalid_argument("projection contains duplicate columns"));
+        }
+        projection.to_vec()
+    };
+    output.push(RECORD_ID_COLUMN.to_string());
+    scanner.project(&output).map_err(|err| classify_lance_error(&err))?;
+    if !schema_columns(dataset).contains(IS_DELETED_COLUMN) {
+        return Err(SearchError::internal("served dataset is missing is_deleted"));
     }
     if let Some(expr) = predicate.combined_expr(dataset)? {
         scanner.filter_expr(expr);
-        scanner.prefilter(predicate.filter_mode == FilterMode::Prefilter);
+        scanner.prefilter(true);
     }
     scanner
-        .limit(
-            Some(i64::try_from(k).unwrap_or(i64::MAX)),
-            offset.map(|skip| i64::try_from(skip).unwrap_or(i64::MAX)),
-        )
+        .limit(Some(i64::try_from(k).unwrap_or(i64::MAX)), None)
         .map_err(|err| classify_lance_error(&err))?;
     Ok(())
 }
@@ -344,12 +422,10 @@ fn apply_common_options(
 struct ScanPredicate<'a> {
     /// Caller-provided typed predicate, if any.
     filter: Option<&'a crate::domain::Filter>,
-    /// Whether the predicate runs before or after the index search.
-    filter_mode: FilterMode,
     /// Optional event-time window, ANDed with `filter`.
     time_range: Option<&'a TimeRange>,
     /// Column the event-time window is applied to.
-    event_timestamp_column: &'a str,
+    ts_column: &'a str,
 }
 
 impl ScanPredicate<'_> {
@@ -362,21 +438,27 @@ impl ScanPredicate<'_> {
         };
         let range_expr = match self.time_range {
             Some(range) if range.is_bounded() => {
-                let data_type = event_timestamp_data_type(dataset, self.event_timestamp_column)?;
-                time_range_to_expr(range, self.event_timestamp_column, &data_type)?
+                let data_type = ts_data_type(dataset, self.ts_column)?;
+                time_range_to_expr(range, self.ts_column, &data_type)?
             }
             _ => None,
         };
-        Ok(match (filter_expr, range_expr) {
+        let caller = match (filter_expr, range_expr) {
             (Some(filter), Some(range)) => Some(filter.and(range)),
             (Some(filter), None) => Some(filter),
             (None, range) => range,
-        })
+        };
+        let live = Expr::Column(lance::deps::datafusion::common::Column::from_name(IS_DELETED_COLUMN))
+            .eq(lance::deps::datafusion::logical_expr::lit(false));
+        Ok(Some(match caller {
+            Some(caller) => caller.and(live),
+            None => live,
+        }))
     }
 }
 
 /// Resolves the Arrow data type of the event-timestamp column, rejecting an absent column.
-fn event_timestamp_data_type(dataset: &Dataset, column: &str) -> Result<DataType, SearchError> {
+fn ts_data_type(dataset: &Dataset, column: &str) -> Result<DataType, SearchError> {
     dataset
         .schema()
         .fields
@@ -418,9 +500,22 @@ fn execution_stats_callback(
 /// with no vector index causes Lance to return an empty result immediately (scanner.rs
 /// ~3804-3807), so the default must be skipped for the unindexed small-org tier. This check is
 /// O(#indices) against the in-memory manifest and does not perform any IO.
-async fn dataset_has_vector_index(dataset: &Dataset, column: &str) -> bool {
-    let Ok(metas) = dataset.load_indices().await else {
-        return false;
+///
+/// A `load_indices` failure is distinct from "no index exists": it means the probe itself could
+/// not complete, so it is logged and counted through [`Metrics::index_probe_error`] before falling
+/// back to the same `false` degrade path (the `fast_search` default is skipped, never applied
+/// blind).
+async fn dataset_has_vector_index(dataset: &Dataset, column: &str, metrics: &Metrics) -> bool {
+    let metas = match dataset.load_indices().await {
+        Ok(metas) => metas,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed to load index metadata while probing for a vector index; disabling the fast_search default"
+            );
+            metrics.index_probe_error(PrewarmIndexKind::Vector);
+            return false;
+        }
     };
     use crate::lance::prewarm::VECTOR_DETAILS_SUFFIX;
     metas.iter().any(|meta| {
@@ -451,9 +546,22 @@ async fn dataset_has_vector_index(dataset: &Dataset, column: &str) -> bool {
 /// default must not fire for the unindexed small-org tier. Without this guard, fresh fragments
 /// appended between nightly index runs would be silently excluded even when no index exists. This
 /// check is O(#indices) against the in-memory manifest and does not perform any IO.
-async fn dataset_has_fts_index(dataset: &Dataset, columns: &[String]) -> bool {
-    let Ok(metas) = dataset.load_indices().await else {
-        return false;
+///
+/// A `load_indices` failure is distinct from "no index exists": it means the probe itself could
+/// not complete, so it is logged and counted through [`Metrics::index_probe_error`] before falling
+/// back to the same `false` degrade path (the `fast_search` default is skipped, never applied
+/// blind).
+async fn dataset_has_fts_index(dataset: &Dataset, columns: &[String], metrics: &Metrics) -> bool {
+    let metas = match dataset.load_indices().await {
+        Ok(metas) => metas,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed to load index metadata while probing for an FTS index; disabling the fast_search default"
+            );
+            metrics.index_probe_error(PrewarmIndexKind::Fts);
+            return false;
+        }
     };
     use crate::lance::prewarm::INVERTED_DETAILS_SUFFIX;
     metas.iter().any(|meta| {
@@ -515,7 +623,7 @@ async fn run_vector_query(
         None => default_vector_column(dataset)?,
     };
     let key = Float32Array::from(query.vector.clone());
-    let fetch = query.k.saturating_add(query.offset.unwrap_or(0));
+    let fetch = query.k;
     validate_k(fetch, context.max_k)?;
     let d = &context.ann_defaults;
     let ceiling = d.nprobes_ceiling;
@@ -557,7 +665,7 @@ async fn run_vector_query(
     }
     let apply_fast_search = match query.fast_search {
         Some(value) => value,
-        None => d.fast_search_default && dataset_has_vector_index(dataset, &column_name).await,
+        None => d.fast_search_default && dataset_has_vector_index(dataset, &column_name, context.metrics).await,
     };
     if apply_fast_search {
         scanner.fast_search();
@@ -565,33 +673,22 @@ async fn run_vector_query(
     if query.bypass_vector_index {
         scanner.use_index(false);
     }
-    let needs_row_id = query.with_row_id || context.rpc == Rpc::HybridSearch;
-    if needs_row_id {
-        scanner.with_row_id();
-    }
     apply_common_options(
         &mut scanner,
         dataset,
         &query.projection,
         ScanPredicate {
             filter: query.filter.as_ref(),
-            filter_mode: query.filter_mode,
             time_range: query.time_range.as_ref(),
-            event_timestamp_column: context.event_timestamp_column,
+            ts_column: context.ts_column,
         },
         query.k,
-        query.offset,
     )?;
     let batch = scanner
         .try_into_batch()
         .await
         .map_err(|err| classify_lance_error(&err))?;
-    rows_to_hits(
-        batch_to_json_rows(&batch)?,
-        DISTANCE_KEY,
-        query.with_row_id,
-        needs_row_id,
-    )
+    rows_to_hits(batch_to_json_rows(&batch)?, DISTANCE_KEY)
 }
 
 /// Runs one full-text query against an open dataset.
@@ -615,7 +712,7 @@ async fn run_text_query(
     context: &QueryContext<'_>,
 ) -> Result<Vec<Hit>, SearchError> {
     validate_k(query.k, context.max_k)?;
-    let fetch = query.k.saturating_add(query.offset.unwrap_or(0));
+    let fetch = query.k;
     validate_k(fetch, context.max_k)?;
     let fts = text_query_to_fts(query, fetch)?;
     let mut scanner = dataset.scan();
@@ -631,14 +728,10 @@ async fn run_text_query(
     let d = &context.ann_defaults;
     let apply_fast_search = match query.fast_search {
         Some(value) => value,
-        None => d.fast_search_default && dataset_has_fts_index(dataset, &query.columns).await,
+        None => d.fast_search_default && dataset_has_fts_index(dataset, &query.columns, context.metrics).await,
     };
     if apply_fast_search {
         scanner.fast_search();
-    }
-    let needs_row_id = query.with_row_id || context.rpc == Rpc::HybridSearch;
-    if needs_row_id {
-        scanner.with_row_id();
     }
     apply_common_options(
         &mut scanner,
@@ -646,18 +739,16 @@ async fn run_text_query(
         &query.projection,
         ScanPredicate {
             filter: query.filter.as_ref(),
-            filter_mode: query.filter_mode,
             time_range: query.time_range.as_ref(),
-            event_timestamp_column: context.event_timestamp_column,
+            ts_column: context.ts_column,
         },
         query.k,
-        query.offset,
     )?;
     let batch = scanner
         .try_into_batch()
         .await
         .map_err(|err| classify_lance_error(&err))?;
-    rows_to_hits(batch_to_json_rows(&batch)?, SCORE_KEY, query.with_row_id, needs_row_id)
+    rows_to_hits(batch_to_json_rows(&batch)?, SCORE_KEY)
 }
 
 /// Converts JSON result rows into hits, extracting the score column and the physical row id.
@@ -667,28 +758,24 @@ async fn run_text_query(
 /// only when `keep_row_id` is also set, otherwise it is stripped after capture. When `has_row_id` is
 /// false the scanner did not fetch the column and the hit carries a placeholder row id of 0, which is
 /// never consulted because such hits never feed fusion dedup.
-fn rows_to_hits(
-    rows: Vec<Map<String, Value>>,
-    score_key: &str,
-    keep_row_id: bool,
-    has_row_id: bool,
-) -> Result<Vec<Hit>, SearchError> {
+///
+/// # Errors
+///
+/// A missing or non-numeric score column is an internal error, same as a missing `record_id`: a
+/// silently defaulted score of `0.0` would rank a real result as if it were maximally relevant, so
+/// a malformed row must fail loudly rather than mis-rank.
+fn rows_to_hits(rows: Vec<Map<String, Value>>, score_key: &str) -> Result<Vec<Hit>, SearchError> {
     rows.into_iter()
         .map(|mut row| {
-            let row_id = if has_row_id {
-                let captured = row
-                    .get(ROW_ID)
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| SearchError::internal("search result row is missing its row id"))?;
-                if !keep_row_id {
-                    row.remove(ROW_ID);
-                }
-                captured
-            } else {
-                0
-            };
-            let score = row.remove(score_key).and_then(|value| value.as_f64()).unwrap_or(0.0);
-            Ok(Hit { row_id, score, row })
+            let record_id = row
+                .remove(RECORD_ID_COLUMN)
+                .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                .ok_or_else(|| SearchError::internal("search result row is missing a string record_id"))?;
+            let score = row
+                .remove(score_key)
+                .and_then(|value| value.as_f64())
+                .ok_or_else(|| SearchError::internal(format!("search result row is missing a numeric {score_key}")))?;
+            Ok(Hit { record_id, score, row })
         })
         .collect()
 }
@@ -726,5 +813,36 @@ mod tests {
     fn validate_k_accepts_within_bounds() {
         validate_k(1, 10_000).unwrap();
         validate_k(10_000, 10_000).unwrap();
+    }
+
+    #[test]
+    fn rows_to_hits_errors_on_a_missing_score() {
+        let mut row = Map::new();
+        row.insert(RECORD_ID_COLUMN.to_string(), Value::String("v1".to_string()));
+        let err = rows_to_hits(vec![row], SCORE_KEY).unwrap_err();
+        assert!(
+            matches!(err, SearchError::Internal(ref message) if message.contains(SCORE_KEY)),
+            "expected an internal error naming the missing score column, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rows_to_hits_errors_on_a_non_numeric_score() {
+        let mut row = Map::new();
+        row.insert(RECORD_ID_COLUMN.to_string(), Value::String("v1".to_string()));
+        row.insert(SCORE_KEY.to_string(), Value::String("not-a-number".to_string()));
+        let err = rows_to_hits(vec![row], SCORE_KEY).unwrap_err();
+        assert!(matches!(err, SearchError::Internal(_)));
+    }
+
+    #[test]
+    fn rows_to_hits_accepts_a_numeric_score() {
+        let mut row = Map::new();
+        row.insert(RECORD_ID_COLUMN.to_string(), Value::String("v1".to_string()));
+        row.insert(SCORE_KEY.to_string(), Value::from(0.5));
+        let hits = rows_to_hits(vec![row], SCORE_KEY).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record_id, "v1");
+        assert_eq!(hits[0].score, 0.5);
     }
 }
